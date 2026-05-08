@@ -1,0 +1,223 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
+import { BurrowClient } from "../../burrow-client/client.ts";
+import { openDatabase, type WarrenDb } from "../../db/client.ts";
+import { createRepos, type Repos } from "../../db/repos/index.ts";
+import type { RunRow, RunTerminalState } from "../../db/schema.ts";
+import {
+	type BridgeRunStreamResult,
+	RunEventBroker,
+	type SpawnRunResult,
+} from "../../runs/index.ts";
+import type { CliContext } from "../output.ts";
+import { runRun } from "./run.ts";
+
+function captureContext(): { context: CliContext; out: string[]; err: string[] } {
+	const out: string[] = [];
+	const err: string[] = [];
+	const context: CliContext = {
+		env: {},
+		stdio: {
+			stdout: { write: (c) => out.push(c) },
+			stderr: { write: (c) => err.push(c) },
+		},
+		spawn: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+		now: () => new Date("2026-05-08T12:00:00.000Z"),
+	};
+	return { context, out, err };
+}
+
+function fakeBurrowClient(): BurrowClient {
+	return new BurrowClient({
+		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
+		fetch: (async () => new Response(null, { status: 500 })) as unknown as typeof fetch,
+	});
+}
+
+function buildSpawnStub(repos: Repos, agentName: string, projectId: string) {
+	return async (): Promise<SpawnRunResult> => {
+		const run: RunRow = repos.runs.create({
+			agentName,
+			projectId,
+			prompt: "fix the bug",
+			renderedAgentJson: { name: agentName, version: 1, sections: { system: "x" } },
+			trigger: "cli",
+			now: new Date("2026-05-08T12:00:00.000Z"),
+		});
+		const burrow: Burrow = {
+			id: "bur_aaaaaaaaaaaa",
+			parentId: null,
+			kind: "task",
+			name: null,
+			projectRoot: "/tmp/p",
+			workspacePath: "/tmp/p/ws",
+			branch: "warren/run/x",
+			provider: "local",
+			providerStateJson: null,
+			profileJson: {},
+			state: "active",
+			createdAt: new Date(),
+			updatedAt: new Date(),
+			destroyedAt: null,
+		};
+		const burrowRun: BurrowRun = {
+			id: "run_zzzzzzzzzzzz",
+			burrowId: burrow.id,
+			agentId: agentName,
+			prompt: "fix the bug",
+			resumeOfRunId: null,
+			state: "queued",
+			exitCode: null,
+			errorMessage: null,
+			metadataJson: null,
+			queuedAt: new Date(),
+			startedAt: null,
+			completedAt: null,
+		};
+		repos.runs.attachBurrow(run.id, { burrowId: burrow.id, burrowRunId: burrowRun.id });
+		return {
+			run,
+			burrow,
+			burrowRun,
+			agent: {
+				name: agentName,
+				version: 1,
+				sections: { system: "x" },
+				resolvedFrom: [],
+				frontmatter: {},
+			},
+		};
+	};
+}
+
+describe("runRun", () => {
+	let db: WarrenDb;
+	let repos: Repos;
+
+	beforeEach(async () => {
+		db = await openDatabase({ path: ":memory:" });
+		repos = createRepos(db);
+		// Seed an agent + project so referential checks would pass for spawnRun
+		// callers; the stubbed spawn we install below does not actually consult
+		// these, but inserting them documents the contract.
+		repos.agents.upsert({
+			name: "refactor-bot",
+			renderedJson: { name: "refactor-bot", version: 1, sections: { system: "x" } },
+			now: new Date("2026-05-08T12:00:00.000Z"),
+		});
+		repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/tmp/p",
+			defaultBranch: "main",
+			now: new Date("2026-05-08T12:00:00.000Z"),
+		});
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	test("rejects missing args with exit 2", async () => {
+		const { context } = captureContext();
+		const result = await runRun(
+			context,
+			{ repos, burrowClient: fakeBurrowClient() },
+			{ agent: "", project: "", prompt: "" },
+		);
+		expect(result.exitCode).toBe(2);
+	});
+
+	test("orchestrates spawn → tail → reap and exits 0 on succeeded", async () => {
+		const projectId = repos.projects.listAll()[0]?.id as string;
+		const broker = new RunEventBroker();
+		const { context, out, err } = captureContext();
+
+		// Bridge resolves immediately; the runner closes the broker in `finally`,
+		// so the tail iterator returns empty.
+		const bridgeStub = (async (): Promise<BridgeRunStreamResult> => ({
+			written: 0,
+			skipped: 0,
+			errored: false,
+		})) as never;
+
+		const reapStub = (async (input: { runId: string; outcome: RunTerminalState }) => {
+			repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
+			repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
+			return {
+				state: input.outcome,
+				mulchUpdated: 0,
+				mulchSkipped: 0,
+				mulchAppended: 0,
+				seedsClosed: 0,
+				branchPushed: false,
+				errors: [],
+				alreadyTerminal: false,
+			};
+		}) as never;
+
+		const result = await runRun(
+			context,
+			{
+				repos,
+				burrowClient: fakeBurrowClient(),
+				broker,
+				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
+				bridge: bridgeStub,
+				reap: reapStub,
+				fetchBurrowRunState: async () => "succeeded",
+			},
+			{ agent: "refactor-bot", project: projectId, prompt: "fix the bug" },
+		);
+
+		expect(err).toEqual([]);
+		expect(result.exitCode).toBe(0);
+		expect(result.state).toBe("succeeded");
+		const events = out.map((l) => JSON.parse(l) as { event: string });
+		const kinds = events.map((e) => e.event);
+		expect(kinds).toContain("run.spawned");
+		expect(kinds).toContain("run.reaped");
+	});
+
+	test("exits 1 when reap reports a non-success terminal state", async () => {
+		const projectId = repos.projects.listAll()[0]?.id as string;
+		const broker = new RunEventBroker();
+		const { context } = captureContext();
+
+		const bridgeStub = (async (): Promise<BridgeRunStreamResult> => ({
+			written: 0,
+			skipped: 0,
+			errored: false,
+		})) as never;
+		const reapStub = (async (input: { runId: string; outcome: RunTerminalState }) => {
+			repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
+			repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
+			return {
+				state: input.outcome,
+				mulchUpdated: 0,
+				mulchSkipped: 0,
+				mulchAppended: 0,
+				seedsClosed: 0,
+				branchPushed: false,
+				errors: [],
+				alreadyTerminal: false,
+			};
+		}) as never;
+
+		const result = await runRun(
+			context,
+			{
+				repos,
+				burrowClient: fakeBurrowClient(),
+				broker,
+				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
+				bridge: bridgeStub,
+				reap: reapStub,
+				fetchBurrowRunState: async () => "failed",
+			},
+			{ agent: "refactor-bot", project: projectId, prompt: "fix the bug" },
+		);
+
+		expect(result.exitCode).toBe(1);
+		expect(result.state).toBe("failed");
+	});
+});
