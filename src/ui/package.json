@@ -1,0 +1,36 @@
+{
+	"name": "@os-eco/warren-ui",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Warren web UI (React + Vite + Tailwind + shadcn-style components).",
+	"type": "module",
+	"scripts": {
+		"dev": "vite",
+		"build": "tsc -b && vite build",
+		"preview": "vite preview",
+		"typecheck": "tsc -b --noEmit"
+	},
+	"dependencies": {
+		"@radix-ui/react-dialog": "^1.1.4",
+		"@radix-ui/react-label": "^2.1.1",
+		"@radix-ui/react-slot": "^1.1.1",
+		"@tanstack/react-query": "^5.62.0",
+		"class-variance-authority": "^0.7.1",
+		"clsx": "^2.1.1",
+		"lucide-react": "^0.468.0",
+		"react": "^18.3.1",
+		"react-dom": "^18.3.1",
+		"react-router-dom": "^7.0.2",
+		"tailwind-merge": "^2.5.5"
+	},
+	"devDependencies": {
+		"@tailwindcss/vite": "^4.0.0",
+		"@types/node": "^22.10.0",
+		"@types/react": "^18.3.18",
+		"@types/react-dom": "^18.3.5",
+		"@vitejs/plugin-react": "^4.3.4",
+		"tailwindcss": "^4.0.0",
+		"typescript": "^5.6.3",
+		"vite": "^6.0.0"
+	}
+}

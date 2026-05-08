@@ -39,7 +39,10 @@
 		"lint": "biome check --error-on-warnings .",
 		"lint:fix": "biome check --write --error-on-warnings .",
 		"typecheck": "tsc --noEmit",
-		"db:generate": "drizzle-kit generate"
+		"db:generate": "drizzle-kit generate",
+		"ui:install": "cd src/ui && bun install",
+		"ui:dev": "cd src/ui && bun run dev",
+		"build:ui": "cd src/ui && bun install && bun run build"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.10",

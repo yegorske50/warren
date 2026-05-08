@@ -1,6 +1,8 @@
 node_modules/
 dist/
 src/ui/dist/
+src/ui/node_modules/
+src/ui/*.tsbuildinfo
 data/
 .env
 .env.local
