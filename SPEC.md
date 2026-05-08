@@ -2,10 +2,12 @@
 
 > A network of interconnected burrows. The control plane and UI for cloud-based custom agents that operate in isolation, self-manage, self-repair, and self-improve.
 
-**Status:** Design phase, draft.
+**Status:** Design phase, V1 spec.
 **Last updated:** 2026-05-08.
 **CLI:** `warren` / `wr` (TBD).
 **Package:** `@os-eco/warren` (TBD).
+
+V1 scope is the **manual run path**: connect canopy, add project, spawn run, watch events, steer/cancel. Scheduler (cron + webhooks) and library API exports are deferred to V2 — kept in this spec for context, marked **(V2)** where they appear.
 
 ---
 
@@ -24,7 +26,7 @@ V1 is single-user, single-host: clone warren, `docker compose up`, browser at `l
 ### 2.1 The day-in-the-life
 
 ```
-$ git clone https://github.com/jaymin/warren && cd warren
+$ git clone https://github.com/jayminwest/warren && cd warren
 $ cp .env.example .env && $EDITOR .env   # CANOPY_REPO_URL, ANTHROPIC_API_KEY, GITHUB_TOKEN
 $ docker compose up -d
 $ open http://homeserver.local:8080
@@ -35,15 +37,15 @@ In the UI:
 2. **Add project** — paste a GitHub URL. Warren clones it under `/data/projects/`.
 3. **Spawn run** — pick agent + project + prompt. Warren provisions a burrow, renders the canopy agent into it, dispatches the run, streams events to the UI.
 4. **Watch and steer** — live event tail, send steering messages, see seeds the agent files for itself, see mulch records the agent records as it learns.
-5. **Schedule** — "every 6 hours, run docs-bot against repo X" or "on PR open, run reviewer-bot." Cron and trigger-driven runs.
+5. **Schedule** *(V2)* — "every 6 hours, run docs-bot against repo X" or "on PR open, run reviewer-bot." Cron and trigger-driven runs. Out of V1 scope; UI surface and HTTP routes return "deferred" placeholders.
 
 ### 2.2 What Warren is
 
 - The **control plane**: one process, one HTTP API, one volume.
 - The **glue**: shells out to mulch/seeds/canopy/sapling CLIs, talks to burrow over its HTTP API.
 - The **UI**: web frontend served from the same process.
-- The **scheduler**: cron and event-triggered runs.
 - The **agent registry**: reads canopy, surfaces installable roles.
+- *(V2)* The **scheduler**: cron and event-triggered runs.
 
 ### 2.3 What Warren is not
 
@@ -63,12 +65,17 @@ Warren is a thin coordinator — most of the value is in the four CLIs and burro
 ### 3.1 V1 Goals
 
 - Single-image deploy: `docker compose up` on a home server, `fly deploy` on Fly.io, same Dockerfile.
-- Web UI for: agent registry, project list, run dispatch, live event tail, scheduled runs, basic settings.
+- Web UI for: agent registry, project list, run dispatch, live event tail, basic settings.
 - HTTP API mirroring the UI's surface so external scripts can drive warren.
 - Custom-agent-as-canopy-prompt: an agent is a single canopy prompt with required sections; warren auto-discovers from a connected canopy repo.
 - Runs against project repos cloned into warren's data dir from GitHub URLs.
-- Cron-scheduled runs and a webhook surface for trigger-driven runs.
 - Self-* loop: agents read seeds queue, write seeds for follow-ups, record mulch on success/failure, prime mulch on next spawn.
+- Durable event log: every event burrow streams is persisted in warren's SQLite so reload-after-crash and post-hoc inspection both work.
+
+**Deferred to V2** (kept in this spec for context, not built in V1):
+- Cron-scheduled runs and the scheduler tick loop.
+- GitHub webhook receiver and signature verification.
+- `@os-eco/warren` library API exports — internal-only `Client` is fine for V1.
 
 ### 3.2 V1 Non-Goals
 
@@ -135,16 +142,14 @@ Inheritance solves the "thousand repos" problem: `base-coding-agent` defines def
 
 When warren spawns a run:
 
-1. **Resolve agent** — `cn render <agent-name>` against the canopy repo. Returns a single object with all sections expanded after inheritance/mixin resolution.
-2. **Provision burrow** — call burrow's create-burrow endpoint with the agent's `burrow_config`, pointing at the project workspace.[^burrow-501]
-3. **Seed the burrow** — write the rendered `system` + `skills` into the burrow's `.canopy/`; pipe `expertise_seed` lines through `ml record` against the burrow's mulch; install the workflow template into burrow's seeds.
-4. **Dispatch** — call burrow's dispatch-run endpoint with the user's prompt + agent identity.
-5. **Stream** — subscribe to burrow's NDJSON event tail over the HTTP API; relay to UI subscribers via warren's own `/runs/:id/events?follow=1`.
-6. **Reap** — on run completion, capture the agent's mulch additions back to the project's persistent mulch (so learnings accumulate), close any seeds the agent marked done, push the workspace branch.
+1. **Resolve agent** — `cn render <agent-name>` against the canopy repo. Returns a single object with all sections expanded after inheritance/mixin resolution. The rendered JSON is persisted on the run row (`runs.rendered_agent_json`) and **frozen for the lifetime of the run** — mid-run edits to canopy do not affect in-flight runs. Run-time agent identity always reads from `runs.rendered_agent_json`, never from a re-render.
+2. **Provision burrow** — `POST /burrows` to burrow with `{ projectRoot, branch?, baseBranch?, network?, ... }` derived from the agent's `burrow_config` and the project's local clone path. Burrow returns 201 + `Burrow` (id, workspace path, branch, state). Warren records `burrow_id` on the run.
+3. **Seed the burrow** — write the rendered `system` + `skills` into the burrow's `.canopy/`; pipe `expertise_seed` lines (one mulch record per line) through `ml record` against the burrow's per-run `.mulch/` (see §11.A); install the workflow template into the burrow's `.seeds/`.
+4. **Dispatch** — `POST /burrows/:burrow_id/runs` with `{ agentId, prompt, metadata? }`. Burrow returns 201 + `Run` in `state='queued'`; its run loop picks it up. Warren records the burrow run id in `runs.burrow_run_id`.
+5. **Stream** — `GET /runs/:burrow_run_id/stream?follow=1` (NDJSON, chunked HTTP). Warren persists every event into its own `events` table (see §9) keyed by warren run id, then fans out to UI subscribers. UI clients hit warren's own `/runs/:id/events?follow=1`, which serves history from the warren log + tails the live stream concurrently. If warren restarts mid-run, on boot it re-subscribes to burrow's stream from `MAX(events.burrow_event_seq)+1` to backfill anything missed.
+6. **Reap** — on run terminal state, copy the burrow's `.mulch/expertise/*.jsonl` back to the project's persistent `.mulch/` with **last-write-wins by record `ts`** (§11.A); close any seeds the agent marked done in the burrow's `.seeds/`; push the workspace branch.
 
-See burrow's `/openapi.json` for canonical request/response shapes.
-
-[^burrow-501]: Burrow's `POST /burrows` currently returns 501 — warren's provisioning flow is blocked on burrow shipping this (tracked in burrow's `.seeds/`).
+Steering: `POST /runs/:id/steer` (warren) → `POST /burrows/:burrow_id/inbox` (burrow). Cancellation: `POST /runs/:id/cancel` (warren) → `POST /runs/:burrow_run_id/cancel` (burrow). Burrow's full HTTP contract is at `GET /openapi.json` on the burrow socket; warren generates code against the OpenAPI document, so contract drift surfaces at build time.
 
 The agent's worklist (seeds) belongs to the project, not the agent. Same project worked on by `refactor-bot` today and `sre-bot` tomorrow uses the same seeds queue.
 
@@ -187,16 +192,17 @@ The agent's worklist (seeds) belongs to the project, not the agent. Same project
 
 ### 5.1 Process model
 
-Two long-running processes inside the container:
+Three processes inside the container, supervised by a small Bun parent (see §10.3):
 
-- **`warren`** — Bun.serve, the platform process. HTTP API + UI + scheduler.
-- **`burrow serve`** — Bun.serve over unix socket, the runtime substrate.
+- **supervisor** — `src/supervisor/main.ts`, ~50–100 LOC. Spawns warren and burrow as children, forwards SIGTERM/SIGINT, restarts `burrow serve` on unexpected exit (with a budget), exits non-zero on warren crash.
+- **`warren`** — Bun.serve, the platform process. HTTP API + UI. (V2: scheduler tick + webhook receiver run inside this process.)
+- **`burrow serve`** — Bun.serve bound to a unix socket at `/var/run/burrow.sock`, the runtime substrate. Owns SQLite + sandboxes.
 
 Plus short-lived shell-outs to `cn`, `sd`, `ml`, `git` invoked from the warren process.
 
 ### 5.2 Why burrow is a separate process
 
-Same reason warren and burrow are separate repos: warren restarts shouldn't kill in-flight agent runs. Burrow's SQLite + run loop persist across warren deploys. The unix socket is the seam.
+Warren restarts shouldn't kill in-flight agent runs. Burrow's SQLite + run loop persist across warren deploys; the supervisor restarts only the failing child. The unix socket is the seam — no TCP exposure, no auth on the loopback, trust-the-socket posture matches burrow's default (§7 of burrow's spec). Warren never imports burrow as a library; only the typed `HttpClient` from `@os-eco/burrow` (§15.6 of burrow's spec) crosses the boundary.
 
 ### 5.3 Sandbox nesting
 
@@ -226,8 +232,9 @@ Verified empirically on Docker 28.4 / Ubuntu 24.04. Same recipe applies to Fly.i
 | Validation | **Zod 4** | Match burrow. |
 | CLI framework | **commander** | Match burrow / mulch / seeds / canopy. |
 | Logging | **pino** | Match burrow. |
-| Frontend | **React + Vite** (TBD) | Single SPA, served as static files from warren. |
-| Cron | **`node-cron`** or in-process timer | One scheduler per warren process. |
+| Frontend | **React + Vite + shadcn/ui + Tailwind** | SPA served as static files from warren. shadcn for component primitives (copy-in, no runtime dep), Tailwind for styling. Build output lives at `src/ui/dist/`, served by the same Bun.serve. |
+| Burrow client | **`HttpClient` from `@os-eco/burrow`** (§15.6) | Typed mirror of burrow's library API over the unix socket. No hand-written HTTP. |
+| Cron | **(V2)** in-process timer | Deferred. |
 
 No HTTP framework on the server. No Postgres, no Redis, no Docker-in-Docker.
 
@@ -262,17 +269,17 @@ warren/
 │   │   └── repo.ts             # discovery, .seeds/.mulch/ presence checks
 │   ├── runs/
 │   │   ├── spawn.ts            # composition flow §4.3
-│   │   ├── reap.ts             # capture mulch deltas, close seeds, push branch
-│   │   └── stream.ts           # bridge burrow events → warren subscribers
-│   ├── burrow-client/          # thin wrapper over burrow's HTTP-backed Client
+│   │   ├── reap.ts             # capture mulch deltas (§11.A), close seeds, push branch
+│   │   ├── stream.ts           # bridge burrow events → warren events table → subscribers
+│   │   └── events.ts           # warren event log (write-through cache of burrow stream)
+│   ├── burrow-client/          # thin facade over @os-eco/burrow HttpClient
+│   ├── supervisor/
+│   │   └── main.ts             # docker entrypoint: spawns warren + burrow serve, signal forwarding (§10.3)
 │   ├── server/
 │   │   ├── main.ts             # Bun.serve entry
 │   │   ├── routes/
 │   │   ├── auth.ts
 │   │   └── ui.ts               # static SPA serving
-│   ├── scheduler/
-│   │   ├── cron.ts             # tick loop
-│   │   └── webhook.ts          # GitHub webhook receiver
 │   ├── db/
 │   │   ├── client.ts
 │   │   ├── schema.ts
@@ -284,7 +291,8 @@ warren/
 │   │       ├── add-project.ts
 │   │       ├── run.ts
 │   │       └── doctor.ts
-│   └── ui/                     # React + Vite SPA, build output served by server
+│   ├── ui/                     # React + Vite + shadcn/ui SPA, build output served by server
+│   └── scheduler/              # (V2) cron tick + GitHub webhook receiver
 ├── data/                       # gitignored, runtime state (mounted volume in deploy)
 └── docker/
     └── burrow-base/            # if base image lives here vs burrow repo
@@ -297,6 +305,7 @@ warren/
 ### 8.1 HTTP API (top-level resources)
 
 ```
+# V1 — manual run path
 GET    /agents                  — list registered agent defs from canopy
 POST   /agents/refresh          — re-clone canopy repo, re-discover agents
 GET    /agents/:name            — full rendered agent (cn render output)
@@ -307,22 +316,22 @@ DELETE /projects/:id            — remove project
 
 POST   /runs                    — { agent, project, prompt } → spawn
 GET    /runs                    — list with filters (status, agent, project)
-GET    /runs/:id                — detail + summary
-GET    /runs/:id/events?follow=1 — NDJSON event tail (proxies burrow)
-POST   /runs/:id/steer          — send steering message
-POST   /runs/:id/cancel
-
-GET    /schedules               — list cron + trigger schedules
-POST   /schedules               — { name, cron|webhook, agent, project, prompt }
-DELETE /schedules/:id
-
-POST   /webhooks/github         — GitHub webhook target
+GET    /runs/:id                — detail + summary (includes rendered_agent_json)
+GET    /runs/:id/events?follow=1 — NDJSON event tail (warren log + live tail)
+POST   /runs/:id/steer          — send steering message (proxies to burrow inbox)
+POST   /runs/:id/cancel         — graceful cancel (proxies to burrow)
 
 GET    /healthz                 — liveness
 GET    /readyz                  — readiness (canopy reachable, burrow reachable)
+
+# V2 — deferred
+GET    /schedules               — list cron + trigger schedules
+POST   /schedules               — { name, cron|webhook, agent, project, prompt }
+DELETE /schedules/:id
+POST   /webhooks/github         — GitHub webhook target
 ```
 
-Auth: `Authorization: Bearer ${WARREN_API_TOKEN}`.
+Auth: `Authorization: Bearer ${WARREN_API_TOKEN}` on every route except `/healthz`. Warren expects HTTPS termination at a reverse proxy (Caddy on home server, Fly's edge on Fly.io); it does not terminate TLS itself. Token is single-user, single-value, no rotation in V1 — see §11 for the security posture.
 
 ### 8.2 CLI (admin-only)
 
@@ -332,15 +341,17 @@ The CLI is for ops, not daily use — the UI is daily.
 warren register-agent <name>       — refresh canopy and register one agent
 warren add-project <git-url>       — clone a project
 warren run <agent> <project> -p "..."  — one-shot, no UI
-warren schedule add ...
-warren schedule list
 warren doctor                       — burrow reachable? canopy clean? bwrap working?
 warren serve                        — start the HTTP server (default in docker entrypoint)
+
+# V2 — deferred
+warren schedule add ...
+warren schedule list
 ```
 
-### 8.3 Library API
+### 8.3 Library API (V2)
 
-`src/index.ts` exports the same shape, so a future user can embed warren in their own Bun program. Mirrors the HTTP routes 1:1.
+Deferred. V1's `Client` class is internal; warren's only public surface is the HTTP API + CLI. When the HTTP surface stabilizes, `src/index.ts` will export a `Client` that mirrors the routes 1:1, following burrow's `Client` / `HttpClient` pattern (§15 of burrow's spec).
 
 ---
 
@@ -368,13 +379,26 @@ runs (
   project_id TEXT,
   burrow_id TEXT,               -- see burrow's /openapi.json
   burrow_run_id TEXT,           -- see burrow's /openapi.json
+  rendered_agent_json TEXT,     -- frozen at run start; survives canopy edits
   state TEXT,                   -- queued | running | succeeded | failed | cancelled
   started_at TEXT,
   ended_at TEXT,
   prompt TEXT,
-  trigger TEXT                  -- 'manual' | 'cron:<sched_id>' | 'webhook:<sched_id>'
+  trigger TEXT                  -- 'manual' (V2: 'cron:<sched_id>' | 'webhook:<sched_id>')
 );
 
+events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES runs(id),
+  burrow_event_seq INTEGER,     -- mirrors burrow's monotonic seq for replay
+  ts TEXT NOT NULL,             -- ISO8601 from burrow envelope
+  kind TEXT NOT NULL,           -- 'tool_use' | 'tool_result' | 'thinking' | 'text' | 'state_change' | 'error' | 'stderr'
+  stream TEXT,                  -- 'stdout' | 'stderr' | 'system'
+  payload_json TEXT NOT NULL    -- pass-through from burrow
+);
+-- Index: events(run_id, burrow_event_seq) for ordered replay; events(run_id, ts) for time queries.
+
+-- V2 — deferred
 schedules (
   id TEXT PRIMARY KEY,          -- sched_xxx
   name TEXT,
@@ -393,7 +417,7 @@ webhook_secrets (
 );
 ```
 
-Run events are not stored in warren — burrow owns them. Warren stores enough run metadata to render the UI list and link out to burrow's event log.
+**Event durability rationale.** Burrow owns the canonical event log (its `events` table, NDJSON archive on destroy). Warren persists a copy of every event it streams from burrow because (a) the UI's "reload page, see history" expectation requires server-side history, (b) warren restart shouldn't lose events users were watching, and (c) decoupling warren's UI from burrow's archive lifecycle keeps the seam clean. Warren's events table is *not* the source of truth — it's a write-through cache of what burrow streamed. On warren restart, the run's stream is re-subscribed at `MAX(events.burrow_event_seq) + 1`. If warren's DB is lost, runs continue (burrow has them); the UI loses scrollback for terminated runs but not for running ones.
 
 ---
 
@@ -439,21 +463,67 @@ COPY . /app
 RUN bun install && bun run build:ui
 ENV WARREN_DATA_DIR=/data
 EXPOSE 8080
-ENTRYPOINT ["bun", "run", "src/server/main.ts"]
+ENTRYPOINT ["bun", "run", "src/supervisor/main.ts"]
 ```
 
-`burrow serve` runs as a sidecar process via a process-supervisor inside the container (s6-overlay, supervisord, or a small Bun parent process — TBD).
+The entrypoint is the Bun supervisor (`src/supervisor/main.ts`), not warren directly:
+
+- Spawns `burrow serve --socket /var/run/burrow.sock` as a child via `Bun.spawn`.
+- Waits for the socket file to appear (`fs.access` poll, 100 ms × 50 = 5s timeout) before spawning warren.
+- Spawns warren (`bun run src/server/main.ts`) as a child.
+- Forwards `SIGTERM` and `SIGINT` to both children, then waits for clean exit (5s grace) before forcing.
+- Restarts `burrow serve` if it exits non-zero, with an exponential backoff and a budget of 5 restarts in 60s; after exhaustion, the supervisor exits, the container restarts under Docker/Fly's restart policy.
+- Crashes if warren exits non-zero (warren is the user-facing process; restart-by-orchestrator is preferred to mask warren bugs in-process).
+
+Rationale: zero non-Bun deps; signal handling and lifecycle are explicit in our code; warren restarts (the more frequent kind, e.g., on deploy) leave burrow's run loop and SQLite untouched.
 
 ---
 
-## 11. Open Questions
+## 11. Decisions & Open Questions
 
-1. **Process supervisor inside the container.** Two long-running Bun processes (warren, burrow serve) — supervised how? Options: s6-overlay, supervisord, a Bun parent that spawns both. Lean toward Bun parent for zero non-Bun deps, but s6 is battle-tested.
-2. **Frontend stack.** React + Vite is default, but Bun + plain HTML/htmx might be enough for the V1 surface (mostly tables + event tail). Decide after the API is stable.
-3. **Webhook framework.** GitHub webhooks need signature verification, replay protection. Rolling our own vs. a small lib like `@octokit/webhooks`.
-4. **Mulch capture from agent runs.** When the agent records to its in-burrow mulch, how do those records get captured back into the project's persistent mulch? Options: (a) bind-mount the project's `.mulch/` into the burrow read-write (simplest, but breaks isolation); (b) the agent commits + pushes mulch deltas as part of its branch (clean, but requires the agent to know to do it); (c) post-run reap step that copies the burrow's `.mulch/expertise/*.jsonl` into the project (clean, requires schema-compatible merge). Probably (c).
-5. **Run cancellation semantics.** Cancel endpoints are now scoped: `POST /runs/:id/cancel` for graceful cancel (optional `{reason}` payload, emits cancel event) and `DELETE /runs/:id` for hard-stop or record cleanup (semantics TBD during burrow implementation). Blocked on burrow shipping the endpoints; tracked in burrow's `.seeds/`.
-6. **OpenAPI spec generation for warren's HTTP surface.** Same question that's been opened against burrow as a follow-up.
+### 11.A Expertise capture (mulch reap)
+
+The decided shape, expanded from prior open question #4:
+
+- **Per-run isolation.** Each burrow run gets its own `.mulch/` inside the burrow workspace — not shared across concurrent runs against the same project. This matches burrow's "one run at a time per burrow" default (§4.2 of burrow's spec) and avoids race conditions if that posture is later relaxed.
+- **Seeding (run start, step 3 of §4.3).** Warren reads `expertise_seed` lines from the rendered agent JSON; for each line, invokes `ml record` inside the burrow workspace via `burrow exec` (or equivalent) so the seed records land in the burrow's per-run `.mulch/expertise/<domain>.jsonl`. Format is canonical mulch record JSONL — one record per line, schema validated by mulch.
+- **Reap (run end, step 6 of §4.3).** Warren reads `<burrow-workspace>/.mulch/expertise/*.jsonl` and merges each record into the project's persistent `.mulch/expertise/<domain>.jsonl` using the project's local clone path. Merge rule: **last-write-wins by record `ts` field**. Conflict resolution:
+  - Same `id` (named record), incoming `ts > existing ts` → overwrite, emit a warren event `mulch.record.updated`.
+  - Same `id`, incoming `ts <= existing ts` → drop incoming, emit `mulch.record.skipped`.
+  - No `id` (anonymous record) → append, no conflict possible.
+- **Failure mode.** Reap errors (disk full, schema violation) do not fail the run — they are logged and surfaced as a `reap_failed` event on the run. The agent's work is preserved on the branch even if expertise capture fails.
+- **Why not bind-mount.** Bind-mounting the project's `.mulch/` into the sandbox would break burrow's isolation contract and risks corrupting the project's expertise log if the agent runs `ml` commands incorrectly. The reap step is the seam.
+- **Why not "agent commits mulch as a branch artifact".** Requires every agent definition to know about persistence mechanics. The reap step is invisible to agents — they just call `ml record` as documented in canopy/mulch.
+
+### 11.B Resolved decisions
+
+| Question | Resolution | Where |
+|---|---|---|
+| Process supervisor | Small Bun parent process (`src/supervisor/main.ts`), zero non-Bun deps. | §10.3 |
+| Frontend stack | React + Vite + shadcn/ui + Tailwind. | §6 |
+| Mulch capture | Per-run isolated `.mulch/`, post-run reap, last-write-wins-by-ts merge. | §11.A |
+| Run cancellation | `POST /runs/:id/cancel` proxies to burrow's `POST /runs/:burrow_run_id/cancel`. Hard-stop = `DELETE /burrows/:burrow_id` is V2; not needed for V1. | §4.3 |
+| Burrow API contract | Burrow's `/openapi.json` is the source of truth. Warren generates a typed client against it. | §4.3 |
+| Burrow shippability | All 21 routes implemented as of `burrow@7926a0e` (2026-05-08). `POST /burrows` no longer returns 501. | — |
+
+### 11.C Open questions for V1
+
+1. **OpenAPI spec for warren's own HTTP surface.** Same question burrow resolved by hand-authoring `src/server/openapi/spec.ts` and golden-locking it. Recommend the same pattern; defer decision until after `/runs` and `/agents` routes stabilize.
+2. **Concurrent runs per project.** Warren can dispatch many runs against the same project; each run gets its own burrow (provisioned per-run, destroyed on completion). Or do we share a long-lived burrow per project and queue runs serially inside it? Decision affects burrow lifecycle (provision-per-run vs. provision-per-project) and `runs.burrow_id` semantics. Lean toward provision-per-run for V1: simpler isolation, matches "task burrow" model from burrow's §4.1.
+3. **Reverse proxy assumption.** Spec assumes warren is fronted by Caddy/Fly edge for TLS. Should warren refuse to start if `WARREN_TRUST_PROXY != true` and the bind address is non-loopback? V1 default: warn loudly in `doctor`, do not refuse — home-server users may not have a proxy yet.
+4. **`readyz` timing.** When does warren consider itself "ready"? Burrow socket reachable + canopy clone present + at least one agent successfully rendered? All three? Affects deploy-time orchestration.
+
+### 11.D V1 security posture (known limitations)
+
+Documented, accepted for V1:
+
+- **Single bearer token.** No rotation, no expiry, no revocation. Loss of `WARREN_API_TOKEN` = full access. Mitigation: rotate by editing `.env` / `fly secrets set` and bouncing the container.
+- **Plaintext secrets in `.env`.** Standard for self-host; user is responsible for filesystem perms (`chmod 600 .env`). Fly.io's secret store is encrypted at rest.
+- **No HTTPS termination in warren.** TLS is the reverse proxy's job. Direct HTTP on a non-loopback address is a misconfiguration; `warren doctor` warns.
+- **Trust-the-socket between warren and burrow.** Burrow's unix socket has no auth; the in-container threat model is "warren is the only client." If a third party gains code execution inside the warren process, they have full burrow access. Acceptable: warren and burrow are co-tenanted by design.
+- **No CSRF protection on the UI.** UI calls warren's API with the bearer token. Not exposed to third-party origins (CORS strict). Single-user posture.
+
+These are limitations for V1, not bugs. V2 candidates: token-pair (read/write), per-token scopes, audit log.
 
 ---
 
@@ -461,7 +531,7 @@ ENTRYPOINT ["bun", "run", "src/server/main.ts"]
 
 | Tool | Warren's relationship |
 |---|---|
-| **burrow** | Hard dependency. HTTP API consumer (`pl-5b40`). Warren cannot run without burrow. |
+| **burrow** | Hard dependency. HTTP API consumer via the typed `HttpClient` from `@os-eco/burrow` (burrow's §15.6). Warren cannot run without burrow. Burrow's HTTP API is shipped as of `7926a0e` (2026-05-08); all routes warren needs (`POST /burrows`, `POST /burrows/:id/runs`, `GET /runs/:id/stream`, `POST /burrows/:id/inbox`, `POST /runs/:id/cancel`, `DELETE /burrows/:id`, `GET /watch`) are live. |
 | **canopy** | Hard dependency. Source of agent definitions. Cloned at startup, refreshed on demand. |
 | **mulch** | Used per-project. Warren shells out to `ml record` / `ml prime` against the project mulch dir during run setup and reap. |
 | **seeds** | Used per-project. Warren reads `sd ready` to surface the project's worklist in the UI; agents file/close seeds during runs. |
@@ -474,7 +544,9 @@ ENTRYPOINT ["bun", "run", "src/server/main.ts"]
 
 ## 13. References
 
-- Burrow HTTP API: `pl-5b40` / `burrow-1d64` (burrow repo `.seeds/`).
+- Burrow HTTP API: shipped via `pl-5b40` / `burrow-1d64`. Canonical contract at `GET /openapi.json` on a running `burrow serve`; spec pointer in burrow's SPEC.md §27. `POST /burrows` provisioning landed in `burrow@7926a0e` (2026-05-08).
+- Burrow library API (`@os-eco/burrow` `HttpClient`): burrow's SPEC.md §15.6.
+- Burrow dashboard snapshot envelope (`GET /watch`): burrow's SPEC.md §26 — possible future basis for warren's dashboard view.
 - Bwrap-in-container recipe: `mx-94901b`, `mx-c085ba` (burrow repo `.mulch/expertise/sandbox.jsonl`).
 - Canopy inheritance + mixins: see canopy `cn tree` / `cn render` (canopy repo).
 - Seeds plan workflow: `sd plan templates` (any os-eco repo with seeds).
