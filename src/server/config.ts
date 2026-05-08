@@ -1,0 +1,97 @@
+/**
+ * Resolve the warren HTTP server's environment-driven config (SPEC §10).
+ *
+ * Five pieces of state matter here:
+ *   1. Where the server binds (host + port; or unix socket path).
+ *   2. Where the SQLite db lives (warren.db under the data dir).
+ *   3. The bearer token that protects every route except /healthz.
+ *   4. Where the UI's static dist dir is (`src/ui/dist` in dev, `/app/src/ui/dist` in container).
+ *   5. The data dir root (joined for default db path).
+ *
+ * Env contract (all warren-namespaced):
+ *   WARREN_API_TOKEN         bearer token — required (or pass --no-auth)
+ *   WARREN_BIND_HOST         TCP host — defaults to 0.0.0.0
+ *   WARREN_BIND_PORT         TCP port — defaults to 8080
+ *   WARREN_BIND_SOCKET       unix socket path — presence flips transport to unix
+ *   WARREN_DATA_DIR          data root — defaults to /data
+ *   WARREN_DB_PATH           SQLite path — defaults to <DATA_DIR>/warren.db
+ *   WARREN_UI_DIST_DIR       UI dist dir — defaults to <repo>/src/ui/dist
+ *   WARREN_DISABLE_UI        '1'/'true' to disable static UI serving entirely
+ *
+ * Other configs (canopy, projects, burrow client) load from their own
+ * env-readers — this loader only handles server-process concerns.
+ */
+
+import { join } from "node:path";
+import { ValidationError } from "../core/errors.ts";
+import type { Transport } from "./types.ts";
+
+export const DEFAULT_DATA_DIR = "/data";
+export const DEFAULT_BIND_HOST = "0.0.0.0";
+export const DEFAULT_BIND_PORT = 8080;
+
+export interface ServerConfig {
+	readonly transport: Transport;
+	readonly token: string | null;
+	readonly dbPath: string;
+	readonly dataDir: string;
+	readonly uiDistDir: string | null;
+}
+
+export type EnvLike = Readonly<Record<string, string | undefined>>;
+
+export interface LoadServerConfigOptions {
+	readonly env?: EnvLike;
+	/** Skip token requirement (CLI `--no-auth`). */
+	readonly noAuth?: boolean;
+	/** Default UI dist directory. Falls back to `<cwd>/src/ui/dist`. */
+	readonly defaultUiDistDir?: string;
+}
+
+export function loadServerConfigFromEnv(opts: LoadServerConfigOptions = {}): ServerConfig {
+	const env = opts.env ?? process.env;
+
+	const transport = resolveTransport(env);
+	const token = resolveToken(env, opts.noAuth ?? false);
+	const dataDir = env.WARREN_DATA_DIR ?? DEFAULT_DATA_DIR;
+	const dbPath = env.WARREN_DB_PATH ?? join(dataDir, "warren.db");
+	const uiDistDir = resolveUiDistDir(env, opts.defaultUiDistDir);
+
+	return { transport, token, dbPath, dataDir, uiDistDir };
+}
+
+function resolveTransport(env: EnvLike): Transport {
+	const socket = env.WARREN_BIND_SOCKET;
+	if (socket !== undefined && socket !== "") {
+		return { kind: "unix", path: socket };
+	}
+	const host = env.WARREN_BIND_HOST ?? DEFAULT_BIND_HOST;
+	const portRaw = env.WARREN_BIND_PORT;
+	const port =
+		portRaw !== undefined && portRaw !== "" ? Number.parseInt(portRaw, 10) : DEFAULT_BIND_PORT;
+	if (!Number.isInteger(port) || port < 0 || port > 65535) {
+		throw new ValidationError(
+			`WARREN_BIND_PORT must be an integer 0..65535 (got ${JSON.stringify(portRaw)})`,
+		);
+	}
+	return { kind: "tcp", hostname: host, port };
+}
+
+function resolveToken(env: EnvLike, noAuth: boolean): string | null {
+	if (noAuth) return null;
+	const token = env.WARREN_API_TOKEN;
+	if (token === undefined || token === "") {
+		throw new ValidationError("WARREN_API_TOKEN is not set", {
+			recoveryHint: "export WARREN_API_TOKEN=<token> or boot with --no-auth (loopback only)",
+		});
+	}
+	return token;
+}
+
+function resolveUiDistDir(env: EnvLike, fallback: string | undefined): string | null {
+	const explicit = env.WARREN_UI_DIST_DIR;
+	const disabled = env.WARREN_DISABLE_UI;
+	if (disabled === "1" || disabled === "true") return null;
+	if (explicit !== undefined && explicit !== "") return explicit;
+	return fallback ?? join(process.cwd(), "src", "ui", "dist");
+}

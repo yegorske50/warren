@@ -1,0 +1,155 @@
+/**
+ * Shared types for the warren HTTP server (SPEC §8.1).
+ *
+ * The shape mirrors burrow's server (`@os-eco/burrow-cli` `src/server/`)
+ * deliberately so a future operator who flips between the two can read
+ * either codebase without retraining: same Route/RouteContext/ServeHandle
+ * surface, same auth seam, same error envelope. Warren's HTTP face is
+ * thin glue over the modules in `runs/`, `registry/`, `projects/`, and
+ * `db/repos/` — this file just declares the seams the wiring rides on.
+ */
+
+import type { BurrowClient } from "../burrow-client/client.ts";
+import type { Repos } from "../db/repos/index.ts";
+import type { ProjectsConfig } from "../projects/config.ts";
+import type { CanopyRegistryConfig } from "../registry/config.ts";
+import type { RunEventBroker } from "../runs/events.ts";
+
+/**
+ * Error envelope rendered for every non-2xx response. Mirrors burrow's
+ * `ErrorEnvelope` so an HTTP consumer hitting both surfaces uses one
+ * decoder. `code` is the stable machine identifier; `message` is human;
+ * `hint` is the optional recovery cue from `WarrenError.recoveryHint`.
+ */
+export interface ErrorEnvelope {
+	error: {
+		code: string;
+		message: string;
+		hint?: string;
+	};
+}
+
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+/**
+ * Compiled route pattern. `paramNames` is the ordered list of `:foo`
+ * segments captured by `regex`; the router populates `RouteContext.params`
+ * from this list at request time without re-parsing the pattern.
+ */
+export interface RoutePattern {
+	method: HttpMethod;
+	pattern: string;
+	regex: RegExp;
+	paramNames: readonly string[];
+}
+
+/**
+ * Per-request context handed to route handlers. `params` carries the
+ * decoded `:foo` captures. `logger` is whatever pino instance the server
+ * was booted with; tests pass a silent one.
+ */
+export interface RouteContext {
+	readonly request: Request;
+	readonly url: URL;
+	readonly params: Readonly<Record<string, string>>;
+	readonly logger: Logger;
+}
+
+export type RouteHandler = (ctx: RouteContext) => Response | Promise<Response>;
+
+export interface Route {
+	readonly method: HttpMethod;
+	readonly pattern: string;
+	readonly handler: RouteHandler;
+}
+
+/**
+ * Wire-level binding for `warren serve`. TCP is the canonical V1 deploy
+ * (warren is fronted by Caddy/Fly edge for TLS — see SPEC §11.D); the
+ * unix socket option is kept for any future "warren next to a reverse
+ * proxy on the same box without a port" deploy. Defaults to ephemeral
+ * loopback TCP for tests.
+ */
+export type Transport =
+	| { readonly kind: "unix"; readonly path: string }
+	| { readonly kind: "tcp"; readonly hostname: string; readonly port: number };
+
+/**
+ * Pino-shaped logger. Loose enough that tests pass `console`-shaped
+ * stubs and prod passes `pino()` without a type dance.
+ */
+export interface Logger {
+	info(obj: object, msg?: string): void;
+	warn(obj: object, msg?: string): void;
+	error(obj: object, msg?: string): void;
+	debug?(obj: object, msg?: string): void;
+}
+
+/**
+ * Everything a handler needs to do its job. The server owns one of these
+ * and threads it through to the route table; handlers never reach
+ * outside this struct (so tests can swap any seam). `bridges` is the
+ * per-server registry that owns the live `bridgeRunStream` controllers
+ * — a fresh spawn registers one, shutdown aborts them all.
+ */
+export interface ServerDeps {
+	readonly repos: Repos;
+	readonly burrowClient: BurrowClient;
+	readonly broker: RunEventBroker;
+	readonly bridges: BridgeRegistry;
+	readonly canopyConfig: CanopyRegistryConfig;
+	readonly projectsConfig: ProjectsConfig;
+	readonly logger: Logger;
+	/** UI dist directory for static serving; null disables `/` and `/assets/*`. */
+	readonly uiDistDir: string | null;
+	/** Provided so tests can override `Date.now()`. */
+	readonly now?: () => Date;
+}
+
+/**
+ * The bridge registry. Per-run bridges are created when `POST /runs`
+ * lands and on warren startup via `recoverActiveRunStreams`; the
+ * registry tracks them so server shutdown can abort everyone in one
+ * pass. Concrete impl lives in `./bridges.ts`.
+ */
+export interface BridgeRegistry {
+	/** Start a bridge for the given run; idempotent against a running bridge. */
+	start(runId: string, burrowRunId: string): void;
+	/** Abort all in-flight bridges and await their drain. */
+	stopAll(): Promise<void>;
+	/** Test/diagnostic surface — number of currently-attached bridges. */
+	size(): number;
+}
+
+export interface ServeOptions {
+	transport?: Transport;
+	/** Auth strategy. Defaults to `NO_AUTH` for tests; main wires `bearerAuth`. */
+	auth?: AuthProvider;
+	/** Override the route table (tests); defaults to `buildRoutes(deps)`. */
+	routes?: readonly Route[];
+	logger?: Logger;
+}
+
+export interface ServeHandle {
+	readonly transport: Transport;
+	readonly url: string;
+	stop(): Promise<void>;
+}
+
+export interface AuthOk {
+	readonly ok: true;
+}
+
+export interface AuthDenied {
+	readonly ok: false;
+	readonly status: number;
+	readonly code: string;
+	readonly message: string;
+	readonly challenge?: string;
+}
+
+export type AuthOutcome = AuthOk | AuthDenied;
+
+export interface AuthProvider {
+	authorize(request: Request): AuthOutcome;
+}
