@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BurrowClient } from "../burrow-client/index.ts";
@@ -51,7 +51,7 @@ const okSpawn: SpawnFn = async (cmd) => {
 function depsFor(
 	repos: Repos,
 	bridges?: BridgeRegistry,
-	overrides: { spawn?: SpawnFn; canopyDir?: string } = {},
+	overrides: { spawn?: SpawnFn; canopyDir?: string; uiDistDir?: string | null } = {},
 ): ServerDeps {
 	const burrowClient = makeBurrowClient();
 	const broker = new RunEventBroker();
@@ -75,9 +75,17 @@ function depsFor(
 		},
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
 		logger: silentLogger,
-		uiDistDir: null,
+		uiDistDir: overrides.uiDistDir === undefined ? null : overrides.uiDistDir,
 		spawn: overrides.spawn ?? okSpawn,
 	};
+}
+
+function setupUiDist(): string {
+	const dir = mkdtempSync(join(tmpdir(), "warren-server-ui-"));
+	writeFileSync(join(dir, "index.html"), "<html><body>warren ui</body></html>");
+	mkdirSync(join(dir, "assets"), { recursive: true });
+	writeFileSync(join(dir, "assets", "app.js"), "console.log('hi')");
+	return dir;
 }
 
 function tcpOpts(extra: Partial<ServeOptions> = {}): ServeOptions {
@@ -140,6 +148,45 @@ describe("startServer — lifecycle", () => {
 			headers: { authorization: "Bearer secret" },
 		});
 		expect(res.status).toBe(200);
+	});
+
+	test("/readyz still requires auth (body reveals failed checks)", async () => {
+		handle = startServer(depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
+		const res = await fetch(`${tcpUrl(handle)}/readyz`);
+		expect(res.status).toBe(401);
+	});
+
+	test("UI shell, assets, and SPA deep links are auth-exempt (warren-d2a5)", async () => {
+		// Without this, a fresh browser hitting `/` gets a 401 envelope and
+		// the user can never reach Login.tsx to enter their bearer token.
+		const distDir = setupUiDist();
+		try {
+			handle = startServer(
+				depsFor(repos, undefined, { uiDistDir: distDir }),
+				tcpOpts({ auth: bearerAuth("secret") }),
+			);
+			const base = tcpUrl(handle);
+
+			const root = await fetch(`${base}/`);
+			expect(root.status).toBe(200);
+			expect(root.headers.get("content-type")).toContain("text/html");
+			expect(await root.text()).toContain("warren ui");
+
+			const asset = await fetch(`${base}/assets/app.js`);
+			expect(asset.status).toBe(200);
+			expect(asset.headers.get("content-type")).toContain("text/javascript");
+
+			// React Router deep link → falls through to index.html, no 401.
+			const deep = await fetch(`${base}/login`);
+			expect(deep.status).toBe(200);
+			expect(await deep.text()).toContain("warren ui");
+
+			// API endpoints stay gated.
+			const agents = await fetch(`${base}/agents`);
+			expect(agents.status).toBe(401);
+		} finally {
+			rmSync(distDir, { recursive: true, force: true });
+		}
 	});
 
 	test("unknown path → 404 not_found envelope", async () => {

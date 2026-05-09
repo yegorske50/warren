@@ -499,11 +499,53 @@ export function buildApiRoutes(deps: ServerDeps): Route[] {
 }
 
 /**
- * Paths that are exempt from auth. Liveness probes can't carry a token
- * and the response is non-sensitive (`{ok: true}`). Readyz IS auth-
- * protected because its body reveals which checks failed.
+ * Top-level prefixes the API claims. Any pathname under one of these is
+ * an API request: it requires auth (except `/healthz`, see
+ * `isAuthExempt`) and the SPA fallback in `ui.ts` refuses to serve
+ * `index.html` for it. Kept in sync with `ROUTE_TABLE` by hand — the
+ * router patterns are richer than prefixes (`/agents/:name`,
+ * `/runs/:id/events`) so we can't derive these without either parsing
+ * the patterns or duplicating the policy.
  */
-export const AUTH_EXEMPT_PATHS = new Set<string>(["/healthz"]);
+export const API_PREFIXES: readonly string[] = [
+	"/agents",
+	"/projects",
+	"/runs",
+	"/healthz",
+	"/readyz",
+];
+
+/**
+ * True iff `pathname` is one of the API surfaces above. Cheap prefix
+ * scan — five entries, no allocations on the hot path.
+ */
+export function isApiPath(pathname: string): boolean {
+	for (const prefix of API_PREFIXES) {
+		if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true;
+	}
+	return false;
+}
+
+/**
+ * Auth predicate for the request gate (server.ts).
+ *
+ * Exempt:
+ *   - `/healthz` — liveness probes can't carry a token and the response
+ *     is non-sensitive (`{ok: true}`).
+ *   - Every non-API path — the SPA shell (`/`), its static assets
+ *     (`/assets/<hash>`), and React Router deep links must be reachable
+ *     from a fresh browser. Otherwise the user can't load `Login.tsx`
+ *     to enter their bearer token (chicken-and-egg, warren-d2a5).
+ *
+ * Auth-required:
+ *   - Every API path other than `/healthz`. `/readyz` stays gated
+ *     because its body reveals which checks failed (sensitive in a
+ *     misconfigured deploy).
+ */
+export function isAuthExempt(pathname: string): boolean {
+	if (pathname === "/healthz") return true;
+	return !isApiPath(pathname);
+}
 
 export const API_ROUTE_PATTERNS: readonly { method: Route["method"]; pattern: string }[] =
 	ROUTE_TABLE.map((e) => ({ method: e.method, pattern: e.pattern }));

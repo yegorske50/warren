@@ -7,9 +7,12 @@
  * `AuthProvider` the caller injects; the dispatch layer never inspects
  * token values.
  *
- * `/healthz` is the one auth-exempt route — liveness probes can't carry
- * a token. `/readyz` is auth-required because its body reveals which
- * checks failed (which is sensitive in a misconfigured deploy).
+ * Auth exemption (see `isAuthExempt` in handlers.ts): `/healthz` plus
+ * every non-API path (SPA shell, static assets, React Router deep
+ * links) — otherwise a fresh browser can't reach `Login.tsx` to enter
+ * its bearer token. `/readyz` and the rest of the API stay gated;
+ * `/readyz` reveals failed checks, which is sensitive in a
+ * misconfigured deploy.
  *
  * `startServer` does NOT own the bridges, broker, or DB — those live in
  * `ServerDeps` so a single test can spin up the wire layer without a
@@ -19,7 +22,7 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { NO_AUTH } from "./auth.ts";
 import { methodNotAllowed, notFound, renderError } from "./errors.ts";
-import { AUTH_EXEMPT_PATHS, buildApiRoutes } from "./handlers.ts";
+import { buildApiRoutes, isAuthExempt } from "./handlers.ts";
 import { jsonResponse } from "./response.ts";
 import { matchRoute, pathExists } from "./router.ts";
 import type {
@@ -138,7 +141,7 @@ async function handleRequest(
 ): Promise<Response> {
 	const url = new URL(request.url);
 
-	if (!AUTH_EXEMPT_PATHS.has(url.pathname)) {
+	if (!isAuthExempt(url.pathname)) {
 		const result = auth.authorize(request);
 		if (!result.ok) return denyResponse(result);
 	}

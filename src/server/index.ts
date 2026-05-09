@@ -27,7 +27,13 @@ export {
 	type RenderedError,
 	renderError,
 } from "./errors.ts";
-export { API_ROUTE_PATTERNS, AUTH_EXEMPT_PATHS, buildApiRoutes } from "./handlers.ts";
+export {
+	API_PREFIXES,
+	API_ROUTE_PATTERNS,
+	buildApiRoutes,
+	isApiPath,
+	isAuthExempt,
+} from "./handlers.ts";
 export { type BootServerOptions, bootServer, type WarrenServerHandle } from "./main.ts";
 export { jsonResponse, ndjsonResponse } from "./response.ts";
 export { compilePattern, matchRoute, pathExists } from "./router.ts";

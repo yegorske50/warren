@@ -23,14 +23,8 @@
 
 import { existsSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
+import { isApiPath } from "./handlers.ts";
 import type { RouteContext, RouteHandler } from "./types.ts";
-
-/**
- * Routes that should never be intercepted by the SPA fallback. API
- * traffic is on these prefixes; if the API didn't match, we want a 404
- * envelope, not the SPA's index.html.
- */
-const API_PREFIXES = ["/agents", "/projects", "/runs", "/healthz", "/readyz"] as const;
 
 const CONTENT_TYPES: Readonly<Record<string, string>> = {
 	".html": "text/html; charset=utf-8",
@@ -85,13 +79,6 @@ export function createUiHandler(opts: UiHandlerOptions): RouteHandler {
 		}
 		return await renderFile(indexPath, index);
 	};
-}
-
-function isApiPath(pathname: string): boolean {
-	for (const prefix of API_PREFIXES) {
-		if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true;
-	}
-	return false;
 }
 
 function decodePath(pathname: string): string {
