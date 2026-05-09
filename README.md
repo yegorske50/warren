@@ -2,7 +2,7 @@
 
 > A network of interconnected burrows. The control plane and UI for cloud-based custom agents that operate in isolation, self-manage, self-repair, and self-improve.
 
-**Status:** V1, 0.1.0. The manual-run path is end-to-end validated as of 2026-05-09 (see [SPEC.md §11.E](SPEC.md#11e-first-run-validation-2026-05-09)). Scheduler (cron + webhooks) and library API exports are deferred to V2.
+**Status:** V1, 0.1.1. The manual-run path is end-to-end validated as of 2026-05-09 (see [SPEC.md §11.E](SPEC.md#11e-first-run-validation-2026-05-09)). Scheduler (cron + webhooks) and library API exports are deferred to V2.
 
 Warren composes the os-eco data-plane tools — [canopy](https://github.com/jayminwest/canopy) (prompts), [mulch](https://github.com/jayminwest/mulch) (expertise), [seeds](https://github.com/jayminwest/seeds) (issues), [sapling](https://github.com/jayminwest/sapling) (harness) — and the [burrow](https://github.com/jayminwest/burrow) sandbox runtime into a single deployable system. **One container, one volume, one HTTP API, one UI.**
 

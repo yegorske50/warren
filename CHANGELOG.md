@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-09
+
+Post-V1 hardening pass. Closes every "Known limitations" seed filed against
+0.1.0 — `GITHUB_TOKEN` git auth, `--no-auth` burrow knob, warren-on-PATH,
+queued-vs-crashed reap classification, and `curl` in the runtime image — plus
+projects can now refresh on every run, run streams survive Bun's 10s idle
+timeout, and the UI no longer overflows on wide tables.
+
+### Added
+
+- **`feat(projects)`** — every run now `git fetch`-refreshes the project clone
+  before composing the burrow; the new `POST /projects/:id/refresh` endpoint
+  exposes the same flow for manual use. Persistent clones in
+  `/data/projects/<owner>/<name>` no longer drift from upstream.
+- **`feat(supervisor)`** — `BURROW_NO_AUTH` and `BURROW_EXTRA_ARGS` env knobs
+  splice into the supervisor's `burrow serve` invocation, supporting loopback
+  dev without bearer auth (warren-93ee).
+- **`feat(runs)`** — failed runs now carry a `failure_reason` column
+  (`crashed | never_started | cancelled | timeout | reap_failed`), so reap can
+  distinguish "queued, never started" from "crashed mid-run" (warren-3c40).
+- **`feat(docker)`** — `curl` is installed in the runtime image so operators
+  can probe the burrow unix socket from inside the container (warren-bd69).
+- **`test(acceptance)`** — scenario 03 covers projects management end-to-end
+  (clone, presence checks, refresh, reap merge).
+
+### Fixed
+
+- **`fix(ui)`** — `min-w-0` on the main pane prevents wide tables (events,
+  reap output) from pushing the viewport horizontally on the runs page
+  (warren-930c).
+- **`fix(docker)`** — the `warren` CLI is now symlinked onto `PATH` inside
+  the container; previously `docker exec ... warren doctor` failed (warren-fab1).
+- **`fix(supervisor)`** — `GITHUB_TOKEN` is wired into `git config --global
+  url.<token>@github.com.insteadOf` at supervisor boot, so private project
+  clones work without per-run setup (warren-dcf3).
+- **`fix(runs)`** — runs transition `queued → running` on the first burrow
+  bridge event (previously stuck in `queued` until completion) (warren-865e).
+- **`fix(server)`** — run-event SSE streams are kept alive past Bun's 10s
+  idleTimeout via periodic comments; long-running agents no longer drop the
+  client connection mid-run (warren-b8fc).
+
+### Build
+
+- Added `.github/workflows/release.yml` — pushes to `main` that bump
+  `package.json#version` (kept in sync with `src/index.ts`'s `VERSION`)
+  automatically tag `v$VERSION` and create a GitHub release with notes
+  extracted from `CHANGELOG.md`. The workflow is idempotent: re-runs against
+  an already-tagged version are a no-op.
+
 ## [0.1.0] — 2026-05-09
 
 Inaugural release. The V1 manual-run path is end-to-end validated against a real
