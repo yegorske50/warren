@@ -21,6 +21,7 @@ export interface ScenarioCtx {
 	readonly token: string;
 	readonly fixtures: {
 		readonly canopyRepoUrl: string;
+		readonly canopyRepoPath: string;
 		readonly sampleProjectGitUrl: string;
 		readonly sampleProjectName: string;
 		readonly sampleProjectPath: string;
