@@ -71,6 +71,13 @@ COPY . /app
 # Pull the prebuilt UI bundle from stage 1.
 COPY --from=ui-builder /ui-build/dist /app/src/ui/dist
 
+# Put warren itself on PATH. package.json declares bin: { warren, wr } but
+# `bun install -g` is not run for /app, so the bin entries aren't wired up.
+# Symlink the entrypoint directly — main.ts is +x with a `#!/usr/bin/env bun`
+# shebang, so it runs as-is once on PATH.
+RUN ln -s /app/src/cli/main.ts /usr/local/bin/warren \
+ && ln -s /app/src/cli/main.ts /usr/local/bin/wr
+
 # Default data root — the deploy mounts a persistent volume here.
 ENV WARREN_DATA_DIR=/data
 ENV WARREN_BURROW_SOCKET=/var/run/burrow.sock
