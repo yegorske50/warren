@@ -71,7 +71,7 @@ export interface SpawnRunResponse {
 export interface CancelRunResponse {
 	state: RunState;
 	alreadyTerminal: boolean;
-	burrowRun: unknown;
+	burrowRun: { state: string } | null;
 }
 
 export interface SteerRunResponse {

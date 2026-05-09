@@ -3,7 +3,7 @@ import { CircleStop, Send } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { runsApi } from "@/api/client.ts";
-import type { RunEvent } from "@/api/types.ts";
+import type { CancelRunResponse, RunEvent } from "@/api/types.ts";
 import { RUN_TERMINAL_STATES } from "@/api/types.ts";
 import { StateBadge } from "@/components/StateBadge.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
@@ -13,6 +13,19 @@ import { Label } from "@/components/ui/label.tsx";
 import { Textarea } from "@/components/ui/textarea.tsx";
 import { useEventStream } from "@/hooks/useEventStream.ts";
 import { formatTimestamp, relativeTime } from "@/lib/utils.ts";
+
+/**
+ * Event kinds whose arrival means the warren run row may have advanced
+ * (state transition, cancel forwarded, reap finalized). When we observe
+ * one in the live event stream we invalidate the run query so the badge
+ * and metadata refresh without waiting for the polling backstop.
+ */
+const REFETCH_TRIGGER_KINDS: ReadonlySet<string> = new Set([
+	"state_change",
+	"cancel.requested",
+	"reap.completed",
+	"reap_failed",
+]);
 
 export function RunDetailPage() {
 	const { id = "" } = useParams<{ id: string }>();
@@ -32,9 +45,37 @@ export function RunDetailPage() {
 		run.data !== undefined && RUN_TERMINAL_STATES.includes(run.data.state);
 	const stream = useEventStream(id, !isTerminal);
 
+	// Invalidate the run query when an event with a state-changing kind
+	// arrives. Tracked via index, not seq, so events appended out of
+	// observed order would still be considered (the hook appends in seq
+	// order so this is mostly a guard).
+	const processedEventCountRef = useRef(0);
+	useEffect(() => {
+		const len = stream.events.length;
+		if (len <= processedEventCountRef.current) {
+			processedEventCountRef.current = len;
+			return;
+		}
+		let trigger = false;
+		for (let i = processedEventCountRef.current; i < len; i++) {
+			const evt = stream.events[i];
+			if (evt !== undefined && REFETCH_TRIGGER_KINDS.has(evt.kind)) {
+				trigger = true;
+				break;
+			}
+		}
+		processedEventCountRef.current = len;
+		if (trigger) {
+			// `["runs"]` (no exact) covers both this row and the list page's
+			// `["runs", filter]` cache so navigating back doesn't show stale
+			// badges either.
+			void qc.invalidateQueries({ queryKey: ["runs"] });
+		}
+	}, [stream.events, id, qc]);
+
 	const cancel = useMutation({
 		mutationFn: () => runsApi.cancel(id, {}),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["runs", id] }),
+		onSettled: () => qc.invalidateQueries({ queryKey: ["runs"] }),
 	});
 
 	if (run.isLoading) {
@@ -72,7 +113,7 @@ export function RunDetailPage() {
 						)}
 					</p>
 				</div>
-				<div className="flex gap-2">
+				<div className="flex flex-col items-end gap-1">
 					<Button
 						variant="destructive"
 						onClick={() => cancel.mutate()}
@@ -81,6 +122,7 @@ export function RunDetailPage() {
 						<CircleStop className="h-4 w-4" />
 						{cancel.isPending ? "Cancelling…" : "Cancel"}
 					</Button>
+					<CancelStatus mutation={cancel} />
 				</div>
 			</header>
 
@@ -118,6 +160,40 @@ export function RunDetailPage() {
 			<SteerForm runId={r.id} disabled={isTerminal} />
 		</div>
 	);
+}
+
+function CancelStatus({
+	mutation,
+}: {
+	mutation: ReturnType<typeof useMutation<CancelRunResponse, Error, void>>;
+}) {
+	if (mutation.isError) {
+		return (
+			<p className="text-xs text-(--color-destructive)">
+				{mutation.error instanceof Error
+					? mutation.error.message
+					: String(mutation.error)}
+			</p>
+		);
+	}
+	if (mutation.isSuccess && mutation.data !== undefined) {
+		const d = mutation.data;
+		if (d.alreadyTerminal) {
+			return (
+				<p className="text-xs text-(--color-muted-foreground)">
+					Run was already terminal ({d.state}).
+				</p>
+			);
+		}
+		const burrowState = d.burrowRun?.state;
+		return (
+			<p className="text-xs text-emerald-700 dark:text-emerald-300">
+				Cancel forwarded
+				{burrowState !== undefined ? ` (burrow: ${burrowState})` : ""}.
+			</p>
+		);
+	}
+	return null;
 }
 
 function MetaCard({ label, children }: { label: string; children: React.ReactNode }) {
