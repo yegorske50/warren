@@ -45,6 +45,15 @@ RUN apt-get update \
 # management, plus burrow itself (the supervisor execs `burrow serve`).
 # Versions track each tool's current release; bumping them is a deliberate
 # image-rebuild decision.
+#
+# BUN_INSTALL=/usr/local relocates the global package store from the default
+# /root/.bun/install/global into /usr/local/install/global. Burrow's bwrap
+# profile only ro-binds /usr, /etc, /lib, /lib64, /bin, /sbin, /opt (see
+# burrow src/provider/local/bwrap.ts SYSTEM_RO_MOUNTS) — /root is not visible
+# inside the sandbox, so symlinks at /usr/local/bin/{sd,ml,cn,sapling,burrow}
+# pointing into /root/.bun would dangle for the UID-1000 agent (warren-1eaa).
+# /usr/local sits under /usr so the symlink targets resolve inside the sandbox.
+ENV BUN_INSTALL=/usr/local
 RUN bun install -g \
     @os-eco/burrow-cli@0.2.6 \
     @os-eco/canopy-cli@0.2.3 \
@@ -57,7 +66,7 @@ RUN bun install -g \
 # postinstall (which downloads the platform-native `claude` binary) doesn't
 # run. Invoke it explicitly so /usr/local/bin/claude is wired up before
 # burrow tries to spawn it.
-RUN bun run /root/.bun/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
+RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
 
 WORKDIR /app
 
