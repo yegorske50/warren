@@ -48,7 +48,14 @@ RUN bun install -g \
     @os-eco/canopy-cli@0.2.3 \
     @os-eco/seeds-cli@0.4.1 \
     @os-eco/mulch-cli@0.8.0 \
-    @os-eco/sapling-cli@0.3.1
+    @os-eco/sapling-cli@0.3.1 \
+    @anthropic-ai/claude-code@2.1.138
+
+# bun install -g skips lifecycle scripts by default, so claude-code's
+# postinstall (which downloads the platform-native `claude` binary) doesn't
+# run. Invoke it explicitly so /usr/local/bin/claude is wired up before
+# burrow tries to spawn it.
+RUN bun run /root/.bun/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
 
 WORKDIR /app
 
