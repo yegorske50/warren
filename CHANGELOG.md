@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-09
+
+Second-dogfood hardening pass. Fixes the "stuck running, no branch" failure
+mode (warren-a69a + warren-67cc compound) by reaping inline on terminal
+bridge events, repairs container recreate past migration 0002 (warren-b060),
+makes the bundled os-eco CLIs resolvable inside the bwrap sandbox
+(warren-1eaa), and survives `DELETE /projects/:id` against a project with
+run history (warren-5f19). Burrow bumped to 0.2.6 for built-in
+`ANTHROPIC_API_KEY` plumbing.
+
+### Fixed
+
+- **`fix(runs)`** — reap runs inline when the burrow bridge sees a runtime
+  terminal event (`kind=state_change`, `stream=system`,
+  `payload.type=result`) or when burrow's cancel response carries a terminal
+  state. Without an external scheduler, runs were stuck in `running` after
+  the agent exited or the operator cancelled; reap is still the sole writer
+  to the terminal state transition (warren-a69a).
+- **`fix(runs)`** — adds `no_model_response` to `failure_reason`, so the
+  reap classifier discriminates "ran but the model never produced an
+  assistant turn" (e.g. claude-code's "Not logged in / Please run /login"
+  exit) from a generic crash. Heuristic: outcome=failed, stateOnEntry=running,
+  no `text`/`thinking`/`tool_use` event ever landed on `stream=stdout`
+  (warren-5165).
+- **`fix(db)`** — hoists `PRAGMA foreign_keys=OFF` onto the raw connection
+  *before* drizzle's migrate transaction opens. SQLite silently ignores
+  PRAGMA foreign_keys toggled inside a multi-statement transaction, so
+  migration 0003's "12-step ALTER" was running with FK still ON and
+  crashing the supervisor on every container recreate past 0002 against any
+  `/data/warren.db` with `events` rows referencing `runs` (warren-b060).
+- **`fix(docker)`** — relocates the global Bun package store from `/root/.bun`
+  to `/usr/local`. Burrow's bwrap profile ro-binds `/usr` but not `/root`,
+  so symlinks in `/usr/local/bin` for `sd`/`ml`/`cn`/`sapling`/`burrow` were
+  dangling inside the agent's UID-1000 namespace. Sandboxed agents can now
+  resolve every bundled os-eco CLI (warren-1eaa).
+- **`fix(projects)`** — `runs.project_id` switched to `ON DELETE SET NULL`
+  and `deleteProject` now reorders so a delete of a project with run history
+  succeeds instead of state-corrupting on the FK error after `rmrf` already
+  wiped the disk. Reap guards a null `projectId` by skipping
+  `mulch_merge`/`seeds_close`/`branch_push`; UI renders orphans as
+  "(deleted project)" on the runs list and detail (warren-5f19).
+- **`fix(ui)`** — `RunDetail` invalidates the `['runs']` query when the live
+  event stream emits `state_change`, `cancel.requested`, `reap.completed`,
+  or `reap_failed`. The state badge and metadata refresh immediately instead
+  of waiting on the 3–5s polling backstop. The cancel button now surfaces
+  burrow's post-cancel state inline (alreadyTerminal vs. forwarded + state)
+  matching SteerForm's no-toast pattern (warren-d9ad).
+
+### Changed
+
+- **Burrow CLI bumped `0.2.4 → 0.2.6`** — built-in claude-code runtime
+  now default-allows `ANTHROPIC_API_KEY` (plus `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_OAUTH_TOKEN`) without requiring a
+  project `burrow.toml` `[env]` block. Pinned in **both** `Dockerfile` and
+  `package.json` + `bun.lock`.
+- **`.env.example`** — replaces the misleading `env_passthrough` claim
+  (warren never wired project-level passthrough; deferred to warren-766b)
+  with a description of burrow's built-in claude-code env contract
+  (warren-5165).
+
+### Docs
+
+- **`docs(claude)`** — `CLAUDE.md` now covers tech stack, build/test
+  commands, quality gates, version management, and an explicit "Relationship
+  to burrow" section (supervisor contract, two-place `@os-eco/burrow-cli`
+  pin, bwrap security flags).
+- **`docs(spec)`** — SPEC §11.F records the second-dogfood findings
+  (warren-67cc + warren-a69a as the "stuck running, no branch" compound).
+
+### Build
+
+- **`ci(release)`** — configures `git config user.name/email` before
+  `git tag -a` in the release workflow. Without an identity the runner
+  failed with "empty ident name not allowed" and `v0.1.1` never tagged.
+
 ## [0.1.1] — 2026-05-09
 
 Post-V1 hardening pass. Closes every "Known limitations" seed filed against
