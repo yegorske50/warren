@@ -13,6 +13,7 @@ domains:
   agents: {}
   warren-config: {}
   diagnostics: {}
+  planning: {}
 governance:
   max_entries: 100
   warn_entries: 150
