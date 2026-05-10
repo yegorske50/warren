@@ -37,10 +37,22 @@ New items follow this shape so the format doesn't drift:
 ---
 
 ## R-01 — Seeds `extensions` field for runtime metadata
-Status: [proposed]
+Status: [partially shipped] — seeds side landed v0.4.3 (2026-05-10); warren consumer not yet wired up
 Depends on: — (cross-repo: lands first in `seeds`, then warren consumes)
 Unlocks: R-04 (issues UI needs role/schedule/trigger metadata on each seed); R-06
 (cron scheduler reads `extensions.scheduledFor` / `extensions.trigger`)
+
+**Cross-repo status (2026-05-10).** Shipped in seeds v0.4.3:
+- `extensions?: Record<string, unknown>` on `Issue` (seeds `src/types.ts:17`)
+- `sd update --extensions <json>` with shallow-merge semantics; `--clear-extensions`
+  for removal (`src/commands/update.ts:211-212`)
+- `sd show` renders an "Extensions:" line (`src/output.ts:74-83`)
+- `sd ready --respect-schedule` filters `extensions.queued === true` and future
+  `extensions.scheduledFor` from the queue (`src/commands/ready.ts:111-114`)
+
+What did **not** ship: a dedicated `sd extensions <set|show|remove>` subcommand.
+The team chose `sd update --extensions` (merge) + `--clear-extensions` as the only
+write path. Warren's consumer-side work (R-04, R-06) calls these directly.
 
 **Problem.** Warren needs to attach runtime metadata to seeds — assigned agent
 role, scheduled-for timestamp, trigger source, last-run pointer — without
@@ -191,7 +203,7 @@ copied into `runs.renderedAgentJson` and never re-rendered mid-run.
 
 ## R-04 — Project + Issues UI (the multica pattern)
 Status: [proposed]
-Depends on: R-01 (seeds `extensions` field for role/schedule/trigger metadata)
+Depends on: R-01 (seeds `extensions` field — **seeds side shipped v0.4.3 2026-05-10**, warren-consumer side is the only remaining blocker)
 Unlocks: team-of-ICs workflow — file work today, run tonight, batch-assign a
 sprint; deferred dispatch; per-project organization in the UI
 
@@ -275,8 +287,9 @@ warren does not touch the JSONL directly.
 
 ## R-05 — Roles tab (in-UI canopy editor)
 Status: [proposed]
-Depends on: R-03 (per-project `.canopy/` tier); requires canopy's
-inheritance/composition to work end-to-end through the UI editor
+Depends on: R-03 (per-project `.canopy/` tier); canopy's inheritance/composition
+end-to-end — **canopy v0.2.4 ships `extends`, mixins, and `cn render --json`
+verified by smoke tests**, so the editor's preview-pane contract is ready
 Unlocks: user-creatable roles without leaving the browser; role iteration
 inside the warren feedback loop instead of an external repo round-trip
 
@@ -336,7 +349,9 @@ user.
 ## R-06 — Cron scheduler
 Status: [proposed]
 Depends on: R-02 (`.warren/triggers.yaml` is the trigger config home); R-01
-(seeds `extensions.scheduledFor` for one-off scheduled runs)
+(seeds `extensions.scheduledFor` for one-off scheduled runs — **seeds side
+shipped v0.4.3, including `sd ready --respect-schedule` to keep deferred seeds
+out of the ready queue**). Only blocker now is warren-internal R-02.
 Unlocks: scheduled agent runs without leaving warren; nightly refactor /
 weekly docs-update / hourly triage-sweep workflows
 
@@ -394,11 +409,31 @@ now" button to dry-fire any trigger.
 
 ## R-07 — Sapling-first runtime surface
 Status: [proposed]
-Depends on: optional sapling-side event additions (separate seed in
-`../sapling`); not blocking — warren ships with whatever sapling exposes
-today, the UI gets richer as sapling adds events
+Depends on: optional sapling-side event additions — **most have shipped in
+sapling v0.3.2** (see cross-repo status below). Not blocking; warren can land
+the default-role toggle and the RunDetail panel today against the existing
+event surface.
 Unlocks: sapling-as-default option for power users; production pressure on
 sapling itself; differentiated UX vs. claude-code runs
+
+**Cross-repo status (2026-05-10).** Sapling v0.3.2 emits everything the
+roadmap originally listed as "future":
+- `turn_end.contextUtilization` ✅ (`src/loop.ts:426`)
+- `ready.model` ✅ (`src/hooks/events.ts:52-54`)
+- `--mode rpc` for steer/abort/getState ✅ (`src/rpc/`)
+- Structured `compact` events with `reason` + `archivedAs` ✅
+  (`src/hooks/events.ts:172-180`)
+- Per-turn score on `turn_end` (`activeOperationScore`, aliased `score`) ✅
+- `commitment_added` / `commitment_resolved` events ✅
+- `pipeline_stage` events under `--verbose` ✅
+- `--system-prompt-file <path>` ✅ (also unlocks R-11's mulch injection path)
+
+Remaining gaps:
+- `operationCount` and `archiveEntryCount` are exposed via RPC `getState`
+  (`src/rpc/types.ts:48,50`) but **not** on the `turn_end` NDJSON event.
+  Workaround for warren: poll RPC `getState` for the panel's counters, or
+  ask sapling to mirror them onto `turn_end` (small upstream patch).
+- MCP / custom tool registry: not started; relevant to R-08 not R-07.
 
 **Problem.** Warren today treats sapling and claude-code identically: spawn,
 tail NDJSON, reap. But sapling has differentiating signals — context
@@ -501,8 +536,16 @@ plus its system prompt.
 ## R-10 — Schema-driven configuration UI
 Status: [proposed]
 Depends on: R-04 (project nav hosts a Settings tab); each os-eco tool needs to
-expose a config JSON Schema (small cross-repo additions to mulch, seeds, and
-eventually canopy/sapling)
+expose a config JSON Schema. **Per-tool readiness (2026-05-10):**
+- Mulch ✅ shipped v0.9.0 — `ml config schema/show/set/unset`
+- Seeds ✅ shipped v0.4.3 — `sd config schema/show/set --json`
+- Canopy ❌ not started — no `cn config` write commands; config is read-only today
+- Sapling ⚠️ partial — config cascade and `sapling config set <key> <value>`
+  exist; `sapling config schema --json` not yet implemented
+
+Warren can ship R-10 against mulch + seeds tabs today; canopy and sapling
+tabs land as those tools add the schema CLI. This matches the original
+"each tab unlocks for free as the upstream ships" framing.
 Unlocks: every config knob in every os-eco tool tunable from warren's UI
 without warren-side code changes; new knobs auto-appear as upstream tools ship
 them; uniform validation/help-text experience across the ecosystem
@@ -603,9 +646,15 @@ cross-repo addition each tool can implement at its own pace.
 ---
 
 ## R-11 — Canopy roles declare mulch dependencies (spawn-time injection)
-Status: [proposed]
-Depends on: small canopy schema addition (`mulch:` + `extends_mulch:` in role
-frontmatter); small mulch CLI surface (`--format plain`, optional `--dry-run`)
+Status: [partially shipped] — both cross-repo halves shipped 2026-05-10; warren consumer-side spawn injection not yet wired up
+Depends on: cross-repo prerequisites — **all shipped (2026-05-10):**
+- Canopy v0.2.4 — `mulch:` + `extends_mulch:` resolve in `cn render --json`,
+  emit on `RenderResult.mulch`; merge semantics tested in render.smoke.test.ts
+- Mulch v0.8.0+ — `ml prime --format plain` and `--dry-run` both exist; compose
+  with `--domain` / `--files` / `--budget` as the roadmap assumed
+- Sapling v0.3.2 — `--system-prompt-file <path>` exists, so the concatenated
+  system prompt can be passed through cleanly (claude-code's equivalent already
+  in use)
 Unlocks: roles become self-contained units of "system prompt + active project
 expertise"; base-prompt expertise dependencies propagate via canopy inheritance
 (opt-in); user no longer has to remember to `ml prime` per session — the role
@@ -801,34 +850,71 @@ so subsequent revisions know what's already off the punch list.
   and `sapling` available without any `CANOPY_REPO_URL` configuration. Fresh
   warren installs work out of the box.
 
+## Cross-repo readiness (2026-05-10)
+
+Snapshot of which sibling-repo features the warren ROADMAP depends on, and
+whether they've landed. Updated when sibling-repo versions bump. Per-item
+detail lives inside each R-NN; this is just the dashboard.
+
+| Dep | Item | Status | Version |
+|---|---|---|---|
+| Seeds `extensions` field + CLI | R-01, R-04, R-06 | ✅ shipped | seeds v0.4.3 |
+| Seeds `--respect-schedule` ready filter | R-04, R-06 | ✅ shipped | seeds v0.4.3 |
+| Seeds config schema CLI | R-10 | ✅ shipped | seeds v0.4.3 |
+| Canopy `extends` + mixins + `cn render --json` | R-05 | ✅ shipped | canopy v0.2.4 |
+| Canopy `mulch:` / `extends_mulch:` frontmatter | R-11 | ✅ shipped | canopy v0.2.4 |
+| Canopy config schema CLI | R-10 | ❌ not started | — |
+| Mulch `ml prime --format plain` / `--dry-run` | R-11 | ✅ shipped | mulch v0.8.0+ |
+| Mulch config schema CLI | R-10 | ✅ shipped | mulch v0.9.0 |
+| Sapling event stream (contextUtilization, score, commitments, compact, RPC) | R-07 | ✅ shipped | sapling v0.3.2 |
+| Sapling `operationCount`/`archiveEntryCount` on `turn_end` | R-07 | ⚠️ via RPC `getState` only | sapling v0.3.2 |
+| Sapling `--system-prompt-file` | R-07, R-11 | ✅ shipped | sapling v0.3.2 |
+| Sapling config schema CLI | R-10 | ⚠️ partial (set ✅, schema ❌) | sapling v0.3.2 |
+| Sapling MCP / custom tool registry | R-08 | ❌ not started | — |
+
+Net: every cross-repo blocker for R-01, R-04, R-05, R-06, R-07, and R-11
+is satisfied. R-10 can ship 2-of-4 tabs (mulch + seeds) today; canopy and
+sapling tabs unlock as those tools add `<tool> config schema --json`. R-08's
+MCP dependency for sapling-as-operator-harness is still out — claude-code
+remains the operator harness for V2.
+
 ## Suggested sequencing
 
-A first cut at order of attack — not committed:
+A first cut at order of attack — not committed. Updated 2026-05-10 to reflect
+cross-repo readiness: R-01's seeds-side and R-11's canopy + mulch sides have
+all shipped, so several items that were "wait on the upstream" are now
+"warren-internal work."
 
-1. **R-01** (seeds `extensions` field) — small, cross-repo, unblocks R-04 and
-   R-06. Lands first in `seeds`, then warren consumes.
-2. **R-02** (`.warren/` directory) — small, internal, establishes the config
-   pattern R-06 builds on.
-3. **R-03** (per-project canopy tier) — small, scoped to the registry module.
-   Independent of R-01 and R-02; can land in parallel.
+1. **R-02** (`.warren/` directory) — small, internal, establishes the config
+   pattern R-06 builds on. No upstream dependency.
+2. **R-03** (per-project canopy tier) — small, scoped to the registry module.
+   Independent of R-02; can land in parallel.
+3. **R-01 consumer-side** — seeds half is shipped; warren needs to wire
+   `sd update --extensions` calls into the spawn / reap paths and start
+   reading `extensions.{role,scheduledFor,trigger,lastRunId}` in the UI.
+   Small; folds naturally into R-04.
 4. **R-04** (project + issues UI) — biggest item. The team-of-ICs UX unlock.
-   Depends on R-01.
-5. **R-06** (cron scheduler) — depends on R-02 and benefits from R-04 (UI for
-   triggers tab); can land before R-04 if pressure is on schedules.
-6. **R-05** (roles tab UI) — depends on R-03. Less load-bearing than R-04;
-   land after the issue UX is solid.
-7. **R-07** (sapling-first runtime) — orthogonal to everything else; can land
-   any time. Sapling-side improvements parallel.
-8. **R-10** (schema-driven config UI) — depends on R-04. Land after R-04
-   is solid; cross-repo schema additions to mulch + seeds can happen in
-   parallel. Each new os-eco tool that publishes a schema unlocks a tab
-   for free.
-9. **R-11** (canopy + mulch meshing) — orthogonal to UI work; cross-repo.
-   Land canopy + mulch additions in parallel; warren consumes when both
-   ship. Pairs nicely with R-05's role editor preview pane but doesn't
+   All seeds-side prereqs satisfied.
+5. **R-06** (cron scheduler) — depends on R-02. Seeds-side scheduling primitives
+   (`extensions.scheduledFor`, `sd ready --respect-schedule`) are ready. Can
+   land before R-04 if scheduling pressure is higher than issue-tracking
+   pressure.
+6. **R-05** (roles tab UI) — depends on R-03. Canopy's render contract is
+   ready. Less load-bearing than R-04; land after the issue UX is solid.
+7. **R-11** (canopy + mulch meshing) — both upstreams shipped; entirely
+   warren-side now. Roughly 30-50 lines in `src/runs/spawn.ts` plus glob
+   expansion. Pairs nicely with R-05's editor preview pane but doesn't
    block on it.
+8. **R-07** (sapling-first runtime) — orthogonal to everything else; can land
+   any time. Most sapling events shipped; warren just consumes them.
+   `operationCount`/`archiveEntryCount` use RPC `getState` until sapling
+   mirrors them onto `turn_end`.
+9. **R-10** (schema-driven config UI) — depends on R-04. Mulch + seeds tabs
+   can ship today against shipped schema CLIs. Canopy and sapling tabs
+   wait on each tool's `config schema --json` to land.
 10. **R-08** (operator agent) — stretch. Depends on R-04 and R-05 being
     stable enough that an agent can drive them. Benefits from R-11 (the
-    operator is itself a role that wants project expertise). Skip if
-    earlier items run long.
+    operator is itself a role that wants project expertise). Sapling MCP
+    is the long-tail dependency for sapling-as-operator-harness; claude-code
+    is the V2 harness regardless. Skip if earlier items run long.
 11. **R-09** (per-user identity) — deferred until a real consumer asks.
