@@ -12,6 +12,7 @@ domains:
   supervisor: {}
   agents: {}
   warren-config: {}
+  diagnostics: {}
 governance:
   max_entries: 100
   warn_entries: 150
