@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-10
+
+Acceptance harness fill-in plus a deploy-time guardrail. Six new
+end-to-end scenarios (05–10) close the warren↔burrow contract gaps
+left by 0.1.3 — events stream, restart-recovery, steer, cancel, and
+both reap roundtrips (mulch LWW + seeds-close mirror) — and the
+supervisor now fails fast on the misconfigured-token mode that
+silently 401'd every dispatch on Fly. Roadmap V2 direction (R-01
+through R-11) lands as a planning artifact.
+
+### Added
+
+- **`feat(supervisor)`** — fail fast on missing or mismatched burrow
+  auth tokens at boot, before `installGitCredentials` and
+  `runSupervisor`. A misconfigured Fly deploy now exits with one
+  pointed error instead of crash-looping `burrow serve` five times
+  and 401-ing every dispatch. `WARREN_BURROW_NO_AUTH=1` bypasses for
+  loopback dev. On success, the validated token's `sha256:<12-hex>`
+  fingerprint is logged so a deployer can eyeball that both ends match
+  without ever logging the secret. SPEC §10.2 fly secrets block now
+  lists `BURROW_API_TOKEN` + `WARREN_BURROW_TOKEN` alongside
+  `WARREN_API_TOKEN` (warren-d317).
+- **`test(acceptance)`** — scenarios 05+06 cover the events stream
+  contract end-to-end. 05 verifies the NDJSON envelope shape on
+  `GET /runs/:id/events`, durability via the non-follow replay path,
+  and the `?since=` filter. 06 kills warren mid-run, restarts it, and
+  asserts the bridge resumes from `MAX(seq)+1` with no event-table
+  gaps — the §9 contract. Adds `ScenarioCtx.lifecycle` so process
+  control doesn't have to thread through fixtures, plus a per-second
+  heartbeat in `stub-agent.sh` so the recovery path has a steady
+  source of new burrow events to courier during the warren-down
+  window. New `lib/burrow-serve.ts` shim programmatically registers
+  declarative `[[agents]]` (which burrow's runtime registry doesn't
+  auto-load from a project's `burrow.toml`) and bypasses bwrap with a
+  direct `Bun.spawn` so the harness runs cleanly inside warren's own
+  production sandbox where userns nesting fails (warren-647e).
+- **`test(acceptance)`** — scenarios 07+08 cover steer + cancel. Steer
+  asserts the `steer.sent` audit event and the burrow message echo
+  prove delivery to the inbox; cancel asserts both warren and burrow
+  surfaces report `cancelled`, idempotent on re-cancel (warren-a7f9).
+- **`test(acceptance)`** — scenarios 09+10 cover the reap roundtrip.
+  Scenario 09 exercises all three SPEC §11.A LWW branches across three
+  sequential runs sharing a stable `mulch_id`: added → updated (newer
+  ts) → skipped (older ts). Scenario 10 covers the seeds-close mirror
+  happy path (`mode='added'`); the `mode='updated'` branch can't be
+  observed end-to-end because `spawnRun`'s pre-spawn
+  `refreshProjectClone` wipes reap's uncommitted writes to the tracked
+  `.seeds/issues.jsonl` between runs (mulch's `acceptance.jsonl`
+  survives because it's not committed in the fixture);
+  `mirrorClosedSeeds`' updated branch is exercised by `reap.test.ts`.
+  The stub agent gains four prompt-driven knobs alongside
+  `[sleep_ms=NNN]`: `[mulch_id=...]`, `[mulch_ts=...]`, `[seed_id=...]`,
+  `[seed_ts=...]` — letting scenarios drive deterministic LWW inputs
+  without warren restarts (warren-c37e).
+
+### Fixed
+
+- **`test(acceptance)`** — scenario 02 now filters built-ins out of
+  the "agents list is empty before first refresh" precondition. The
+  server now boot-seeds claude-code + sapling built-ins (mx-f52e13),
+  so the original assertion was always wrong. Filters to
+  `source !== 'builtin'` before counting; `AgentRow` gains the
+  optional `source` field already returned by `GET /agents`
+  (warren-3682).
+
+### Changed
+
+- **TypeScript `5.9.3 → 6.0.3`** — dev dependency bump (dependabot).
+
+### Docs
+
+- **`docs(roadmap)`** — `ROADMAP.md` adds the V2 direction (R-01
+  through R-11): the team-of-ICs phase. Captures seeds extensions,
+  `.warren/` config dir, per-project canopy tier, project + issues UI
+  (multica pattern), roles tab editor, cron scheduler, sapling-first
+  runtime, operator agent, schema-driven config UI, and canopy+mulch
+  role meshing. Records the decisions already made (DB only for
+  runtime state; seeds is source of truth for issues; markdown editor
+  with full canopy feature set; sapling personal default, claude-code
+  public default). Cross-repo follow-ups tracked as seeds in
+  seeds/sapling/canopy/mulch.
+- **`docs(fly)`** — `fly.toml` operator-workflow comment now spells
+  out the `BURROW_API_TOKEN` ↔ `WARREN_BURROW_TOKEN` pairing
+  requirement. Deploying without setting both to the same value
+  crashed the supervisor in a boot loop, then silently 401'd every
+  dispatch once the server-side secret was set alone. App name
+  corrected to `warren-deployed` to match the created Fly app
+  (warren-d317).
+
 ## [0.1.3] — 2026-05-09
 
 Third-dogfood follow-through. Closes the warren-on-warren findings from

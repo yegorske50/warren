@@ -1,6 +1,6 @@
 {
 	"name": "@os-eco/warren-cli",
-	"version": "0.1.3",
+	"version": "0.1.4",
 	"description": "Control plane and UI for cloud-based custom agents (canopy + mulch + seeds + sapling, on burrow)",
 	"type": "module",
 	"bin": {
