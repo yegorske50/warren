@@ -132,6 +132,35 @@ export const events = sqliteTable(
 	],
 );
 
+/**
+ * R-06 scheduler state (warren-3f59).
+ *
+ * One row per (project, trigger-id-from-.warren/triggers.yaml). The PK is a
+ * composite string `<projectId>:<triggerId>` so the scheduler tick can write
+ * back last/next fire timestamps without juggling a separate generated id —
+ * the trigger's authoring identity in YAML is what survives across restarts.
+ *
+ * The trigger definition itself stays in .warren/triggers.yaml (R-02); only
+ * mutable scheduler bookkeeping lives here. last_run_id points at the most
+ * recent dispatched run (ON DELETE SET NULL so deleting a run row doesn't
+ * orphan the trigger). project_id is the cascade root — deleting the project
+ * drops its triggers, mirroring the .warren/ clone going away with it.
+ */
+export const triggers = sqliteTable(
+	"triggers",
+	{
+		id: text("id").primaryKey(),
+		projectId: text("project_id")
+			.notNull()
+			.references(() => projects.id, { onDelete: "cascade" }),
+		triggerId: text("trigger_id").notNull(),
+		lastFiredAt: text("last_fired_at"),
+		nextFireAt: text("next_fire_at"),
+		lastRunId: text("last_run_id").references(() => runs.id, { onDelete: "set null" }),
+	},
+	(t) => [index("triggers_project_idx").on(t.projectId)],
+);
+
 export type AgentRow = typeof agents.$inferSelect;
 export type AgentInsert = typeof agents.$inferInsert;
 export type ProjectRow = typeof projects.$inferSelect;
@@ -140,3 +169,14 @@ export type RunRow = typeof runs.$inferSelect;
 export type RunInsert = typeof runs.$inferInsert;
 export type EventRow = typeof events.$inferSelect;
 export type EventInsert = typeof events.$inferInsert;
+export type TriggerRow = typeof triggers.$inferSelect;
+export type TriggerInsert = typeof triggers.$inferInsert;
+
+/**
+ * Build the composite PK from a project + trigger pair. The colon separator
+ * matches the plan's `<projectId>:<triggerId>` shape so a row key can be read
+ * back into its components without consulting the columns.
+ */
+export function makeTriggerRowId(projectId: string, triggerId: string): string {
+	return `${projectId}:${triggerId}`;
+}

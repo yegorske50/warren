@@ -8,12 +8,14 @@ import { AgentsRepo } from "./agents.ts";
 import { EventsRepo } from "./events.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunsRepo } from "./runs.ts";
+import { TriggersRepo } from "./triggers.ts";
 
 export interface Repos {
 	agents: AgentsRepo;
 	projects: ProjectsRepo;
 	runs: RunsRepo;
 	events: EventsRepo;
+	triggers: TriggersRepo;
 }
 
 export function createRepos(db: WarrenDb): Repos {
@@ -22,7 +24,8 @@ export function createRepos(db: WarrenDb): Repos {
 		projects: new ProjectsRepo(db.drizzle),
 		runs: new RunsRepo(db.drizzle),
 		events: new EventsRepo(db.drizzle),
+		triggers: new TriggersRepo(db.drizzle),
 	};
 }
 
-export { AgentsRepo, EventsRepo, ProjectsRepo, RunsRepo };
+export { AgentsRepo, EventsRepo, ProjectsRepo, RunsRepo, TriggersRepo };
