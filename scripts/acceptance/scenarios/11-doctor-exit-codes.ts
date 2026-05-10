@@ -5,11 +5,14 @@
  *   "warren doctor exits 0 when the host is healthy, exits non-zero
  *   with a hint when something is broken."
  *
- * Doctor probes seven things (mx-89606e):
+ * Doctor probes eight things (mx-1a70ef, post-R-02):
  *   WARREN_API_TOKEN, CANOPY_REPO_URL, canopy_clone, canopy_clean,
- *   projects_root, bwrap, burrow_reachable.
+ *   projects_root, bwrap, warren_config, burrow_reachable.
  * The shared check functions live in src/diagnostics/checks.ts so this
- * scenario tests the same surface /readyz exposes (mx-718b25).
+ * scenario tests the same surface /readyz exposes (mx-718b25). Scenario
+ * 14 covers the warren_config-with-real-projects matrix; here we only
+ * assert the check is present and `ok: true` against the empty-projects
+ * baseline (the "no projects registered" branch).
  *
  * Two invocations, each spawning `bun run src/cli/main.ts doctor` as a
  * child process so we exercise the real exit code path:
@@ -65,6 +68,7 @@ const EXPECTED_CHECK_NAMES: readonly string[] = [
 	"canopy_clean",
 	"projects_root",
 	"bwrap",
+	"warren_config",
 	"burrow_reachable",
 ];
 
@@ -187,6 +191,14 @@ function buildDoctorEnv(ctx: ScenarioCtx, shimDir: string): Record<string, strin
 		// Setting WARREN_PROJECTS_DIR keeps projects_root pointing somewhere
 		// inside our scratch tree rather than /data/projects.
 		WARREN_PROJECTS_DIR: join(ctx.tmp, "scenario-11", "projects-root"),
+		// Doctor wraps in `withCliDb` (warren-3151) so the warren_config
+		// check can walk every registered project. The default DB path is
+		// /data/warren.db, which doesn't exist on macOS dev hosts —
+		// pointing at a scratch path makes openDatabase mkdirp the parent
+		// and create an empty DB. With no projects registered, the
+		// warren_config check reports `ok: true` ("no projects registered")
+		// and doctor still exits 0.
+		WARREN_DB_PATH: join(ctx.tmp, "scenario-11", "warren.db"),
 	};
 }
 
