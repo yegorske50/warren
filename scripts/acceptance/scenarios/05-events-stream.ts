@@ -63,7 +63,9 @@ const MIN_EVENTS = 3;
 export const scenario: Scenario = {
 	id: "05",
 	title: "GET /runs/:id/events follows NDJSON; events durable in events table",
-	modes: ["in-proc", "container"],
+	// Events stream requires a spawned run, which needs the host-side
+	// sample project + canopy fixture. In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

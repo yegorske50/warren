@@ -47,7 +47,9 @@ interface ErrorEnvelope {
 export const scenario: Scenario = {
 	id: "03",
 	title: "POST /projects clones via insteadOf, GET lists, DELETE removes row + disk",
-	modes: ["in-proc", "container"],
+	// Container mode does not bind-mount the host sample-project fixture,
+	// so POST /projects {gitUrl: <fake>} can't clone. In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

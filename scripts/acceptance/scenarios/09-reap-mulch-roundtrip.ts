@@ -98,7 +98,9 @@ export const scenario: Scenario = {
 	id: "09",
 	title:
 		"Reap mulch roundtrip — LWW added/updated/skipped events; project .mulch/expertise advances",
-	modes: ["in-proc", "container"],
+	// Reap mulch requires a spawned run + host-side project fixture so
+	// the harness can poke the on-disk .mulch/. In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

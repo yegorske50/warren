@@ -81,7 +81,9 @@ export const scenario: Scenario = {
 	id: "08",
 	title:
 		"POST /runs/:id/cancel terminates run; both warren + burrow surfaces report cancelled (idempotent)",
-	modes: ["in-proc", "container"],
+	// Cancel requires a spawned run, which needs the host-side fixtures.
+	// In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

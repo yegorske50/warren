@@ -38,7 +38,9 @@
 		"db:generate": "drizzle-kit generate",
 		"ui:install": "cd src/ui && bun install",
 		"ui:dev": "cd src/ui && bun run dev",
-		"build:ui": "cd src/ui && bun install && bun run build"
+		"build:ui": "cd src/ui && bun install && bun run build",
+		"acceptance": "bun run scripts/acceptance/run.ts",
+		"acceptance:container": "bun run scripts/acceptance/run.ts --mode container"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.10",

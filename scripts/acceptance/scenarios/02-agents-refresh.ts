@@ -23,7 +23,10 @@ interface AgentRow {
 export const scenario: Scenario = {
 	id: "02",
 	title: "POST /agents/refresh clones canopy + GET /agents lists stub-shell",
-	modes: ["in-proc", "container"],
+	// Container mode does not bind-mount the host canopy fixture, so a
+	// CANOPY_REPO_URL refresh against a file:// path inside the container
+	// has nothing to clone. Scenario 13 covers the no-canopy boot path.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

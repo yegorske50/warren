@@ -95,7 +95,9 @@ export const scenario: Scenario = {
 	id: "10",
 	title:
 		"Reap seeds-close roundtrip — closed seeds land in project .seeds/; seeds.closed events visible",
-	modes: ["in-proc", "container"],
+	// Reap seeds requires a spawned run + host-side project fixture so
+	// the harness can poke the on-disk .seeds/. In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

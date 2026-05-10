@@ -76,7 +76,9 @@ const RUN_ID_PATTERN = /^run_[0-9a-hjkmnpqrstvwxyz]{12}$/;
 export const scenario: Scenario = {
 	id: "04",
 	title: "POST /runs returns 201 + run_xxx; renderedAgentJson populated and frozen at spawn",
-	modes: ["in-proc", "container"],
+	// Run spawn requires the host-side sample project + canopy fixture,
+	// neither of which the compose harness bind-mounts. In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

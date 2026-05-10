@@ -81,7 +81,9 @@ const MESSAGE_ID_PATTERN = /^msg_[0-9a-hjkmnpqrstvwxyz]+$/;
 export const scenario: Scenario = {
 	id: "07",
 	title: "POST /runs/:id/steer reaches burrow inbox + emits steer.sent audit event",
-	modes: ["in-proc", "container"],
+	// Steer requires a spawned run, which needs the host-side fixtures.
+	// In-proc only.
+	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 

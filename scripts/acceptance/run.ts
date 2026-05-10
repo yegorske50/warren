@@ -3,17 +3,17 @@
  *
  * Phase 14 (warren-3ee3): exercises the §3.1 V1 acceptance criteria
  * against a real warren+burrow process pair (in-proc by default,
- * docker compose with `--container`).
+ * `--mode container` brings up the docker-compose stack and runs the
+ * container-supported scenarios on top of it).
  *
  * Flags:
  *   --mode in-proc | container       boot mode (default in-proc)
  *   --only <id1,id2,...>             run a subset of scenarios by id
  *   --stop-on-failure                exit on first failure
- *   --keep-tmp                       leave the temp dir after run (debug)
- *   --real                           opt into real-LLM scenarios that
- *                                    require ANTHROPIC_API_KEY (deferred —
- *                                    today this is a no-op; ACCEPTANCE.md
- *                                    runbook covers the manual gate)
+ *   --keep-tmp                       leave the temp dir / compose stack after run (debug)
+ *   --real                           opt into real-LLM scenarios; today
+ *                                    a no-op flag — ACCEPTANCE.md
+ *                                    documents the manual gate
  *
  * Exit code: 0 if all scenarios pass, 1 otherwise.
  */
@@ -29,6 +29,7 @@ import {
 	type ScenarioCtx,
 	type ScenarioLogger,
 } from "./lib/assert.ts";
+import { bootCompose, type ComposeBootHandle } from "./lib/compose.ts";
 import { type BuiltFixtures, buildFixtures } from "./lib/fixtures.ts";
 import { type BootHandle, bootInProc } from "./lib/inproc.ts";
 
@@ -44,6 +45,7 @@ import { scenario as scenario09 } from "./scenarios/09-reap-mulch-roundtrip.ts";
 import { scenario as scenario10 } from "./scenarios/10-reap-seeds-roundtrip.ts";
 import { scenario as scenario11 } from "./scenarios/11-doctor-exit-codes.ts";
 import { scenario as scenario12 } from "./scenarios/12-supervisor-restart-budget.ts";
+import { scenario as scenario13 } from "./scenarios/13-container-smoke.ts";
 
 const SCENARIOS: readonly Scenario[] = [
 	scenario01,
@@ -58,6 +60,7 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario10,
 	scenario11,
 	scenario12,
+	scenario13,
 ];
 
 interface ParsedArgs {
@@ -135,19 +138,36 @@ to passthrough child-process logs.`);
 
 async function main(): Promise<number> {
 	const args = parseArgs(process.argv.slice(2));
-
-	if (args.mode === "container") {
-		console.error("acceptance: --container mode not yet wired (deferred to follow-up).");
-		return 2;
-	}
-
 	const tmpRoot = await mkdtemp(join(tmpdir(), "warren-acceptance-"));
 	const logger = makeLogger();
 
 	logger.info(`acceptance: mode=${args.mode} tmp=${tmpRoot}`);
+	if (args.real) {
+		// --real is a documented gate flag (ACCEPTANCE.md §"Manual gates");
+		// today the harness has no automated --real scenario, so we surface
+		// the no-op explicitly rather than silently dropping it.
+		logger.warn(
+			"acceptance: --real is a doc-only gate today; see ACCEPTANCE.md for the manual claude-code run.",
+		);
+	}
 
 	const token = randomToken();
 
+	if (args.mode === "container") {
+		return await runContainerMode({ tmpRoot, token, args, logger });
+	}
+	return await runInProcMode({ tmpRoot, token, args, logger });
+}
+
+interface RunModeArgs {
+	readonly tmpRoot: string;
+	readonly token: string;
+	readonly args: ParsedArgs;
+	readonly logger: ScenarioLogger;
+}
+
+async function runInProcMode(opts: RunModeArgs): Promise<number> {
+	const { tmpRoot, token, args, logger } = opts;
 	let handle: BootHandle | undefined;
 	let fixtures: BuiltFixtures | undefined;
 	try {
@@ -215,6 +235,77 @@ async function main(): Promise<number> {
 					await handle.killWarren().catch(() => undefined);
 					await handle.killBurrow().catch(() => undefined);
 					console.log(`acceptance: kept tmp dir at ${tmpRoot}`);
+				} else {
+					await handle.stop();
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.error(`acceptance: teardown error: ${message}`);
+			}
+		}
+	}
+}
+
+async function runContainerMode(opts: RunModeArgs): Promise<number> {
+	const { tmpRoot, token, args, logger } = opts;
+	// Fixtures are host-side and not bind-mounted into the container (see
+	// lib/compose.ts header). Container-mode scenarios that need them
+	// declare in-proc-only via `modes: [...]` and skip cleanly here. We
+	// still hand the harness empty placeholders for ctx.fixtures so the
+	// type contract holds.
+	let handle: ComposeBootHandle | undefined;
+	try {
+		logger.info("acceptance: docker compose up (this builds the image on first run)…");
+		handle = await bootCompose({
+			tmpRoot,
+			token,
+			repoRoot: process.cwd(),
+		});
+		logger.info(
+			`acceptance: warren ready at ${handle.warrenUrl} (compose project=${handle.projectName} port=${handle.hostPort})`,
+		);
+
+		const ctx: ScenarioCtx = {
+			mode: args.mode,
+			warrenUrl: handle.warrenUrl,
+			token: handle.token,
+			socketPath: handle.socketPath,
+			fixtures: {
+				canopyRepoUrl: "",
+				canopyRepoPath: "",
+				sampleProjectGitUrl: "",
+				sampleProjectName: "",
+				sampleProjectPath: "",
+				stubAgentName: "",
+				knownSeedTitle: "",
+				knownMulchDomain: "",
+			},
+			logger,
+			tmp: tmpRoot,
+			// lifecycle is intentionally undefined in container mode — the
+			// supervisor inside the container owns burrow lifecycle and
+			// scenarios that need to drive process control are in-proc only.
+		};
+
+		const { outcomes, exitCode } = await runScenarios(SCENARIOS, ctx, {
+			mode: args.mode,
+			stopOnFailure: args.stopOnFailure,
+			...(args.only !== undefined ? { only: args.only } : {}),
+		});
+
+		console.log(formatOutcomes(outcomes));
+		return exitCode;
+	} catch (err) {
+		const message = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
+		console.error(`acceptance: container boot failed:\n${message}`);
+		return 1;
+	} finally {
+		if (handle !== undefined) {
+			try {
+				if (args.keepTmp) {
+					console.log(
+						`acceptance: --keep-tmp set; leaving compose stack ${handle.projectName} running. Tear down with: docker compose -p ${handle.projectName} down -v`,
+					);
 				} else {
 					await handle.stop();
 				}
