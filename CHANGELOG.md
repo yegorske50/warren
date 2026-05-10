@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-10
+
+R-02 lands: `.warren/` per-project config directory ships end-to-end —
+loader, cache, HTTP read endpoint, UI panel, and `warren doctor` /
+`/readyz` diagnostics. Triggers are parsed but not dispatched; R-06
+(cron scheduler) is the consumer and is now fully unblocked. New
+acceptance scenario 14 covers absent / valid / malformed lifecycle.
+
 ### Added
 
 - **`feat(warren-config)`** — `.warren/` per-project config directory

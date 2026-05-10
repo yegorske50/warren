@@ -13,7 +13,7 @@ Run a Claude Code or Sapling agent against any GitHub project from a browser, wa
 
 ## Status
 
-V1 (`0.1.4`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 13 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). Scheduler (cron + GitHub webhooks) and library API exports are deferred to V2.
+V1 (`0.1.5`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 14 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). Scheduler (cron + GitHub webhooks) and library API exports are deferred to V2.
 
 ## What you get
 
@@ -149,7 +149,7 @@ bun run ui:install
 bun run ui:dev
 ```
 
-The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 13 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, and container-mode parity. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
+The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 14 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, container-mode parity, and `.warren/` config lifecycle. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, testing conventions, and PR expectations.
 
