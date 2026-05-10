@@ -439,14 +439,19 @@ open http://localhost:8080
 ```bash
 fly launch                          # uses ./fly.toml
 fly volumes create warren_data --size 50 --region sjc
+BURROW_TOKEN=$(openssl rand -hex 32)
 fly secrets set \
-    WARREN_API_TOKEN=... \
+    WARREN_API_TOKEN=$(openssl rand -hex 32) \
+    BURROW_API_TOKEN=$BURROW_TOKEN \
+    WARREN_BURROW_TOKEN=$BURROW_TOKEN \
     ANTHROPIC_API_KEY=... \
     GITHUB_TOKEN=...
 # Optional: layer a custom canopy library on top of the built-ins:
 #   CANOPY_REPO_URL=https://github.com/<you>/agents.git
 fly deploy
 ```
+
+`BURROW_API_TOKEN` (read by `burrow serve`) and `WARREN_BURROW_TOKEN` (read by warren's burrow-client) are the two ends of one channel and **must hold the same value** — the supervisor validates equality at boot (warren-d317) and refuses to spawn burrow + warren if either is missing or they disagree, instead of letting `burrow serve` crash-loop with `[validation_error]` and warren 401 on every dispatch. `WARREN_API_TOKEN` is the browser-facing bearer; rotate the three independently. For loopback-dev only, set `WARREN_BURROW_NO_AUTH=1` to skip burrow auth (and the validation).
 
 Same image, same volume layout, same security flags. Mac Pro and Fly.io are interchangeable hosts.
 

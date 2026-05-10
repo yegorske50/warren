@@ -34,3 +34,10 @@ export {
 	type SupervisorResult,
 } from "./main.ts";
 export { type WaitForSocketOptions, waitForSocket } from "./socket.ts";
+export {
+	type TokenValidationConfig,
+	TokenValidationError,
+	type TokenValidationResult,
+	tokenFingerprint,
+	validateBurrowAuthTokens,
+} from "./tokens.ts";

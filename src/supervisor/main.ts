@@ -25,6 +25,7 @@
 import { backoffMs, RestartBudget } from "./budget.ts";
 import { defaultGitCredentialsRun, installGitCredentials } from "./git-credentials.ts";
 import { waitForSocket } from "./socket.ts";
+import { TokenValidationError, validateBurrowAuthTokens } from "./tokens.ts";
 
 export interface SupervisedChild {
 	readonly name: string;
@@ -396,6 +397,38 @@ if (import.meta.main) {
 		level: process.env.WARREN_LOG_LEVEL ?? "info",
 	});
 	const cmd = resolveCommandFromEnv();
+	try {
+		const noAuth = parseBoolEnv(process.env.WARREN_BURROW_NO_AUTH);
+		const tokens = validateBurrowAuthTokens({
+			burrowApiToken: process.env.BURROW_API_TOKEN,
+			warrenBurrowToken: process.env.WARREN_BURROW_TOKEN,
+			noAuth,
+		});
+		if (tokens.fingerprint === null) {
+			logger.warn(
+				{},
+				"supervisor: WARREN_BURROW_NO_AUTH=1 — burrow will serve without auth (loopback-dev mode)",
+			);
+		} else {
+			logger.info(
+				{ fingerprint: tokens.fingerprint },
+				"supervisor: burrow auth token validated (BURROW_API_TOKEN == WARREN_BURROW_TOKEN)",
+			);
+		}
+	} catch (err) {
+		if (err instanceof TokenValidationError) {
+			logger.error(
+				{ recoveryHint: err.recoveryHint },
+				`supervisor: ${err.message} — refusing to spawn burrow + warren`,
+			);
+			process.exit(1);
+		}
+		logger.error(
+			{ err: err instanceof Error ? err.message : String(err) },
+			"supervisor: failed to validate burrow auth tokens",
+		);
+		process.exit(1);
+	}
 	try {
 		await installGitCredentials(
 			{ run: defaultGitCredentialsRun, logger },
