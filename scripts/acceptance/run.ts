@@ -42,6 +42,8 @@ import { scenario as scenario07 } from "./scenarios/07-steer.ts";
 import { scenario as scenario08 } from "./scenarios/08-cancel.ts";
 import { scenario as scenario09 } from "./scenarios/09-reap-mulch-roundtrip.ts";
 import { scenario as scenario10 } from "./scenarios/10-reap-seeds-roundtrip.ts";
+import { scenario as scenario11 } from "./scenarios/11-doctor-exit-codes.ts";
+import { scenario as scenario12 } from "./scenarios/12-supervisor-restart-budget.ts";
 
 const SCENARIOS: readonly Scenario[] = [
 	scenario01,
@@ -54,6 +56,8 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario08,
 	scenario09,
 	scenario10,
+	scenario11,
+	scenario12,
 ];
 
 interface ParsedArgs {
@@ -171,6 +175,7 @@ async function main(): Promise<number> {
 			mode: args.mode,
 			warrenUrl: handle.warrenUrl,
 			token: handle.token,
+			socketPath: handle.socketPath,
 			fixtures: {
 				canopyRepoUrl: fixtures.canopyRepoUrl,
 				canopyRepoPath: fixtures.canopyRepoPath,

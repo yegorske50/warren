@@ -19,6 +19,14 @@ export interface ScenarioCtx {
 	readonly mode: BootMode;
 	readonly warrenUrl: string;
 	readonly token: string;
+	/**
+	 * Burrow's unix socket path inside the harness. Scenarios that need
+	 * to point an out-of-band warren CLI (e.g. `warren doctor` in scenario
+	 * 11) at the same burrow process read this. Container mode supplies
+	 * the in-container path; `--container` is deferred so today this is
+	 * always the in-proc layout's `${tmp}/sock/burrow.sock`.
+	 */
+	readonly socketPath: string;
 	readonly fixtures: {
 		readonly canopyRepoUrl: string;
 		readonly canopyRepoPath: string;
