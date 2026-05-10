@@ -36,6 +36,8 @@ import { scenario as scenario01 } from "./scenarios/01-boot-healthz-readyz.ts";
 import { scenario as scenario02 } from "./scenarios/02-agents-refresh.ts";
 import { scenario as scenario03 } from "./scenarios/03-projects-management.ts";
 import { scenario as scenario04 } from "./scenarios/04-run-spawn.ts";
+import { scenario as scenario05 } from "./scenarios/05-events-stream.ts";
+import { scenario as scenario06 } from "./scenarios/06-restart-recovery.ts";
 import { scenario as scenario07 } from "./scenarios/07-steer.ts";
 import { scenario as scenario08 } from "./scenarios/08-cancel.ts";
 
@@ -44,6 +46,8 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario02,
 	scenario03,
 	scenario04,
+	scenario05,
+	scenario06,
 	scenario07,
 	scenario08,
 ];
@@ -148,9 +152,17 @@ async function main(): Promise<number> {
 			token,
 			canopyRepoUrl: fixtures.canopyRepoUrl,
 			gitConfigPath: fixtures.gitConfigPath,
+			extraEnv: {
+				// Stub agent reads this; burrow's [env].optional in the sample
+				// project's burrow.toml forwards it into the sandbox. 8s gives
+				// scenarios 05/06 a steady stream of per-second heartbeat
+				// events while leaving room to kill+restart warren mid-run.
+				WARREN_STUB_SLEEP_MS: "8000",
+			},
 		});
 		logger.info(`acceptance: warren ready at ${handle.warrenUrl}`);
 
+		const bootHandle = handle;
 		const ctx: ScenarioCtx = {
 			mode: args.mode,
 			warrenUrl: handle.warrenUrl,
@@ -167,6 +179,11 @@ async function main(): Promise<number> {
 			},
 			logger,
 			tmp: tmpRoot,
+			lifecycle: {
+				killWarren: () => bootHandle.killWarren(),
+				restartWarren: () => bootHandle.restartWarren(),
+				killBurrow: () => bootHandle.killBurrow(),
+			},
 		};
 
 		const { outcomes, exitCode } = await runScenarios(SCENARIOS, ctx, {

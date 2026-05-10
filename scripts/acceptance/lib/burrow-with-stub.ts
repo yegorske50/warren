@@ -26,9 +26,8 @@
  * Client.close() drops the SQLite handle. Used only by the acceptance
  * harness — production warren talks to `burrow serve` directly.
  */
-import { Client, loadAgentConfig } from "@os-eco/burrow-cli";
+import { Client, type DispatchSpawnFn, loadAgentConfig } from "@os-eco/burrow-cli";
 import { runServeCommand } from "@os-eco/burrow-cli/src/cli/commands/serve.ts";
-import type { SpawnFn } from "@os-eco/burrow-cli/src/runner/dispatch.ts";
 
 interface ParsedArgs {
 	socket?: string;
@@ -66,7 +65,7 @@ function parseArgs(argv: readonly string[]): ParsedArgs {
  * of a real burrow process pair, so spawning the agent directly via
  * Bun.spawn against the resolved workspace is enough.
  */
-const noSandboxSpawn: SpawnFn = async (profile, command) => {
+const noSandboxSpawn: DispatchSpawnFn = async (profile, command) => {
 	const cwd = resolveCwd(profile.workspace, command.cwd);
 	const wantsStdin = command.stdin !== undefined;
 	const env: Record<string, string> = { ...profile.setEnv };
