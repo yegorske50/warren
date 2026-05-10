@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { agentsApi, projectsApi, runsApi } from "@/api/client.ts";
 import type { CreateRunInput } from "@/api/types.ts";
@@ -22,9 +22,32 @@ export function NewRunPage() {
 	});
 
 	const [agent, setAgent] = useState("");
+	const [agentTouched, setAgentTouched] = useState(false);
 	const [project, setProject] = useState("");
 	const [prompt, setPrompt] = useState("");
 	const [ref, setRef] = useState("");
+
+	// Per-project defaults from `.warren/defaults.json` (R-02). When the project
+	// declares a `defaultRole` that matches a registered agent, auto-fill the
+	// agent picker — unless the user has already taken control of it.
+	const warrenConfig = useQuery({
+		queryKey: ["projects", project, "warren-config"],
+		queryFn: ({ signal }) => projectsApi.warrenConfig(project, signal),
+		enabled: project.length > 0,
+	});
+	const defaultRole = warrenConfig.data?.defaults?.defaultRole;
+	const registeredAgents = agents.data?.agents ?? [];
+	const defaultRoleRegistered =
+		defaultRole !== undefined && registeredAgents.some((a) => a.name === defaultRole);
+	const agentFromDefault =
+		!agentTouched && defaultRoleRegistered && agent === defaultRole;
+
+	useEffect(() => {
+		if (agentTouched) return;
+		if (!defaultRoleRegistered) return;
+		if (agent === defaultRole) return;
+		setAgent(defaultRole as string);
+	}, [agentTouched, defaultRoleRegistered, defaultRole, agent]);
 
 	const spawn = useMutation({
 		mutationFn: (input: CreateRunInput) => runsApi.create(input),
@@ -88,7 +111,10 @@ export function NewRunPage() {
 								id="agent"
 								required
 								value={agent}
-								onChange={(e) => setAgent(e.target.value)}
+								onChange={(e) => {
+									setAgent(e.target.value);
+									setAgentTouched(true);
+								}}
 								className="flex h-9 w-full rounded-md border bg-(--color-card) px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-(--color-ring)"
 							>
 								<option value="" disabled>
@@ -100,6 +126,18 @@ export function NewRunPage() {
 									</option>
 								))}
 							</select>
+							{agentFromDefault ? (
+								<p className="text-xs text-(--color-muted-foreground)">
+									Defaulted from this project's{" "}
+									<code className="font-mono">.warren/defaults.json</code>.
+								</p>
+							) : defaultRole !== undefined && !defaultRoleRegistered ? (
+								<p className="text-xs text-(--color-destructive)">
+									Project default role{" "}
+									<code className="font-mono">{defaultRole}</code> is not a
+									registered agent.
+								</p>
+							) : null}
 						</div>
 
 						<div className="space-y-1.5">

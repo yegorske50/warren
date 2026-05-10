@@ -185,9 +185,11 @@ control plane.
 
 **Scope deliberately deferred** to keep this seed bounded:
 
-- `defaults.defaultRole` is parsed but not yet wired into spawn. R-04's
-  NewRun form will fall back to `WARREN_DEFAULT_AGENT` until R-04 picks up
-  per-project defaults.
+- `defaults.defaultRole` is wired into the NewRun agent picker
+  (warren-fd14): when a selected project's `.warren/defaults.json` declares
+  a `defaultRole` that matches a registered agent, the picker auto-fills
+  to that role until the user manually overrides. CLI `warren run`
+  consumption is still deferred to R-04.
 - `defaults.defaultPrompt` is parsed but no template substitution path
   consumes it. R-04 (issue → run dispatch) and R-06 (scheduled runs) are
   the natural consumers.

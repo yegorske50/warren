@@ -11,9 +11,10 @@
  * breaking schema rev.
  *
  * Triggers are parsed and exposed by this module but NOT dispatched here —
- * R-06 (cron scheduler) is the consumer. Defaults are parsed; one consumer
- * (NewRun branch placeholder) wires in via a separate seed; broader use
- * (defaultRole on spawn, defaultPrompt template substitution) is deferred
+ * R-06 (cron scheduler) is the consumer. Defaults are parsed; the NewRun
+ * UI consumes `defaultRole` (warren-fd14) by auto-filling its agent picker
+ * when the project declares one; CLI `warren run` consumption of
+ * `defaultRole` and any `defaultPrompt` template substitution are deferred
  * to R-04 / R-06.
  *
  * `parseTriggersConfig` and `parseDefaultsConfig` return discriminated
