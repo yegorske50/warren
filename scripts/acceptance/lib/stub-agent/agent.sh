@@ -31,15 +31,31 @@ record_id="${WARREN_STUB_MULCH_ID:-mx-stub-$$}"
 seed_id="${WARREN_STUB_SEED_ID:-stub-seed-1}"
 sleep_ms="${WARREN_STUB_SLEEP_MS:-0}"
 
-# Prompt-driven sleep override — burrow's [env] block can't pin per-run
+ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+mulch_ts="${ts}"
+seed_ts="${ts}"
+
+# Prompt-driven overrides — burrow's [env] block can't pin per-run
 # values, but the prompt arg always reaches us verbatim. Scenarios that
 # need a long-running agent (steer, cancel, restart-recovery) embed
-# `[sleep_ms=NNN]` anywhere in the prompt and we honour it.
+# `[sleep_ms=NNN]`; reap-roundtrip scenarios (09, 10) embed
+# `[mulch_id=...]`, `[mulch_ts=...]`, `[seed_id=...]`, `[seed_ts=...]`
+# to drive deterministic LWW inputs without restarting warren.
 if [[ "${1:-}" =~ \[sleep_ms=([0-9]+)\] ]]; then
   sleep_ms="${BASH_REMATCH[1]}"
 fi
-
-ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+if [[ "${1:-}" =~ \[mulch_id=([A-Za-z0-9_.-]+)\] ]]; then
+  record_id="${BASH_REMATCH[1]}"
+fi
+if [[ "${1:-}" =~ \[mulch_ts=([0-9T:.Z+-]+)\] ]]; then
+  mulch_ts="${BASH_REMATCH[1]}"
+fi
+if [[ "${1:-}" =~ \[seed_id=([A-Za-z0-9_.-]+)\] ]]; then
+  seed_id="${BASH_REMATCH[1]}"
+fi
+if [[ "${1:-}" =~ \[seed_ts=([0-9T:.Z+-]+)\] ]]; then
+  seed_ts="${BASH_REMATCH[1]}"
+fi
 
 # Ensure target directories exist (warren may not have seeded them if
 # expertise_seed/workflow were empty).
@@ -49,7 +65,7 @@ mkdir -p .mulch/expertise .seeds
 #    field warren's reap LWW compares on per mx-32631d).
 mulch_path=".mulch/expertise/${domain}.jsonl"
 record="$(cat <<JSON
-{"id":"${record_id}","domain":"${domain}","type":"convention","content":"stub agent ran successfully","recorded_at":"${ts}","confidence":1.0}
+{"id":"${record_id}","domain":"${domain}","type":"convention","content":"stub agent ran successfully","recorded_at":"${mulch_ts}","confidence":1.0}
 JSON
 )"
 printf '%s\n' "${record}" >> "${mulch_path}"
@@ -60,7 +76,7 @@ printf '%s\n' "${record}" >> "${mulch_path}"
 #    overwrites or skips. Either way a deterministic outcome.
 seeds_path=".seeds/issues.jsonl"
 seed_row="$(cat <<JSON
-{"id":"${seed_id}","title":"stub seed closed by acceptance harness","status":"closed","type":"task","priority":3,"createdAt":"${ts}","updatedAt":"${ts}"}
+{"id":"${seed_id}","title":"stub seed closed by acceptance harness","status":"closed","type":"task","priority":3,"createdAt":"${seed_ts}","updatedAt":"${seed_ts}"}
 JSON
 )"
 printf '%s\n' "${seed_row}" >> "${seeds_path}"
