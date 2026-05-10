@@ -8,6 +8,7 @@ import { NotFoundError, StateTransitionError, ValidationError } from "../core/er
 import { ProjectUnavailableError } from "../projects/errors.ts";
 import { AgentSchemaError, CanopyUnavailableError } from "../registry/errors.ts";
 import { RunSpawnError } from "../runs/errors.ts";
+import { WarrenConfigUnavailableError } from "../warren-config/errors.ts";
 import { methodNotAllowed, notFound, notImplemented, renderError } from "./errors.ts";
 
 describe("renderError — WarrenError mapping", () => {
@@ -38,6 +39,12 @@ describe("renderError — WarrenError mapping", () => {
 
 	test("ProjectUnavailableError → 503", () => {
 		expect(renderError(new ProjectUnavailableError("rm failed")).status).toBe(503);
+	});
+
+	test("WarrenConfigUnavailableError → 503 with code passthrough", () => {
+		const r = renderError(new WarrenConfigUnavailableError("clone vanished"));
+		expect(r.status).toBe(503);
+		expect(r.envelope.error.code).toBe("warren_config_unavailable");
 	});
 
 	test("AgentSchemaError → 422", () => {

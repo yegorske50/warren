@@ -42,6 +42,7 @@ import { type AgentSource, readAgentSource } from "../registry/builtins/index.ts
 import { CanopyClient } from "../registry/canopy.ts";
 import { refreshAgentRegistry } from "../registry/refresh.ts";
 import { cancelRun, spawnRun, steerRun, tailRunEvents } from "../runs/index.ts";
+import { type LoadedWarrenConfig, loadWarrenConfig } from "../warren-config/index.ts";
 import { jsonResponse, ndjsonResponse } from "./response.ts";
 import type { Route, RouteContext, RouteHandler, ServerDeps } from "./types.ts";
 
@@ -246,6 +247,25 @@ function deleteProjectHandler(deps: ServerDeps): RouteHandler {
 			...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
 		});
 		return jsonResponse(200, row);
+	};
+}
+
+function getProjectWarrenConfigHandler(deps: ServerDeps): RouteHandler {
+	return async (ctx) => {
+		const id = requireParam(ctx, "id");
+		// `require` throws NotFoundError → 404 via renderError; the cache
+		// only knows ids it's been asked about, so the project lookup has
+		// to come first to keep the 404 contract honest.
+		const project = deps.repos.projects.require(id);
+		const loaded: LoadedWarrenConfig =
+			deps.warrenConfigs !== undefined
+				? await deps.warrenConfigs.get(project.id, project.localPath)
+				: await loadWarrenConfig({ projectPath: project.localPath });
+		return jsonResponse(200, {
+			triggers: loaded.triggers,
+			defaults: loaded.defaults,
+			errors: loaded.errors,
+		});
 	};
 }
 
@@ -546,6 +566,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 
 	{ method: "GET", pattern: "/projects", build: listProjectsHandler },
 	{ method: "POST", pattern: "/projects", build: createProjectHandler },
+	{ method: "GET", pattern: "/projects/:id/warren-config", build: getProjectWarrenConfigHandler },
 	{ method: "POST", pattern: "/projects/:id/refresh", build: refreshProjectHandler },
 	{ method: "DELETE", pattern: "/projects/:id", build: deleteProjectHandler },
 

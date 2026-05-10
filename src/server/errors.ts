@@ -42,6 +42,7 @@ import {
 import { ProjectUnavailableError } from "../projects/errors.ts";
 import { AgentSchemaError, CanopyUnavailableError } from "../registry/errors.ts";
 import { RunSpawnError } from "../runs/errors.ts";
+import { WarrenConfigUnavailableError } from "../warren-config/errors.ts";
 import type { ErrorEnvelope } from "./types.ts";
 
 export interface RenderedError {
@@ -107,6 +108,7 @@ function warrenStatusFor(err: WarrenError): number {
 	if (err instanceof BurrowUnreachableError) return 503;
 	if (err instanceof CanopyUnavailableError) return 503;
 	if (err instanceof ProjectUnavailableError) return 503;
+	if (err instanceof WarrenConfigUnavailableError) return 503;
 	if (err instanceof AgentSchemaError) return 422;
 	if (err instanceof RunSpawnError) return 500;
 	return 500;
