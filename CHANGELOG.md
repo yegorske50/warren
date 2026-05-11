@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-10
+
+R-06 lands: the cron half of the scheduler ships end-to-end. New
+`src/triggers/` module (tick + dispatcher) wires into `bootServer`,
+fires `.warren/triggers.yaml` entries via croner with no-catch-up
+prev-vs-last semantics, and dispatches past-due `scheduledFor` seed
+extensions as `trigger='scheduled'` runs. `GET /projects/:id/triggers`
++ `POST /projects/:id/triggers/:triggerId/run` surface scheduler
+state in the API and UI (last/next-fire + Run Now button on Project
+Detail). New `triggers` table (migration 0005) holds per-trigger fire
+state. Acceptance scenario 15 drives the full cron + scheduled-for
+round-trip against an in-proc warren+burrow. R-02's defaults consumer
+also expands: NewRun pre-fills the agent picker from
+`defaults.defaultRole` and the prompt textarea from
+`defaults.defaultPrompt`. Webhook triggers remain V2; cron is in V1.
+
+### Added
+
+- **`feat(triggers)`** — `src/triggers/` module ships end-to-end
+  (R-06, plan `pl-2f15`). Mirrors `src/warren-config/`'s layout:
+  `errors`, `config` (env + tick-ms), `schema`, `cron` (croner
+  facade), `repo`, `dispatch` (cron + scheduled), `seeds-extension`
+  (`sd list` / `sd update --extensions` shell-outs), `tick`
+  (`runTick` + `startScheduler`), `index`. `dispatchCronTrigger`
+  encodes the no-catch-up posture via prev-vs-last (`mx-?`): a fire
+  happens iff `previousRun(now) > lastFiredAt`, then stamps `now` and
+  rolls `nextFireAt` forward — a 4-hour outage on an hourly trigger
+  dispatches once, not four times. First observation seeds the row
+  at `now` without firing. `dispatchScheduledSeed` walks `sd list`
+  output, dispatches past-due `extensions.scheduledFor` as runs with
+  `trigger='scheduled'`; per `pl-2f15` risk #4 the warren-side write
+  happens first, and `clearScheduledFor` failures surface as
+  `trigger.cleared_extension_failed` system events on the dispatched
+  run. `startScheduler` wraps `runTick` in a single-flight guard
+  (`pl-2f15` risk #5) so overlapping ticks log
+  `scheduler.tick_skipped` instead of stacking; `stop()` drains the
+  in-flight tick. Decisions recorded in mulch: croner over a
+  homegrown 5-token parser, default-UTC tz, skip-and-log on missing
+  seeds, no catch-up after downtime, warren row as source of truth
+  for fire state (write-once contract).
+- **`feat(db)`** — new `triggers` table (migration 0005) keyed by the
+  composite string `<projectId>:<triggerId>` so each tick can write
+  back `lastFiredAt` / `nextFireAt` / `lastRunId` without juggling a
+  generated id (warren-9d8d). `project_id` cascades on delete (mirrors
+  the `.warren/` clone disappearing with the project); `last_run_id`
+  sets null on delete so a run cleanup doesn't orphan the trigger.
+  `TriggersRepo.upsert` merges undefined-omitted patch fields and
+  treats explicit `null` as a clear (same shape as
+  `RunsRepo.attachBurrow`); `recordFire` is the dispatcher
+  convenience that stamps `lastFiredAt` + `lastRunId` and rolls
+  `nextFireAt` forward in one transaction.
+- **`feat(server)`** — scheduler boots inside `bootServer` from
+  `loadTriggerSchedulerConfigFromEnv` and registers `scheduler.stop()`
+  on `WarrenServerHandle.stop` between handle stop and bridge/burrow/
+  db shutdown so an in-flight tick mid-`spawnRun` drains cleanly
+  (warren-0a1b). A new `DispatchSpawnFn` wraps `spawnRun` and calls
+  `bridges.start(runId, burrowRunId)` so scheduled-run events flow
+  into `warren.events` the same way `POST /runs` does.
+- **`feat(server)`** — `GET /projects/:id/triggers` returns
+  `TriggerSummary[]` joining parsed `.warren/triggers.yaml` entries
+  with persisted scheduler state (`lastFiredAt` / `nextFireAt` /
+  `lastRunId`) and a freshly-computed `nextFireAt` via croner;
+  per-trigger `parseError` surfaces strict-grammar failures the loose
+  warren-config check waved through (warren-99c3). `POST /projects/:id/triggers/:triggerId/run`
+  resolves the trigger from warren-config, dispatches inline via
+  `spawnRun` with `trigger='manual-trigger'`, bridges the run, and
+  records the fire so the next cron tick's prev-vs-last semantic
+  stays correct. Handlers 404 on unknown project/trigger ids.
+- **`feat(ui)`** — Project Detail page (`src/ui/src/pages/ProjectDetail.tsx`)
+  grows a triggers block driven by `GET /projects/:id/triggers` on
+  its own react-query key. Each row shows last/next-fire timestamps,
+  the most recent dispatched `lastRunId`, and any per-trigger
+  `parseError`; a Run Now button per row invalidates the triggers
+  query on success and navigates to the new run page (warren-7bbc).
+- **`feat(ui)`** — `NewRunPage` auto-fills the agent select from the
+  selected project's `.warren/defaults.defaultRole` when it matches a
+  registered agent, and pre-fills the prompt textarea from
+  `defaults.defaultPrompt`. Both fills latch off the first time the
+  user touches the control so manual edits survive subsequent project
+  switches; an inline hint surfaces the source of each default while
+  the value still equals it, and a destructive-color warning flags a
+  `defaultRole` that doesn't resolve to a registered agent
+  (warren-fd14, warren-af38). Broader `defaultRole` consumption (CLI
+  `warren run`, scheduled-run prompt fallback) remains deferred to
+  R-04.
+- **`deps`** — `croner ^10.0.1` for the R-06 cron scheduler
+  (warren-a006). Picked over a homegrown 5-token parser: small,
+  tz-aware with DST handling, no native deps, supports both Vixie and
+  6-token grammars. Warren-config keeps its loose validation
+  (`mx-40fe51`) and defers strict parsing to fire time.
+- **`config`** — warren now dogfoods its own `.warren/`:
+  `defaults.json` sets `defaultRole=claude-code` + `defaultBranch=main`;
+  `triggers.yaml` is a comment-only stub. warren-bd22 tracks adding a
+  CLI/UI affordance so users don't have to hand-author these files.
+- **`test(acceptance)`** — scenario 15
+  (`scripts/acceptance/scenarios/15-triggers-roundtrip.ts`) drives the
+  R-06 scheduler end-to-end against a live in-proc warren+burrow: Run
+  Now persists `lastFiredAt` / `lastRunId`; `scheduledFor` in the
+  past dispatches exactly one `trigger='scheduled'` run and the
+  seed's `scheduledFor` is cleared via `sd update --extensions`;
+  future-dated and closed seeds skip; no spontaneous cron fires
+  occur. `WARREN_SCHEDULER_TICK_MS=1000` keeps the dispatch budget
+  tight (`pl-2f15` risk #8).
+
+### Docs
+
+- **`docs(roadmap)`** — `ROADMAP.md` flips R-06 from `[proposed]` to
+  `[shipped]`, resolves the four open questions (croner over
+  homegrown, default-UTC tz, skip-and-log on missing seeds, no
+  catch-up after downtime), adds R-06 to "Recently shipped", and
+  updates suggested sequencing.
+- **`docs(spec)`** — new `SPEC.md` §11.I pins the scheduler
+  convention into V1's frozen record: tick cadence, triggers table
+  shape (migration 0005), failure semantics, the seeds write-once
+  contract. §1 / §2 / §3 framing updates so V1 includes the cron
+  half of the scheduler (webhooks still V2); §7 project structure
+  adds `src/triggers/`; §8.1 HTTP routes adds the two new endpoints;
+  §9 schema reflects the `triggers` table; §11.H deferred-scope note
+  updates accordingly.
+
 ## [0.1.5] — 2026-05-10
 
 R-02 lands: `.warren/` per-project config directory ships end-to-end —

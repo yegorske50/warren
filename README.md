@@ -13,7 +13,7 @@ Run a Claude Code or Sapling agent against any GitHub project from a browser, wa
 
 ## Status
 
-V1 (`0.1.5`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 14 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). Scheduler (cron + GitHub webhooks) and library API exports are deferred to V2.
+V1 (`0.1.6`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 15 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). The cron half of the scheduler now ships in V1 ([SPEC §11.I](SPEC.md)); GitHub webhook triggers and library API exports remain deferred to V2.
 
 ## What you get
 
@@ -116,6 +116,9 @@ GET    /projects                     list cloned projects
 POST   /projects                     { gitUrl, defaultBranch? } → clone
 POST   /projects/:id/refresh         git fetch + reset to upstream HEAD
 DELETE /projects/:id                 remove project
+GET    /projects/:id/warren-config   parsed .warren/ envelope
+GET    /projects/:id/triggers        scheduler state per trigger
+POST   /projects/:id/triggers/:tid/run   dispatch a trigger inline
 
 POST   /runs                         { agent, project, prompt } → spawn
 GET    /runs                         list (filter by status / agent / project)
@@ -149,7 +152,7 @@ bun run ui:install
 bun run ui:dev
 ```
 
-The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 14 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, container-mode parity, and `.warren/` config lifecycle. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
+The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 15 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, container-mode parity, `.warren/` config lifecycle, and cron + scheduled-for trigger dispatch. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, testing conventions, and PR expectations.
 
@@ -162,6 +165,8 @@ src/
 ├── registry/           canopy → agent definition resolution
 ├── projects/           GitHub clone management
 ├── runs/               spawn / stream / reap composition flow (SPEC §4.3)
+├── triggers/           cron + scheduled-for dispatcher (SPEC §11.I)
+├── warren-config/      .warren/ per-project config loader + cache (SPEC §11.H)
 ├── burrow-client/      facade over @os-eco/burrow HttpClient
 ├── supervisor/         container entrypoint (spawns warren + burrow serve)
 ├── server/             Bun.serve HTTP API + static UI serving
@@ -179,7 +184,7 @@ Documented in [SPEC §11.D](SPEC.md#11d-v1-security-posture-known-limitations) a
 - **Trust-the-socket** between warren and burrow inside the container — they are co-tenanted by design.
 - **No CSRF, single-user.** UI calls warren's API with the bearer; CORS is strict.
 
-V2 candidates: scheduler (cron + GitHub webhooks), token-pair (read/write), per-token scopes, audit log, library API exports. See [ROADMAP.md](ROADMAP.md).
+V2 candidates: GitHub webhook triggers (cron triggers ship in V1), token-pair (read/write), per-token scopes, audit log, library API exports. See [ROADMAP.md](ROADMAP.md).
 
 ## Security
 

@@ -7,8 +7,10 @@ single deployable system: one container, one volume, one HTTP API,
 one UI.
 
 [SPEC.md](SPEC.md) is the V1 design record. The manual-run path
-(`warren run <agent> <project> -p "..."`) is what V1 ships; the
-scheduler (cron + webhooks) and library API exports are deferred to V2.
+(`warren run <agent> <project> -p "..."`) and the cron half of the
+scheduler (`.warren/triggers.yaml` + past-due `scheduledFor` seed
+extensions, SPEC §11.I) are what V1 ships; GitHub webhook triggers
+and library API exports are deferred to V2.
 
 ## Relationship to burrow
 
