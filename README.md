@@ -1,19 +1,23 @@
 # Warren
 
-Control plane and UI for cloud-based coding agents.
+A self-hostable control plane for ephemeral cloud agents — short-lived, sandboxed agents that complete a task, validate the changes, open a PR, then spin down.
 
 [![CI](https://github.com/jayminwest/warren/actions/workflows/ci.yml/badge.svg)](https://github.com/jayminwest/warren/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > A network of interconnected burrows. Agents that operate in isolation, self-manage, self-repair, and self-improve.
 
-Warren composes the [os-eco](https://github.com/jayminwest/os-eco) data-plane tools — [canopy](https://github.com/jayminwest/canopy) (prompts), [mulch](https://github.com/jayminwest/mulch) (expertise), [seeds](https://github.com/jayminwest/seeds) (issues), [sapling](https://github.com/jayminwest/sapling) (harness) — on top of the [burrow](https://github.com/jayminwest/burrow) sandbox runtime into a single deployable system. **One container, one volume, one HTTP API, one UI.**
+Engineering teams keep asking the same question: *can we give every IC a fleet of agents that write code, run the tests, and open a PR without us building the orchestration ourselves?* Warren is that orchestration — point it at your repos, define your agents as versioned prompts, dispatch from a browser, watch them work. Composes the [os-eco](https://github.com/jayminwest/os-eco) data-plane tools — [canopy](https://github.com/jayminwest/canopy) (prompts), [mulch](https://github.com/jayminwest/mulch) (expertise), [seeds](https://github.com/jayminwest/seeds) (issues), [sapling](https://github.com/jayminwest/sapling) (harness) — on top of the [burrow](https://github.com/jayminwest/burrow) sandbox runtime into a single deployable system.
 
-Run a Claude Code or Sapling agent against any GitHub project from a browser, watch its events stream live, steer it mid-run, and reap its expertise back into the project's `.mulch/` and its open work back into `.seeds/` — all without exposing the agent to the host.
+Run a Claude Code or Sapling agent against any GitHub project from a browser, watch its events stream live, steer it mid-run, and reap its expertise back into the project's `.mulch/` and its open work back into `.seeds/` — all without exposing the agent to the host. **One container, one volume, one HTTP API, one UI.**
+
+## Who this is for
+
+Engineering teams self-hosting their own agent infrastructure — not a SaaS, not a hosted product. The deployment unit is one team or one org running one warren on their own box, their own Fly account, or (post-V1) their own cluster. Run it for yourself on a home server today; the [post-V1 direction](SPEC.md#11j-org-readiness-direction-2026-05-11) extends the same architecture to a 50+ engineer organization without forcing a fork.
 
 ## Status
 
-V1 (`0.1.6`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 15 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). The cron half of the scheduler now ships in V1 ([SPEC §11.I](SPEC.md)); GitHub webhook triggers and library API exports remain deferred to V2.
+V1 (`0.1.6`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 15 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). The cron half of the scheduler now ships in V1 ([SPEC §11.I](SPEC.md)); GitHub webhook triggers and library API exports remain deferred to V2. V1 is single-user / single-host as shipped; the [org-readiness cluster](ROADMAP.md#org-readiness-cluster-r-12--r-18) (SSO, remote burrow workers, Postgres backend, MCP, audit, budgets, GitHub App) is the active forward direction.
 
 ## What you get
 
@@ -175,7 +179,7 @@ src/
 └── ui/                 React + Vite + shadcn SPA
 ```
 
-## V1 limitations
+## V1 today
 
 Documented in [SPEC §11.D](SPEC.md#11d-v1-security-posture-known-limitations) and accepted for this release:
 
@@ -183,8 +187,22 @@ Documented in [SPEC §11.D](SPEC.md#11d-v1-security-posture-known-limitations) a
 - **TLS is upstream's job.** Direct HTTP on a non-loopback bind is a misconfiguration; `warren doctor` warns.
 - **Trust-the-socket** between warren and burrow inside the container — they are co-tenanted by design.
 - **No CSRF, single-user.** UI calls warren's API with the bearer; CORS is strict.
+- **SQLite-only state.** Run history and scheduler state live in `/data/warren.db` on the local volume.
+- **One host is the concurrency ceiling.** Burrows run inside the warren container; horizontal scale-out across machines isn't a V1 feature.
 
-V2 candidates: GitHub webhook triggers (cron triggers ship in V1), token-pair (read/write), per-token scopes, audit log, library API exports. See [ROADMAP.md](ROADMAP.md).
+## Where this is going
+
+The org-readiness cluster recorded in [SPEC §11.J](SPEC.md#11j-org-readiness-direction-2026-05-11) is the active direction — the seams to extend warren from "one team, one box" to "50-engineer org, their own infra":
+
+- **Remote burrow workers** ([R-12](ROADMAP.md)) — one warren dispatching across many burrow workers; lifts the single-host ceiling. Burrow-side protocol design is in flight as `burrow-c47a`.
+- **Bring-your-own database** ([R-13](ROADMAP.md)) — `WARREN_DB_URL` with Postgres as a first-class backend alongside SQLite, so org state lives where the SRE team can operate it.
+- **SSO / per-user identity** ([R-09](ROADMAP.md)) — OIDC login replacing the shared bearer; the bearer stays as a service-account path for CI.
+- **MCP support** ([R-15](ROADMAP.md)) — agents declare `mcp_servers` in canopy frontmatter; warren plumbs credentials into the sandbox.
+- **Cross-project activity UI + stable OpenAPI** ([R-14](ROADMAP.md)) — a "what is every agent doing right now" view, plus a versioned API contract so teams can build their own dashboards.
+- **Audit log** ([R-16](ROADMAP.md)) and **cost / concurrency guardrails** ([R-17](ROADMAP.md)) — the security-review and budget-control surface that follows from real user identity.
+- **GitHub App auth** ([R-18](ROADMAP.md)) — installation-scoped, short-lived per-run tokens replacing the shared PAT.
+
+Each item is additive — none of them change V1's shipped behavior when the relevant feature is unconfigured. See [ROADMAP.md](ROADMAP.md) for full design sketches and sequencing.
 
 ## Security
 

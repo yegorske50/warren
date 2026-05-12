@@ -9,6 +9,8 @@
 
 V1 scope is the **manual run path** plus the **cron half of the scheduler**: connect canopy, add project, spawn run, watch events, steer/cancel, and dispatch recurring runs from `.warren/triggers.yaml` + one-off seeds with `extensions.scheduledFor` (R-06, shipped 2026-05-11). Webhook triggers and library API exports are deferred to V2 — kept in this spec for context, marked **(V2)** where they appear.
 
+**Post-V1 direction (2026-05-11).** Warren is being positioned as a self-hostable control plane for engineering organizations of 50+ ICs, not only a solo home-server appliance. V1 stays single-user / single-host as shipped; V2/V3 layer in multi-user identity (SSO), remote burrow workers, a bring-your-own-database backend, MCP support, audit logging, cost/concurrency guardrails, and a GitHub App auth path. See `ROADMAP.md` R-09 + R-12 through R-18, and §11.J below for the dated decision record.
+
 ---
 
 ## 1. TL;DR
@@ -54,7 +56,7 @@ In the UI:
 - Not an issue tracker. Seeds owns the work queue.
 - Not a prompt manager. Canopy owns the agent definitions.
 - Not an expertise store. Mulch owns memory.
-- Not a multi-tenant SaaS. One token, one user, one box.
+- Not a multi-tenant SaaS. The deployment unit is one team / one org self-hosting one warren — never a shared hosted service. V1 ships single-user (one bearer token, one box); V2/V3 layer in SSO + per-user identity + remote workers so a team of 50 ICs can share one warren without sharing one credential or one machine (R-09, R-12, §11.J).
 
 Warren is a thin coordinator — most of the value is in the four CLIs and burrow. Warren's job is to compose them into a deployable system with a UI on top.
 
@@ -78,12 +80,17 @@ Warren is a thin coordinator — most of the value is in the four CLIs and burro
 
 ### 3.2 V1 Non-Goals
 
-- No multi-tenant auth, no per-user RBAC. Single bearer token, one user.
+- No multi-tenant auth, no per-user RBAC in V1. Single bearer token, one user. Multi-user identity via OIDC is a planned post-V1 addition (R-09).
 - No agent marketplace. Agents come from your own canopy repo.
-- No remote burrow workers. Burrows run inside warren's container; no FlyProvider-driven worker pool.
-- No laptop-driven `burrow up` against warren. The home server is the canonical deploy.
+- No remote burrow workers in V1 — burrows run inside warren's container. The "single warren box is the concurrency ceiling" shape is acceptable for V1; remote workers are planned for V2 (R-12, design tracked in `burrow-c47a`). The warren↔burrow seam is already HTTP, so this is additive rather than a rewrite.
+- No laptop-driven `burrow up` against warren. The home server is the canonical V1 deploy.
 - No real-time collaboration. One UI, one user at a time.
-- No payment, no usage metering, no quota.
+- No payment, no usage metering, no quota in V1. Per-user / per-project cost and concurrency guardrails are planned post-V1 (R-17).
+- No cost or run-budget enforcement in V1. Token spend and concurrent-run caps are planned post-V1 (R-17).
+- No bring-your-own database in V1 — SQLite via `bun:sqlite` is the only backend. Postgres-as-a-backend is planned post-V1 (R-13).
+- No MCP server configuration in V1. Canopy-frontmatter-driven MCP plus burrow-side credential mounts are planned post-V1 (R-15).
+- No audit log in V1. Append-only dispatch/steer/cancel/secret-read ledger is planned post-V1 (R-16), and lands alongside R-09 since it depends on real user identity.
+- No GitHub App auth in V1 — shared PAT via `GITHUB_TOKEN`. GitHub App with installation-scoped tokens and per-repo allowlists is planned post-V1 (R-18).
 
 ### 3.3 The seams that matter
 
@@ -722,6 +729,65 @@ three places in lockstep: ROADMAP R-06 (or its successor entry), this section
 (§11.I), and acceptance scenario 15. New `TriggerSchema` fields must stay
 additive (all-optional) so existing `triggers.yaml` files keep parsing —
 warren-config (R-02) and the dispatcher (R-06) co-own the schema.
+
+### 11.J Org-readiness direction (2026-05-11)
+
+V1 is shipped — manual dispatch, cron + scheduled-for, single-user box. The
+next direction, decided 2026-05-11, is to make warren self-hostable by an
+engineering organization of 50+ ICs without forcing a fork. V1's
+"one token, one user, one box" posture stays accurate for what's shipped;
+the additions below extend the seams that are already in place rather than
+rewriting them. None of this changes V1 — `docker compose up` against the
+current code still works exactly the same.
+
+**Why now.** Warren is being positioned externally as the answer to the
+"ephemeral cloud agents that complete a task, validate it, open a PR, then
+spin down" problem that vertical-SaaS engineering teams keep asking for.
+The existing architecture (warren↔burrow HTTP seam, canopy as agent source,
+seeds as work queue) already points at that shape. What's missing for an
+org to actually adopt it on their own infra is: multi-user identity, a
+backend an SRE team will operate, MCP, audit, budgets, and the ability for
+one warren to dispatch across more than one host.
+
+**The eight planned additions, in priority order.** Full design in
+`ROADMAP.md`; this section is the cross-reference:
+
+1. **Remote burrow workers** (R-12) — one warren, N burrow workers across
+   hosts. Lifts the "single box is the concurrency ceiling" limit. Burrow
+   side tracked in `burrow-c47a` (the protocol design — transport, auth,
+   worker registration, placement). Warren side is a worker registry + a
+   dispatch router. Today's local burrow keeps working with zero registered
+   remote workers, so this is additive.
+2. **Bring-your-own database** (R-13) — `WARREN_DB_URL`, Postgres as a
+   first-class backend alongside SQLite. SQLite stays the home-server
+   default. Burrow's own SQLite stays per-worker (it's run-local state, not
+   org truth).
+3. **Per-user identity / SSO** (R-09, repromoted from `[deferred]`) — OIDC
+   login replacing the single bearer token; the bearer stays as a
+   service-account path for CI. Prerequisite for R-16 and R-17.
+4. **MCP support** (R-15) — `mcp_servers` block in canopy frontmatter,
+   threaded into the agent's runtime config; burrow-side per-run credential
+   mount (same architectural shape as the `.gitconfig` resolution in §11.G).
+5. **Cross-project activity UI + stable OpenAPI** (R-14) — a global "what
+   is every agent doing right now" view; a versioned OpenAPI spec so teams
+   can build their own dashboards (closes §11.C #1).
+6. **Audit log** (R-16) — append-only dispatch/steer/cancel/secret-read
+   ledger keyed to the authenticated user. Depends on R-09.
+7. **Cost & concurrency guardrails** (R-17) — per-user / per-project token
+   budgets and concurrent-run caps enforced at dispatch time. Depends on R-09.
+8. **GitHub App** (R-18) — installation-scoped tokens with per-repo
+   allowlists replacing the shared PAT; short-lived tokens minted per run.
+
+**What stays single-tenant.** "Not a multi-tenant SaaS" remains a non-goal
+(§2.3). The deployment unit is one team / one org self-hosting one warren.
+SSO does not turn warren into a hosted service — it turns one warren into
+something a 50-person team can share without sharing a credential.
+
+**Cross-repo footprint.** Only burrow has an open dependency: the
+`burrow-c47a` design (remote-worker protocol) gates R-12. Seeds, canopy,
+mulch, and sapling have no new asks from this direction — the org-readiness
+work is almost entirely warren-internal. Update the cross-repo readiness
+table in `ROADMAP.md` when `burrow-c47a` produces a sub-plan.
 
 ---
 

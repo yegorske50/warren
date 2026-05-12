@@ -1,9 +1,16 @@
 # Warren Roadmap
 
 Direction for warren as it grows from "single-user end-to-end works on Fly" to a
-self-hosted control plane usable by a team of ICs. Each item is a self-contained
-idea with a stable ID for reference. Items can be sequenced independently; the
-dependency graph is captured per-item.
+self-hosted control plane that an engineering organization of 50+ ICs can adopt
+on their own infrastructure. Each item is a self-contained idea with a stable
+ID for reference. Items can be sequenced independently; the dependency graph is
+captured per-item.
+
+The positioning shift toward org-scale self-hosting is recorded in `SPEC.md`
+§11.J (2026-05-11). The **Org-readiness cluster** below (R-12 through R-18,
+plus the repromoted R-09) captures the eight planned additions: remote burrow
+workers, bring-your-own database, multi-user identity, MCP support, a
+cross-project activity UI, audit log, cost guardrails, and GitHub App auth.
 
 This file is the punch list, not the spec. Items here become seeds issues when
 committed to. [SPEC.md](SPEC.md) is the frozen V1 design record; ROADMAP.md is
@@ -815,28 +822,343 @@ record IDs after spawn (clickable to view).
 
 ---
 
-## R-09 — Per-user identity and audit
-Status: [deferred]
-Depends on: — (independent of all above)
+## R-09 — Per-user identity and SSO
+Status: [proposed] — repromoted 2026-05-11 from `[deferred]` as part of the
+org-readiness cluster (SPEC §11.J). The "wait for a real consumer" condition
+is satisfied: org-scale self-hosting is now the explicit direction.
+Depends on: — (independent of R-01 through R-08; load-bearing for R-16 and R-17)
 Unlocks: real attribution on issues/runs, multi-user assignee picker
-("members + roles"), audit log for compliance-conscious teams
+("members + roles"), audit log for compliance-conscious teams (R-16),
+per-user cost & concurrency budgets (R-17), service-account separation for
+CI vs. interactive users
 
-**Why deferred (2026-05-10).** Locked in design discussion: stay single-shared-
-bearer for V2. The team-of-ICs use case can be served by everyone sharing one
-Fly deploy with one token, and treating the project repo's git history as the
-audit trail. Per-user accounts are the gating feature for richer attribution
-UX (multica's member picker, Slack-style mentions) but not for any of R-01
-through R-08.
+**Problem.** A single shared bearer token doesn't work for a 50-engineer
+team. Every dispatch is attributed to "the warren box"; revoking access for
+one departing engineer means rotating one secret everybody now needs;
+compliance review can't accept "we share one credential" as a finding. SSO
+via OIDC (Okta / Google Workspace / GitHub OAuth) is the table-stakes shape
+every internal-platform tool ends up needing at this size.
 
-Pick up when one of these is true: (a) a team adopts warren at >5 ICs and
-asks for attribution, (b) compliance/security review requires per-user audit,
-(c) R-08's operator agent grows enough power that scoping its access becomes
-worth the cost.
+**Sketch.** OIDC login as the primary path; the existing single bearer
+token stays as a *service account* path for CI scripts and the greenhouse
+outer loop. Schema additions: `users` table (id, email, oidc_subject,
+created_at, disabled_at), `runs.created_by` (FK to users, nullable for
+service-account dispatches), `seeds.extensions.assignedBy` populated on
+warren-side issue updates. The UI gains a session-cookie auth layer and a
+top-bar identity widget. Service-account bearer dispatches show in the
+audit log (R-16) as their own pseudo-user.
 
-**Sketch (for when revisited).** Local-first auth: a `users` table in warren's
-SQLite, password or local-token login (no external SSO in V2 of this item),
-attribution on `runs.created_by`, `seeds.extensions.assignedBy`, etc. OAuth
-(GitHub) login as a follow-up if external SSO becomes important.
+**Open questions.**
+- Provider abstraction — bake against a generic OIDC library (`openid-client`
+  or similar) so Okta / Google / GitHub / Auth0 all work, or hard-code two
+  or three concrete providers? Lean generic OIDC for the same reason warren
+  uses generic Bun.serve over a framework.
+- Token lifetime / refresh strategy. Short-lived access tokens + refresh
+  tokens stored server-side, signed session cookie holds the user id.
+- Migration story for existing single-bearer deploys. Probably: SSO is
+  opt-in via `WARREN_OIDC_ISSUER_URL`; if unset, warren stays in
+  single-bearer mode (V1 posture preserved).
+- Per-user authorization is intentionally *not* in this item — every
+  authenticated user can do everything in V2 of R-09. RBAC is a separate
+  follow-up if it ever lands.
+
+---
+
+## Org-readiness cluster (R-12 – R-18)
+
+The seven items below are the rest of the org-readiness direction recorded
+in `SPEC.md` §11.J (2026-05-11). R-09 (above) is the eighth; it's
+sequenced first because R-16 and R-17 depend on real user identity. The
+cluster is additive — none of these change V1's shipped behavior when the
+relevant feature is unconfigured (no SSO issuer = single-bearer mode, no
+`WARREN_DB_URL` = SQLite, no remote workers registered = local burrow,
+etc.).
+
+## R-12 — Remote burrow workers
+Status: [proposed]
+Depends on: `burrow-c47a` (burrow-side protocol design — transport, auth,
+worker registration, run placement). Filed 2026-05-11 as a stub-with-plan
+seed; the burrow agent expands it into a sub-plan before any code lands.
+Unlocks: warren as a control plane across multiple hosts; lifting the
+"single box is the concurrency ceiling" limit; per-worker capabilities
+(e.g. GPU-only workers) for advanced use cases
+
+**Problem.** Today every burrow runs inside the warren container. One box
+is the concurrency ceiling — 50 engineers each dispatching an agent at
+once exhausts the host. The warren↔burrow seam is already HTTP
+(`HttpClient` from `@os-eco/burrow` over a unix socket, §3.3); making
+burrow listen on a network address with auth is additive, not a rewrite.
+The SPEC's "No remote burrow workers" non-goal (§3.2) was an explicit
+choice for V1 simplicity; org-scale adoption is the reason to lift it.
+
+**Sketch.** Burrow side (tracked in `burrow-c47a`): a "worker mode" for
+`burrow serve` that binds TCP with bearer-token auth (mTLS as the
+recommended deploy posture). Warren side: a `workers` table (id, url,
+auth_token_ref, labels, last_seen_at, drained_at), a worker registry
+endpoint workers call into on boot, a placement function that picks a
+worker per run (round-robin with project-affinity for warm clones). Local
+burrow stays the default — a warren with zero registered remote workers
+behaves exactly like today (`burrow.sock` over a unix socket).
+
+**Open questions.**
+- Worker discovery — static config list, warren-side registration
+  endpoint, or both? Static for V2, dynamic registration as a follow-up.
+- Run placement policy — round-robin, project-affinity, label-based,
+  explicit pin? Start with project-affinity (keep a project's clones warm
+  on the worker that first saw it) and let users override per-dispatch.
+- State boundary — keep burrow's SQLite per-worker, warren queries each
+  worker for its runs and aggregates. Don't try to lift run state up to
+  warren; the existing local-state-per-burrow contract is correct.
+- Threat model — assume the network between warren and worker is
+  hostile by default (TLS required, no plaintext bearer). VPC-private
+  deploys can downgrade if they want.
+
+---
+
+## R-13 — Bring-your-own database (Postgres backend)
+Status: [proposed]
+Depends on: — (independent; uses Drizzle's existing dialect abstraction)
+Unlocks: SREs operating warren state in their org's existing managed
+Postgres rather than a docker volume; org-scale deploy stories
+("attach warren to our RDS instance") that V1 can't tell
+
+**Problem.** SQLite via `bun:sqlite` is the only backend today (§6).
+That's the right default for a home-server appliance and the wrong one
+for an internal-platform tool a 50-engineer org adopts. Org SRE teams
+won't operate "state lives in a docker volume" as their source of truth
+for what their engineers ran when. The fact that Drizzle is already the
+ORM (§6) makes this swappable at the storage layer rather than a
+rewrite.
+
+**Sketch.** `WARREN_DB_URL` env var. If unset (or `sqlite:///data/warren.db`),
+warren behaves as today. If a Postgres URL (`postgres://...`), warren
+uses `drizzle-orm/node-postgres` and runs Postgres-dialect migrations.
+Burrow's own SQLite stays per-worker — that's run-local sandbox state,
+not org truth, and the boundary is already clean. Audit the schema for
+SQLite-isms (no `WITHOUT ROWID`, no SQLite-specific JSON ops, careful
+with text-as-enum) and have Drizzle Kit emit both dialects from one
+schema file.
+
+**Open questions.**
+- Connection pooling shape — Drizzle's default `node-postgres` Pool with
+  `WARREN_DB_POOL_MAX` knob, or PgBouncer assumed in front? Default pool
+  for V2 of this item; document the PgBouncer path.
+- Migration story for existing SQLite users. Probably: ship a
+  `warren db migrate-to-postgres --from <sqlite-path> --to <pg-url>`
+  one-shot tool, not an in-place online migration.
+- What about MySQL? Drizzle supports it. Decision: Postgres only for V2;
+  MySQL as a follow-up if a real consumer asks. Keep the dialect
+  abstraction clean so it's a config change, not a code change.
+
+---
+
+## R-14 — Cross-project activity UI + stable OpenAPI
+Status: [proposed]
+Depends on: R-04 (project + issues UI) for the per-project drill-down
+target. The activity feed lives above R-04, not instead of it.
+Unlocks: cognitive scalability when a team is running dozens of agents
+across many repos; third-party dashboards built against warren's API
+(closes §11.C open question #1 on OpenAPI)
+
+**Problem.** Today's UI is project-scoped — pick a project first, then
+see its runs and triggers. That breaks at any non-trivial fleet size:
+an SRE on-call wants "what is every agent doing right now, what needs
+attention" without clicking through 30 projects. Kanban boards (multica,
+OpenAI Codex Web) are one answer; an engineering-team-shaped answer is
+**a unified activity feed sorted by 'needs attention'** with collapse-by-
+project. Separately, the lack of a versioned OpenAPI spec means teams who
+want to build their own dashboards have to reverse-engineer the wire
+envelope.
+
+**Sketch.** New top-level UI page `/activity`: time-sorted feed of runs
+across all projects, with filters (status, agent, project, user once
+R-09 lands), grouping by project as an option not a default. Each row
+links to its run / project / PR / failing test. "Needs attention" is a
+computed pseudo-status: `failed`, `awaiting_input` (steered run with no
+follow-up), `pr_review_requested`, `pr_check_failed`. Backed by a new
+`GET /activity` endpoint that aggregates across projects. Separately,
+hand-author `src/server/openapi/spec.ts` (same pattern burrow uses, per
+§11.C #1), golden-lock it, generate a typed client for the UI off of it.
+
+**Open questions.**
+- Real-time vs. polled? Today's project page polls; activity feed wants
+  SSE to feel live. Reuse the existing event-stream bridge or a new
+  cross-project SSE? Probably new — single subscription, server-side
+  fan-in.
+- Pagination shape for the OpenAPI surface. Cursor-based against a
+  monotonic id is the right answer; document it once and use it
+  everywhere.
+- Where does the audit log (R-16) surface? Same feed with a filter, or
+  a separate page? Same feed; audit is "what happened" and activity is
+  "what's happening." Different filters over the same underlying
+  stream.
+
+---
+
+## R-15 — MCP support
+Status: [proposed]
+Depends on: burrow-side per-run credential mount (not yet filed; same
+architectural shape as the `.gitconfig` resolution in SPEC §11.G). Sapling
+MCP support tracked as the long-tail dep in §R-08.
+Unlocks: agents that use the team's existing MCP servers (GitHub, Slack,
+Notion, Linear, internal tools) without per-deployment glue; closes the
+biggest "we already standardized on MCP" objection from would-be adopters
+
+**Problem.** MCP isn't mentioned anywhere in `SPEC.md`. Every large
+engineering org has already adopted MCP for tool integrations and will
+expect their agents to use it. Two distinct problems sit underneath:
+(a) how does an agent definition declare which MCP servers it wants, and
+(b) how do those servers authenticate from inside a sandbox where OAuth
+flows can't redirect to localhost?
+
+**Sketch.** Canopy frontmatter gains an `mcp_servers` block alongside
+the existing `burrow_config`:
+
+    mcp_servers:
+      - name: github
+        url: https://mcp.github.com
+        auth: oauth          # or "token"
+      - name: linear
+        url: https://mcp.linear.app
+        auth: token
+
+Warren reads the block at spawn time and threads it into the agent's
+runtime config (sapling and claude-code both speak MCP). For `auth: token`
+servers, warren mounts a credential file from `WARREN_MCP_CREDENTIALS_DIR`
+into the burrow workspace at a known path (`/run/secrets/mcp/<name>`).
+For `auth: oauth`, V2 of this item ships static-token-only ("paste the
+already-issued token into the credentials dir"); a proper OAuth broker
+on the warren host with refresh-token mounting is a follow-up.
+
+**Open questions.**
+- Where does the burrow-side mount live? Burrow's bwrap profile currently
+  binds `/usr`, `/etc`, `/lib`, etc. (read-only). A per-run secrets bind
+  is the same architectural change as the `.gitconfig` problem (§11.G);
+  do it once, use it for both. File the burrow-side seed when this item
+  becomes committed work.
+- Credential rotation — static tokens until they expire, or refresh
+  on-the-fly? Static for V2; refresh broker as a follow-up.
+- Server discovery — purely declared per-agent, or a project-level
+  default in `.warren/`? Per-agent for V2; project-level defaults can be
+  layered on top once the per-agent path is shipped.
+
+---
+
+## R-16 — Audit log
+Status: [proposed]
+Depends on: R-09 (need real user identity to attribute events to)
+Unlocks: compliance review, "who ran what against which repo when"
+queries, security-review sign-off; doubles as the data source for R-14's
+activity feed
+
+**Problem.** Today every dispatch is attributable to "the warren box" via
+a shared bearer. That's not survivable for any org with a compliance
+function — security review will ask "who can dispatch agents, and how do
+you know after the fact what they did?" and the only answer warren can
+give today is "the git history of the PRs they opened." Insufficient for
+read actions (secret reads, agent edits, steer messages) that don't
+produce a commit.
+
+**Sketch.** New `audit_log` table — append-only, never updated, indexed
+on `user_id` + `created_at`. Events: `run.dispatched`, `run.steered`,
+`run.cancelled`, `agent.created`, `agent.updated`, `secret.read`,
+`trigger.run_now`, `project.added`, `project.deleted`, `auth.login`,
+`auth.token_rotated`. Each row: `(id, user_id, action, resource_type,
+resource_id, metadata jsonb, ip_address, user_agent, created_at)`.
+Service-account dispatches use a synthetic user id (`svc:<token-name>`).
+Surfaced in the UI as a filtered view of R-14's activity feed; exportable
+as JSONL for SIEM ingest via `GET /audit-log.jsonl?since=<cursor>`.
+
+**Open questions.**
+- Retention policy. Append-only forever is the right default for
+  compliance; add a `WARREN_AUDIT_LOG_RETENTION_DAYS` knob for orgs that
+  want a hard cap.
+- Tamper-evidence — chain rows with a hash-of-previous-row, or just
+  trust append-only-via-Postgres? Trust the DB for V2 of this item;
+  hash chaining is a follow-up if any real consumer asks.
+- Secret-read event resolution — log "this run accessed
+  `ANTHROPIC_API_KEY`" or just "this run was authorized to access
+  these secret names at dispatch time"? Latter for V2; the per-access
+  granularity requires a hook in burrow that doesn't exist yet.
+
+---
+
+## R-17 — Cost & concurrency guardrails
+Status: [proposed]
+Depends on: R-09 (per-user budgets need user identity)
+Unlocks: predictable spend at org scale; "one runaway agent can't take
+down the box" SLO; pre-dispatch rejection rather than post-bill surprise
+
+**Problem.** Nothing today prevents one excited engineer from kicking off
+a 12-hour refactor that drains a month of API budget, or 50 simultaneous
+dispatches that exhaust the host. V1's "no payment, no usage metering,
+no quota" (§3.2) was a deliberate single-user-home-server choice; at
+org scale it becomes a foot-gun. Token spend per run is already
+observable (claude-code emits token counts; sapling has
+`turn_end.contextUtilization`); the gap is enforcement before dispatch.
+
+**Sketch.** Two budget tables — `budgets` (per-user, per-project,
+per-agent; columns: scope_type, scope_id, period, tokens_max,
+runs_concurrent_max, runs_per_period_max) and `budget_usage` (rolling
+counters keyed by scope_id + period_start). Pre-dispatch check
+intercepts `POST /runs` and rejects with a structured 429 + remaining
+budget. Soft-warn at 80% via a UI banner; hard-fail at 100%. Per-run
+token spend tallied at reap time from the run's terminal `result` event
+(same source `branchPushed` uses). Concurrent-run cap is a simple count
+of `runs.state IN ('queued', 'running')`.
+
+**Open questions.**
+- Budget granularity — token budgets only, or also "dollars" with a
+  configurable per-model rate card? Tokens for V2 (model-agnostic);
+  dollars as a follow-up using a config file pinning rates.
+- Period semantics — calendar month, rolling 30-day window,
+  fiscal-month-with-org-timezone? Rolling 30-day is the simplest;
+  calendar-aligned periods are a follow-up.
+- Who can change budgets — anyone authenticated, or an "admin" pseudo-
+  role? V2 ships "anyone authenticated can change any budget" and lets
+  the audit log (R-16) be the accountability mechanism. RBAC for budget
+  edits is a follow-up.
+
+---
+
+## R-18 — GitHub App auth
+Status: [proposed]
+Depends on: — (independent; touches secrets handling and the supervisor's
+git credential plumbing)
+Unlocks: per-repo permission scoping, automatic token rotation,
+short-lived per-run tokens (so a compromised run can't exfiltrate a
+long-lived PAT), elimination of "everybody shares one human's PAT" as
+a deploy pattern
+
+**Problem.** V1 uses a shared `GITHUB_TOKEN` (a PAT) for cloning,
+pushing, and PR creation. PATs are long-lived, broadly scoped, and
+attributed to whatever human created them — none of those properties
+are correct for an org-scale deploy. The supervisor's git credential
+plumbing (`src/supervisor/git-credentials.ts`, see §11.G) already mints
+the in-container git config; the change is in what it mints and how
+it refreshes.
+
+**Sketch.** Warren stores a GitHub App's private key + installation id
+in its DB (encrypted at rest if `WARREN_ENCRYPTION_KEY` is set). At
+dispatch time, the supervisor mints a fresh installation token scoped
+to the project's repo via the GitHub API, valid for the duration of
+the run (≤ 1 hour). The token is written to the same git-credentials
+path that the PAT goes today (`/root/.gitconfig` `insteadOf` rewrite,
+§11.G). PAT mode stays supported via `GITHUB_TOKEN` for the home-server
+deploy; GitHub App mode activates when `WARREN_GITHUB_APP_ID` +
+`WARREN_GITHUB_APP_PRIVATE_KEY` are set.
+
+**Open questions.**
+- Per-repo allowlist — installation-level (the App is installed on
+  specific repos via GitHub's UI) is the natural answer; warren-side
+  allowlist on top of that is a follow-up if needed.
+- Token caching — mint per run, or cache for the install's
+  `expires_at` and reuse across runs? Cache for the install duration;
+  mint a new one if cached token has < 5 minutes left. Audit log
+  (R-16) records each mint.
+- Webhook signature verification — the V2 webhook receiver (§3.1)
+  will want this too; GitHub App webhook secret lives next to the App
+  credentials. Synergistic with R-18 but not blocking.
 
 ---
 
@@ -852,7 +1174,10 @@ relitigated when items become seeds issues.
   architectural anchor for R-01 through R-08.
 - **Seeds is the source of truth for issues.** No warren issues table.
   The UI is a friendlier wrapper over `sd` CLI.
-- **Single-bearer auth in V2.** Per-user identity (R-09) is deferred.
+- **Single-bearer auth in V1.** Per-user identity (R-09) was deferred in
+  the 2026-05-10 design discussion and repromoted 2026-05-11 as part of the
+  org-readiness direction (SPEC §11.J). The bearer stays as a
+  service-account path once R-09 ships OIDC.
 - **Sapling for personal use, claude-code as public default.**
   `WARREN_DEFAULT_AGENT` env var, no source change.
 - **Roles tab editor is raw markdown with full canopy feature set.**
@@ -941,7 +1266,7 @@ so subsequent revisions know what's already off the punch list.
   trigger seeds `lastFiredAt=now`. Webhook triggers (the V2 half of the
   scheduler) remain deferred.
 
-## Cross-repo readiness (2026-05-10)
+## Cross-repo readiness (2026-05-11)
 
 Snapshot of which sibling-repo features the warren ROADMAP depends on, and
 whether they've landed. Updated when sibling-repo versions bump. Per-item
@@ -954,6 +1279,7 @@ detail lives inside each R-NN; this is just the dashboard.
 | Seeds config schema CLI | R-10 | ✅ shipped | seeds v0.4.3 |
 | Canopy `extends` + mixins + `cn render --json` | R-05 | ✅ shipped | canopy v0.2.4 |
 | Canopy `mulch:` / `extends_mulch:` frontmatter | R-11 | ✅ shipped | canopy v0.2.4 |
+| Canopy `mcp_servers` frontmatter block | R-15 | ❌ not started | — |
 | Canopy config schema CLI | R-10 | ❌ not started | — |
 | Mulch `ml prime --format plain` / `--dry-run` | R-11 | ✅ shipped | mulch v0.8.0+ |
 | Mulch config schema CLI | R-10 | ✅ shipped | mulch v0.9.0 |
@@ -961,20 +1287,26 @@ detail lives inside each R-NN; this is just the dashboard.
 | Sapling `operationCount`/`archiveEntryCount` on `turn_end` | R-07 | ⚠️ via RPC `getState` only | sapling v0.3.2 |
 | Sapling `--system-prompt-file` | R-07, R-11 | ✅ shipped | sapling v0.3.2 |
 | Sapling config schema CLI | R-10 | ⚠️ partial (set ✅, schema ❌) | sapling v0.3.2 |
-| Sapling MCP / custom tool registry | R-08 | ❌ not started | — |
+| Sapling MCP / custom tool registry | R-08, R-15 | ❌ not started | — |
+| Burrow remote-worker protocol design | R-12 | 🟡 in design (`burrow-c47a`, 2026-05-11) | — |
+| Burrow per-run credential mount (for MCP secrets) | R-15 | ❌ not filed yet | — |
 
 Net: every cross-repo blocker for R-01, R-04, R-05, R-06, R-07, and R-11
 is satisfied. R-10 can ship 2-of-4 tabs (mulch + seeds) today; canopy and
 sapling tabs unlock as those tools add `<tool> config schema --json`. R-08's
 MCP dependency for sapling-as-operator-harness is still out — claude-code
-remains the operator harness for V2.
+remains the operator harness for V2. The org-readiness cluster (R-12 – R-18)
+has minimal cross-repo footprint: only R-12 (burrow worker protocol, in
+design as `burrow-c47a`) and R-15 (canopy frontmatter + burrow secrets
+mount) need sibling-repo work; the other six items are warren-internal.
 
 ## Suggested sequencing
 
-A first cut at order of attack — not committed. Updated 2026-05-10 to reflect
-cross-repo readiness: R-01's seeds-side and R-11's canopy + mulch sides have
-all shipped, so several items that were "wait on the upstream" are now
-"warren-internal work."
+A first cut at order of attack — not committed. Updated 2026-05-11 to layer
+in the org-readiness cluster. The R-01 through R-11 ordering is unchanged;
+R-09 is repromoted and R-12 through R-18 are slotted in.
+
+**Wave 1 — team-of-ICs UX (warren-internal, no cross-repo blockers).**
 
 1. **R-02** (`.warren/` directory) — ✅ shipped 2026-05-10 (plan `pl-5d74`).
    Establishes the config pattern R-06 builds on. R-06 now unblocked.
@@ -1007,4 +1339,37 @@ all shipped, so several items that were "wait on the upstream" are now
     operator is itself a role that wants project expertise). Sapling MCP
     is the long-tail dependency for sapling-as-operator-harness; claude-code
     is the V2 harness regardless. Skip if earlier items run long.
-11. **R-09** (per-user identity) — deferred until a real consumer asks.
+
+**Wave 2 — org-readiness cluster (SPEC §11.J, 2026-05-11).**
+
+11. **R-12** (remote burrow workers) — top priority of the cluster.
+    Blocked on `burrow-c47a` design output. Lifts the single-host
+    concurrency ceiling that prevents real org adoption. Warren-side
+    work (worker registry + dispatch routing) is parallelizable with the
+    burrow-side protocol design.
+12. **R-13** (bring-your-own database / Postgres) — independent of R-12;
+    can land in parallel. Drizzle abstraction is already in place, so the
+    main work is dialect-auditing the schema and shipping a migration
+    tool. Highest-leverage org-readiness item per unit-of-work.
+13. **R-09** (per-user identity / SSO) — repromoted from `[deferred]`.
+    Independent of R-12 and R-13. Load-bearing for R-16 and R-17 — both
+    need real user identity to attribute events and enforce per-user
+    budgets. Do this before R-16 and R-17.
+14. **R-15** (MCP support) — independent of R-09; can land in parallel
+    with the identity work. Needs a burrow-side per-run credential mount
+    (not yet filed). Static-token-only for V2; OAuth broker as a
+    follow-up.
+15. **R-14** (cross-project activity UI + OpenAPI) — depends on R-04
+    (per-project UI) for the drill-down targets. Closes §11.C open
+    question #1 on OpenAPI. Sequences after R-04 lands; can layer on
+    top of any subset of R-12 / R-13 / R-09 / R-15.
+16. **R-16** (audit log) — depends on R-09 for user identity. Shares
+    the activity feed (R-14) as a presentation surface, so pairs
+    naturally with R-14.
+17. **R-17** (cost & concurrency guardrails) — depends on R-09 for
+    per-user budgets. Can ship per-project budgets earlier without R-09
+    if pressure dictates. Pre-dispatch enforcement is the integration
+    point.
+18. **R-18** (GitHub App) — independent of the rest of the cluster.
+    Can ship any time once an org actually asks; PAT mode stays
+    supported indefinitely as the home-server path.
