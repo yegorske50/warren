@@ -1,4 +1,4 @@
 {
-	"defaultRole": "claude-code",
+	"defaultRole": "pi",
 	"defaultBranch": "main"
 }
