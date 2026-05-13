@@ -7,7 +7,7 @@ import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { AgentDefinition } from "../registry/schema.ts";
 import { RunSpawnError } from "./errors.ts";
-import { composeDispatchPrompt, type SeedWorkspaceInput, spawnRun } from "./spawn.ts";
+import { composeDispatchPrompt, spawnRun } from "./spawn.ts";
 
 // `typeof fetch` requires a `preconnect` method we don't exercise in tests; cast
 // each stub so callers can pass a plain async function.
@@ -128,6 +128,23 @@ function serializeRun(r: BurrowRun): unknown {
 	};
 }
 
+/**
+ * Pull `.canopy/agent.json` out of the seed payload that rode on POST /burrows
+ * and return its `frontmatter`. The seed payload travels as part of
+ * `burrows.up({ seed: { files } })`, so the canopy envelope is recoverable
+ * from the recorded request body without a separate seam.
+ */
+function readCanopyFrontmatter(calls: readonly RecordedCall[]): Record<string, unknown> {
+	const up = calls.find((c) => c.method === "POST" && c.path === "/burrows");
+	const seed = (
+		up?.body as { seed?: { files?: ReadonlyArray<{ path: string; contents: string }> } }
+	)?.seed;
+	const canopy = seed?.files?.find((f) => f.path === ".canopy/agent.json");
+	if (canopy === undefined) throw new Error(".canopy/agent.json missing from seed payload");
+	const parsed = JSON.parse(canopy.contents) as { frontmatter?: Record<string, unknown> };
+	return parsed.frontmatter ?? {};
+}
+
 function makeAgentJson(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
 	return {
 		name: "refactor-bot",
@@ -171,7 +188,6 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "   ",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
@@ -187,7 +203,6 @@ describe("spawnRun", () => {
 				agentName: "no-such-agent",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "fix it",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeInstanceOf(NotFoundError);
 		expect(calls).toHaveLength(0);
@@ -202,13 +217,11 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_doesnotexist",
 				prompt: "fix it",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeInstanceOf(NotFoundError);
 	});
 
-	test("end-to-end: creates the warren run, provisions a burrow, seeds, dispatches", async () => {
-		const seedCalls: SeedWorkspaceInput[] = [];
+	test("end-to-end: creates the warren run, provisions+seeds the burrow atomically, dispatches", async () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
@@ -216,9 +229,6 @@ describe("spawnRun", () => {
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "fix the flaky test",
-			seedWorkspace: async (input) => {
-				seedCalls.push(input);
-			},
 		});
 
 		// Warren run row
@@ -235,34 +245,32 @@ describe("spawnRun", () => {
 		expect(stored.name).toBe("refactor-bot");
 		expect(stored.sections.system).toBe("be a refactor agent");
 
-		// Burrow provisioning + dispatch — agents: ["refactor-bot"] is forwarded
-		// at up-time so burrow can mount the runtime's binary into the sandbox
-		// even when the project clone has no burrow.toml (warren-8526).
-		expect(calls).toEqual([
-			{
-				method: "POST",
-				path: "/burrows",
-				body: {
-					projectRoot: "/data/projects/x/y",
-					originUrl: "https://github.com/x/y.git",
-					agents: ["refactor-bot"],
-				},
+		// Two HTTP calls: provision-with-seed, then dispatch. The seed.files
+		// payload rides on POST /burrows so provisioning + workspace drops are
+		// atomic — burrow rolls back if any file is rejected (R-07).
+		expect(calls).toHaveLength(2);
+		expect(calls[1]).toEqual({
+			method: "POST",
+			path: "/burrows/bur_aaaaaaaaaaaa/runs",
+			body: {
+				agentId: "refactor-bot",
+				prompt: "be a refactor agent\n\n---\n\nfix the flaky test",
+				metadata: { frontmatter: {} },
 			},
-			{
-				method: "POST",
-				path: "/burrows/bur_aaaaaaaaaaaa/runs",
-				body: {
-					agentId: "refactor-bot",
-					prompt: "be a refactor agent\n\n---\n\nfix the flaky test",
-					metadata: { frontmatter: {} },
-				},
-			},
-		]);
+		});
 
-		// Seeding ran with the provisioned workspacePath and a populated file list
-		expect(seedCalls).toHaveLength(1);
-		expect(seedCalls[0]?.workspacePath).toBe("/data/burrow/workspaces/bur_aaaaaaaaaaaa");
-		const seededPaths = (seedCalls[0]?.files ?? []).map((f) => f.path);
+		// POST /burrows body: agents + seed.files payload (no half-seeded
+		// workspace ever observable on warren's side).
+		const upBody = calls[0]?.body as {
+			projectRoot: string;
+			originUrl: string;
+			agents: readonly string[];
+			seed?: { files: ReadonlyArray<{ path: string; contents: string }> };
+		};
+		expect(upBody.projectRoot).toBe("/data/projects/x/y");
+		expect(upBody.originUrl).toBe("https://github.com/x/y.git");
+		expect(upBody.agents).toEqual(["refactor-bot"]);
+		const seededPaths = (upBody.seed?.files ?? []).map((f) => f.path);
 		expect(seededPaths).toContain(".canopy/agent.json");
 	});
 
@@ -285,7 +293,6 @@ describe("spawnRun", () => {
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
 			metadata: { runByOperator: "alice" },
-			seedWorkspace: async () => undefined,
 		});
 
 		expect(calls[0]).toMatchObject({
@@ -324,7 +331,6 @@ describe("spawnRun", () => {
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
-			seedWorkspace: async () => undefined,
 		});
 
 		const dispatch = calls.find((c) => c.path === "/burrows/bur_aaaaaaaaaaaa/runs");
@@ -361,7 +367,6 @@ describe("spawnRun", () => {
 				clear: () => undefined,
 				size: () => 0,
 			},
-			seedWorkspace: async () => undefined,
 		});
 
 		const dispatch = calls.find((c) => c.path === "/burrows/bur_aaaaaaaaaaaa/runs");
@@ -371,8 +376,19 @@ describe("spawnRun", () => {
 		expect(body.metadata.frontmatter.model).toBe("claude-opus-4-7");
 	});
 
-	test("rolls back: cancels the warren row and destroys the burrow when seeding fails", async () => {
-		const { client, calls } = makeBurrowClient();
+	test("rolls back: cancels the warren row when burrow rejects the seed payload (atomic rollback, R-07)", async () => {
+		// A bad seed file makes burrow's `POST /burrows` reject before the
+		// burrow ever materializes — the rollback is on burrow's side, so
+		// warren never sees a burrow id and there's no DELETE to fire.
+		const { client, calls } = makeBurrowClient({
+			burrowsUpStatus: 422,
+			burrowsUpBody: {
+				error: {
+					code: "validation_error",
+					message: "seed file rejected: workspace path escapes root",
+				},
+			},
+		});
 		await expect(
 			spawnRun({
 				repos,
@@ -380,23 +396,20 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
-				seedWorkspace: async () => {
-					throw new Error("disk full");
-				},
 			}),
-		).rejects.toBeInstanceOf(RunSpawnError);
+		).rejects.toBeDefined();
 
-		// Warren row still exists in cancelled state
+		// Warren row still exists in cancelled state with no burrow attached.
 		const rows = repos.runs.listAll();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.state).toBe("cancelled");
+		expect(rows[0]?.burrowId).toBeNull();
+		expect(rows[0]?.burrowRunId).toBeNull();
 
-		// Burrow was provisioned then destroyed (best-effort)
+		// Only POST /burrows fired; no DELETE (burrow rolled back on its side)
+		// and no /runs dispatch.
 		const methods = calls.map((c) => `${c.method} ${c.path}`);
-		expect(methods).toContain("POST /burrows");
-		expect(methods).toContain("DELETE /burrows/bur_aaaaaaaaaaaa");
-		// /runs dispatch was never reached
-		expect(methods).not.toContain("POST /burrows/bur_aaaaaaaaaaaa/runs");
+		expect(methods).toEqual(["POST /burrows"]);
 	});
 
 	test("rolls back when burrow dispatch fails", async () => {
@@ -411,7 +424,6 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeDefined();
 
@@ -441,7 +453,6 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeInstanceOf(BurrowUnreachableError);
 
@@ -472,7 +483,6 @@ describe("spawnRun", () => {
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
-			seedWorkspace: async () => undefined,
 		});
 		const stored = result.run.renderedAgentJson as { sections: Record<string, string> };
 		expect(stored.sections.system).toBe("s");
@@ -491,7 +501,6 @@ describe("spawnRun", () => {
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeInstanceOf(RunSpawnError);
 	});
@@ -517,7 +526,6 @@ describe("spawnRun", () => {
 				});
 				return { project: updated, headSha: "feedface".repeat(5), ref: input.ref ?? "main" };
 			},
-			seedWorkspace: async () => undefined,
 		});
 
 		expect(refreshCalled).toBe(true);
@@ -551,7 +559,6 @@ describe("spawnRun", () => {
 				});
 				return { project: updated, headSha: "abcd".repeat(10), ref: input.ref ?? "" };
 			},
-			seedWorkspace: async () => undefined,
 		});
 		expect(receivedRef).toBe("feature/x");
 	});
@@ -570,7 +577,6 @@ describe("spawnRun", () => {
 				refreshProjectFn: async () => {
 					throw new Error("git fetch failed");
 				},
-				seedWorkspace: async () => undefined,
 			}),
 		).rejects.toBeDefined();
 
@@ -586,8 +592,7 @@ describe("spawnRun", () => {
 				frontmatter: { source: "builtin", provider: "anthropic", model: "claude-sonnet-4-6" },
 			}),
 		});
-		const seedCalls: SeedWorkspaceInput[] = [];
-		const { client } = makeBurrowClient();
+		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
 			burrowClient: client,
@@ -596,14 +601,12 @@ describe("spawnRun", () => {
 			prompt: "run",
 			providerOverride: "openai",
 			modelOverride: "gpt-4o",
-			seedWorkspace: async (input) => {
-				seedCalls.push(input);
-			},
 		});
 
-		// Seed sees the override-applied agent
-		expect(seedCalls).toHaveLength(1);
-		const seededFm = (seedCalls[0]?.agent.frontmatter ?? {}) as Record<string, unknown>;
+		// The seed payload shipped on POST /burrows carries the override-applied
+		// agent envelope verbatim (buildSeedFiles materializes the resolved
+		// frontmatter into `.canopy/agent.json`).
+		const seededFm = readCanopyFrontmatter(calls);
 		expect(seededFm.provider).toBe("openai");
 		expect(seededFm.model).toBe("gpt-4o");
 		// Original builtin frontmatter preserved
@@ -632,8 +635,7 @@ describe("spawnRun", () => {
 				frontmatter: { source: "builtin", provider: "pi", model: "pi-default" },
 			}),
 		});
-		const seedCalls: SeedWorkspaceInput[] = [];
-		const { client } = makeBurrowClient();
+		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
 			burrowClient: client,
@@ -650,12 +652,9 @@ describe("spawnRun", () => {
 				clear: () => undefined,
 				size: () => 0,
 			},
-			seedWorkspace: async (input) => {
-				seedCalls.push(input);
-			},
 		});
 
-		const seededFm = (seedCalls[0]?.agent.frontmatter ?? {}) as Record<string, unknown>;
+		const seededFm = readCanopyFrontmatter(calls);
 		expect(seededFm.provider).toBe("anthropic");
 		expect(seededFm.model).toBe("claude-opus-4-7");
 		expect(seededFm.source).toBe("builtin");
@@ -692,7 +691,6 @@ describe("spawnRun", () => {
 				clear: () => undefined,
 				size: () => 0,
 			},
-			seedWorkspace: async () => undefined,
 		});
 		const stored = result.run.renderedAgentJson as { frontmatter: Record<string, unknown> };
 		// Operator override wins for provider; project default wins for model
@@ -718,7 +716,6 @@ describe("spawnRun", () => {
 			prompt: "run",
 			providerOverride: "  ",
 			modelOverride: "",
-			seedWorkspace: async () => undefined,
 		});
 		const stored = result.run.renderedAgentJson as { frontmatter: Record<string, unknown> };
 		expect(stored.frontmatter.provider).toBe("anthropic");
@@ -738,7 +735,6 @@ describe("spawnRun", () => {
 				refreshCalled = true;
 				return { project: repos.projects.require("prj_xxxxxxxxxxxx"), headSha: "x", ref: "main" };
 			},
-			seedWorkspace: async () => undefined,
 		});
 		expect(refreshCalled).toBe(false);
 		// Project row's lastHeadSha stays null

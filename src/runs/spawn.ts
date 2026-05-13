@@ -1,7 +1,7 @@
 /**
  * `spawnRun` — the §4.3 composition flow.
  *
- * One call drives the four-step ritual that turns "the operator picked
+ * One call drives the three-step ritual that turns "the operator picked
  * an agent + project + prompt" into "burrow has a queued run":
  *
  *   1. Resolve the cached agent definition (registry refresh seeded it
@@ -12,12 +12,13 @@
  *
  *   2. Provision a burrow via `POST /burrows`, deriving the request body
  *      from the project clone (`projectRoot`, `originUrl`) and the
- *      agent's `burrow_config` (`network`).
+ *      agent's `burrow_config` (`network`). The `.canopy/`, `.mulch/`,
+ *      `.seeds/`, `.pi/` workspace drops (see `./seed.ts`) ride along as
+ *      the `seed.files` payload so provisioning + seeding land in a
+ *      single atomic round-trip — burrow rolls the burrow back on its
+ *      side if any seed file fails validation (R-07).
  *
- *   3. Seed `.canopy/`, `.mulch/expertise/<domain>.jsonl`, and
- *      `.seeds/` inside the burrow workspace (see `./seed.ts`).
- *
- *   4. Dispatch via `POST /burrows/:id/runs`.
+ *   3. Dispatch via `POST /burrows/:id/runs`.
  *
  * The warren run row is created BEFORE any burrow call, with both
  * burrow IDs nulled — `attachBurrow` writes them back as each call
@@ -27,19 +28,18 @@
  *
  * Failure handling:
  *   - Anything before step 2 (agent/project lookup, agent JSON
- *     re-validation) just throws — no warren row was created.
+ *     re-validation, seed-payload validation) just throws — no warren
+ *     row was created.
  *   - Failures from step 2 onward are caught: the warren row is
  *     transitioned `queued → cancelled` (allowed by the runs state
  *     machine), and if a burrow was provisioned we best-effort destroy
- *     it so it doesn't sit as a stranded sandbox. The original error
- *     is rethrown so the caller (HTTP route, CLI) can surface it.
- *
- * Burrow client + seedWorkspace + clock are all injectable; default
- * paths use the live HTTP client and the disk filesystem.
+ *     it so it doesn't sit as a stranded sandbox. A seed-validation
+ *     failure inside `burrows.up` rolls back on burrow's side before
+ *     warren ever observes a burrow id — `burrow` stays `null` so no
+ *     destroy call fires. The original error is rethrown so the caller
+ *     (HTTP route, CLI) can surface it.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import type {
 	Burrow,
 	Run as BurrowRun,
@@ -65,17 +65,6 @@ import { parseBurrowConfig } from "./burrow_config.ts";
 import { RunSpawnError } from "./errors.ts";
 import { buildSeedFiles } from "./seed.ts";
 
-/**
- * Inputs the test-only `seedWorkspace` seam sees. Step 2 (warren-eaee) will
- * remove the seam entirely once `buildSeedFiles` output is threaded through
- * `burrows.up({ seed: { files } })` and spawn no longer touches disk.
- */
-export interface SeedWorkspaceInput {
-	readonly workspacePath: string;
-	readonly agent: AgentDefinition;
-	readonly files: readonly HttpWorkspaceFile[];
-}
-
 export interface SpawnRunInput {
 	readonly repos: Repos;
 	readonly burrowClient: BurrowClient;
@@ -93,14 +82,6 @@ export interface SpawnRunInput {
 	readonly providerOverride?: string;
 	/** Optional per-run override of the agent's `frontmatter.model`. */
 	readonly modelOverride?: string;
-	/**
-	 * Override the workspace seeder. Receives the workspace path, the
-	 * resolved agent, and the `HttpWorkspaceFile[]` payload that step 2 will
-	 * thread into `burrows.up({ seed })`. Tests pass an override so the
-	 * spawn flow can run without touching disk; the default writes each
-	 * file under `workspacePath` using fs/promises.
-	 */
-	readonly seedWorkspace?: (input: SeedWorkspaceInput) => Promise<unknown>;
 	readonly now?: () => Date;
 	/**
 	 * Refresh the project's on-disk clone before provisioning burrow.
@@ -185,6 +166,12 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
 	});
 
+	// Build the seed payload BEFORE creating the warren row so a malformed
+	// expertise_seed / pi_skills / pi_prompts section surfaces as a clean
+	// `RunSpawnError` with no half-spawned row to garbage-collect. Anything
+	// burrow rejects later still rolls back via the try/catch below.
+	const seedResult = buildSeedFiles(agent);
+
 	const run = input.repos.runs.create({
 		agentName: agent.name,
 		projectId: projectAfterRefresh.id,
@@ -202,20 +189,9 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			projectAfterRefresh.gitUrl,
 			burrowConfig.network,
 			agent.name,
+			seedResult.files,
 		);
 		input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
-
-		const seedResult = buildSeedFiles(agent);
-		const seedFn = input.seedWorkspace ?? writeSeedFilesToDisk;
-		try {
-			await seedFn({ workspacePath: burrow.workspacePath, agent, files: seedResult.files });
-		} catch (err) {
-			throw err instanceof RunSpawnError
-				? err
-				: new RunSpawnError(`failed to seed burrow workspace: ${formatError(err)}`, {
-						cause: err,
-					});
-		}
 
 		const burrowRun = await dispatchRun(
 			input.burrowClient,
@@ -238,6 +214,7 @@ async function provisionBurrow(
 	originUrl: string,
 	network: NetworkPolicy | undefined,
 	agentId: string,
+	seedFiles: readonly HttpWorkspaceFile[],
 ): Promise<Burrow> {
 	// Warren's canopy agent name is the burrow runtime id by convention
 	// (claude-code → claude-code). Forwarding it as a `[[agents]]` patch row
@@ -245,12 +222,18 @@ async function provisionBurrow(
 	// even when the project clone has no burrow.toml — without this,
 	// collectToolchainPaths returns [] and bwrap fails `execvp claude`
 	// (warren-8526 / burrow-55e3).
+	//
+	// The seed payload (R-07) rides on the same up call so provisioning +
+	// `.canopy/`/`.mulch/`/`.seeds/`/`.pi/` drops are atomic: a failed seed
+	// rolls the burrow back on burrow's side before this promise resolves,
+	// so the caller never observes a half-seeded workspace.
 	return withTransportMapping(client.config, () =>
 		client.http.burrows.up({
 			projectRoot,
 			originUrl,
 			agents: [agentId],
 			...(network !== undefined ? { network } : {}),
+			...(seedFiles.length > 0 ? { seed: { files: seedFiles } } : {}),
 		}),
 	);
 }
@@ -356,11 +339,6 @@ function readCachedAgent(raw: unknown, name: string): AgentDefinition {
 	throw new RunSpawnError(`cached agent "${name}" does not match AgentDefinition shape`);
 }
 
-function formatError(err: unknown): string {
-	if (err instanceof Error) return err.message;
-	return String(err);
-}
-
 /**
  * Merge the operator-supplied dispatch metadata with the post-override agent
  * frontmatter so burrow's piRuntime can read provider/model from
@@ -407,26 +385,6 @@ function resolveOverride(
  * project defaults) or when the load fails — a malformed `.warren/` should
  * never abort a spawn, just downgrade to "no project default" behavior.
  */
-/**
- * Materialize a `HttpWorkspaceFile[]` under `workspacePath`. Temporary
- * step-1 adapter for the warren↔burrow shared-disk co-tenancy; step 2
- * (warren-eaee) replaces this with `burrows.up({ seed: { files } })` so
- * provisioning + seeding land as a single atomic round-trip.
- *
- * Base64 entries are decoded before write; utf-8 (default) writes verbatim.
- * `mode` is applied via chmod when set; otherwise filesystem defaults apply.
- */
-async function writeSeedFilesToDisk(input: SeedWorkspaceInput): Promise<void> {
-	for (const file of input.files) {
-		const target = join(input.workspacePath, file.path);
-		await mkdir(dirname(target), { recursive: true });
-		const encoding = file.encoding ?? "utf-8";
-		const data: Parameters<typeof writeFile>[1] =
-			encoding === "base64" ? Buffer.from(file.contents, "base64") : file.contents;
-		await writeFile(target, data, file.mode !== undefined ? { mode: file.mode } : undefined);
-	}
-}
-
 async function readProjectDefaults(
 	cache: WarrenConfigCache | undefined,
 	projectId: string,

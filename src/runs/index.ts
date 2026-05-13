@@ -37,12 +37,7 @@ export {
 	buildSeedFiles,
 	type HttpWorkspaceFile,
 } from "./seed.ts";
-export {
-	type SeedWorkspaceInput,
-	type SpawnRunInput,
-	type SpawnRunResult,
-	spawnRun,
-} from "./spawn.ts";
+export { type SpawnRunInput, type SpawnRunResult, spawnRun } from "./spawn.ts";
 export { type SteerRunInput, type SteerRunResult, steerRun } from "./steer.ts";
 export {
 	type ActiveBridge,
