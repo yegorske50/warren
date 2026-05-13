@@ -5,7 +5,7 @@
     "": {
       "name": "@os-eco/warren-cli",
       "dependencies": {
-        "@os-eco/burrow-cli": "^0.2.9",
+        "@os-eco/burrow-cli": "^0.2.10",
         "chalk": "^5.6.2",
         "commander": "^14.0.3",
         "croner": "^10.0.1",
@@ -101,7 +101,7 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.25.12", "", { "os": "win32", "cpu": "x64" }, "sha512-alJC0uCZpTFrSL0CCDjcgleBXPnCrEAhTBILpeAp7M/OFgoqtAetfBzX0xM00MUsVVPpVjlPuMbREqnZCXaTnA=="],
 
-    "@os-eco/burrow-cli": ["@os-eco/burrow-cli@0.2.9", "", { "dependencies": { "chalk": "^5.6.2", "commander": "^14.0.3", "drizzle-orm": "^0.45.2", "p-queue": "^9.2.0", "pino": "^10.3.1", "pino-pretty": "^13.1.3", "smol-toml": "^1.6.1", "zod": "^4.4.3" }, "bin": { "burrow": "src/cli/main.ts", "bw": "src/cli/main.ts" } }, "sha512-nYADyRbe9dRSi6qtORKqPPFYzB1c9ECRZ0qKC4+o8vMHx0uTclvH/AhWJHaaLnmT+dVc2p7xn/UOmIvpi6/jkw=="],
+    "@os-eco/burrow-cli": ["@os-eco/burrow-cli@0.2.10", "", { "dependencies": { "chalk": "^5.6.2", "commander": "^14.0.3", "drizzle-orm": "^0.45.2", "p-queue": "^9.2.0", "pino": "^10.3.1", "pino-pretty": "^13.1.3", "smol-toml": "^1.6.1", "zod": "^4.4.3" }, "bin": { "burrow": "src/cli/main.ts", "bw": "src/cli/main.ts" } }, "sha512-SeOxhWZVuav3T1nXgNkLrQWDFPR+RDbG72Yu5cTIZqIp90f3ml3WR/gCWoFgYlMPk+SZ2GFRxi7BHodO2wFmNQ=="],
 
     "@pinojs/redact": ["@pinojs/redact@0.4.0", "", {}, "sha512-k2ENnmBugE/rzQfEcdWHcCY+/FM3VLzH9cYEsbdsoqrvzAKRhUZeRNhAZvB8OitQJ1TBed3yqWtdjzS6wJKBwg=="],
 
