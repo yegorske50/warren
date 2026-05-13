@@ -33,12 +33,16 @@ export {
 	reapRun,
 } from "./reap.ts";
 export {
-	type SeedBurrowWorkspaceInput,
-	type SeedBurrowWorkspaceResult,
-	type SeedFs,
-	seedBurrowWorkspace,
+	type BuildSeedFilesResult,
+	buildSeedFiles,
+	type HttpWorkspaceFile,
 } from "./seed.ts";
-export { type SpawnRunInput, type SpawnRunResult, spawnRun } from "./spawn.ts";
+export {
+	type SeedWorkspaceInput,
+	type SpawnRunInput,
+	type SpawnRunResult,
+	spawnRun,
+} from "./spawn.ts";
 export { type SteerRunInput, type SteerRunResult, steerRun } from "./steer.ts";
 export {
 	type ActiveBridge,

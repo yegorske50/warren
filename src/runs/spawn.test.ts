@@ -7,8 +7,7 @@ import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { AgentDefinition } from "../registry/schema.ts";
 import { RunSpawnError } from "./errors.ts";
-import type { SeedBurrowWorkspaceInput } from "./seed.ts";
-import { composeDispatchPrompt, spawnRun } from "./spawn.ts";
+import { composeDispatchPrompt, type SeedWorkspaceInput, spawnRun } from "./spawn.ts";
 
 // `typeof fetch` requires a `preconnect` method we don't exercise in tests; cast
 // each stub so callers can pass a plain async function.
@@ -209,7 +208,7 @@ describe("spawnRun", () => {
 	});
 
 	test("end-to-end: creates the warren run, provisions a burrow, seeds, dispatches", async () => {
-		const seedCalls: SeedBurrowWorkspaceInput[] = [];
+		const seedCalls: SeedWorkspaceInput[] = [];
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
@@ -260,9 +259,11 @@ describe("spawnRun", () => {
 			},
 		]);
 
-		// Seeding ran with the provisioned workspacePath
+		// Seeding ran with the provisioned workspacePath and a populated file list
 		expect(seedCalls).toHaveLength(1);
 		expect(seedCalls[0]?.workspacePath).toBe("/data/burrow/workspaces/bur_aaaaaaaaaaaa");
+		const seededPaths = (seedCalls[0]?.files ?? []).map((f) => f.path);
+		expect(seededPaths).toContain(".canopy/agent.json");
 	});
 
 	test("forwards burrow_config network and metadata onto the burrow calls", async () => {
@@ -585,7 +586,7 @@ describe("spawnRun", () => {
 				frontmatter: { source: "builtin", provider: "anthropic", model: "claude-sonnet-4-6" },
 			}),
 		});
-		const seedCalls: SeedBurrowWorkspaceInput[] = [];
+		const seedCalls: SeedWorkspaceInput[] = [];
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
@@ -631,7 +632,7 @@ describe("spawnRun", () => {
 				frontmatter: { source: "builtin", provider: "pi", model: "pi-default" },
 			}),
 		});
-		const seedCalls: SeedBurrowWorkspaceInput[] = [];
+		const seedCalls: SeedWorkspaceInput[] = [];
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,

@@ -38,7 +38,14 @@
  * paths use the live HTTP client and the disk filesystem.
  */
 
-import type { Burrow, Run as BurrowRun, NetworkPolicy } from "@os-eco/burrow-cli";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type {
+	Burrow,
+	Run as BurrowRun,
+	HttpWorkspaceFile,
+	NetworkPolicy,
+} from "@os-eco/burrow-cli";
 import type { BurrowClient } from "../burrow-client/client.ts";
 import { withTransportMapping } from "../burrow-client/client.ts";
 import { ValidationError } from "../core/errors.ts";
@@ -56,7 +63,18 @@ import {
 import type { DefaultsConfig, WarrenConfigCache } from "../warren-config/index.ts";
 import { parseBurrowConfig } from "./burrow_config.ts";
 import { RunSpawnError } from "./errors.ts";
-import { type SeedBurrowWorkspaceInput, seedBurrowWorkspace } from "./seed.ts";
+import { buildSeedFiles } from "./seed.ts";
+
+/**
+ * Inputs the test-only `seedWorkspace` seam sees. Step 2 (warren-eaee) will
+ * remove the seam entirely once `buildSeedFiles` output is threaded through
+ * `burrows.up({ seed: { files } })` and spawn no longer touches disk.
+ */
+export interface SeedWorkspaceInput {
+	readonly workspacePath: string;
+	readonly agent: AgentDefinition;
+	readonly files: readonly HttpWorkspaceFile[];
+}
 
 export interface SpawnRunInput {
 	readonly repos: Repos;
@@ -75,8 +93,14 @@ export interface SpawnRunInput {
 	readonly providerOverride?: string;
 	/** Optional per-run override of the agent's `frontmatter.model`. */
 	readonly modelOverride?: string;
-	/** Override the workspace seeder; defaults to `seedBurrowWorkspace`. */
-	readonly seedWorkspace?: (input: SeedBurrowWorkspaceInput) => Promise<unknown>;
+	/**
+	 * Override the workspace seeder. Receives the workspace path, the
+	 * resolved agent, and the `HttpWorkspaceFile[]` payload that step 2 will
+	 * thread into `burrows.up({ seed })`. Tests pass an override so the
+	 * spawn flow can run without touching disk; the default writes each
+	 * file under `workspacePath` using fs/promises.
+	 */
+	readonly seedWorkspace?: (input: SeedWorkspaceInput) => Promise<unknown>;
 	readonly now?: () => Date;
 	/**
 	 * Refresh the project's on-disk clone before provisioning burrow.
@@ -181,9 +205,10 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		);
 		input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
 
-		const seedFn = input.seedWorkspace ?? seedBurrowWorkspace;
+		const seedResult = buildSeedFiles(agent);
+		const seedFn = input.seedWorkspace ?? writeSeedFilesToDisk;
 		try {
-			await seedFn({ workspacePath: burrow.workspacePath, agent });
+			await seedFn({ workspacePath: burrow.workspacePath, agent, files: seedResult.files });
 		} catch (err) {
 			throw err instanceof RunSpawnError
 				? err
@@ -382,6 +407,26 @@ function resolveOverride(
  * project defaults) or when the load fails — a malformed `.warren/` should
  * never abort a spawn, just downgrade to "no project default" behavior.
  */
+/**
+ * Materialize a `HttpWorkspaceFile[]` under `workspacePath`. Temporary
+ * step-1 adapter for the warren↔burrow shared-disk co-tenancy; step 2
+ * (warren-eaee) replaces this with `burrows.up({ seed: { files } })` so
+ * provisioning + seeding land as a single atomic round-trip.
+ *
+ * Base64 entries are decoded before write; utf-8 (default) writes verbatim.
+ * `mode` is applied via chmod when set; otherwise filesystem defaults apply.
+ */
+async function writeSeedFilesToDisk(input: SeedWorkspaceInput): Promise<void> {
+	for (const file of input.files) {
+		const target = join(input.workspacePath, file.path);
+		await mkdir(dirname(target), { recursive: true });
+		const encoding = file.encoding ?? "utf-8";
+		const data: Parameters<typeof writeFile>[1] =
+			encoding === "base64" ? Buffer.from(file.contents, "base64") : file.contents;
+		await writeFile(target, data, file.mode !== undefined ? { mode: file.mode } : undefined);
+	}
+}
+
 async function readProjectDefaults(
 	cache: WarrenConfigCache | undefined,
 	projectId: string,

@@ -1,21 +1,25 @@
 /**
- * Seed a burrow workspace with the agent's canopy/mulch/seeds inputs
- * (SPEC §4.3 step 3, §11.A).
+ * Pure builder that turns an `AgentDefinition` into the `.canopy/`,
+ * `.mulch/`, `.seeds/`, `.pi/` workspace drops (SPEC §4.3 step 3, §11.A).
  *
- * Five drops, all written directly into the burrow workspace path
- * (warren and burrow share the container filesystem, so direct writes
- * are the "or equivalent" of `burrow exec` from §11.A):
+ * Returns `HttpWorkspaceFile[]` with workspace-relative paths so the
+ * caller can either thread the list into `HttpClient.burrows.up({ seed })`
+ * (R-07 atomic provision-and-seed) or post-provision via
+ * `HttpClient.files.write`. No side effects — same validation errors as
+ * the prior writer, but the disk writes themselves move to the caller.
  *
- *   `.canopy/agent.json` — the rendered AgentDefinition. The harness
- *      (claude-code or sapling) reads whichever sections it needs;
- *      packaging the whole envelope avoids prematurely freezing a
- *      per-section file layout before harness expectations stabilize.
+ * Five drops:
  *
- *   `.mulch/expertise/<domain>.jsonl` — one append per `expertise_seed`
+ *   `.canopy/agent.json` — the rendered AgentDefinition envelope. The
+ *      harness (claude-code or sapling) reads whichever sections it
+ *      needs; packaging the whole envelope avoids prematurely freezing
+ *      a per-section file layout before harness expectations stabilize.
+ *
+ *   `.mulch/expertise/<domain>.jsonl` — one entry per `expertise_seed`
  *      line, grouped by the line's `domain` field. Format is canonical
- *      mulch record JSONL; bad lines (non-JSON, missing `domain`) abort
- *      seeding so the operator sees the schema break before the run
- *      starts. Idempotent within a fresh per-run workspace.
+ *      mulch record JSONL; bad lines (non-JSON, missing `domain`) throw
+ *      `RunSpawnError` so the operator sees the schema break before the
+ *      run starts.
  *
  *   `.seeds/workflow.txt` — the workflow body verbatim. Seeds tooling
  *      consumes it; warren is just the courier.
@@ -25,35 +29,21 @@
  *      canopy section is one envelope-per-line so a single canopy
  *      section can ship many skills without inventing a new artifact
  *      type. Bad lines (non-JSON, missing/invalid `name` or `body`)
- *      abort seeding with the same RunSpawnError shape as expertise_seed.
+ *      throw `RunSpawnError`.
  *
  *   `.pi/prompts/<name>.md` — same JSONL `{name, body}` shape as
  *      pi_skills but flat (one .md per prompt, no per-prompt
  *      directory).
- *
- * Mkdir + writeFile are injectable so unit tests don't touch disk. The
- * default impls call `fs/promises` directly with `recursive: true` and
- * append-mode writes for the JSONL files.
  */
 
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import type { HttpWorkspaceFile } from "@os-eco/burrow-cli";
 import type { AgentDefinition } from "../registry/schema.ts";
 import { RunSpawnError } from "./errors.ts";
 
-export interface SeedFs {
-	readonly mkdirp: (path: string) => Promise<void>;
-	readonly writeFile: (path: string, contents: string) => Promise<void>;
-	readonly appendFile: (path: string, contents: string) => Promise<void>;
-}
+export type { HttpWorkspaceFile } from "@os-eco/burrow-cli";
 
-export interface SeedBurrowWorkspaceInput {
-	readonly workspacePath: string;
-	readonly agent: AgentDefinition;
-	readonly fs?: SeedFs;
-}
-
-export interface SeedBurrowWorkspaceResult {
+export interface BuildSeedFilesResult {
+	readonly files: readonly HttpWorkspaceFile[];
 	readonly canopyPath: string;
 	readonly mulchDomains: readonly string[];
 	readonly workflowPath: string | null;
@@ -61,66 +51,58 @@ export interface SeedBurrowWorkspaceResult {
 	readonly piPrompts: readonly string[];
 }
 
-export async function seedBurrowWorkspace(
-	input: SeedBurrowWorkspaceInput,
-): Promise<SeedBurrowWorkspaceResult> {
-	const fs = input.fs ?? defaultFs;
-	const canopyPath = await writeCanopyAgent(input.workspacePath, input.agent, fs);
-	const mulchDomains = await writeExpertiseSeed(
-		input.workspacePath,
-		input.agent.sections.expertise_seed,
-		fs,
-	);
-	const workflowPath = await writeWorkflowTemplate(
-		input.workspacePath,
-		input.agent.sections.workflow,
-		fs,
-	);
-	const piSkills = await writePiArtifacts(
-		input.workspacePath,
-		input.agent.sections.pi_skills,
-		fs,
+export function buildSeedFiles(agent: AgentDefinition): BuildSeedFilesResult {
+	const files: HttpWorkspaceFile[] = [];
+
+	const canopyPath = ".canopy/agent.json";
+	files.push({
+		path: canopyPath,
+		contents: `${JSON.stringify(
+			{
+				name: agent.name,
+				version: agent.version,
+				sections: agent.sections,
+				resolvedFrom: agent.resolvedFrom,
+				frontmatter: agent.frontmatter,
+			},
+			null,
+			2,
+		)}\n`,
+	});
+
+	const { domains, files: mulchFiles } = buildExpertiseFiles(agent.sections.expertise_seed);
+	files.push(...mulchFiles);
+
+	const workflowFile = buildWorkflowFile(agent.sections.workflow);
+	if (workflowFile !== null) files.push(workflowFile);
+
+	const { names: piSkills, files: skillFiles } = buildPiArtifactFiles(
+		agent.sections.pi_skills,
 		"skill",
 	);
-	const piPrompts = await writePiArtifacts(
-		input.workspacePath,
-		input.agent.sections.pi_prompts,
-		fs,
+	files.push(...skillFiles);
+
+	const { names: piPrompts, files: promptFiles } = buildPiArtifactFiles(
+		agent.sections.pi_prompts,
 		"prompt",
 	);
-	return { canopyPath, mulchDomains, workflowPath, piSkills, piPrompts };
+	files.push(...promptFiles);
+
+	return {
+		files,
+		canopyPath,
+		mulchDomains: domains,
+		workflowPath: workflowFile?.path ?? null,
+		piSkills,
+		piPrompts,
+	};
 }
 
-async function writeCanopyAgent(
-	workspacePath: string,
-	agent: AgentDefinition,
-	fs: SeedFs,
-): Promise<string> {
-	const path = join(workspacePath, ".canopy", "agent.json");
-	await fs.mkdirp(dirname(path));
-	const body = JSON.stringify(
-		{
-			name: agent.name,
-			version: agent.version,
-			sections: agent.sections,
-			resolvedFrom: agent.resolvedFrom,
-			frontmatter: agent.frontmatter,
-		},
-		null,
-		2,
-	);
-	await fs.writeFile(path, `${body}\n`);
-	return path;
-}
-
-async function writeExpertiseSeed(
-	workspacePath: string,
-	body: string | undefined,
-	fs: SeedFs,
-): Promise<readonly string[]> {
-	if (body === undefined || body.trim() === "") return [];
-	const expertiseDir = join(workspacePath, ".mulch", "expertise");
-	await fs.mkdirp(expertiseDir);
+function buildExpertiseFiles(body: string | undefined): {
+	domains: readonly string[];
+	files: HttpWorkspaceFile[];
+} {
+	if (body === undefined || body.trim() === "") return { domains: [], files: [] };
 
 	const grouped = new Map<string, string[]>();
 	const lines = body.split("\n");
@@ -152,35 +134,29 @@ async function writeExpertiseSeed(
 		grouped.set(domain, bucket);
 	}
 
-	for (const [domain, records] of grouped) {
-		const target = join(expertiseDir, `${domain}.jsonl`);
-		await fs.appendFile(target, `${records.join("\n")}\n`);
-	}
-
-	return [...grouped.keys()].sort();
+	const domains = [...grouped.keys()].sort();
+	const files = domains.map((domain) => {
+		const records = grouped.get(domain) ?? [];
+		return { path: `.mulch/expertise/${domain}.jsonl`, contents: `${records.join("\n")}\n` };
+	});
+	return { domains, files };
 }
 
-async function writeWorkflowTemplate(
-	workspacePath: string,
-	body: string | undefined,
-	fs: SeedFs,
-): Promise<string | null> {
+function buildWorkflowFile(body: string | undefined): HttpWorkspaceFile | null {
 	if (body === undefined || body.trim() === "") return null;
-	const path = join(workspacePath, ".seeds", "workflow.txt");
-	await fs.mkdirp(dirname(path));
-	await fs.writeFile(path, body.endsWith("\n") ? body : `${body}\n`);
-	return path;
+	return {
+		path: ".seeds/workflow.txt",
+		contents: body.endsWith("\n") ? body : `${body}\n`,
+	};
 }
 
 type PiArtifactKind = "skill" | "prompt";
 
-async function writePiArtifacts(
-	workspacePath: string,
+function buildPiArtifactFiles(
 	body: string | undefined,
-	fs: SeedFs,
 	kind: PiArtifactKind,
-): Promise<readonly string[]> {
-	if (body === undefined || body.trim() === "") return [];
+): { names: readonly string[]; files: HttpWorkspaceFile[] } {
+	if (body === undefined || body.trim() === "") return { names: [], files: [] };
 	const sectionName = kind === "skill" ? "pi_skills" : "pi_prompts";
 
 	const entries: Array<{ name: string; body: string }> = [];
@@ -226,21 +202,16 @@ async function writePiArtifacts(
 		entries.push({ name: obj.name, body: obj.body });
 	}
 
-	if (entries.length === 0) return [];
+	if (entries.length === 0) return { names: [], files: [] };
 
-	const baseDir = join(workspacePath, ".pi", kind === "skill" ? "skills" : "prompts");
-	await fs.mkdirp(baseDir);
-
-	for (const entry of entries) {
-		const target =
-			kind === "skill" ? join(baseDir, entry.name, "SKILL.md") : join(baseDir, `${entry.name}.md`);
-		if (kind === "skill") {
-			await fs.mkdirp(dirname(target));
-		}
-		await fs.writeFile(target, entry.body.endsWith("\n") ? entry.body : `${entry.body}\n`);
-	}
-
-	return entries.map((e) => e.name).sort();
+	const baseDir = kind === "skill" ? ".pi/skills" : ".pi/prompts";
+	const files = entries.map((entry) => {
+		const path =
+			kind === "skill" ? `${baseDir}/${entry.name}/SKILL.md` : `${baseDir}/${entry.name}.md`;
+		return { path, contents: entry.body.endsWith("\n") ? entry.body : `${entry.body}\n` };
+	});
+	const names = entries.map((e) => e.name).sort();
+	return { names, files };
 }
 
 function isSafeArtifactName(name: string): boolean {
@@ -258,15 +229,3 @@ function formatError(err: unknown): string {
 	if (err instanceof Error) return err.message;
 	return String(err);
 }
-
-const defaultFs: SeedFs = {
-	mkdirp: async (path) => {
-		await mkdir(path, { recursive: true });
-	},
-	writeFile: async (path, contents) => {
-		await writeFile(path, contents);
-	},
-	appendFile: async (path, contents) => {
-		await appendFile(path, contents);
-	},
-};
