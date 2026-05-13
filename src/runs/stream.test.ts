@@ -332,6 +332,46 @@ describe("bridgeRunStream", () => {
 		expect(result.terminalDetected).toBeUndefined();
 	});
 
+	test("warren-2687: pi agent_end envelope sets terminalDetected and breaks the loop", async () => {
+		const piEnd = evt(burrowRunId, 1, {
+			kind: "state_change",
+			stream: "system",
+			payload: { type: "agent_end", messages: [] },
+		});
+		const trailing = evt(burrowRunId, 2, { kind: "text", payload: { text: "post-terminal" } });
+		const result = await bridgeRunStream({
+			runId,
+			burrowRunId,
+			repos,
+			broker,
+			burrowClient: makeBurrowClient(),
+			source: source([piEnd, trailing]),
+		});
+		expect(result.terminalDetected).toEqual({ outcome: "succeeded" });
+		// The trailing event after terminal must NOT be persisted — bridge breaks.
+		const seqs = repos.events.listByRun(runId).map((e) => e.burrowEventSeq);
+		expect(seqs).toEqual([1]);
+	});
+
+	test("warren-2687: pi agent_end on non-system stream does not set terminalDetected", async () => {
+		// Defensive: agent_end must arrive on the canonical system stream
+		// to be recognized; payload type alone isn't enough.
+		const offStream = evt(burrowRunId, 1, {
+			kind: "state_change",
+			stream: "stdout",
+			payload: { type: "agent_end", messages: [] },
+		});
+		const result = await bridgeRunStream({
+			runId,
+			burrowRunId,
+			repos,
+			broker,
+			burrowClient: makeBurrowClient(),
+			source: source([offStream]),
+		});
+		expect(result.terminalDetected).toBeUndefined();
+	});
+
 	test("piStats: snapshots baseline + terminal and persists the delta on agent_end", async () => {
 		const calls: { burrowRunId: string; phase: "baseline" | "terminal" }[] = [];
 		const responses: SessionStats[] = [

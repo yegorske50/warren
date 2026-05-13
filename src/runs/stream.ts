@@ -259,22 +259,30 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 }
 
 /**
- * Inspect a burrow event for a runtime-terminal shape (warren-a69a).
+ * Inspect a burrow event for a runtime-terminal shape (warren-a69a,
+ * warren-2687).
  * Returns the warren-side outcome to reap with, or `null` if the event
  * doesn't carry a terminal signal.
  *
- * The only runtime warren currently dispatches to is claude-code, which
- * emits a `result` envelope as its final stream-json line. burrow's
- * jsonl-claude parser surfaces that as `kind=state_change`,
- * `stream=system`, with `payload.type === "result"`. The `is_error`
- * field on that payload distinguishes a clean exit from a crash; we map
- * `is_error: true` → `failed`, anything else → `succeeded`. burrow's
- * own cancel path emits a different terminal shape; that case is
- * handled by `cancelRun` which already has the burrow run state in
+ * Two runtime terminal shapes ride the same `kind=state_change`,
+ * `stream=system` carrier:
+ *
+ *   - claude-code: burrow's jsonl-claude parser emits `payload.type ===
+ *     "result"`. The `is_error` field distinguishes a clean exit from a
+ *     crash; `is_error: true` → `failed`, anything else → `succeeded`.
+ *   - pi: burrow's pi parser emits `payload.type === "agent_end"` as the
+ *     final lifecycle envelope (burrow `src/runtime/parsers/pi.ts`).
+ *     The envelope carries no error flag, so the bridge treats it as
+ *     "the agent reached its natural end" → `succeeded`; reap then
+ *     reconciles against burrow's authoritative `exit_code` /
+ *     `state` if the process crashed afterwards.
+ *
+ * burrow's own cancel path emits a different terminal shape; that case
+ * is handled by `cancelRun` which already has the burrow run state in
  * hand, so the bridge doesn't need to detect it here.
  *
- * Future runtimes (sapling, etc.) extend this dispatch by adding their
- * runtime-specific terminal shape.
+ * Future runtimes extend this dispatch by adding their runtime-specific
+ * terminal shape.
  */
 function detectRuntimeTerminal(event: RunEvent): RunTerminalState | null {
 	if (event.kind !== "state_change") return null;
@@ -282,8 +290,9 @@ function detectRuntimeTerminal(event: RunEvent): RunTerminalState | null {
 	const payload = event.payload;
 	if (payload === null || typeof payload !== "object") return null;
 	const env = payload as Record<string, unknown>;
-	if (env.type !== "result") return null;
-	return env.is_error === true ? "failed" : "succeeded";
+	if (env.type === "result") return env.is_error === true ? "failed" : "succeeded";
+	if (env.type === "agent_end") return "succeeded";
+	return null;
 }
 
 /**
