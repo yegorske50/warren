@@ -348,9 +348,9 @@ function resolveOverride(
 	projectDefault: string | undefined,
 ): string | undefined {
 	const op = operator?.trim();
-	if (op !== undefined && op !== "") return operator;
+	if (op !== undefined && op !== "") return op;
 	const pd = projectDefault?.trim();
-	if (pd !== undefined && pd !== "") return projectDefault;
+	if (pd !== undefined && pd !== "") return pd;
 	return undefined;
 }
 
