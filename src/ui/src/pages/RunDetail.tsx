@@ -405,19 +405,51 @@ function statusVariant(
 	}
 }
 
+/**
+ * Pi-runtime event kinds whose payload carries meaningful auxiliary
+ * detail (warren-70af). Burrow's pi parser (`src/runtime/parsers/pi.ts`)
+ * collapses these into `state_change` / `telemetry` on the `system`
+ * stream and preserves the pi envelope `type` inside `payload.type`, so
+ * we detect them by peeking at the payload. If a future burrow release
+ * promotes any of them to first-class `event.kind` values, the same
+ * label is used (kind-direct match takes precedence).
+ *
+ * Unknown kinds fall through to the generic renderer (mx-0db923).
+ */
+const PI_SUBKIND_LABELS: Readonly<Record<string, string>> = {
+	compaction_start: "compaction ▶",
+	compaction_end: "compaction ✓",
+	auto_retry_start: "auto-retry ▶",
+	auto_retry_end: "auto-retry ✓",
+	extension_error: "extension error",
+	queue_update: "queue update",
+};
+
+function piSubKind(event: RunEvent): string | null {
+	if (event.kind in PI_SUBKIND_LABELS) return event.kind;
+	if (event.kind !== "state_change" && event.kind !== "telemetry") return null;
+	const p = event.payload;
+	if (p === null || typeof p !== "object" || Array.isArray(p)) return null;
+	const t = (p as { type?: unknown }).type;
+	if (typeof t !== "string") return null;
+	return t in PI_SUBKIND_LABELS ? t : null;
+}
+
 function EventLine({ event }: { event: RunEvent }) {
-	const colour =
-		event.stream === "stderr"
-			? "text-rose-700 dark:text-rose-300"
-			: event.stream === "system"
-				? "text-emerald-700 dark:text-emerald-300"
-				: "text-(--color-fg)";
+	const sub = piSubKind(event);
+	const isError = event.stream === "stderr" || sub === "extension_error";
+	const colour = isError
+		? "text-rose-700 dark:text-rose-300"
+		: event.stream === "system"
+			? "text-emerald-700 dark:text-emerald-300"
+			: "text-(--color-fg)";
 	const payload =
 		typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload);
+	const displayKind = sub !== null ? (PI_SUBKIND_LABELS[sub] ?? event.kind) : event.kind;
 	return (
 		<div className={`whitespace-pre-wrap break-words ${colour}`}>
 			<span className="text-(--color-muted-foreground)">
-				[{event.seq}] {event.kind}
+				[{event.seq}] {displayKind}
 				{event.stream ? ` ${event.stream}` : ""}
 			</span>{" "}
 			{payload}
