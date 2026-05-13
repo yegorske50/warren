@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Burrow } from "@os-eco/burrow-cli";
+import { type Burrow, NotFoundError } from "@os-eco/burrow-cli";
 import { BurrowClient } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
@@ -78,7 +78,19 @@ function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 	return { exec, calls, fail };
 }
 
-function fakeBurrowClient(burrow: Burrow): BurrowClient {
+interface FakeBurrowClientOpts {
+	/**
+	 * Body the workspace-side seeds file (`.seeds/issues.jsonl`) returns
+	 * over `client.http.files.read`. `undefined` (default) makes the read
+	 * throw `NotFoundError` — i.e. the agent never created the file —
+	 * mirroring the no-op path. Pass a string to exercise the mirror code.
+	 */
+	seedsIssuesBody?: string;
+	/** Override `client.http.files.read` end-to-end (advanced). */
+	filesRead?: (burrowId: string, path: string) => Promise<{ contents: string }>;
+}
+
+function fakeBurrowClient(burrow: Burrow, opts: FakeBurrowClientOpts = {}): BurrowClient {
 	const client = new BurrowClient({
 		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 		fetch: (async () =>
@@ -89,6 +101,19 @@ function fakeBurrowClient(burrow: Burrow): BurrowClient {
 	});
 	(client.http.burrows as unknown as { get: (id: string) => Promise<Burrow> }).get = async () =>
 		burrow;
+	const filesRead =
+		opts.filesRead ??
+		(async (_burrowId: string, path: string) => {
+			if (path === ".seeds/issues.jsonl" && opts.seedsIssuesBody !== undefined) {
+				return { contents: opts.seedsIssuesBody };
+			}
+			throw new NotFoundError(`file not found: ${path}`);
+		});
+	(
+		client.http.files as unknown as {
+			read: (burrowId: string, path: string) => Promise<{ contents: string }>;
+		}
+	).read = filesRead;
 	return client;
 }
 
@@ -494,11 +519,35 @@ describe("reapRun", () => {
 		expect(ctx.repos.events.countByRun(ctx.runId)).toBe(0);
 	});
 
-	test("mirrors closed seeds into the project's .seeds/issues.jsonl", async () => {
+	test("mirrors closed seeds into the project's .seeds/issues.jsonl via HttpClient.files.read", async () => {
 		const f = fakeFs({
-			"/data/burrow/ws/.seeds/issues.jsonl":
-				'{"id":"sd-1","status":"closed","updatedAt":"2026-05-08T22:00:00Z","title":"x"}\n' +
-				'{"id":"sd-2","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"y"}\n',
+			"/data/projects/x/y/.seeds/issues.jsonl":
+				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
+		});
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClient: fakeBurrowClient(makeBurrow(), {
+				seedsIssuesBody:
+					'{"id":"sd-1","status":"closed","updatedAt":"2026-05-08T22:00:00Z","title":"x"}\n' +
+					'{"id":"sd-2","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"y"}\n',
+			}),
+			fs: f.fs,
+			exec: fakeExec().exec,
+		});
+		expect(result.seedsClosed).toBe(1);
+		const merged = f.files.get("/data/projects/x/y/.seeds/issues.jsonl") ?? "";
+		expect(merged).toContain('"status":"closed"');
+		expect(merged).not.toContain('"status":"open","updatedAt":"2026-05-08T19:00:00Z"');
+	});
+
+	test("seeds_close treats NotFoundError from files.read as 'no seeds file' (no error, no mirror)", async () => {
+		// Default fakeBurrowClient throws NotFoundError from files.read —
+		// the workspace-side seeds file does not exist, which is the
+		// agent-never-created-it shape. seeds_close should be a no-op,
+		// not a reap_failed.
+		const f = fakeFs({
 			"/data/projects/x/y/.seeds/issues.jsonl":
 				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
 		});
@@ -510,10 +559,30 @@ describe("reapRun", () => {
 			fs: f.fs,
 			exec: fakeExec().exec,
 		});
-		expect(result.seedsClosed).toBe(1);
-		const merged = f.files.get("/data/projects/x/y/.seeds/issues.jsonl") ?? "";
-		expect(merged).toContain('"status":"closed"');
-		expect(merged).not.toContain('"status":"open","updatedAt":"2026-05-08T19:00:00Z"');
+		expect(result.seedsClosed).toBe(0);
+		expect(result.errors.map((x) => x.step)).not.toContain("seeds_close");
+		// Project-side file untouched.
+		expect(f.files.get("/data/projects/x/y/.seeds/issues.jsonl")).toBe(
+			'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
+		);
+	});
+
+	test("seeds_close surfaces non-NotFound errors from files.read as reap_failed", async () => {
+		const f = fakeFs();
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClient: fakeBurrowClient(makeBurrow(), {
+				filesRead: async () => {
+					throw new Error("boom");
+				},
+			}),
+			fs: f.fs,
+			exec: fakeExec().exec,
+		});
+		expect(result.seedsClosed).toBe(0);
+		expect(result.errors.map((x) => x.step)).toContain("seeds_close");
 	});
 
 	test("publishes reap-emitted events to the broker for live tailers", async () => {

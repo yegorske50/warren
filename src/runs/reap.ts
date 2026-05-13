@@ -11,13 +11,16 @@
  *      → drop (`mulch.record.skipped`); no `id` → append.
  *
  *   2. Seeds close mirror — read `.seeds/issues.jsonl` from the burrow
- *      workspace; for any row in `closed` state whose `updatedAt` is
+ *      workspace over the HTTP file surface
+ *      (`burrowClient.http.files.read`, R-07). A 404/NotFoundError means
+ *      the agent never created the file; treat as "nothing to mirror"
+ *      and return 0. For any row in `closed` state whose `updatedAt` is
  *      newer than the project's row (or absent there entirely), mirror
- *      the row into the project's `.seeds/issues.jsonl`. Emits
- *      `seeds.closed` events. Narrower than a full LWW merge — only
- *      closes propagate, matching the spec wording "close seeds the
- *      agent marked done". Other seed mutations ride on the workspace
- *      branch push below.
+ *      the row into the project's `.seeds/issues.jsonl` (still on disk —
+ *      the project clone is warren-side). Emits `seeds.closed` events.
+ *      Narrower than a full LWW merge — only closes propagate, matching
+ *      the spec wording "close seeds the agent marked done". Other seed
+ *      mutations ride on the workspace branch push below.
  *
  *   3. Branch push — `git -C <workspacePath> push origin HEAD` so the
  *      agent's commits (code, test edits, sd sync output, etc.) land on
@@ -74,6 +77,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { NotFoundError } from "@os-eco/burrow-cli";
 import type { BurrowClient } from "../burrow-client/client.ts";
 import { withTransportMapping } from "../burrow-client/client.ts";
 import type { Repos } from "../db/repos/index.ts";
@@ -315,7 +319,13 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		}
 
 		try {
-			seedsClosed = await mirrorClosedSeeds(workspacePath, project.localPath, fs, emit);
+			seedsClosed = await mirrorClosedSeeds({
+				burrowClient: input.burrowClient,
+				burrowId: run.burrowId as string,
+				projectPath: project.localPath,
+				fs,
+				emit,
+			});
 		} catch (err) {
 			fail("seeds_close", err);
 		}
@@ -681,17 +691,28 @@ interface SeedRow {
 	raw: string;
 }
 
-async function mirrorClosedSeeds(
-	workspacePath: string,
-	projectPath: string,
-	fs: ReapFs,
-	emit: (kind: string, payload: unknown) => EventRow,
-): Promise<number> {
-	const burrowFile = join(workspacePath, ".seeds", "issues.jsonl");
+interface MirrorClosedSeedsInput {
+	readonly burrowClient: BurrowClient;
+	readonly burrowId: string;
+	readonly projectPath: string;
+	readonly fs: ReapFs;
+	readonly emit: (kind: string, payload: unknown) => EventRow;
+}
+
+async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number> {
+	const { burrowClient, burrowId, projectPath, fs, emit } = input;
 	const projectFile = join(projectPath, ".seeds", "issues.jsonl");
 
-	const burrowBody = await fs.readFile(burrowFile);
-	if (burrowBody === null) return 0;
+	let burrowBody: string;
+	try {
+		const out = await withTransportMapping(burrowClient.config, () =>
+			burrowClient.http.files.read(burrowId, ".seeds/issues.jsonl"),
+		);
+		burrowBody = out.contents;
+	} catch (err) {
+		if (err instanceof NotFoundError) return 0;
+		throw err;
+	}
 
 	const projectBody = (await fs.readFile(projectFile)) ?? "";
 	const projectRows = parseSeeds(projectBody);
