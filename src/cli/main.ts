@@ -87,32 +87,47 @@ export function buildProgram(context: CliContext): Command {
 		.argument("<project>", "project id (prj_xxx)")
 		.requiredOption("-p, --prompt <text>", "prompt text the agent receives")
 		.option("--trigger <label>", "run trigger label", "cli")
-		.action(async (agent: string, project: string, opts: { prompt: string; trigger?: string }) => {
-			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-				// Seed built-ins so `warren run claude-code <prj> -p ...` works
-				// against a fresh DB without first registering the agent from
-				// a canopy library (warren-d3e9). Idempotent against existing
-				// rows.
-				seedBuiltinAgents(repos.agents, undefined, context.now);
-				const burrowClient = BurrowClient.fromEnv(context.env);
-				try {
-					const result = await runRun(
-						context,
-						{ repos, burrowClient },
-						{
-							agent,
-							project,
-							prompt: opts.prompt,
-							...(opts.trigger !== undefined ? { trigger: opts.trigger } : {}),
-						},
-					);
-					return result.exitCode;
-				} finally {
-					await burrowClient.close().catch(() => undefined);
-				}
-			});
-			process.exit(exitCode);
-		});
+		.option("--provider <name>", "per-run override of agent frontmatter.provider")
+		.option("--model <name>", "per-run override of agent frontmatter.model")
+		.action(
+			async (
+				agent: string,
+				project: string,
+				opts: {
+					prompt: string;
+					trigger?: string;
+					provider?: string;
+					model?: string;
+				},
+			) => {
+				const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+					// Seed built-ins so `warren run claude-code <prj> -p ...` works
+					// against a fresh DB without first registering the agent from
+					// a canopy library (warren-d3e9). Idempotent against existing
+					// rows.
+					seedBuiltinAgents(repos.agents, undefined, context.now);
+					const burrowClient = BurrowClient.fromEnv(context.env);
+					try {
+						const result = await runRun(
+							context,
+							{ repos, burrowClient },
+							{
+								agent,
+								project,
+								prompt: opts.prompt,
+								...(opts.trigger !== undefined ? { trigger: opts.trigger } : {}),
+								...(opts.provider !== undefined ? { providerOverride: opts.provider } : {}),
+								...(opts.model !== undefined ? { modelOverride: opts.model } : {}),
+							},
+						);
+						return result.exitCode;
+					} finally {
+						await burrowClient.close().catch(() => undefined);
+					}
+				});
+				process.exit(exitCode);
+			},
+		);
 
 	program
 		.command("doctor")

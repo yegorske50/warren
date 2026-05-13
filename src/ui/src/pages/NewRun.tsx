@@ -50,6 +50,8 @@ export function NewRunPage() {
 	});
 	const defaultRole = warrenConfig.data?.defaults?.defaultRole;
 	const defaultPrompt = warrenConfig.data?.defaults?.defaultPrompt;
+	const defaultProvider = warrenConfig.data?.defaults?.defaultProvider;
+	const defaultModel = warrenConfig.data?.defaults?.defaultModel;
 	const registeredAgents = agents.data?.agents ?? [];
 	const defaultRoleRegistered =
 		defaultRole !== undefined && registeredAgents.some((a) => a.name === defaultRole);
@@ -75,22 +77,40 @@ export function NewRunPage() {
 	// Pull provider/model defaults off the selected agent's frontmatter
 	// (warren-f8c0). Both are free-text strings — runtimes that don't
 	// support multi-provider just ignore them. Auto-fill stops once the
-	// operator types in either field.
+	// operator types in either field. Per warren-618b, when the project
+	// declares `.warren/defaults.json.defaultProvider` / `defaultModel`,
+	// those win over the agent's frontmatter — the form surfaces the same
+	// precedence the server applies (operator override > project default >
+	// agent frontmatter).
 	const selectedAgent = agents.data?.agents.find((a) => a.name === agent);
 	const agentFrontmatter = readFrontmatter(selectedAgent?.renderedJson);
 	const agentProvider =
 		typeof agentFrontmatter.provider === "string" ? agentFrontmatter.provider : "";
 	const agentModel = typeof agentFrontmatter.model === "string" ? agentFrontmatter.model : "";
+	const providerAutoFill =
+		defaultProvider !== undefined && defaultProvider.length > 0 ? defaultProvider : agentProvider;
+	const modelAutoFill =
+		defaultModel !== undefined && defaultModel.length > 0 ? defaultModel : agentModel;
+	const providerFromProjectDefault =
+		!providerTouched &&
+		defaultProvider !== undefined &&
+		defaultProvider.length > 0 &&
+		providerOverride === defaultProvider;
+	const modelFromProjectDefault =
+		!modelTouched &&
+		defaultModel !== undefined &&
+		defaultModel.length > 0 &&
+		modelOverride === defaultModel;
 	useEffect(() => {
 		if (providerTouched) return;
-		if (providerOverride === agentProvider) return;
-		setProviderOverride(agentProvider);
-	}, [providerTouched, agentProvider, providerOverride]);
+		if (providerOverride === providerAutoFill) return;
+		setProviderOverride(providerAutoFill);
+	}, [providerTouched, providerAutoFill, providerOverride]);
 	useEffect(() => {
 		if (modelTouched) return;
-		if (modelOverride === agentModel) return;
-		setModelOverride(agentModel);
-	}, [modelTouched, agentModel, modelOverride]);
+		if (modelOverride === modelAutoFill) return;
+		setModelOverride(modelAutoFill);
+	}, [modelTouched, modelAutoFill, modelOverride]);
 
 	const spawn = useMutation({
 		mutationFn: (input: CreateRunInput) => runsApi.create(input),
@@ -233,11 +253,18 @@ export function NewRunPage() {
 										setProviderOverride(e.target.value);
 										setProviderTouched(true);
 									}}
-									placeholder={agentProvider.length > 0 ? agentProvider : "anthropic, openai, …"}
+									placeholder={
+										providerAutoFill.length > 0 ? providerAutoFill : "anthropic, openai, …"
+									}
 									autoComplete="off"
 									spellCheck={false}
 								/>
-								{!providerTouched && agentProvider.length > 0 ? (
+								{providerFromProjectDefault ? (
+									<p className="text-xs text-(--color-muted-foreground)">
+										Defaulted from this project's{" "}
+										<code className="font-mono">.warren/defaults.json</code>.
+									</p>
+								) : !providerTouched && agentProvider.length > 0 ? (
 									<p className="text-xs text-(--color-muted-foreground)">
 										Defaulted from agent frontmatter.
 									</p>
@@ -257,12 +284,17 @@ export function NewRunPage() {
 										setModelTouched(true);
 									}}
 									placeholder={
-										agentModel.length > 0 ? agentModel : "claude-sonnet-4-6, gpt-4o, …"
+										modelAutoFill.length > 0 ? modelAutoFill : "claude-sonnet-4-6, gpt-4o, …"
 									}
 									autoComplete="off"
 									spellCheck={false}
 								/>
-								{!modelTouched && agentModel.length > 0 ? (
+								{modelFromProjectDefault ? (
+									<p className="text-xs text-(--color-muted-foreground)">
+										Defaulted from this project's{" "}
+										<code className="font-mono">.warren/defaults.json</code>.
+									</p>
+								) : !modelTouched && agentModel.length > 0 ? (
 									<p className="text-xs text-(--color-muted-foreground)">
 										Defaulted from agent frontmatter.
 									</p>

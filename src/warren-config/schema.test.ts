@@ -82,6 +82,8 @@ describe("DefaultsConfigSchema", () => {
 			defaultRole: "claude-code",
 			defaultBranch: "main",
 			defaultPrompt: "Read the issue, plan, execute.",
+			defaultProvider: "anthropic",
+			defaultModel: "claude-opus-4-7",
 		});
 		expect(parsed.success).toBe(true);
 	});
@@ -100,6 +102,8 @@ describe("DefaultsConfigSchema", () => {
 		expect(DefaultsConfigSchema.safeParse({ defaultRole: "" }).success).toBe(false);
 		expect(DefaultsConfigSchema.safeParse({ defaultBranch: "" }).success).toBe(false);
 		expect(DefaultsConfigSchema.safeParse({ defaultPrompt: "" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ defaultProvider: "" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ defaultModel: "" }).success).toBe(false);
 	});
 
 	test("rejects role names that aren't canopy-shaped", () => {

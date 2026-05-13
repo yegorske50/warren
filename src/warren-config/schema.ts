@@ -14,7 +14,10 @@
  * R-06 (cron scheduler) is the consumer. Defaults are parsed; the NewRun
  * UI consumes `defaultRole` (warren-fd14) by auto-filling its agent picker
  * and `defaultPrompt` (warren-af38) by pre-filling its prompt textarea
- * when the project declares one. CLI `warren run` consumption of
+ * when the project declares one. `defaultProvider` / `defaultModel`
+ * (warren-618b) are folded into the agent's frontmatter at spawn time, in
+ * the same precedence slot as per-run overrides — operator override >
+ * project default > agent frontmatter. CLI `warren run` consumption of
  * `defaultRole`, scheduled-run prompt fallback for `defaultPrompt`, and
  * any template substitution are deferred to R-04 / R-06.
  *
@@ -98,6 +101,12 @@ export const DefaultsConfigSchema = z
 		defaultRole: RoleNameSchema.optional(),
 		defaultBranch: z.string().min(1, "defaultBranch must be non-empty if provided").optional(),
 		defaultPrompt: PromptSchema.optional(),
+		// warren-618b: free-text provider/model defaults applied at spawn time
+		// the same way per-run overrides are (operator override > project
+		// default > agent frontmatter). Runtimes that don't honor frontmatter
+		// .provider/.model just ignore them — same shape as the per-run override.
+		defaultProvider: z.string().min(1, "defaultProvider must be non-empty if provided").optional(),
+		defaultModel: z.string().min(1, "defaultModel must be non-empty if provided").optional(),
 	})
 	.strict();
 

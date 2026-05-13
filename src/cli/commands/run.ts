@@ -35,6 +35,7 @@ import {
 	spawnRun,
 	tailRunEvents,
 } from "../../runs/index.ts";
+import { createWarrenConfigCache, type WarrenConfigCache } from "../../warren-config/index.ts";
 import type { CliContext } from "../output.ts";
 import { formatError, writeJsonLine } from "../output.ts";
 
@@ -43,6 +44,15 @@ export interface RunArgs {
 	readonly project: string;
 	readonly prompt: string;
 	readonly trigger?: string;
+	/**
+	 * Optional per-run override of the agent's `frontmatter.provider`. Empty
+	 * / whitespace-only values are ignored. Per warren-618b, takes precedence
+	 * over `.warren/defaults.json.defaultProvider`, which in turn takes
+	 * precedence over the agent's own frontmatter.
+	 */
+	readonly providerOverride?: string;
+	/** Optional per-run override of the agent's `frontmatter.model`. */
+	readonly modelOverride?: string;
 }
 
 export interface RunDeps {
@@ -64,6 +74,14 @@ export interface RunDeps {
 	 * `{ enabled: false, ... }` to keep the network out of the surface.
 	 */
 	readonly autoOpenPr?: AutoOpenPrConfig;
+	/**
+	 * Per-project `.warren/` config cache (warren-618b). When wired, spawnRun
+	 * picks up `defaultProvider` / `defaultModel` from `.warren/defaults.json`
+	 * with the precedence operator override > project default > agent
+	 * frontmatter. Defaults to a fresh cache so the CLI honors project
+	 * defaults the same way the HTTP server does; tests inject their own.
+	 */
+	readonly warrenConfigs?: WarrenConfigCache;
 }
 
 export interface RunResult {
@@ -87,6 +105,7 @@ export async function runRun(
 	const bridge = deps.bridge ?? bridgeRunStream;
 	const reap = deps.reap ?? reapRun;
 	const autoOpenPr = deps.autoOpenPr ?? loadAutoOpenPrConfigFromEnv();
+	const warrenConfigs = deps.warrenConfigs ?? createWarrenConfigCache();
 	const fetchBurrowRunState =
 		deps.fetchBurrowRunState ?? defaultFetchBurrowRunState(deps.burrowClient);
 
@@ -99,6 +118,9 @@ export async function runRun(
 			projectId: args.project,
 			prompt: args.prompt,
 			trigger: args.trigger ?? "cli",
+			warrenConfigs,
+			...(args.providerOverride !== undefined ? { providerOverride: args.providerOverride } : {}),
+			...(args.modelOverride !== undefined ? { modelOverride: args.modelOverride } : {}),
 			...(context.now !== undefined ? { now: context.now } : {}),
 		});
 	} catch (err) {

@@ -210,6 +210,14 @@ export interface DefaultsConfig {
 	defaultRole?: string;
 	defaultBranch?: string;
 	defaultPrompt?: string;
+	/**
+	 * warren-618b: per-project default provider/model. Applied at spawn time
+	 * with precedence operator override > project default > agent frontmatter.
+	 * The NewRun page surfaces these as the provider/model auto-fill when no
+	 * per-run override is typed.
+	 */
+	defaultProvider?: string;
+	defaultModel?: string;
 }
 
 export interface WarrenConfigResponse {

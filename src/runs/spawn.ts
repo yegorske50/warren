@@ -53,7 +53,7 @@ import {
 	RenderResponseSchema,
 	withProviderOverrides,
 } from "../registry/schema.ts";
-import type { WarrenConfigCache } from "../warren-config/index.ts";
+import type { DefaultsConfig, WarrenConfigCache } from "../warren-config/index.ts";
 import { parseBurrowConfig } from "./burrow_config.ts";
 import { RunSpawnError } from "./errors.ts";
 import { type SeedBurrowWorkspaceInput, seedBurrowWorkspace } from "./seed.ts";
@@ -118,11 +118,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	const agentRow = input.repos.agents.require(input.agentName);
 	const project = input.repos.projects.require(input.projectId);
 	const baseAgent = readCachedAgent(agentRow.renderedJson, agentRow.name);
-	const agent = withProviderOverrides(baseAgent, {
-		...(input.providerOverride !== undefined ? { providerOverride: input.providerOverride } : {}),
-		...(input.modelOverride !== undefined ? { modelOverride: input.modelOverride } : {}),
-	});
-	const burrowConfig = parseBurrowConfig(agent.sections.burrow_config);
+	const burrowConfig = parseBurrowConfig(baseAgent.sections.burrow_config);
 
 	// Refresh the project clone to origin/<ref> so the run sees the
 	// latest commits. Skipped only when the caller didn't wire the
@@ -143,6 +139,27 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 				})
 			: null;
 	const projectAfterRefresh = refreshed?.project ?? project;
+
+	// warren-618b: fold per-project provider/model defaults onto the agent
+	// frontmatter, with the operator's per-run override winning. Final order
+	// is operator override > .warren/defaults.json > agent frontmatter. The
+	// resolved values ride the same `withProviderOverrides` path, so the
+	// frozen `runs.rendered_agent_json` reflects the effective frontmatter
+	// regardless of which slot supplied it.
+	const projectDefaults = await readProjectDefaults(
+		input.warrenConfigs,
+		projectAfterRefresh.id,
+		projectAfterRefresh.localPath,
+	);
+	const effectiveProvider = resolveOverride(
+		input.providerOverride,
+		projectDefaults?.defaultProvider,
+	);
+	const effectiveModel = resolveOverride(input.modelOverride, projectDefaults?.defaultModel);
+	const agent = withProviderOverrides(baseAgent, {
+		...(effectiveProvider !== undefined ? { providerOverride: effectiveProvider } : {}),
+		...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
+	});
 
 	const run = input.repos.runs.create({
 		agentName: agent.name,
@@ -317,4 +334,45 @@ function readCachedAgent(raw: unknown, name: string): AgentDefinition {
 function formatError(err: unknown): string {
 	if (err instanceof Error) return err.message;
 	return String(err);
+}
+
+/**
+ * Pick the effective frontmatter override given a per-run operator value and
+ * a project default. Empty / whitespace-only strings are treated the same as
+ * "not provided" (matches `withProviderOverrides`'s shape). Returns the
+ * operator value when present, otherwise the project default, otherwise
+ * `undefined` so the agent's own frontmatter remains in force.
+ */
+function resolveOverride(
+	operator: string | undefined,
+	projectDefault: string | undefined,
+): string | undefined {
+	const op = operator?.trim();
+	if (op !== undefined && op !== "") return operator;
+	const pd = projectDefault?.trim();
+	if (pd !== undefined && pd !== "") return projectDefault;
+	return undefined;
+}
+
+/**
+ * Load the project's `.warren/defaults.json` envelope through the cache.
+ * Returns `null` when no cache is wired (CLI/tests that don't care about
+ * project defaults) or when the load fails — a malformed `.warren/` should
+ * never abort a spawn, just downgrade to "no project default" behavior.
+ */
+async function readProjectDefaults(
+	cache: WarrenConfigCache | undefined,
+	projectId: string,
+	projectPath: string,
+): Promise<DefaultsConfig | null> {
+	if (cache === undefined) return null;
+	try {
+		const envelope = await cache.get(projectId, projectPath);
+		return envelope.defaults;
+	} catch {
+		// Project clone vanished or .warren/ I/O errored — leave the agent
+		// frontmatter as the final source of truth and let the rest of the
+		// flow surface any project-state failure on its own path.
+		return null;
+	}
 }

@@ -560,6 +560,83 @@ describe("spawnRun", () => {
 		expect(reread.frontmatter.model).toBe("claude-sonnet-4-6");
 	});
 
+	test("falls back to .warren/defaults.json provider/model when no per-run override (warren-618b)", async () => {
+		repos.agents.upsert({
+			name: "pi",
+			renderedJson: makeAgentJson({
+				name: "pi",
+				frontmatter: { source: "builtin", provider: "pi", model: "pi-default" },
+			}),
+		});
+		const seedCalls: SeedBurrowWorkspaceInput[] = [];
+		const { client } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClient: client,
+			agentName: "pi",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "run",
+			warrenConfigs: {
+				get: async () => ({
+					triggers: null,
+					defaults: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-7" },
+					errors: [],
+				}),
+				invalidate: () => undefined,
+				clear: () => undefined,
+				size: () => 0,
+			},
+			seedWorkspace: async (input) => {
+				seedCalls.push(input);
+			},
+		});
+
+		const seededFm = (seedCalls[0]?.agent.frontmatter ?? {}) as Record<string, unknown>;
+		expect(seededFm.provider).toBe("anthropic");
+		expect(seededFm.model).toBe("claude-opus-4-7");
+		expect(seededFm.source).toBe("builtin");
+		const stored = repos.runs.require(result.run.id).renderedAgentJson as {
+			frontmatter: Record<string, unknown>;
+		};
+		expect(stored.frontmatter.provider).toBe("anthropic");
+		expect(stored.frontmatter.model).toBe("claude-opus-4-7");
+	});
+
+	test("per-run override beats .warren/defaults.json beats agent frontmatter (warren-618b)", async () => {
+		repos.agents.upsert({
+			name: "pi",
+			renderedJson: makeAgentJson({
+				name: "pi",
+				frontmatter: { provider: "pi", model: "pi-default" },
+			}),
+		});
+		const { client } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClient: client,
+			agentName: "pi",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "run",
+			providerOverride: "openai",
+			warrenConfigs: {
+				get: async () => ({
+					triggers: null,
+					defaults: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-7" },
+					errors: [],
+				}),
+				invalidate: () => undefined,
+				clear: () => undefined,
+				size: () => 0,
+			},
+			seedWorkspace: async () => undefined,
+		});
+		const stored = result.run.renderedAgentJson as { frontmatter: Record<string, unknown> };
+		// Operator override wins for provider; project default wins for model
+		// since no per-run modelOverride was supplied.
+		expect(stored.frontmatter.provider).toBe("openai");
+		expect(stored.frontmatter.model).toBe("claude-opus-4-7");
+	});
+
 	test("leaves frontmatter alone when overrides are empty / whitespace (warren-f8c0)", async () => {
 		repos.agents.upsert({
 			name: "pi",
