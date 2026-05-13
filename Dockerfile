@@ -73,6 +73,14 @@ RUN bun install -g \
 # burrow tries to spawn it.
 RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
 
+# Pi ships dist/cli.js with a `#!/usr/bin/env node` shebang. The oven/bun
+# image provides a node-compatible shim at /usr/local/bun-node-fallback-bin/node,
+# but that path is not on the PATH burrow exposes inside the sandbox. Burrow
+# does ro-bind /usr/local/bin via the SYSTEM_RO_MOUNTS profile, so symlinking
+# node there makes pi's shebang resolve for the UID-1000 agent. Without this
+# `pi` fails immediately with `/usr/bin/env: 'node': No such file or directory`.
+RUN ln -s /usr/local/bun-node-fallback-bin/node /usr/local/bin/node
+
 WORKDIR /app
 
 # Server-side dependencies. Copy lockfiles first so a code-only edit
