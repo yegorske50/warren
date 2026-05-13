@@ -14,10 +14,10 @@ function silentContext(): CliContext {
 }
 
 describe("buildProgram", () => {
-	test("registers all five SPEC §8.2 subcommands", () => {
+	test("registers all SPEC §8.2 subcommands + the `init` scaffolder", () => {
 		const program = buildProgram(silentContext());
 		const names = program.commands.map((c) => c.name()).sort();
-		expect(names).toEqual(["add-project", "doctor", "register-agent", "run", "serve"]);
+		expect(names).toEqual(["add-project", "doctor", "init", "register-agent", "run", "serve"]);
 	});
 
 	test("--version reports the package VERSION constant", () => {

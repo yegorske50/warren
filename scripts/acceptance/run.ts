@@ -49,6 +49,7 @@ import { scenario as scenario13 } from "./scenarios/13-container-smoke.ts";
 import { scenario as scenario14 } from "./scenarios/14-warren-config.ts";
 import { scenario as scenario15 } from "./scenarios/15-triggers-roundtrip.ts";
 import { scenario as scenario16 } from "./scenarios/16-pi-parity-smoke.ts";
+import { scenario as scenario17 } from "./scenarios/17-init-scaffold.ts";
 
 const SCENARIOS: readonly Scenario[] = [
 	scenario01,
@@ -67,6 +68,7 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario14,
 	scenario15,
 	scenario16,
+	scenario17,
 ];
 
 interface ParsedArgs {

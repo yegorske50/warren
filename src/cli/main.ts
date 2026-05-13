@@ -18,6 +18,7 @@ import { seedBuiltinAgents } from "../registry/builtins/index.ts";
 import { requireCanopyRegistryConfigFromEnv } from "../registry/config.ts";
 import { runAddProject } from "./commands/add-project.ts";
 import { runDoctor } from "./commands/doctor.ts";
+import { runInit } from "./commands/init.ts";
 import { runRegisterAgent } from "./commands/register-agent.ts";
 import { runRun } from "./commands/run.ts";
 import { runServe } from "./commands/serve.ts";
@@ -128,6 +129,41 @@ export function buildProgram(context: CliContext): Command {
 				process.exit(exitCode);
 			},
 		);
+
+	program
+		.command("init")
+		.description("scaffold a .warren/ directory (triggers.yaml + defaults.json) in a project repo")
+		.option("--project <id>", "target a registered project by id (writes into its warren clone)")
+		.option("--cwd <path>", "target a directory on disk (defaults to process.cwd())")
+		.option("--default-role <name>", "pin defaults.defaultRole to this registered agent")
+		.action(async (opts: { project?: string; cwd?: string; defaultRole?: string }) => {
+			if (opts.project !== undefined && opts.cwd !== undefined) {
+				context.stdio.stderr.write("warren: --project and --cwd are mutually exclusive\n");
+				process.exit(2);
+			}
+			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
+				seedBuiltinAgents(repos.agents, undefined, context.now);
+				const args =
+					opts.project !== undefined
+						? {
+								mode: "project" as const,
+								projectId: opts.project,
+								...(opts.defaultRole !== undefined ? { defaultRole: opts.defaultRole } : {}),
+							}
+						: {
+								mode: "cwd" as const,
+								cwd: opts.cwd ?? process.cwd(),
+								...(opts.defaultRole !== undefined ? { defaultRole: opts.defaultRole } : {}),
+							};
+				const result = await runInit(
+					context,
+					{ projects: repos.projects, agents: repos.agents },
+					args,
+				);
+				return result.exitCode;
+			});
+			process.exit(exitCode);
+		});
 
 	program
 		.command("doctor")
