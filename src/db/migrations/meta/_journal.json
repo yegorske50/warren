@@ -50,6 +50,13 @@
 			"when": 1778683956971,
 			"tag": "0006_add_run_cost_columns",
 			"breakpoints": true
+		},
+		{
+			"idx": 7,
+			"version": "6",
+			"when": 1778720542555,
+			"tag": "0007_zippy_millenium_guard",
+			"breakpoints": true
 		}
 	]
 }

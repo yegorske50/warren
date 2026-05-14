@@ -55,6 +55,23 @@ export type RunFailureReason = (typeof RUN_FAILURE_REASONS)[number];
 export const EVENT_STREAMS = ["stdout", "stderr", "system"] as const;
 export type EventStream = (typeof EVENT_STREAMS)[number];
 
+/**
+ * Worker state machine (warren-b0a3 / pl-9ba1 step 1).
+ *
+ *   - `healthy`     — probe succeeded; eligible for new burrow placement.
+ *   - `draining`    — operator-initiated; existing burrows continue to run,
+ *                     but `placeFor` skips this worker for new placement.
+ *                     Set by `POST /workers/:name/drain` (step 6).
+ *   - `unreachable` — probe failed; sticky-by-burrow requests against this
+ *                     worker fail loudly rather than silently migrating
+ *                     (plan risk #5). Flipped back to `healthy` when probe
+ *                     recovers (step 6).
+ *
+ * A fourth `failed` state is deferred to a future R-NN (plan step 1 prose).
+ */
+export const WORKER_STATES = ["healthy", "draining", "unreachable"] as const;
+export type WorkerState = (typeof WORKER_STATES)[number];
+
 export const agents = sqliteTable("agents", {
 	name: text("name").primaryKey(),
 	renderedJson: text("rendered_json", { mode: "json" }).notNull(),
@@ -171,6 +188,34 @@ export const triggers = sqliteTable(
 	(t) => [index("triggers_project_idx").on(t.projectId)],
 );
 
+/**
+ * Multi-worker placement registry (warren-b0a3 / pl-9ba1 step 1, parent
+ * warren-6747).
+ *
+ * Each row is one burrow worker warren can dispatch to. `name` is the stable
+ * operator-chosen handle (used in URLs like `POST /workers/:name/drain` and
+ * referenced by `burrows.worker_id` / `runs.worker_id` once those columns
+ * land in step 2). `url` is the transport target (`unix:///var/run/burrow.sock`
+ * or `http://host:port`); `BurrowClientPool` (step 3) builds an `HttpClient`
+ * per row keyed by name.
+ *
+ * The bearer token is intentionally NOT stored here: the deploy uses a single
+ * shared `BURROW_API_TOKEN` env var across the pool (plan alternative #3 —
+ * VPC-private threat model; rotation = one env-var update across the fleet).
+ *
+ * Zero-row table is the steady state for today's single-worker deploys —
+ * `BurrowClientPool` synthesizes a local row from `WARREN_BURROW_*` env vars
+ * when this table is empty, preserving back-compat (acceptance #1). Operators
+ * with a `[workers]` block in warren config materialize rows here at boot
+ * (step 7 lands that loader).
+ */
+export const workers = sqliteTable("workers", {
+	name: text("name").primaryKey(),
+	url: text("url").notNull(),
+	state: text("state", { enum: WORKER_STATES }).notNull().default("healthy"),
+	addedAt: text("added_at").notNull(),
+});
+
 export type AgentRow = typeof agents.$inferSelect;
 export type AgentInsert = typeof agents.$inferInsert;
 export type ProjectRow = typeof projects.$inferSelect;
@@ -181,6 +226,8 @@ export type EventRow = typeof events.$inferSelect;
 export type EventInsert = typeof events.$inferInsert;
 export type TriggerRow = typeof triggers.$inferSelect;
 export type TriggerInsert = typeof triggers.$inferInsert;
+export type WorkerRow = typeof workers.$inferSelect;
+export type WorkerInsert = typeof workers.$inferInsert;
 
 /**
  * Build the composite PK from a project + trigger pair. The colon separator
