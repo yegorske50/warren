@@ -14,10 +14,31 @@ function silentContext(): CliContext {
 }
 
 describe("buildProgram", () => {
-	test("registers all SPEC §8.2 subcommands + the `init` scaffolder", () => {
+	test("registers all SPEC §8.2 subcommands + the `init` scaffolder + `db` admin group", () => {
 		const program = buildProgram(silentContext());
 		const names = program.commands.map((c) => c.name()).sort();
-		expect(names).toEqual(["add-project", "doctor", "init", "register-agent", "run", "serve"]);
+		expect(names).toEqual([
+			"add-project",
+			"db",
+			"doctor",
+			"init",
+			"register-agent",
+			"run",
+			"serve",
+		]);
+	});
+
+	test("`db migrate-to-postgres` is registered under the db group", () => {
+		const program = buildProgram(silentContext());
+		const dbCmd = program.commands.find((c) => c.name() === "db");
+		expect(dbCmd).toBeDefined();
+		const subNames = dbCmd?.commands.map((c) => c.name()).sort() ?? [];
+		expect(subNames).toEqual(["migrate-to-postgres"]);
+		const migrateCmd = dbCmd?.commands.find((c) => c.name() === "migrate-to-postgres");
+		const fromOpt = migrateCmd?.options.find((o) => o.long === "--from");
+		const toOpt = migrateCmd?.options.find((o) => o.long === "--to");
+		expect(fromOpt?.mandatory).toBe(true);
+		expect(toOpt?.mandatory).toBe(true);
 	});
 
 	test("--version reports the package VERSION constant", () => {
