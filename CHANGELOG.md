@@ -7,6 +7,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-05-13
+
+Patch follow-through on the 0.3.0 multi-worker substrate plus a UI
+polish pass on cost / events / agents. The remaining per-resource
+burrow calls (cancel / steer / reap / bridges) now route through
+`BurrowClientPool.clientFor` so control-plane ops hit the worker that
+actually owns each burrow; the legacy `deps.burrowClient` singleton and
+`pool.singleton()` scaffolding are gone. `bootBridges` no longer
+crash-loops the supervisor on pre-`pl-9ba1` placement orphans. The pi
+cost / tokens columns introduced in 0.1.7 (warren-17a4) get scenario-16
+acceptance coverage end-to-end, and the Runs page now defaults the
+Cost column on. Burrow CLI bumps `0.2.12 → 0.3.0` for the multi-worker
+wire pieces (`--bind-host`, `POST /admin/drain`, `GET /burrows/:id/files`).
+
+### Added
+
+- **`feat(ui)`** — Cost column on `/runs` is on by default (warren-a7ec).
+  Pi runs (the common runtime) reliably hydrate `costUsd` via in-stream
+  extraction (`warren-17a4`), so the column carries signal for most
+  installs. The Show cost toggle remains as a hide option; localStorage
+  persists the choice. Card header now shows a total-of-loaded-runs
+  aggregate next to the run count. On `/runs/:id`, the small header
+  cost badge with a hover-only token tooltip is replaced by a dedicated
+  `CostCard` inside the meta grid that renders `formatCostUsd(costUsd)`
+  in `font-mono text-lg` and the in/out/cache-r/cache-w breakdown inline.
+- **`feat(reap)`** — structured auto-PR title and body (warren-9ee3).
+  Title precedence: seed title → first commit subject → first prompt
+  line → synthetic fallback. Body adds Summary, Run, Seeds, Commits,
+  and Files-changed sections; the original prompt now lives in a
+  collapsed `<details>` block so the audit trail survives without
+  dominating the PR. `reap.ts` gathers commits via
+  `git log --reverse <base>..HEAD`, files via `git diff --stat`, and an
+  optional seed title via `sd show <id> --format json` before calling
+  `buildPrContent`. Each sub-call swallows errors so a missing `sd` CLI
+  or bad base ref degrades to a less-rich body rather than failing the
+  `pr_open` step.
+- **`test(burrow-client)`** — cross-process two-burrow integration test
+  for R-12 (`src/burrow-client/integration.cross-process.test.ts`).
+  Spawns two real `burrow serve` subprocesses on unix sockets with bearer
+  auth, builds a real `BurrowClientPool.fromConfig` over them, and
+  asserts the wire pieces that in-process stubs can't prove: `pool.probe()`
+  round-trip, authenticated `burrows.list` via shared `BURROW_API_TOKEN`,
+  anonymous client rejected with 401, `fanOutAcrossWorkers` unioning
+  burrows from both workers, `client.setDrain(true)/(false)` against
+  the real `POST /admin/drain`, partial-failure surfaces as
+  `worker_unreachable`, and sticky-by-burrow against a killed worker
+  raises `StickyWorkerUnreachableError` (placement risk #5, fail loudly).
+  Cross-host topology (TLS, network partitions) remains the territory of
+  acceptance scenario 18 (`warren-82ea`).
+- **`test(acceptance)`** — scenario 16 asserts non-null pi cost/token
+  columns end-to-end after a pi run (`warren-17a4`). New
+  `scripts/acceptance/lib/stub-agent/pi-agent.sh` fixture emits pi v0.74
+  RPC JSONL (response → `agent_start` → `turn_start` → user/assistant
+  `message_start`/`end` → `turn_end` with `message.usage.cost.total` +
+  tokens → `agent_end`). `burrow-with-stub.ts` registers a custom `pi`
+  `AgentRuntime` by spreading the declarative config and overriding
+  `parseEvents` with `parsePiEvents` from `@os-eco/burrow-cli`, bypassing
+  burrow's `outputFormat` enum (`raw-text` / `stream-json` /
+  `jsonl-claude`) with zero burrow changes.
+
+### Changed
+
+- **`refactor(runs,server)`** — route cancel / steer / reap / bridges
+  via `BurrowClientPool.clientFor({burrowId})` so control-plane ops
+  hit the worker that actually owns each burrow (`warren-c0c9`).
+  `cancelRun` / `steerRun` / `reapRun` / `bridgeRunStream` +
+  `recoverActiveRunStreams` (`src/runs/`) now take a
+  `BurrowClientPool` instead of a `BurrowClient`. `bridgeRunStream`
+  input grew a `burrowId` field; `BridgeRegistry.start` signature
+  gained a third `burrowId` arg (handlers, scheduler, `bootBridges`
+  thread it through). `/readyz` uses `checkBurrowPoolReachable`
+  (aggregates `pool.probe()` across workers); `warren doctor` keeps
+  the single-client `checkBurrowReachable`.
+  `StickyWorkerUnreachableError` propagates as-is (already 503-mapped).
+  `deps.burrowClient` is removed from `ServerDeps` and
+  `pool.singleton()` is deleted — every consumer now resolves a client
+  via `placeFor` or `clientFor`. The CLI `warren run` fan-outs across
+  `pool.entries()` for the burrow-run state lookup (single-worker
+  today; correct under multi-worker too).
+- **Burrow CLI bumped `0.2.12 → 0.3.0`** — burrow v0.3.0 lands the
+  multi-worker substrate (`--bind-host`, `POST /admin/drain`,
+  `GET /burrows/:id/files`). Additive: warren's defaults and
+  single-host posture are unchanged. Pin bumped in all three lockstep
+  locations (`package.json` + `bun.lock` + `Dockerfile` global
+  install — see CLAUDE.md "Relationship to burrow"). Mulch + seeds
+  Dockerfile pins stay at `0.9.0` / `0.4.3` (next public versions not
+  released yet).
+
+### Fixed
+
+- **`fix(server)`** — stop `bootBridges` crash-looping on burrow
+  placement orphans (`warren-018a`). Two layers landed: (1)
+  `bootBridges` now pre-flights `repos.burrows.get(burrowId)` and
+  skips pre-`pl-9ba1` orphans with `reason='no_placement'`, mirroring
+  the existing `no_burrow_id` / `no_burrow_run_id` skip patterns. (2)
+  `registry.start` chains `.catch` before `.finally` on the
+  fire-and-forgotten `done` promise — defends against **all**
+  bridge-startup throws (placement, transient pool errors, etc.) so
+  the supervisor no longer crash-loops under docker
+  `restart: unless-stopped`. The throw is surfaced as a
+  `kind='bridge_fatal'`, `stream='system'` event so the UI shows why
+  the bridge stopped.
+- **`fix(ui)`** — one-line-per-event with expand on run detail
+  (`warren-3ad4`). The Events card rendered each event as a stringified
+  payload inline, so a 300+ event pi run became a wall of escaped
+  JSON. Render each event as a single-line `<details>` summary
+  (`seq · HH:MM:SS · kind · stream · derived summary`) with
+  click-to-expand pretty-printed JSON. `summarizeEvent()` defensively
+  probes payload shape per kind so `state_change` / `turn_end` shows
+  `message (toolCall: X) · usage in/out · $cost`, `reap.*` surfaces
+  `branchPushed` / `commitsAhead` / `prUrl`, and `tool_*` / `text`
+  fall back to `name+exit` / first-text. Unknown shapes degrade to a
+  truncated JSON dump — full payload is still one click away.
+- **`fix(ui)`** — wrap agent panel content and render definition
+  structurally (`warren-f755`). Long system prompts in the Agents page
+  expanded row used to widen the table and trigger page-level
+  horizontal scroll. Replace the raw `JSON.stringify <pre>` with a
+  structured `AgentDefinitionPanel`: metadata grid
+  (name / version / source / provider / model / tags), `resolvedFrom`
+  breadcrumb, each `sections.*` as a collapsible `<details>` with the
+  system prompt expanded by default, and a "View raw JSON" toggle for
+  parity. All `pre`/text blocks use `whitespace-pre-wrap` +
+  `break-words` inside a `max-w-0` cell, so the panel wraps at the
+  row width instead of widening the table.
+
+### Build
+
+- **`ci(auto-merge)`** — `.github/workflows/auto-merge.yml` enables
+  GitHub's built-in auto-merge (squash) on PRs authored by the repo
+  owner so they merge the moment the `ci` check is green. Outside
+  contributors' PRs are skipped by the author guard — they still run
+  CI but require a manual merge action. Pairs with the repo-side
+  changes already applied (`allow_auto_merge=true`,
+  `delete_branch_on_merge=true`; branch protection on `main` with
+  required reviews dropped, `ci` check still required with strict
+  mode).
+
 ## [0.3.0] — 2026-05-13
 
 Lands the multi-worker placement substrate (`pl-9ba1`, parent
