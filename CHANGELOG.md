@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`fix(db)`** — complete R-13 end-to-end Postgres support (`pl-f1be`,
+  follow-up to `pl-f17e` / v0.3.2). v0.3.2 announced bring-your-own
+  database, but the seven repos in `src/db/repos/*` were still
+  sqlite-coupled internally — 15 `.get()`, 23 `.run()`, 14 `.all()`,
+  and 4 sync `db.transaction()` calls across the repo layer.
+  `WARREN_DB_URL=postgres://...` would boot, run migrations, and serve
+  `/healthz`, then crash the moment any repo method was invoked;
+  fail-fast guards in `createReposForDialect` (`src/server/main.ts`)
+  and `withCliDb` (`src/cli/context.ts`) backstopped the gap with a
+  pointer to this plan. New `src/db/repos/drizzle-adapter.ts`
+  (~50 LOC) maps sqlite's sync `.get()` / `.run()` / `.all()` and sync
+  `db.transaction()` to dialect-agnostic async equivalents (`pickOne`
+  / `pickAll` / `runWrite` / `runInTransaction`); all seven repos
+  (`Agents`, `Burrows`, `Projects`, `Events`, `Triggers`, `Workers`,
+  `Runs`) now go through it. `createRepos` is widened to `AnyWarrenDb`
+  and both dialect guards are deleted. CI grows a `ci-postgres` job
+  (`.github/workflows/ci.yml`) running `bun test` against
+  `postgres:16`, so the per-PR matrix exercises both dialects on every
+  push. Acceptance scenario 19 (`warren-on-postgres`) now passes
+  end-to-end against a real Postgres rather than skipping on missing
+  `WARREN_TEST_PG_URL`. Closes `warren-5549`.
+
 ## [0.3.3] — 2026-05-14
 
 R-19 (per-run preview environments) ships. Plan `pl-2c59` closed all
@@ -93,6 +117,17 @@ failure tail when applicable, and a manual teardown button.
   `WARREN_PREVIEW_EVICTION_DISABLED`.
 
 ## [0.3.2] — 2026-05-14
+
+> **Correction (2026-05-14):** This release announced R-13 as shipped,
+> but the repo layer in `src/db/repos/*` was still sqlite-coupled at
+> the implementation level — `WARREN_DB_URL=postgres://...` would boot
+> and run migrations cleanly, then crash the moment any repo method was
+> invoked. The async-everywhere refactor, schema split, per-dialect
+> migrations, dialect-aware `openDatabase`, and `migrate-to-postgres`
+> porter described below all landed as advertised; the dialect-
+> polymorphic repo layer that makes them actually work against
+> Postgres ships under plan `pl-f1be` — see the [Unreleased] entry
+> above and `warren-5549`.
 
 R-13 ships: warren now supports Postgres as an opt-in backend via
 `WARREN_DB_URL=postgres://...` (default stays sqlite). The work
