@@ -296,6 +296,57 @@ describe("createBridgeRegistry", () => {
 		expect(registry.size()).toBe(0);
 	});
 
+	test("warren-018a: a synchronous throw inside bridge does not crash the registry", async () => {
+		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+		});
+		const run = repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_a",
+			burrowRunId: "rb_a",
+		});
+
+		const errors: { runId: string; err: string }[] = [];
+		const registry = createBridgeRegistry({
+			repos,
+			broker: new RunEventBroker(),
+			burrowClientPool: makePool(repos),
+			bridge: async () => {
+				throw new Error("burrow has no placement record: bur_a");
+			},
+			logger: {
+				error: (obj: object) => {
+					const o = obj as { runId?: string; err?: string };
+					if (o.runId !== undefined && o.err !== undefined) {
+						errors.push({ runId: o.runId, err: o.err });
+					}
+				},
+			},
+			reconnectBackoffMs: [0],
+		});
+
+		registry.start(run.id, "rb_a", "bur_a");
+		while (registry.size() > 0) await new Promise((r) => setTimeout(r, 0));
+
+		// Rejection was caught (no unhandled rejection ⇒ no process exit).
+		expect(errors.some((e) => e.runId === run.id && /placement/.test(e.err))).toBe(true);
+
+		// A `bridge_fatal` system event landed so the UI shows why the
+		// bridge stopped.
+		const tail = repos.events.listByRun(run.id);
+		expect(tail.length).toBe(1);
+		expect(tail[0]?.kind).toBe("bridge_fatal");
+		expect(tail[0]?.stream).toBe("system");
+		expect((tail[0]?.payloadJson as { error: string }).error).toMatch(/placement/);
+	});
+
 	test("stopAll() aborts a reconnect sleep so the loop exits promptly", async () => {
 		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
 		const project = repos.projects.create({
@@ -368,6 +419,7 @@ describe("bootBridges", () => {
 			burrowId: "bur_xxxxxxxxxxxx",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
+		repos.burrows.create({ id: "bur_xxxxxxxxxxxx", workerId: "local" });
 
 		const r2 = repos.runs.create({
 			agentName: "refactor-bot",
@@ -391,6 +443,54 @@ describe("bootBridges", () => {
 
 		expect(result.resumed.map((r) => r.runId)).toEqual([r1.id]);
 		expect(result.skipped.map((s) => s.runId)).toEqual([r2.id]);
+		expect(calls).toEqual([r1.id]);
+		await result.registry.stopAll();
+	});
+
+	test("warren-018a: skips runs whose burrow_id has no `burrows` placement row", async () => {
+		const project = repos.projects.listAll()[0];
+		if (!project) throw new Error("project missing");
+
+		// r1 — placed: burrow row exists.
+		const r1 = repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: { sections: { system: "x" } },
+			trigger: "manual",
+		});
+		repos.runs.attachBurrow(r1.id, {
+			burrowId: "bur_aaaaaaaaaaaa",
+			burrowRunId: "rb_aaaaaaaaaa",
+		});
+		repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
+
+		// r2 — pre-pl-9ba1 orphan: burrow_id is set but no `burrows` row.
+		const r2 = repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: { sections: { system: "x" } },
+			trigger: "manual",
+		});
+		repos.runs.attachBurrow(r2.id, {
+			burrowId: "bur_orphanorphan",
+			burrowRunId: "rb_orphan_aaaa",
+		});
+
+		const calls: string[] = [];
+		const result = bootBridges({
+			repos,
+			broker: new RunEventBroker(),
+			burrowClientPool: makePool(repos),
+			bridge: async (input) => {
+				calls.push(input.runId);
+				return { written: 0, skipped: 0, errored: false };
+			},
+		});
+
+		expect(result.resumed.map((r) => r.runId)).toEqual([r1.id]);
+		expect(result.skipped).toEqual([{ runId: r2.id, reason: "no_placement" }]);
 		expect(calls).toEqual([r1.id]);
 		await result.registry.stopAll();
 	});

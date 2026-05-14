@@ -124,9 +124,44 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 		});
 		const entry: BridgeEntry = { burrowRunId, abort, done };
 		live.set(runId, entry);
-		void done.finally(() => {
-			if (live.get(runId) === entry) live.delete(runId);
-		});
+		// warren-018a: `done` is fire-and-forgotten. Without a `.catch` here,
+		// any synchronous-in-bridge throw (placement missing, transient pool
+		// error, etc.) rejects an un-awaited promise and Bun terminates the
+		// process — which crash-loops the supervisor under docker
+		// `restart: unless-stopped`. Catch and surface as a `bridge_fatal`
+		// event so the UI shows why the bridge stopped; the run row stays
+		// in its current state for the reaper to finalize.
+		void done
+			.catch((err) => {
+				const message = err instanceof Error ? err.message : String(err);
+				input.logger?.error?.(
+					{ runId, burrowRunId, burrowId, err: message },
+					"bridge crashed with unhandled error",
+				);
+				try {
+					const seq = (input.repos.events.maxSeqForRun(runId) ?? 0) + 1;
+					const row = input.repos.events.append({
+						runId,
+						burrowEventSeq: seq,
+						ts: new Date().toISOString(),
+						kind: "bridge_fatal",
+						stream: "system",
+						payload: { error: message },
+					});
+					input.broker.publish(runId, row);
+				} catch (eventErr) {
+					input.logger?.error?.(
+						{
+							runId,
+							err: eventErr instanceof Error ? eventErr.message : String(eventErr),
+						},
+						"failed to write bridge_fatal event",
+					);
+				}
+			})
+			.finally(() => {
+				if (live.get(runId) === entry) live.delete(runId);
+			});
 	}
 
 	async function stopAll(): Promise<void> {
@@ -310,6 +345,23 @@ export function bootBridges(input: CreateBridgeRegistryInput): BootBridgesResult
 			input.logger?.warn?.(
 				{ runId: run.id, state: run.state, burrowRunId: run.burrowRunId },
 				"skipping recovery: run has burrow_run_id but no burrow_id",
+			);
+			continue;
+		}
+		// warren-018a: runs predating multi-worker placement (pl-9ba1) carry a
+		// burrow_id without a matching `burrows` row. Starting their bridge
+		// makes `pool.clientFor({burrowId})` throw NoEligibleWorkerError on
+		// the first stream call. Skip with a clean operator signal instead.
+		if (input.repos.burrows.get(run.burrowId) === null) {
+			skipped.push({ runId: run.id, reason: "no_placement" });
+			input.logger?.warn?.(
+				{
+					runId: run.id,
+					state: run.state,
+					burrowRunId: run.burrowRunId,
+					burrowId: run.burrowId,
+				},
+				"skipping recovery: burrow_id has no `burrows` row (pre-pl-9ba1 orphan)",
 			);
 			continue;
 		}
