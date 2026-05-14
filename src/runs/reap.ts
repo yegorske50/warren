@@ -83,7 +83,16 @@ import { withTransportMapping } from "../burrow-client/client.ts";
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { EventRow, RunFailureReason, RunTerminalState } from "../db/schema.ts";
+import {
+	formatPreviewUrl,
+	type LaunchPreviewInput,
+	type LaunchPreviewResult,
+	launchPreview,
+	type PreviewLaunchConfig,
+} from "../preview/launch.ts";
+import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import { parseGitHubUrl } from "../projects/url.ts";
+import type { ServerPreviewConfig } from "../warren-config/index.ts";
 import type { RunEventBroker } from "./events.ts";
 import {
 	type AutoOpenPrConfig,
@@ -95,6 +104,11 @@ import {
 	type PrCommit,
 	type PrSeed,
 } from "./pr.ts";
+import {
+	type AnnotatePrPreviewInput,
+	type AnnotatePrPreviewResult,
+	annotatePrPreview,
+} from "./pr-annotate.ts";
 import type { BridgeLogger } from "./stream.ts";
 
 const execFileAsync = promisify(execFile);
@@ -166,6 +180,37 @@ export interface ReapRunInput {
 	 * function so tests can assert call arguments.
 	 */
 	readonly openPr?: (input: OpenPullRequestInput) => Promise<OpenPullRequestResult>;
+	/**
+	 * Per-run preview environments (R-19 / SPEC §11.L, warren-f156). When
+	 * the project has opted in via `.warren/defaults.json` and `outcome ===
+	 * "succeeded"`, reap launches `preview.command` as a long-lived burrow
+	 * sidecar in the same workspace (`preview_launch`) and — if `pr_open`
+	 * produced a PR url — patches the live URL into the PR body
+	 * (`pr_annotate_preview`). Both sub-steps are best-effort: failure
+	 * emits `reap_failed` events with `step` ∈ {`preview_launch`,
+	 * `pr_annotate_preview`} and never fails the run.
+	 *
+	 * Both `previewConfig` and `portAllocator` must be supplied together;
+	 * omit `previewConfig` to skip the launch entirely (matching projects
+	 * that haven't opted in). Tests typically omit; production wiring
+	 * resolves the config from the per-project `.warren/defaults.json`
+	 * loader and constructs one allocator per warren process.
+	 */
+	readonly previewConfig?: ServerPreviewConfig;
+	readonly portAllocator?: PreviewPortAllocator;
+	readonly previewLaunchConfig?: PreviewLaunchConfig;
+	/**
+	 * Override the preview-launch mechanics (tests). Defaults to
+	 * `launchPreview`. Receives the resolved input shape, including the
+	 * port allocator and the worker-local burrow client, so tests can
+	 * assert call arguments without touching real sidecars.
+	 */
+	readonly launchPreview?: (input: LaunchPreviewInput) => Promise<LaunchPreviewResult>;
+	/**
+	 * Override the preview-annotation seam (tests). Defaults to
+	 * `annotatePrPreview`.
+	 */
+	readonly annotatePrPreview?: (input: AnnotatePrPreviewInput) => Promise<AnnotatePrPreviewResult>;
 }
 
 export interface ReapStepError {
@@ -179,7 +224,9 @@ export type ReapStep =
 	| "mulch_merge"
 	| "seeds_close"
 	| "branch_push"
-	| "pr_open";
+	| "pr_open"
+	| "preview_launch"
+	| "pr_annotate_preview";
 
 export interface ReapRunResult {
 	readonly state: RunTerminalState;
@@ -216,6 +263,29 @@ export interface ReapRunResult {
 	 * GitHub call itself errored (errors append to `errors` instead).
 	 */
 	readonly prUrl: string | null;
+	/**
+	 * Terminal state of the preview launch (R-19 / SPEC §11.L,
+	 * warren-f156). `null` when the sub-step was skipped (project didn't
+	 * opt in, outcome !== succeeded, worker !== local, type !== server) —
+	 * not when it failed. `live` / `failed` carry the matching
+	 * `runs.preview_state` transition. The full failure tail lives on
+	 * `runs.preview_failure_message`; reap surfaces only the lifecycle
+	 * state here so callers can branch quickly.
+	 */
+	readonly previewState: "live" | "failed" | null;
+	/**
+	 * Allocated host port for a `live` or `failed` preview. Cleared when
+	 * the launch was skipped or when the failure path released the port
+	 * (port-exhausted, readiness timeout, sidecar exited early).
+	 */
+	readonly previewPort: number | null;
+	/**
+	 * URL the `pr_annotate_preview` sub-step patched into the PR body
+	 * (`https://run-<id>.<host>`). Null when annotation was skipped (no
+	 * PR opened, `WARREN_PREVIEW_HOST` unset, or launch failed) or when
+	 * the GitHub call itself errored (errors append to `errors`).
+	 */
+	readonly previewUrl: string | null;
 	readonly errors: readonly ReapStepError[];
 	/** True when the row was already terminal on entry — sub-steps were skipped. */
 	readonly alreadyTerminal: boolean;
@@ -236,6 +306,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			{ runId: run.id, state: run.state },
 			"reap skipped: run already in terminal state",
 		);
+		const idempotentPreviewState =
+			run.previewState === "live" || run.previewState === "failed" ? run.previewState : null;
 		return {
 			state: run.state as RunTerminalState,
 			failureReason: run.failureReason,
@@ -246,6 +318,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			branchPushed: false,
 			commitsAhead: null,
 			prUrl: run.prUrl,
+			previewState: idempotentPreviewState,
+			previewPort: run.previewPort,
+			previewUrl: null,
 			errors: [],
 			alreadyTerminal: true,
 		};
@@ -294,6 +369,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	let branchPushed = false;
 	let commitsAhead: number | null = null;
 	let prUrl: string | null = null;
+	let previewLaunchState: "live" | "failed" | null = null;
+	let previewLaunchPort: number | null = null;
+	let previewUrl: string | null = null;
 
 	let workspacePath: string | null = null;
 	let branch: string | null = null;
@@ -421,6 +499,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 					autoOpen: input.autoOpenPr,
 					run,
 					prContext,
+					previewOptedIn: input.previewConfig !== undefined,
 					openPr: input.openPr ?? openPullRequest,
 				});
 				if (opened.ok) {
@@ -432,6 +511,116 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 				}
 			} catch (err) {
 				await fail("pr_open", err);
+			}
+		}
+
+		// Preview launch (warren-f156 / SPEC §11.L, 5th best-effort sub-step).
+		// Mirrors pr_open's pattern (mx-05abb2): runs only when `outcome ===
+		// "succeeded"` and the project opted in via `.warren/defaults.json`,
+		// never fails the run. Failure surfaces as `preview_state: failed`
+		// with the stderr tail in `preview_failure_message`. The sub-step
+		// requires the worker that hosts the burrow be `local` for V1 —
+		// cross-host preview routing is the explicit R-12 deferral in §11.L.
+		if (
+			input.outcome === "succeeded" &&
+			input.previewConfig !== undefined &&
+			input.portAllocator !== undefined &&
+			workerClient !== null &&
+			run.burrowId !== null
+		) {
+			if (run.workerId !== null && run.workerId !== "local") {
+				const message = `preview launch skipped: cross-host preview routing deferred to R-12 (run.worker_id='${run.workerId}')`;
+				await fail("preview_launch", new Error(message));
+				previewLaunchState = "failed";
+				await input.repos.runs.attachPreview(run.id, {
+					previewState: "failed",
+					previewFailureMessage: message,
+				});
+			} else {
+				try {
+					const result = await (input.launchPreview ?? launchPreview)({
+						runId: run.id,
+						burrowId: run.burrowId,
+						previewConfig: input.previewConfig,
+						repos: input.repos,
+						allocator: input.portAllocator,
+						sidecars: workerClient.http.sidecars,
+						now,
+					});
+					if (result.ok) {
+						previewLaunchState = "live";
+						previewLaunchPort = result.port;
+						await emit("preview_launched", {
+							port: result.port,
+							sidecarId: result.sidecarId,
+						});
+					} else {
+						previewLaunchState = "failed";
+						previewLaunchPort = result.port;
+						await fail("preview_launch", new Error(`${result.reason}: ${result.message}`));
+					}
+				} catch (err) {
+					previewLaunchState = "failed";
+					await fail("preview_launch", err);
+				}
+			}
+		}
+
+		// PR-annotate preview (warren-f156 / SPEC §11.L, 6th best-effort sub-
+		// step). Mirrors pr_open's pattern: idempotent PATCH on the PR body
+		// replacing the `<!-- warren:preview-start -->…<!-- warren:preview-end -->`
+		// fragment with the live URL or the failure tail. Skipped when no PR
+		// was opened, when launch was skipped entirely (`previewLaunchState
+		// === null`), or when the host suffix isn't configured (operator
+		// hasn't wired `WARREN_PREVIEW_HOST` yet — the launch still ran so
+		// state stays observable in the UI, but no URL exists to publish).
+		const previewHost = input.previewLaunchConfig?.host ?? null;
+		if (
+			prUrl !== null &&
+			previewLaunchState !== null &&
+			input.autoOpenPr?.enabled === true &&
+			input.autoOpenPr.token !== ""
+		) {
+			try {
+				if (previewLaunchState === "live" && previewHost === null) {
+					await fail(
+						"pr_annotate_preview",
+						new Error(
+							"WARREN_PREVIEW_HOST unset; cannot patch preview URL into PR (launch state stays live)",
+						),
+					);
+				} else {
+					const failureTail =
+						previewLaunchState === "failed"
+							? ((await input.repos.runs.require(run.id)).previewFailureMessage ?? "")
+							: "";
+					const result = await (input.annotatePrPreview ?? annotatePrPreview)({
+						prUrl,
+						token: input.autoOpenPr.token,
+						preview:
+							previewLaunchState === "live"
+								? {
+										state: "live",
+										url: formatPreviewUrl(run.id, previewHost as string),
+									}
+								: { state: "failed", failureTail },
+					});
+					if (result.ok) {
+						if (previewLaunchState === "live") {
+							previewUrl = formatPreviewUrl(run.id, previewHost as string);
+						}
+						await emit("preview_annotated", {
+							prUrl,
+							previewUrl,
+							mode: result.mode,
+							state: previewLaunchState,
+						});
+					} else {
+						await fail("pr_annotate_preview", new Error(`${result.reason}: ${result.message}`));
+					}
+				}
+			} catch (err) {
+				await fail("pr_annotate_preview", err);
 			}
 		}
 	} else if (workspacePath !== null && project === null) {
@@ -463,6 +652,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		branchPushed,
 		commitsAhead,
 		prUrl,
+		previewState: previewLaunchState,
+		previewPort: previewLaunchPort,
+		previewUrl,
 		errors,
 	});
 
@@ -480,6 +672,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			branchPushed,
 			commitsAhead,
 			prUrl,
+			previewState: previewLaunchState,
+			previewPort: previewLaunchPort,
+			previewUrl,
 			errored: errors.length > 0,
 		},
 		"reap completed",
@@ -495,6 +690,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		branchPushed,
 		commitsAhead,
 		prUrl,
+		previewState: previewLaunchState,
+		previewPort: previewLaunchPort,
+		previewUrl,
 		errors,
 		alreadyTerminal: false,
 	};
@@ -520,6 +718,7 @@ interface TryOpenPrInput {
 		tokensCacheRead: number | null;
 	};
 	readonly prContext: PrContext;
+	readonly previewOptedIn: boolean;
 	readonly openPr: (input: OpenPullRequestInput) => Promise<OpenPullRequestResult>;
 }
 
@@ -538,6 +737,7 @@ async function tryOpenPr(input: TryOpenPrInput): Promise<OpenPullRequestResult> 
 		agentName: input.run.agentName,
 		commits: input.prContext.commits,
 		diffStat: input.prContext.diffStat,
+		previewOptedIn: input.previewOptedIn,
 		...(input.autoOpen.warrenBaseUrl !== null
 			? { warrenBaseUrl: input.autoOpen.warrenBaseUrl }
 			: {}),

@@ -28,7 +28,8 @@ import { BurrowClientPool } from "../burrow-client/index.ts";
 import { type AnyWarrenDb, openDatabase, WARREN_DB_POOL_MAX_ENV } from "../db/client.ts";
 import { createRepos } from "../db/repos/index.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
-import { loadPreviewPortRangeFromEnv } from "../preview/port-allocator.ts";
+import { loadPreviewLaunchConfigFromEnv } from "../preview/launch.ts";
+import { loadPreviewPortRangeFromEnv, PreviewPortAllocator } from "../preview/port-allocator.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
 import { loadProjectsConfigFromEnv } from "../projects/config.ts";
 import { seedBuiltinAgents } from "../registry/builtins/index.ts";
@@ -143,12 +144,26 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
+	const warrenConfigs = createWarrenConfigCache();
+	const runBranchPrefixDefault = loadRunBranchPrefixFromEnv(env);
+	const previewPortRange = loadPreviewPortRangeFromEnv(env);
+	// The SQLite-backed port allocator is the only dialect today (warren-2277);
+	// the postgres branch lights up when the repo layer becomes dialect-aware
+	// (pl-f17e follow-up). Until then, postgres deployments skip preview
+	// launches at the boot wiring step — same as `/readyz` (mx-b82a55).
+	const portAllocator =
+		db.dialect === "sqlite" ? new PreviewPortAllocator(db, previewPortRange) : undefined;
+	const previewLaunchConfig = loadPreviewLaunchConfigFromEnv(env);
+
 	const bridgesBoot = await bootBridges({
 		repos,
 		broker,
 		burrowClientPool,
 		logger: bridgeLoggerFromPino(logger),
 		autoOpenPr,
+		warrenConfigs,
+		...(portAllocator !== undefined ? { portAllocator } : {}),
+		previewLaunchConfig,
 	});
 	if (bridgesBoot.resumed.length > 0) {
 		logger.info(
@@ -183,10 +198,6 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			);
 		}
 	});
-
-	const warrenConfigs = createWarrenConfigCache();
-	const runBranchPrefixDefault = loadRunBranchPrefixFromEnv(env);
-	const previewPortRange = loadPreviewPortRangeFromEnv(env);
 
 	const probeConfig = loadWorkerProbeConfigFromEnv(env);
 	const workerProbe = startWorkerProbe({

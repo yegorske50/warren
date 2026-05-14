@@ -33,6 +33,8 @@
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { RunState } from "../db/schema.ts";
+import type { PreviewLaunchConfig } from "../preview/launch.ts";
+import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import {
 	type AutoOpenPrConfig,
 	type BridgeLogger,
@@ -44,6 +46,7 @@ import {
 	type RunEventBroker,
 	reapRun,
 } from "../runs/index.ts";
+import type { ServerPreviewConfig, WarrenConfigCache } from "../warren-config/index.ts";
 import type { BridgeRegistry } from "./types.ts";
 
 interface BridgeEntry {
@@ -95,6 +98,26 @@ export interface CreateBridgeRegistryInput {
 	 * pushed branch. Omit to disable; `bootServer` resolves it from env.
 	 */
 	readonly autoOpenPr?: AutoOpenPrConfig;
+	/**
+	 * Per-project warren-config cache (R-19 / warren-f156). When provided
+	 * alongside `portAllocator`, the terminal-detect reap loads each run's
+	 * `.warren/defaults.json` preview block and forwards it to reap's
+	 * `preview_launch` sub-step. Omit to disable preview entirely (e.g.
+	 * tests).
+	 */
+	readonly warrenConfigs?: WarrenConfigCache;
+	/**
+	 * SQLite-backed port allocator (warren-2277). Same singleton for the
+	 * whole warren process; reap's `preview_launch` sub-step calls
+	 * `allocator.allocate(runId)` to claim a free port atomically.
+	 */
+	readonly portAllocator?: PreviewPortAllocator;
+	/**
+	 * Preview launch host suffix (`WARREN_PREVIEW_HOST`). Drives the
+	 * `pr_annotate_preview` URL format; null when the operator hasn't
+	 * wired the proxy yet — the launch still runs but no URL is published.
+	 */
+	readonly previewLaunchConfig?: PreviewLaunchConfig;
 }
 
 export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRegistry {
@@ -121,6 +144,11 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 			sleep,
 			...(input.logger !== undefined ? { logger: input.logger } : {}),
 			...(input.autoOpenPr !== undefined ? { autoOpenPr: input.autoOpenPr } : {}),
+			...(input.warrenConfigs !== undefined ? { warrenConfigs: input.warrenConfigs } : {}),
+			...(input.portAllocator !== undefined ? { portAllocator: input.portAllocator } : {}),
+			...(input.previewLaunchConfig !== undefined
+				? { previewLaunchConfig: input.previewLaunchConfig }
+				: {}),
 		});
 		const entry: BridgeEntry = { burrowRunId, abort, done };
 		live.set(runId, entry);
@@ -192,6 +220,9 @@ interface RunWithReconnectInput {
 	readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
 	readonly logger?: BridgeLogger;
 	readonly autoOpenPr?: AutoOpenPrConfig;
+	readonly warrenConfigs?: WarrenConfigCache;
+	readonly portAllocator?: PreviewPortAllocator;
+	readonly previewLaunchConfig?: PreviewLaunchConfig;
 }
 
 /**
@@ -225,6 +256,10 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 			// external scheduler. reap is idempotent + best-effort, so
 			// errors land as `reap.completed`/`reap_failed` events on the
 			// run rather than escaping back up the registry.
+			const previewConfig =
+				result.terminalDetected.outcome === "succeeded"
+					? await resolveProjectPreviewConfig(input)
+					: undefined;
 			try {
 				await input.reap({
 					runId: input.runId,
@@ -234,6 +269,11 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 					broker: input.broker,
 					...(input.logger !== undefined ? { logger: input.logger } : {}),
 					...(input.autoOpenPr !== undefined ? { autoOpenPr: input.autoOpenPr } : {}),
+					...(previewConfig !== undefined ? { previewConfig } : {}),
+					...(input.portAllocator !== undefined ? { portAllocator: input.portAllocator } : {}),
+					...(input.previewLaunchConfig !== undefined
+						? { previewLaunchConfig: input.previewLaunchConfig }
+						: {}),
 				});
 			} catch (err) {
 				input.logger?.error?.(
@@ -290,6 +330,49 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 		if (input.signal.aborted) {
 			return { written: totalWritten, skipped: totalSkipped, errored: true };
 		}
+	}
+}
+
+/**
+ * Resolve the project's `.warren/defaults.json` preview block (R-19) for
+ * the run the bridge just observed reach terminal. Returns `undefined`
+ * when the project hasn't opted in or when the warren-config seam isn't
+ * wired (tests that omit `warrenConfigs`/`portAllocator`). The launcher
+ * gate inside reap is what skips the actual preview spawn when this
+ * function returns `undefined`.
+ *
+ * Errors from the per-project loader (`malformed defaults.json`, etc.)
+ * surface as a `null` defaults block, so this function returns
+ * `undefined` and the preview just skips. Operators see the underlying
+ * error via the `/projects/:id/warren-config` route.
+ */
+async function resolveProjectPreviewConfig(
+	input: RunWithReconnectInput,
+): Promise<ServerPreviewConfig | undefined> {
+	if (input.warrenConfigs === undefined || input.portAllocator === undefined) return undefined;
+	const run = await input.repos.runs.get(input.runId);
+	if (run === null || run.projectId === null) return undefined;
+	const project = await input.repos.projects.get(run.projectId);
+	if (project === null) return undefined;
+	try {
+		const config = await input.warrenConfigs.get(project.id, project.localPath);
+		const preview = config.defaults?.preview;
+		if (preview === undefined) return undefined;
+		// `type: 'static'` is filed as a follow-up (per SPEC §11.L); reap
+		// would reject at launch time anyway. Skip cleanly here so the
+		// PR-body placeholder doesn't promise a preview that can't run.
+		if (preview.type !== "server") return undefined;
+		return preview;
+	} catch (err) {
+		input.logger?.warn?.(
+			{
+				runId: input.runId,
+				projectId: project.id,
+				err: err instanceof Error ? err.message : String(err),
+			},
+			"preview config load failed; skipping preview launch",
+		);
+		return undefined;
 	}
 }
 

@@ -212,7 +212,26 @@ export interface BuildPrContentInput {
 	readonly tokensInput?: number;
 	readonly tokensOutput?: number;
 	readonly tokensCacheRead?: number;
+	/**
+	 * Project opted into per-run preview environments (R-19 / SPEC §11.L).
+	 * When true, the body includes a `preview_url_or_placeholder` fragment
+	 * (a `## Preview` section bracketed by `<!-- warren:preview-start -->`
+	 * and `<!-- warren:preview-end -->`) so reap's `pr_annotate_preview`
+	 * sub-step can patch in the live URL once the sidecar is ready. False /
+	 * absent renders no fragment — non-opted-in projects don't see preview
+	 * scaffolding in their PR body.
+	 */
+	readonly previewOptedIn?: boolean;
 }
+
+/**
+ * Markers `pr_annotate_preview` looks for when patching the live URL or
+ * failure tail into the PR body (warren-f156). Exported so the annotator
+ * can match without duplicating the literal — drift between the two
+ * sides would silently break idempotency.
+ */
+export const PREVIEW_FRAGMENT_START = "<!-- warren:preview-start -->" as const;
+export const PREVIEW_FRAGMENT_END = "<!-- warren:preview-end -->" as const;
 
 export interface PrContent {
 	readonly title: string;
@@ -261,6 +280,7 @@ function formatBody(input: BuildPrContentInput): string {
 	sections.push(formatSummarySection(input));
 	sections.push(formatRunSection(input));
 	if (input.seed !== undefined) sections.push(formatSeedsSection(input.seed));
+	if (input.previewOptedIn === true) sections.push(formatPreviewSection());
 	if (input.commits !== undefined && input.commits.length > 0) {
 		sections.push(formatCommitsSection(input.commits));
 	}
@@ -270,6 +290,10 @@ function formatBody(input: BuildPrContentInput): string {
 	sections.push(formatPromptSection(input.prompt));
 	sections.push(formatFooter(input.runId));
 	return sections.join("\n\n");
+}
+
+function formatPreviewSection(): string {
+	return `## Preview\n\n${PREVIEW_FRAGMENT_START}\nPreview launching…\n${PREVIEW_FRAGMENT_END}`;
 }
 
 function formatSummarySection(input: BuildPrContentInput): string {

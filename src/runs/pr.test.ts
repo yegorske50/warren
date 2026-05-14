@@ -285,6 +285,31 @@ describe("buildPrContent", () => {
 		const c = buildPrContent({ prompt: "do x", runId: "run_abc", agentName: "pi" });
 		expect(c.body).toContain("**Warren run:** `run_abc`");
 	});
+
+	test("emits the preview_url_or_placeholder fragment when previewOptedIn is true", () => {
+		const c = buildPrContent({
+			prompt: "do x",
+			runId: "run_abc",
+			agentName: "pi",
+			previewOptedIn: true,
+		});
+		expect(c.body).toContain("## Preview");
+		expect(c.body).toContain("<!-- warren:preview-start -->");
+		expect(c.body).toContain("Preview launching…");
+		expect(c.body).toContain("<!-- warren:preview-end -->");
+	});
+
+	test("omits the preview fragment when previewOptedIn is absent or false", () => {
+		const a = buildPrContent({ prompt: "do x", runId: "run_abc", agentName: "pi" });
+		const b = buildPrContent({
+			prompt: "do x",
+			runId: "run_abc",
+			agentName: "pi",
+			previewOptedIn: false,
+		});
+		expect(a.body).not.toContain("warren:preview-start");
+		expect(b.body).not.toContain("warren:preview-start");
+	});
 });
 
 describe("loadAutoOpenPrConfigFromEnv", () => {
