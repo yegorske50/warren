@@ -18,3 +18,38 @@ jobs:
       - run: bun run lint
       - run: bun run typecheck
       - run: bun test
+
+  # Re-runs `bun test` against a real Postgres so the pg-side branches of the
+  # dialect-polymorphic repo layer (R-13, pl-f1be) execute on every PR. The
+  # `services.postgres` block boots postgres:16, and `WARREN_TEST_PG_URL` +
+  # `WARREN_TEST_DIALECT=postgres` flip `withDb()` (src/db/testing.ts) into
+  # the per-test schema substrate; the repo test suites then iterate sqlite
+  # and postgres via their `if (isPostgresTestEnabled()) suite("postgres")`
+  # tail. The default `ci` job above continues to cover lint/typecheck and
+  # the sqlite path.
+  ci-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: warren
+          POSTGRES_PASSWORD: warren
+          POSTGRES_DB: warren_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U warren -d warren_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WARREN_TEST_DIALECT: postgres
+      WARREN_TEST_PG_URL: postgres://warren:warren@127.0.0.1:5432/warren_test
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install
+      - run: bun test
