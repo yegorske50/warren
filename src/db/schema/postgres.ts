@@ -26,6 +26,7 @@ import { doublePrecision, index, integer, jsonb, pgTable, serial, text } from "d
 import {
 	EVENT_STREAMS,
 	INDEX_NAMES,
+	PREVIEW_STATES,
 	RUN_FAILURE_REASONS,
 	RUN_STATES,
 	TABLE_NAMES,
@@ -77,6 +78,11 @@ export const runs = pgTable(
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
 		tokensCacheWrite: integer("tokens_cache_write"),
+		previewState: text("preview_state", { enum: PREVIEW_STATES }),
+		previewPort: integer("preview_port"),
+		previewStartedAt: text("preview_started_at"),
+		previewLastHitAt: text("preview_last_hit_at"),
+		previewFailureMessage: text("preview_failure_message"),
 	},
 	(t) => [
 		index(INDEX_NAMES.runsState).on(t.state),

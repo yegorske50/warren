@@ -141,6 +141,73 @@ describe("RunsRepo", () => {
 		expect(repo.attachStats(row.id, {})).rejects.toThrow(ValidationError);
 	});
 
+	test("create leaves preview columns null", async () => {
+		const row = await spawn();
+		expect(row.previewState).toBeNull();
+		expect(row.previewPort).toBeNull();
+		expect(row.previewStartedAt).toBeNull();
+		expect(row.previewLastHitAt).toBeNull();
+		expect(row.previewFailureMessage).toBeNull();
+	});
+
+	test("attachPreview persists partial preview fields", async () => {
+		const row = await spawn();
+		const startedAt = "2026-05-14T18:00:00.000Z";
+		const tagged = await repo.attachPreview(row.id, {
+			previewState: "starting",
+			previewPort: 48201,
+			previewStartedAt: startedAt,
+		});
+		expect(tagged.previewState).toBe("starting");
+		expect(tagged.previewPort).toBe(48201);
+		expect(tagged.previewStartedAt).toBe(startedAt);
+		expect(tagged.previewLastHitAt).toBeNull();
+		expect(tagged.previewFailureMessage).toBeNull();
+		const reread = await repo.require(row.id);
+		expect(reread.previewState).toBe("starting");
+		expect(reread.previewPort).toBe(48201);
+	});
+
+	test("attachPreview merges across calls — omitted fields preserved", async () => {
+		const row = await spawn();
+		const startedAt = "2026-05-14T18:00:00.000Z";
+		await repo.attachPreview(row.id, {
+			previewState: "starting",
+			previewPort: 48201,
+			previewStartedAt: startedAt,
+		});
+		const live = await repo.attachPreview(row.id, { previewState: "live" });
+		expect(live.previewState).toBe("live");
+		expect(live.previewPort).toBe(48201);
+		expect(live.previewStartedAt).toBe(startedAt);
+	});
+
+	test("attachPreview accepts explicit null to clear a field", async () => {
+		const row = await spawn();
+		await repo.attachPreview(row.id, {
+			previewState: "failed",
+			previewFailureMessage: "boot crashed",
+		});
+		const cleared = await repo.attachPreview(row.id, { previewFailureMessage: null });
+		expect(cleared.previewState).toBe("failed");
+		expect(cleared.previewFailureMessage).toBeNull();
+	});
+
+	test("attachPreview throws when called with no fields", async () => {
+		const row = await spawn();
+		expect(repo.attachPreview(row.id, {})).rejects.toThrow(ValidationError);
+	});
+
+	test("attachPreview last_hit_at independent updates (proxy path)", async () => {
+		const row = await spawn();
+		await repo.attachPreview(row.id, { previewState: "live", previewPort: 48201 });
+		const hit = "2026-05-14T18:05:00.000Z";
+		const touched = await repo.attachPreview(row.id, { previewLastHitAt: hit });
+		expect(touched.previewLastHitAt).toBe(hit);
+		expect(touched.previewState).toBe("live");
+		expect(touched.previewPort).toBe(48201);
+	});
+
 	test("markRunning sets state and startedAt", async () => {
 		const row = await spawn();
 		const t = new Date("2026-05-08T12:34:56.000Z");

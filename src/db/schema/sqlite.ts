@@ -22,6 +22,7 @@ import { index, integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core
 import {
 	EVENT_STREAMS,
 	INDEX_NAMES,
+	PREVIEW_STATES,
 	RUN_FAILURE_REASONS,
 	RUN_STATES,
 	TABLE_NAMES,
@@ -97,6 +98,19 @@ export const runs = sqliteTable(
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
 		tokensCacheWrite: integer("tokens_cache_write"),
+		// Per-run preview environment columns (R-19 / SPEC §11.L). All nullable
+		// because only projects that opt in via `.warren/defaults.json`'s
+		// `preview` block exercise this path; non-opted-in runs leave every
+		// field null. Populated by reap's `preview_launch` sub-step, the
+		// readiness probe, the host reverse proxy (last_hit_at), and the
+		// eviction worker / manual teardown route. ISO8601 TEXT mirrors the
+		// existing started_at/ended_at convention so cross-dialect passthrough
+		// (mx-845f11) stays lossless.
+		previewState: text("preview_state", { enum: PREVIEW_STATES }),
+		previewPort: integer("preview_port"),
+		previewStartedAt: text("preview_started_at"),
+		previewLastHitAt: text("preview_last_hit_at"),
+		previewFailureMessage: text("preview_failure_message"),
 	},
 	(t) => [
 		index(INDEX_NAMES.runsState).on(t.state),

@@ -15,6 +15,7 @@ import { NotFoundError, StateTransitionError, ValidationError } from "../../core
 import { generateId } from "../../core/ids.ts";
 import type { DrizzleDb } from "../client.ts";
 import {
+	type PreviewState,
 	type RunFailureReason,
 	type RunRow,
 	type RunState,
@@ -70,6 +71,14 @@ export interface AttachStatsInput {
 	tokensCacheWrite?: number | null;
 }
 
+export interface AttachPreviewInput {
+	previewState?: PreviewState | null;
+	previewPort?: number | null;
+	previewStartedAt?: string | null;
+	previewLastHitAt?: string | null;
+	previewFailureMessage?: string | null;
+}
+
 export class RunsRepo {
 	constructor(private readonly db: DrizzleDb) {}
 
@@ -94,6 +103,11 @@ export class RunsRepo {
 			tokensOutput: null,
 			tokensCacheRead: null,
 			tokensCacheWrite: null,
+			previewState: null,
+			previewPort: null,
+			previewStartedAt: null,
+			previewLastHitAt: null,
+			previewFailureMessage: null,
 		};
 		this.db.insert(runs).values(row).run();
 		return row;
@@ -221,6 +235,37 @@ export class RunsRepo {
 		for (const k of keys) {
 			if (input[k] !== undefined) {
 				(patch as Record<string, number | null>)[k] = input[k] as number | null;
+			}
+		}
+		this.db.update(runs).set(patch).where(eq(runs.id, id)).run();
+		return { ...current, ...patch };
+	}
+
+	/**
+	 * Persist per-run preview environment fields (R-19 / SPEC §11.L). Mirrors
+	 * `attachStats`'s partial-input semantics (mx-49272e): omitted fields
+	 * preserve existing values, explicit `null` clears. Throws ValidationError
+	 * when called with no fields, matching `attachBurrow` / `attachStats`.
+	 * Used by reap's `preview_launch` sub-step, the readiness probe, the host
+	 * reverse proxy (debounced `previewLastHitAt`), the eviction worker, and
+	 * the manual teardown route.
+	 */
+	async attachPreview(id: string, input: AttachPreviewInput): Promise<RunRow> {
+		const keys: (keyof AttachPreviewInput)[] = [
+			"previewState",
+			"previewPort",
+			"previewStartedAt",
+			"previewLastHitAt",
+			"previewFailureMessage",
+		];
+		if (keys.every((k) => input[k] === undefined)) {
+			throw new ValidationError("attachPreview requires at least one preview field");
+		}
+		const current = await this.require(id);
+		const patch: Partial<RunRow> = {};
+		for (const k of keys) {
+			if (input[k] !== undefined) {
+				(patch as Record<string, unknown>)[k] = input[k];
 			}
 		}
 		this.db.update(runs).set(patch).where(eq(runs.id, id)).run();

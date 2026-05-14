@@ -57,6 +57,25 @@ export const EVENT_STREAMS = ["stdout", "stderr", "system"] as const;
 export type EventStream = (typeof EVENT_STREAMS)[number];
 
 /**
+ * Preview environment lifecycle (R-19 / SPEC §11.L).
+ *
+ *   - `starting`    — `preview_launch` sub-step has spawned the sidecar
+ *                     command in burrow; readiness probe hasn't returned
+ *                     2xx yet.
+ *   - `live`        — readiness probe succeeded; the host reverse proxy
+ *                     can route requests to `preview_port`.
+ *   - `failed`      — sidecar exited or readiness probe timed out;
+ *                     `preview_failure_message` holds the stderr tail.
+ *   - `torn-down`   — eviction worker or manual teardown stopped the
+ *                     sidecar and released the port. Workspace stays.
+ *
+ * TS-only narrowing — no SQL CHECK constraint (mx-2ab984). Null on rows
+ * for projects that haven't opted into previews.
+ */
+export const PREVIEW_STATES = ["starting", "live", "failed", "torn-down"] as const;
+export type PreviewState = (typeof PREVIEW_STATES)[number];
+
+/**
  * Worker state machine (warren-b0a3 / pl-9ba1 step 1).
  *
  *   - `healthy`     — probe succeeded; eligible for new burrow placement.
