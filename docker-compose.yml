@@ -4,8 +4,11 @@
 #   - the four bwrap-friendly security flags (SPEC §5.3 / mx-94901b /
 #     mx-c085ba). They relax the outer container so burrow's nested
 #     userns sandboxes can come up.
-#   - a named volume mounted at /data for warren.db, the canopy clone,
-#     and cloned project repos.
+#   - a named volume mounted at /data for warren.db (SQLite default),
+#     the canopy clone, and cloned project repos. When WARREN_DB_URL
+#     points at an external Postgres (R-13, shipped 2026-05-14),
+#     warren.db is unused but the volume still holds canopy + project
+#     clones, so the mount stays in place either way.
 #   - the runtime env loaded from .env (`cp .env.example .env` first).
 #
 # The supervisor inside the container spawns `burrow serve` and `warren`

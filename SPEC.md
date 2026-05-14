@@ -86,7 +86,7 @@ Warren is a thin coordinator — most of the value is in the runtime plus whiche
 - No real-time collaboration. One UI, one user at a time.
 - No payment, no usage metering, no quota in V1. Per-user / per-project cost and concurrency guardrails are planned post-V1 (R-17).
 - No cost or run-budget enforcement in V1. Token spend and concurrent-run caps are planned post-V1 (R-17). V1 does *report* per-run cost + token usage for the `pi` built-in (`runs.cost_usd`, `runs.tokens_*`, §11.K) — reporting is observability; enforcement (per-user / per-project budget caps) is the deferred half.
-- No bring-your-own database in V1 — SQLite via `bun:sqlite` is the only backend. Postgres-as-a-backend is planned post-V1 (R-13).
+- ~~No bring-your-own database in V1~~ — **shipped post-V1 (R-13, pl-f17e, 2026-05-14):** SQLite (default, `bun:sqlite`) and Postgres (`drizzle-orm/node-postgres`) are both first-class backends selected by `WARREN_DB_URL`. Burrow's own per-worker SQLite stays untouched — that's run-local sandbox state, not org truth.
 - No MCP server configuration in V1. Canopy-frontmatter-driven MCP plus burrow-side credential mounts are planned post-V1 (R-15).
 - No audit log in V1. Append-only dispatch/steer/cancel/secret-read ledger is planned post-V1 (R-16), and lands alongside R-09 since it depends on real user identity.
 - No GitHub App auth in V1 — shared PAT via `GITHUB_TOKEN`. GitHub App with installation-scoped tokens and per-repo allowlists is planned post-V1 (R-18).
@@ -381,7 +381,7 @@ tokens, and auto-migration on decommission.
 | Runtime | **Bun** (≥1.1) | Matches every other os-eco tool. |
 | Language | **TypeScript** (strict) | Type safety across server, scheduler, UI. |
 | HTTP | **Bun.serve** | Same posture as burrow's `serve` — sufficient, no framework. |
-| DB | **`bun:sqlite`** (WAL mode) | Run history, schedules, webhook secrets. Same as burrow. |
+| DB | **`bun:sqlite`** (WAL mode, default) or **Postgres** (`drizzle-orm/node-postgres`, opt-in via `WARREN_DB_URL`) | Run history, schedules, webhook secrets. SQLite stays the zero-config default for the home-server appliance; Postgres lights up for org-scale deploys (R-13). Burrow's per-worker SQLite is untouched. |
 | ORM | **Drizzle** | Match burrow. |
 | Validation | **Zod 4** | Match burrow. |
 | CLI framework | **commander** | Match burrow / mulch / seeds / canopy. |
@@ -390,7 +390,7 @@ tokens, and auto-migration on decommission.
 | Burrow client | **`HttpClient` from `@os-eco/burrow`** (§15.6) | Typed mirror of burrow's library API over the unix socket. No hand-written HTTP. |
 | Cron | **`croner`** (in-process tick) | Tz/DST-aware, ~30 KB, no native deps. Single in-process tick wrapped in a single-flight guard; cadence via `WARREN_SCHEDULER_TICK_MS` (§11.I). |
 
-No HTTP framework on the server. No Postgres, no Redis, no Docker-in-Docker.
+No HTTP framework on the server. No Redis, no Docker-in-Docker. Postgres is opt-in (R-13) — SQLite remains the zero-config default.
 
 ---
 
@@ -600,7 +600,7 @@ docker compose up -d
 open http://localhost:8080
 ```
 
-`docker-compose.yml` mounts a single named volume at `/data` and applies the bwrap-friendly security flags.
+`docker-compose.yml` mounts a single named volume at `/data` and applies the bwrap-friendly security flags. Storage defaults to SQLite under `/data/warren.db`. To run against a managed Postgres instead (R-13), set `WARREN_DB_URL=postgres://user:pw@host/db` in `.env`; pg migrations apply on first start, and the SQLite path is bypassed entirely.
 
 ### 10.2 Fly.io
 
@@ -616,12 +616,15 @@ fly secrets set \
     GITHUB_TOKEN=...
 # Optional: layer a custom canopy library on top of the built-ins:
 #   CANOPY_REPO_URL=https://github.com/<you>/agents.git
+# Optional: attach to a managed Postgres instead of the on-volume SQLite
+# (R-13). Without this, warren falls back to sqlite:///data/warren.db.
+#   fly secrets set WARREN_DB_URL=postgres://user:pw@host/db
 fly deploy
 ```
 
 `BURROW_API_TOKEN` (read by `burrow serve`) and `WARREN_BURROW_TOKEN` (read by warren's burrow-client) are the two ends of one channel and **must hold the same value** — the supervisor validates equality at boot (warren-d317) and refuses to spawn burrow + warren if either is missing or they disagree, instead of letting `burrow serve` crash-loop with `[validation_error]` and warren 401 on every dispatch. `WARREN_API_TOKEN` is the browser-facing bearer; rotate the three independently. For loopback-dev only, set `WARREN_BURROW_NO_AUTH=1` to skip burrow auth (and the validation).
 
-Same image, same volume layout, same security flags. Mac Pro and Fly.io are interchangeable hosts.
+Same image, same volume layout, same security flags. Mac Pro and Fly.io are interchangeable hosts. The storage backend (SQLite-on-volume vs. external Postgres) is a `WARREN_DB_URL` flip — the rest of the deploy is unchanged.
 
 ### 10.3 Container layout
 
@@ -910,10 +913,12 @@ one warren to dispatch across more than one host.
    worker registration, placement). Warren side is a worker registry + a
    dispatch router. Today's local burrow keeps working with zero registered
    remote workers, so this is additive.
-2. **Bring-your-own database** (R-13) — `WARREN_DB_URL`, Postgres as a
-   first-class backend alongside SQLite. SQLite stays the home-server
-   default. Burrow's own SQLite stays per-worker (it's run-local state, not
-   org truth).
+2. **Bring-your-own database** (R-13, **shipped 2026-05-14 via `pl-f17e`**) —
+   `WARREN_DB_URL` selects SQLite (default) or Postgres
+   (`drizzle-orm/node-postgres`). SQLite stays the home-server default.
+   Burrow's own SQLite stays per-worker (it's run-local state, not org
+   truth). One-shot porter for existing operators:
+   `warren db migrate-to-postgres --from <sqlite> --to <pg-url>`.
 3. **Per-user identity / SSO** (R-09, repromoted from `[deferred]`) — OIDC
    login replacing the single bearer token; the bearer stays as a
    service-account path for CI. Prerequisite for R-16 and R-17.

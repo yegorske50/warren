@@ -65,6 +65,9 @@ fly secrets set \
     WARREN_BURROW_TOKEN=... \
     ANTHROPIC_API_KEY=... \
     GITHUB_TOKEN=...
+# Optional — attach a managed Postgres instead of the on-volume SQLite
+# (R-13). Without this, warren falls back to sqlite:///data/warren.db.
+#   fly secrets set WARREN_DB_URL=postgres://user:pw@host/db
 fly deploy
 ```
 
@@ -207,7 +210,7 @@ Documented in [SPEC §11.D](SPEC.md#11d-v1-security-posture-known-limitations) a
 - **TLS is upstream's job.** Direct HTTP on a non-loopback bind is a misconfiguration; `warren doctor` warns.
 - **Trust-the-socket** between warren and the runtime inside the container — they are co-tenanted by design.
 - **No CSRF, single-user.** UI calls warren's API with the bearer; CORS is strict.
-- **SQLite-only state.** Run history and scheduler state live in `/data/warren.db` on the local volume.
+- **SQLite by default; Postgres optional.** Run history and scheduler state live in `/data/warren.db` on the local volume out of the box. Org-scale deploys can attach a managed Postgres by setting `WARREN_DB_URL=postgres://user:pw@host/db` ([R-13](ROADMAP.md), shipped 2026-05-14); burrow's per-run SQLite stays untouched on either path.
 - **One host is the concurrency ceiling.** Sandboxes run inside the warren container; horizontal scale-out across machines isn't a V1 feature.
 
 ## Where this is going
@@ -215,7 +218,7 @@ Documented in [SPEC §11.D](SPEC.md#11d-v1-security-posture-known-limitations) a
 The org-readiness cluster recorded in [SPEC §11.J](SPEC.md#11j-org-readiness-direction-2026-05-11) is the active direction — the seams to extend warren from "one team, one box" to "50-engineer org, their own infra":
 
 - **Remote sandbox workers** ([R-12](ROADMAP.md)) — one warren dispatching across many runtime workers; lifts the single-host ceiling. Runtime-side protocol design is in flight as `burrow-c47a`.
-- **Bring-your-own database** ([R-13](ROADMAP.md)) — `WARREN_DB_URL` with Postgres as a first-class backend alongside SQLite, so org state lives where the SRE team can operate it.
+- **Bring-your-own database** ([R-13](ROADMAP.md), shipped) — `WARREN_DB_URL` selects SQLite (default) or Postgres; SREs can attach warren to their managed Postgres instead of a docker volume. One-shot porter: `warren db migrate-to-postgres --from <sqlite> --to <pg-url>`.
 - **SSO / per-user identity** ([R-09](ROADMAP.md)) — OIDC login replacing the shared bearer; the bearer stays as a service-account path for CI.
 - **MCP support** ([R-15](ROADMAP.md)) — agents declare `mcp_servers` in their prompt frontmatter; warren plumbs credentials into the sandbox.
 - **Cross-project activity UI + stable OpenAPI** ([R-14](ROADMAP.md)) — a "what is every agent doing right now" view, plus a versioned API contract so teams can build their own dashboards.

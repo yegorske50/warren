@@ -946,7 +946,7 @@ behaves exactly like today (`burrow.sock` over a unix socket).
 ---
 
 ## R-13 — Bring-your-own database (Postgres backend)
-Status: [proposed]
+Status: [shipped] (2026-05-14, plan `pl-f17e`)
 Depends on: — (independent; uses Drizzle's existing dialect abstraction)
 Unlocks: SREs operating warren state in their org's existing managed
 Postgres rather than a docker volume; org-scale deploy stories
@@ -960,25 +960,56 @@ for what their engineers ran when. The fact that Drizzle is already the
 ORM (§6) makes this swappable at the storage layer rather than a
 rewrite.
 
-**Sketch.** `WARREN_DB_URL` env var. If unset (or `sqlite:///data/warren.db`),
-warren behaves as today. If a Postgres URL (`postgres://...`), warren
-uses `drizzle-orm/node-postgres` and runs Postgres-dialect migrations.
-Burrow's own SQLite stays per-worker — that's run-local sandbox state,
-not org truth, and the boundary is already clean. Audit the schema for
-SQLite-isms (no `WITHOUT ROWID`, no SQLite-specific JSON ops, careful
-with text-as-enum) and have Drizzle Kit emit both dialects from one
-schema file.
+**Shipped shape (2026-05-14, plan `pl-f17e`).** `WARREN_DB_URL` selects
+the backend at boot:
+- unset or `sqlite:`/`file:`/bare path / `:memory:` → `bun:sqlite` (today's
+  path, zero-config home-server default; the legacy `WARREN_DB_PATH` env
+  var is synthesized into a `sqlite://` URL when `WARREN_DB_URL` is unset);
+- `postgres://` / `postgresql://` → `drizzle-orm/node-postgres` with a
+  `WARREN_DB_POOL_MAX` knob (default 10).
 
-**Open questions.**
-- Connection pooling shape — Drizzle's default `node-postgres` Pool with
-  `WARREN_DB_POOL_MAX` knob, or PgBouncer assumed in front? Default pool
-  for V2 of this item; document the PgBouncer path.
-- Migration story for existing SQLite users. Probably: ship a
+Schema split into a shared `src/db/schema/columns.ts` constants module
+plus parallel `src/db/schema/sqlite.ts` and `src/db/schema/postgres.ts`
+table declarations. JSON columns map to `text({ mode: 'json' })` on
+SQLite and `jsonb` on Postgres; text-enums stay TEXT in both (TS-only
+narrowing, no SQL CHECK — `mx-2ab984`). Postgres migrations were
+regenerated from scratch as a single `0000_init` against the pg
+schema and live under `src/db/migrations/postgres/` with their own
+`meta/_journal.json`; per-dialect drizzle configs
+(`drizzle.config.sqlite.ts`, `drizzle.config.postgres.ts`) keep
+generation lockstep. Burrow's per-worker SQLite is untouched — that's
+run-local sandbox state, not org truth, and the warren↔burrow boundary
+is already clean (warren talks to burrow over HTTP-over-unix-socket,
+never reaches into burrow's DB).
+
+The repo layer is async-first (every method on the 7 repos returns
+`Promise<T>`); the SQLite path wraps `bun:sqlite`'s sync `.run/.get/.all`
+in `Promise.resolve` so existing behavior is preserved while the pg
+path uses native async drivers. Test substrate: env-gated
+`WARREN_TEST_PG_URL` + `WARREN_TEST_DIALECT=postgres` (pglite /
+testcontainers deferred); each `withDb()` call provisions a fresh
+`warren_test_<8hex>` Postgres schema via the `search_path` startup
+option and drops it on close.
+
+**Resolved open questions.**
+- *Connection pooling shape.* Shipped Drizzle's default `node-postgres`
+  Pool with a `WARREN_DB_POOL_MAX` knob. PgBouncer (transaction-pool
+  mode) is the recommended production path; documented in
+  `.env.example` and SPEC §10.
+- *Migration story for existing SQLite users.* Shipped
   `warren db migrate-to-postgres --from <sqlite-path> --to <pg-url>`
-  one-shot tool, not an in-place online migration.
-- What about MySQL? Drizzle supports it. Decision: Postgres only for V2;
-  MySQL as a follow-up if a real consumer asks. Keep the dialect
-  abstraction clean so it's a config change, not a code change.
+  as a one-shot porter (plan step 8, seed `warren-14ac`). FK-ordered
+  walk, idempotent re-runs, advances the `events.id` sequence after
+  bulk insert (`mx-e431d9`).
+- *MySQL?* Out of scope. Postgres only; MySQL is a follow-up if a real
+  consumer asks. The shared-columns / parallel-tables abstraction keeps
+  it a config change, not a code change.
+
+**Acceptance.** Acceptance scenario 19 (`19-warren-on-postgres.ts`,
+seed `warren-480a`) dispatches a run end-to-end against a Postgres
+backend, streams events, restarts warren mid-stream, and verifies
+event resume from `MAX(events.burrow_event_seq)+1` works the same as
+on SQLite (SPEC §9 restart-recovery contract).
 
 ---
 
@@ -1507,10 +1538,13 @@ R-09 is repromoted and R-12 through R-18 are slotted in.
     concurrency ceiling that prevents real org adoption. Warren-side
     work (worker registry + dispatch routing) is parallelizable with the
     burrow-side protocol design.
-12. **R-13** (bring-your-own database / Postgres) — independent of R-12;
-    can land in parallel. Drizzle abstraction is already in place, so the
-    main work is dialect-auditing the schema and shipping a migration
-    tool. Highest-leverage org-readiness item per unit-of-work.
+12. **R-13** (bring-your-own database / Postgres) — **shipped 2026-05-14
+    via `pl-f17e`**. `WARREN_DB_URL` selects SQLite
+    (default) or Postgres (`drizzle-orm/node-postgres`); shared schema
+    constants + parallel dialect files; one-shot porter
+    `warren db migrate-to-postgres`; acceptance scenario 19 covers the
+    pg path end-to-end. Highest-leverage org-readiness item per
+    unit-of-work; landed first in the cluster.
 13. **R-09** (per-user identity / SSO) — repromoted from `[deferred]`.
     Independent of R-12 and R-13. Load-bearing for R-16 and R-17 — both
     need real user identity to attribute events and enforce per-user

@@ -18,6 +18,12 @@
 #   # Optional — only if you want a custom canopy agent library on top
 #   # of the built-in claude-code + sapling agents:
 #   #     fly secrets set CANOPY_REPO_URL=https://github.com/<you>/agents.git
+#   # Optional — attach a managed Postgres instead of the on-volume
+#   # SQLite (R-13, shipped 2026-05-14). Without this, warren falls back
+#   # to sqlite:///data/warren.db on the warren_data volume. Use this
+#   # path when an SRE team operates warren state in their own Postgres
+#   # (e.g., Fly Postgres, RDS, Supabase) rather than a docker volume.
+#   #     fly secrets set WARREN_DB_URL=postgres://user:pw@host/db
 #   fly deploy
 #
 # BURROW_API_TOKEN (read by `burrow serve`) and WARREN_BURROW_TOKEN
@@ -46,7 +52,10 @@ primary_region = "sjc"
 
 # Warren is single-instance: one Machine, one persistent volume. Deploys
 # bounce the supervisor (which restarts both children); the volume keeps
-# warren.db, canopy clone, and project clones across deploys.
+# warren.db (SQLite default), canopy clone, and project clones across
+# deploys. When WARREN_DB_URL points at an external Postgres, warren.db
+# is unused — the volume still holds canopy + project clones, so the
+# mount stays in place either way.
 [[services]]
   internal_port = 8080
   protocol = "tcp"
