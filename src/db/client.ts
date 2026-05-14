@@ -3,10 +3,10 @@
  *
  * `openDatabase` opens warren's durable state against either SQLite (today's
  * default, zero-config fresh-install path) or Postgres (operator opt-in via
- * `WARREN_DB_URL=postgres://...`). The pg branch lights up with the Postgres
- * migration set landed in step 4; until then `migrate()` no-ops gracefully on
- * a missing postgres migrations folder, and production boot still passes
- * `{ path }` so the sqlite branch is the only path exercised at runtime.
+ * `WARREN_DB_URL=postgres://...`). The pg migration set lives under
+ * `src/db/migrations/postgres/` (warren-373e); production boot still passes
+ * `{ path }` so the sqlite branch is the only path exercised at runtime until
+ * step 5 (warren-e2ea) widens server/main.ts onto WARREN_DB_URL.
  *
  * Two shapes share one entry point. The `{ path }` overload preserves the
  * pre-R-13 sqlite signature exactly — tests and the existing server boot path
@@ -186,11 +186,10 @@ async function openPostgres(
 
 	if (!options.skipMigrations) {
 		const folder = options.pgMigrationsFolder ?? DEFAULT_PG_MIGRATIONS_FOLDER;
-		// Step 4 populates the pg migrations folder. Until that lands, the
-		// directory may not exist on a fresh checkout. Skip-on-missing keeps
-		// the pg branch callable for integration scaffolding (step 6 test
-		// substrate; step 7 acceptance) without coupling step 3 to step 4's
-		// landing order.
+		// Skip-on-missing is here for test scaffolding that points at a temp
+		// folder it hasn't populated yet (step 6 test substrate; step 7
+		// acceptance scenarios). The default folder is populated under
+		// `src/db/migrations/postgres/` (step 4, warren-373e).
 		if (existsSync(folder)) {
 			await migratePg(db, { migrationsFolder: folder });
 		}
