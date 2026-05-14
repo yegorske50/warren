@@ -21,7 +21,7 @@ export interface UpsertAgentInput {
 export class AgentsRepo {
 	constructor(private readonly db: DrizzleDb) {}
 
-	upsert(input: UpsertAgentInput): AgentRow {
+	async upsert(input: UpsertAgentInput): Promise<AgentRow> {
 		const ts = (input.now ?? new Date()).toISOString();
 		return this.db.transaction((tx) => {
 			const existing = tx.select().from(agents).where(eq(agents.name, input.name)).get();
@@ -44,12 +44,12 @@ export class AgentsRepo {
 		});
 	}
 
-	get(name: string): AgentRow | null {
+	async get(name: string): Promise<AgentRow | null> {
 		return this.db.select().from(agents).where(eq(agents.name, name)).get() ?? null;
 	}
 
-	require(name: string): AgentRow {
-		const row = this.get(name);
+	async require(name: string): Promise<AgentRow> {
+		const row = await this.get(name);
 		if (!row) {
 			throw new NotFoundError(`agent not found: ${name}`, {
 				recoveryHint: "POST /agents/refresh to re-discover from canopy",
@@ -58,11 +58,11 @@ export class AgentsRepo {
 		return row;
 	}
 
-	listAll(): AgentRow[] {
+	async listAll(): Promise<AgentRow[]> {
 		return this.db.select().from(agents).orderBy(asc(agents.name)).all();
 	}
 
-	delete(name: string): void {
+	async delete(name: string): Promise<void> {
 		this.db.delete(agents).where(eq(agents.name, name)).run();
 	}
 }

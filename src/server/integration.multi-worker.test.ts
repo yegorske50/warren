@@ -285,7 +285,7 @@ async function boot(): Promise<Harness> {
 	const db = await openDatabase({ path: ":memory:" });
 	const repos = createRepos(db);
 
-	repos.agents.upsert({
+	await repos.agents.upsert({
 		name: "refactor-bot",
 		renderedJson: {
 			name: "refactor-bot",
@@ -298,12 +298,12 @@ async function boot(): Promise<Harness> {
 
 	const aPath = await mkdtemp(join(tmpdir(), "warren-integ-A-"));
 	const bPath = await mkdtemp(join(tmpdir(), "warren-integ-B-"));
-	const projectA = repos.projects.create({
+	const projectA = await repos.projects.create({
 		gitUrl: "https://github.com/x/a.git",
 		localPath: aPath,
 		defaultBranch: "main",
 	});
-	const projectB = repos.projects.create({
+	const projectB = await repos.projects.create({
 		gitUrl: "https://github.com/x/b.git",
 		localPath: bPath,
 		defaultBranch: "main",
@@ -315,8 +315,8 @@ async function boot(): Promise<Harness> {
 	const beta = makeStubWorker("beta", token, clock);
 
 	const pool = new BurrowClientPool({ repos });
-	repos.workers.upsert({ name: "alpha", url: "unix:///tmp/alpha.sock" });
-	repos.workers.upsert({ name: "beta", url: "unix:///tmp/beta.sock" });
+	await repos.workers.upsert({ name: "alpha", url: "unix:///tmp/alpha.sock" });
+	await repos.workers.upsert({ name: "beta", url: "unix:///tmp/beta.sock" });
 	pool.register("alpha", alpha.client);
 	pool.register("beta", beta.client);
 
@@ -356,7 +356,7 @@ async function boot(): Promise<Harness> {
 
 async function teardown(h: Harness): Promise<void> {
 	await h.handle.stop();
-	h.db.close();
+	await h.db.close();
 	await Promise.all(h.tmpdirs.map((p) => rm(p, { recursive: true, force: true })));
 }
 
@@ -406,7 +406,7 @@ describe("two-worker integration (warren-a801)", () => {
 		// affinity the alphabetical tiebreak would pick alpha; affinity must
 		// override that. This is the cleanest way to prove placeForProject is
 		// honouring `runs.mostRecentSucceededWithWorker` end-to-end.
-		const seed = h.repos.runs.create({
+		const seed = await h.repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: h.projectIds.get("A") ?? "",
 			prompt: "warm-up",
@@ -414,36 +414,36 @@ describe("two-worker integration (warren-a801)", () => {
 			trigger: "manual",
 			workerId: "beta",
 		});
-		h.repos.runs.markRunning(seed.id, new Date("2026-05-12T00:00:00Z"));
-		h.repos.runs.finalize(seed.id, "succeeded", new Date("2026-05-12T01:00:00Z"));
+		await h.repos.runs.markRunning(seed.id, new Date("2026-05-12T00:00:00Z"));
+		await h.repos.runs.finalize(seed.id, "succeeded", new Date("2026-05-12T01:00:00Z"));
 
 		// A's first HTTP-dispatched run → beta (affinity).
 		const first = await spawnViaHttp(h, "A");
 		expect(workerOf(h, first.burrowId)).toBe("beta");
-		expect(h.repos.runs.require(first.runId).workerId).toBe("beta");
+		expect((await h.repos.runs.require(first.runId)).workerId).toBe("beta");
 
 		// Finalize the run so it stops counting as load; affinity for A
 		// remains beta because that's the most recent succeeded run.
-		h.repos.runs.markRunning(first.runId);
-		h.repos.runs.finalize(first.runId, "succeeded");
+		await h.repos.runs.markRunning(first.runId);
+		await h.repos.runs.finalize(first.runId, "succeeded");
 
 		// A's second HTTP-dispatched run → beta again (affinity holds).
 		const second = await spawnViaHttp(h, "A");
 		expect(workerOf(h, second.burrowId)).toBe("beta");
-		expect(h.repos.runs.require(second.runId).workerId).toBe("beta");
+		expect((await h.repos.runs.require(second.runId)).workerId).toBe("beta");
 
 		// Leave A's second run in-flight (load=1 on beta), then spawn for
 		// project B. B has no affinity → least-loaded healthy wins. Alpha
 		// has zero in-flight; beta has one → alpha wins.
 		const third = await spawnViaHttp(h, "B");
 		expect(workerOf(h, third.burrowId)).toBe("alpha");
-		expect(h.repos.runs.require(third.runId).workerId).toBe("alpha");
+		expect((await h.repos.runs.require(third.runId)).workerId).toBe("alpha");
 
 		// `burrows.worker_id` is the source of truth for sticky-by-burrow;
 		// it must match the worker that physically holds the sandbox.
-		expect(h.repos.burrows.require(first.burrowId).workerId).toBe("beta");
-		expect(h.repos.burrows.require(second.burrowId).workerId).toBe("beta");
-		expect(h.repos.burrows.require(third.burrowId).workerId).toBe("alpha");
+		expect((await h.repos.burrows.require(first.burrowId)).workerId).toBe("beta");
+		expect((await h.repos.burrows.require(second.burrowId)).workerId).toBe("beta");
+		expect((await h.repos.burrows.require(third.burrowId)).workerId).toBe("alpha");
 	});
 
 	test("drain on the affinity worker forwards /admin/drain and the next dispatch falls through to the other worker", async () => {
@@ -451,8 +451,8 @@ describe("two-worker integration (warren-a801)", () => {
 		// alphabetical wins). Mark succeeded so alpha becomes A's affinity.
 		const first = await spawnViaHttp(h, "A");
 		expect(workerOf(h, first.burrowId)).toBe("alpha");
-		h.repos.runs.markRunning(first.runId);
-		h.repos.runs.finalize(first.runId, "succeeded");
+		await h.repos.runs.markRunning(first.runId);
+		await h.repos.runs.finalize(first.runId, "succeeded");
 
 		// Drain alpha through the admin API. The handler must forward
 		// `/admin/drain` to alpha's burrow process with the shared bearer,
@@ -460,8 +460,8 @@ describe("two-worker integration (warren-a801)", () => {
 		const drainRes = await fetch(`${tcpUrl(h.handle)}/workers/alpha/drain`, { method: "POST" });
 		expect(drainRes.status).toBe(200);
 		expect(await drainRes.json()).toEqual({ name: "alpha", state: "draining", drain: true });
-		expect(h.repos.workers.require("alpha").state).toBe("draining");
-		expect(h.repos.workers.require("beta").state).toBe("healthy");
+		expect((await h.repos.workers.require("alpha")).state).toBe("draining");
+		expect((await h.repos.workers.require("beta")).state).toBe("healthy");
 		const drainCall = h.alpha.state.calls.find((c) => c.path === "/admin/drain");
 		expect(drainCall).toBeDefined();
 		expect(drainCall?.method).toBe("POST");
@@ -474,7 +474,7 @@ describe("two-worker integration (warren-a801)", () => {
 		// beta is now the only healthy worker.
 		const second = await spawnViaHttp(h, "A");
 		expect(workerOf(h, second.burrowId)).toBe("beta");
-		expect(h.repos.runs.require(second.runId).workerId).toBe("beta");
+		expect((await h.repos.runs.require(second.runId)).workerId).toBe("beta");
 
 		// Sticky-by-burrow holds for the burrow already pinned to alpha:
 		// `GET /burrows/:id` still routes to alpha even though it is
@@ -497,8 +497,8 @@ describe("two-worker integration (warren-a801)", () => {
 		// load from second A run → beta wins least-loaded).
 		const a1 = await spawnViaHttp(h, "A");
 		expect(workerOf(h, a1.burrowId)).toBe("alpha");
-		h.repos.runs.markRunning(a1.runId);
-		h.repos.runs.finalize(a1.runId, "succeeded");
+		await h.repos.runs.markRunning(a1.runId);
+		await h.repos.runs.finalize(a1.runId, "succeeded");
 
 		// Leave a2 in-flight so beta wins least-loaded for the next dispatch
 		// to project B; otherwise both workers tie on load and alphabetical
@@ -545,7 +545,7 @@ describe("two-worker integration (warren-a801)", () => {
 		// loop would normally do this; the test mutates state directly so
 		// the failure path is deterministic). `GET /burrows/:id` for a
 		// beta-pinned burrow MUST NOT silently re-place onto alpha.
-		h.repos.workers.setState("beta", "unreachable");
+		await h.repos.workers.setState("beta", "unreachable");
 		const stickyRes = await fetch(`${tcpUrl(h.handle)}/burrows/${b1.burrowId}`);
 		const stickyBody = (await stickyRes.json()) as { error: { code: string } };
 		expect(stickyBody.error.code).toBe("sticky_worker_unreachable");

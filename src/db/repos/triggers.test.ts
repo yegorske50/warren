@@ -20,14 +20,14 @@ describe("TriggersRepo", () => {
 		projects = new ProjectsRepo(db.drizzle);
 		runs = new RunsRepo(db.drizzle);
 		repo = new TriggersRepo(db.drizzle);
-		const a = agents.upsert({ name: "refactor-bot", renderedJson: { sections: {} } });
-		const p = projects.create({
+		const a = await agents.upsert({ name: "refactor-bot", renderedJson: { sections: {} } });
+		const p = await projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
 		projectId = p.id;
-		const r = runs.create({
+		const r = await runs.create({
 			agentName: a.name,
 			projectId,
 			prompt: "p",
@@ -37,12 +37,12 @@ describe("TriggersRepo", () => {
 		runId = r.id;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("upsert composes the row id from project + trigger", () => {
-		const row = repo.upsert({
+	test("upsert composes the row id from project + trigger", async () => {
+		const row = await repo.upsert({
 			projectId,
 			triggerId: "nightly",
 			nextFireAt: "2026-05-11T00:00:00.000Z",
@@ -55,14 +55,14 @@ describe("TriggersRepo", () => {
 		expect(row.lastRunId).toBeNull();
 	});
 
-	test("upsert merges existing fields without clobbering omitted ones", () => {
-		repo.upsert({
+	test("upsert merges existing fields without clobbering omitted ones", async () => {
+		await repo.upsert({
 			projectId,
 			triggerId: "nightly",
 			lastFiredAt: "2026-05-10T00:00:00.000Z",
 			lastRunId: runId,
 		});
-		const merged = repo.upsert({
+		const merged = await repo.upsert({
 			projectId,
 			triggerId: "nightly",
 			nextFireAt: "2026-05-11T00:00:00.000Z",
@@ -72,28 +72,28 @@ describe("TriggersRepo", () => {
 		expect(merged.nextFireAt).toBe("2026-05-11T00:00:00.000Z");
 	});
 
-	test("upsert with no patch fields preserves the existing row", () => {
-		const initial = repo.upsert({
+	test("upsert with no patch fields preserves the existing row", async () => {
+		const initial = await repo.upsert({
 			projectId,
 			triggerId: "nightly",
 			nextFireAt: "2026-05-11T00:00:00.000Z",
 		});
-		const echoed = repo.upsert({ projectId, triggerId: "nightly" });
+		const echoed = await repo.upsert({ projectId, triggerId: "nightly" });
 		expect(echoed).toEqual(initial);
 	});
 
-	test("upsert accepts null to explicitly clear nextFireAt", () => {
-		repo.upsert({
+	test("upsert accepts null to explicitly clear nextFireAt", async () => {
+		await repo.upsert({
 			projectId,
 			triggerId: "nightly",
 			nextFireAt: "2026-05-11T00:00:00.000Z",
 		});
-		const cleared = repo.upsert({ projectId, triggerId: "nightly", nextFireAt: null });
+		const cleared = await repo.upsert({ projectId, triggerId: "nightly", nextFireAt: null });
 		expect(cleared.nextFireAt).toBeNull();
 	});
 
-	test("recordFire stamps lastFiredAt + lastRunId and rolls nextFireAt forward", () => {
-		const fired = repo.recordFire({
+	test("recordFire stamps lastFiredAt + lastRunId and rolls nextFireAt forward", async () => {
+		const fired = await repo.recordFire({
 			projectId,
 			triggerId: "nightly",
 			firedAt: new Date("2026-05-10T00:00:00.000Z"),
@@ -105,8 +105,8 @@ describe("TriggersRepo", () => {
 		expect(fired.lastRunId).toBe(runId);
 	});
 
-	test("recordFire accepts null nextFireAt for one-shot triggers", () => {
-		const fired = repo.recordFire({
+	test("recordFire accepts null nextFireAt for one-shot triggers", async () => {
+		const fired = await repo.recordFire({
 			projectId,
 			triggerId: "one-off",
 			firedAt: new Date("2026-05-10T00:00:00.000Z"),
@@ -116,50 +116,50 @@ describe("TriggersRepo", () => {
 		expect(fired.nextFireAt).toBeNull();
 	});
 
-	test("require throws NotFoundError for an unknown trigger", () => {
-		expect(() => repo.require({ projectId, triggerId: "missing" })).toThrow(NotFoundError);
+	test("require throws NotFoundError for an unknown trigger", async () => {
+		expect(repo.require({ projectId, triggerId: "missing" })).rejects.toThrow(NotFoundError);
 	});
 
-	test("listByProject returns triggers in stable trigger-id order", () => {
-		repo.upsert({ projectId, triggerId: "weekly" });
-		repo.upsert({ projectId, triggerId: "nightly" });
-		repo.upsert({ projectId, triggerId: "hourly" });
-		expect(repo.listByProject(projectId).map((t) => t.triggerId)).toEqual([
+	test("listByProject returns triggers in stable trigger-id order", async () => {
+		await repo.upsert({ projectId, triggerId: "weekly" });
+		await repo.upsert({ projectId, triggerId: "nightly" });
+		await repo.upsert({ projectId, triggerId: "hourly" });
+		expect((await repo.listByProject(projectId)).map((t) => t.triggerId)).toEqual([
 			"hourly",
 			"nightly",
 			"weekly",
 		]);
 	});
 
-	test("listByProject scopes by project", () => {
-		const other = projects.create({
+	test("listByProject scopes by project", async () => {
+		const other = await projects.create({
 			gitUrl: "https://github.com/x/z.git",
 			localPath: "/data/projects/x/z",
 			defaultBranch: "main",
 		});
-		repo.upsert({ projectId, triggerId: "nightly" });
-		repo.upsert({ projectId: other.id, triggerId: "nightly" });
-		expect(repo.listByProject(projectId)).toHaveLength(1);
-		expect(repo.listByProject(other.id)).toHaveLength(1);
+		await repo.upsert({ projectId, triggerId: "nightly" });
+		await repo.upsert({ projectId: other.id, triggerId: "nightly" });
+		expect(await repo.listByProject(projectId)).toHaveLength(1);
+		expect(await repo.listByProject(other.id)).toHaveLength(1);
 	});
 
-	test("delete removes the row", () => {
-		repo.upsert({ projectId, triggerId: "nightly" });
-		repo.delete({ projectId, triggerId: "nightly" });
-		expect(repo.get({ projectId, triggerId: "nightly" })).toBeNull();
+	test("delete removes the row", async () => {
+		await repo.upsert({ projectId, triggerId: "nightly" });
+		await repo.delete({ projectId, triggerId: "nightly" });
+		expect(await repo.get({ projectId, triggerId: "nightly" })).toBeNull();
 	});
 
-	test("project delete cascades to triggers (FK ON DELETE CASCADE)", () => {
-		repo.upsert({ projectId, triggerId: "nightly" });
-		repo.upsert({ projectId, triggerId: "weekly" });
-		projects.delete(projectId);
-		expect(repo.listByProject(projectId)).toEqual([]);
+	test("project delete cascades to triggers (FK ON DELETE CASCADE)", async () => {
+		await repo.upsert({ projectId, triggerId: "nightly" });
+		await repo.upsert({ projectId, triggerId: "weekly" });
+		await projects.delete(projectId);
+		expect(await repo.listByProject(projectId)).toEqual([]);
 	});
 
-	test("run delete clears lastRunId (FK ON DELETE SET NULL)", () => {
-		repo.upsert({ projectId, triggerId: "nightly", lastRunId: runId });
+	test("run delete clears lastRunId (FK ON DELETE SET NULL)", async () => {
+		await repo.upsert({ projectId, triggerId: "nightly", lastRunId: runId });
 		db.raw.exec(`DELETE FROM runs WHERE id = '${runId}'`);
-		const row = repo.require({ projectId, triggerId: "nightly" });
+		const row = await repo.require({ projectId, triggerId: "nightly" });
 		expect(row.lastRunId).toBeNull();
 	});
 });

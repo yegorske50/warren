@@ -15,8 +15,8 @@ import type { BridgeRegistry, ServeHandle, ServerDeps } from "./types.ts";
  * synthetic `local` worker row so `placeForProject` has a healthy
  * candidate.
  */
-function poolFor(repos: Repos, client: BurrowClient): BurrowClientPool {
-	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+async function poolFor(repos: Repos, client: BurrowClient): Promise<BurrowClientPool> {
+	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
 	const pool = new BurrowClientPool({ repos });
 	pool.register("local", client);
 	return pool;
@@ -104,9 +104,13 @@ function makeBurrowClient(
 	});
 }
 
-function depsFor(repos: Repos, burrowClient: BurrowClient, bridges?: BridgeRegistry): ServerDeps {
+async function depsFor(
+	repos: Repos,
+	burrowClient: BurrowClient,
+	bridges?: BridgeRegistry,
+): Promise<ServerDeps> {
 	const broker = new RunEventBroker();
-	const burrowClientPool = poolFor(repos, burrowClient);
+	const burrowClientPool = await poolFor(repos, burrowClient);
 	return {
 		repos,
 		burrowClientPool,
@@ -156,7 +160,7 @@ describe("POST /runs — spawn flow", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: {
 				name: "refactor-bot",
@@ -175,7 +179,7 @@ describe("POST /runs — spawn flow", () => {
 		const { join } = await import("node:path");
 		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-handlers-proj-"));
 
-		repos.projects.create({
+		await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: projectLocalPath,
 			defaultBranch: "main",
@@ -187,11 +191,11 @@ describe("POST /runs — spawn flow", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("provisions burrow, dispatches run, returns 201 + run id, registers a bridge", async () => {
-		const project = repos.projects.listAll()[0];
+		const project = (await repos.projects.listAll())[0];
 		if (!project) throw new Error("project missing");
 
 		// Use a real tmpdir for the burrow workspace so the handler's seed
@@ -217,7 +221,7 @@ describe("POST /runs — spawn flow", () => {
 			stopAll: async () => {},
 			size: () => bridgeStarted.length,
 		};
-		const deps = depsFor(repos, burrowClient, bridges);
+		const deps = await depsFor(repos, burrowClient, bridges);
 
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -254,7 +258,7 @@ describe("POST /runs — spawn flow", () => {
 			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -277,7 +281,7 @@ describe("POST /runs — spawn flow", () => {
 			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -305,7 +309,7 @@ describe("POST /projects/:id/refresh — git fetch + hard reset", () => {
 		const { join } = await import("node:path");
 		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-refresh-proj-"));
 
-		const row = repos.projects.create({
+		const row = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: projectLocalPath,
 			defaultBranch: "main",
@@ -318,7 +322,7 @@ describe("POST /projects/:id/refresh — git fetch + hard reset", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("refreshes the clone, stamps lastFetchedAt + lastHeadSha, returns 200", async () => {
@@ -326,7 +330,7 @@ describe("POST /projects/:id/refresh — git fetch + hard reset", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -356,7 +360,7 @@ describe("POST /projects/:id/refresh — git fetch + hard reset", () => {
 		});
 		const seenRefs: string[] = [];
 		const deps: ServerDeps = {
-			...depsFor(repos, burrowClient),
+			...(await depsFor(repos, burrowClient)),
 			spawn: async (cmd) => {
 				if (cmd[1] === "checkout") {
 					seenRefs.push(cmd[3] ?? "");
@@ -387,7 +391,7 @@ describe("POST /projects/:id/refresh — git fetch + hard reset", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -417,7 +421,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 		const { join } = await import("node:path");
 		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-wcfg-proj-"));
 
-		const row = repos.projects.create({
+		const row = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: projectLocalPath,
 			defaultBranch: "main",
@@ -430,7 +434,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("returns null fields + empty errors when .warren/ is absent", async () => {
@@ -438,7 +442,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -474,7 +478,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -511,7 +515,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -539,7 +543,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -558,7 +562,7 @@ describe("GET /projects/:id/warren-config — per-project .warren/ envelope (war
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -587,11 +591,11 @@ describe("GET /agents — listing with source provenance (warren-d3e9)", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("returns source: 'builtin' when frontmatter.source === 'builtin'", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "claude-code",
 			renderedJson: {
 				name: "claude-code",
@@ -605,7 +609,7 @@ describe("GET /agents — listing with source provenance (warren-d3e9)", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -619,7 +623,7 @@ describe("GET /agents — listing with source provenance (warren-d3e9)", () => {
 	});
 
 	test("returns source: 'library' for canopy-loaded rows (no source frontmatter)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: {
 				name: "refactor-bot",
@@ -633,7 +637,7 @@ describe("GET /agents — listing with source provenance (warren-d3e9)", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -661,7 +665,7 @@ describe("POST /agents/refresh without canopy library (warren-d3e9)", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("returns 400 with friendly hint when canopyConfig is undefined", async () => {
@@ -669,7 +673,7 @@ describe("POST /agents/refresh without canopy library (warren-d3e9)", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		// Strip canopyConfig — equivalent to booting without CANOPY_REPO_URL.
 		const noCanopyDeps: ServerDeps = {
 			repos: deps.repos,
@@ -703,20 +707,20 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "x", renderedJson: { name: "x" } });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "x", renderedJson: { name: "x" } });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "x",
 			projectId: project.id,
 			prompt: "p",
 			renderedAgentJson: { name: "x", sections: { system: "x" } },
 			trigger: "manual",
 		});
-		repos.events.append({
+		await repos.events.append({
 			runId: run.id,
 			burrowEventSeq: 1,
 			ts: "2026-05-08T12:00:00Z",
@@ -724,7 +728,7 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 			stream: "stdout",
 			payload: { tool: "bash" },
 		});
-		repos.events.append({
+		await repos.events.append({
 			runId: run.id,
 			burrowEventSeq: 2,
 			ts: "2026-05-08T12:00:01Z",
@@ -739,7 +743,7 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("non-follow returns the events as NDJSON", async () => {
@@ -747,14 +751,14 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
 			logger: silentLogger,
 		});
 
-		const run = repos.runs.listAll()[0];
+		const run = (await repos.runs.listAll())[0];
 		if (!run) throw new Error("run missing");
 		const res = await fetch(`${tcpUrl(handle)}/runs/${run.id}/events`);
 		expect(res.status).toBe(200);
@@ -775,7 +779,7 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -803,7 +807,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 		const { join } = await import("node:path");
 		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-triggers-get-"));
 
-		const row = repos.projects.create({
+		const row = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: projectLocalPath,
 			defaultBranch: "main",
@@ -816,7 +820,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("empty list + empty errors when .warren/ is absent", async () => {
@@ -824,7 +828,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -848,7 +852,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 		);
 
 		// Seed an agent + run so the scheduler row's lastRunId FK resolves.
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: {
 				name: "refactor-bot",
@@ -858,7 +862,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 				frontmatter: {},
 			},
 		});
-		const seedRun = repos.runs.create({
+		const seedRun = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId,
 			prompt: "p",
@@ -869,7 +873,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 		// Pre-populate the scheduler row so the join surfaces lastFiredAt +
 		// lastRunId. Persisted nextFireAt is intentionally stale so the
 		// freshly-computed value beats it on the wire.
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: "nightly",
 			lastFiredAt: "2026-05-09T02:00:00.000Z",
@@ -882,7 +886,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
 		const deps: ServerDeps = {
-			...depsFor(repos, burrowClient),
+			...(await depsFor(repos, burrowClient)),
 			// Freeze "now" so the recomputed nextFireAt is deterministic.
 			now: () => new Date("2026-05-10T12:00:00.000Z"),
 		};
@@ -936,7 +940,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -960,7 +964,7 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 			fetch: stub(async () => new Response("{}", { status: 200 })),
 		});
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -983,7 +987,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
 
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: {
 				name: "refactor-bot",
@@ -999,7 +1003,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 		const { join } = await import("node:path");
 		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-triggers-run-"));
 
-		const row = repos.projects.create({
+		const row = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: projectLocalPath,
 			defaultBranch: "main",
@@ -1012,7 +1016,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("dispatches the named trigger, returns 201, records fire + bridge", async () => {
@@ -1041,7 +1045,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 			size: () => bridgeStarted.length,
 		};
 		const deps: ServerDeps = {
-			...depsFor(repos, burrowClient, bridges),
+			...(await depsFor(repos, burrowClient, bridges)),
 			now: () => new Date("2026-05-10T12:00:00.000Z"),
 		};
 		handle = startServer(deps, {
@@ -1067,7 +1071,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 		expect(bridgeStarted[0]?.burrowRunId).toBe("run_zzzzzzzzzzzz");
 
 		// Triggers row stamped with manual fire + nextFireAt rolled forward.
-		const row = repos.triggers.get({ projectId, triggerId: "nightly" });
+		const row = await repos.triggers.get({ projectId, triggerId: "nightly" });
 		expect(row?.lastFiredAt).toBe("2026-05-10T12:00:00.000Z");
 		expect(row?.nextFireAt).toBe("2026-05-11T02:00:00.000Z");
 		expect(row?.lastRunId).toBe(body.run.id);
@@ -1087,7 +1091,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -1108,7 +1112,7 @@ describe("POST /projects/:id/triggers/:triggerId/run — manual Run Now (warren-
 			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, burrowClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,

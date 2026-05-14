@@ -40,7 +40,7 @@ export class WorkersRepo {
 	 * one — config-driven reloads (step 7) omit `state` so the probe loop
 	 * (step 6) stays the source of truth for liveness.
 	 */
-	upsert(input: UpsertWorkerInput): WorkerRow {
+	async upsert(input: UpsertWorkerInput): Promise<WorkerRow> {
 		return this.db.transaction((tx) => {
 			const existing = tx.select().from(workers).where(eq(workers.name, input.name)).get();
 			if (existing) {
@@ -60,17 +60,17 @@ export class WorkersRepo {
 		});
 	}
 
-	setState(name: string, state: WorkerState): WorkerRow {
+	async setState(name: string, state: WorkerState): Promise<WorkerRow> {
 		this.db.update(workers).set({ state }).where(eq(workers.name, name)).run();
 		return this.require(name);
 	}
 
-	get(name: string): WorkerRow | null {
+	async get(name: string): Promise<WorkerRow | null> {
 		return this.db.select().from(workers).where(eq(workers.name, name)).get() ?? null;
 	}
 
-	require(name: string): WorkerRow {
-		const row = this.get(name);
+	async require(name: string): Promise<WorkerRow> {
+		const row = await this.get(name);
 		if (!row) {
 			throw new NotFoundError(`worker not found: ${name}`, {
 				recoveryHint: "GET /workers to list known names",
@@ -79,11 +79,11 @@ export class WorkersRepo {
 		return row;
 	}
 
-	listAll(): WorkerRow[] {
+	async listAll(): Promise<WorkerRow[]> {
 		return this.db.select().from(workers).orderBy(asc(workers.name)).all();
 	}
 
-	delete(name: string): void {
+	async delete(name: string): Promise<void> {
 		this.db.delete(workers).where(eq(workers.name, name)).run();
 	}
 }

@@ -46,7 +46,7 @@ export class TriggersRepo {
 	 * across many ticks without disturbing last-fired-at / last-run-id from
 	 * the most recent dispatch.
 	 */
-	upsert(input: UpsertTriggerInput): TriggerRow {
+	async upsert(input: UpsertTriggerInput): Promise<TriggerRow> {
 		return this.db.transaction((tx) => {
 			const id = makeTriggerRowId(input.projectId, input.triggerId);
 			const existing = tx.select().from(triggers).where(eq(triggers.id, id)).get();
@@ -79,7 +79,7 @@ export class TriggersRepo {
 	 * row (no half-state where the run is recorded but next-fire still
 	 * points at the past).
 	 */
-	recordFire(input: RecordFireInput): TriggerRow {
+	async recordFire(input: RecordFireInput): Promise<TriggerRow> {
 		return this.upsert({
 			projectId: input.projectId,
 			triggerId: input.triggerId,
@@ -89,13 +89,13 @@ export class TriggersRepo {
 		});
 	}
 
-	get(key: TriggerKey): TriggerRow | null {
+	async get(key: TriggerKey): Promise<TriggerRow | null> {
 		const id = makeTriggerRowId(key.projectId, key.triggerId);
 		return this.db.select().from(triggers).where(eq(triggers.id, id)).get() ?? null;
 	}
 
-	require(key: TriggerKey): TriggerRow {
-		const row = this.get(key);
+	async require(key: TriggerKey): Promise<TriggerRow> {
+		const row = await this.get(key);
 		if (!row) {
 			throw new NotFoundError(
 				`trigger not found: ${makeTriggerRowId(key.projectId, key.triggerId)}`,
@@ -104,7 +104,7 @@ export class TriggersRepo {
 		return row;
 	}
 
-	listByProject(projectId: string): TriggerRow[] {
+	async listByProject(projectId: string): Promise<TriggerRow[]> {
 		return this.db
 			.select()
 			.from(triggers)
@@ -113,7 +113,7 @@ export class TriggersRepo {
 			.all();
 	}
 
-	listAll(): TriggerRow[] {
+	async listAll(): Promise<TriggerRow[]> {
 		return this.db
 			.select()
 			.from(triggers)
@@ -121,7 +121,7 @@ export class TriggersRepo {
 			.all();
 	}
 
-	delete(key: TriggerKey): void {
+	async delete(key: TriggerKey): Promise<void> {
 		const id = makeTriggerRowId(key.projectId, key.triggerId);
 		this.db.delete(triggers).where(eq(triggers.id, id)).run();
 	}

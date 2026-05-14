@@ -87,13 +87,13 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const fileConfig = await loadWarrenServerConfigFromFile({ env });
 	const burrowClientPool =
 		fileConfig.workers.length > 0
-			? BurrowClientPool.fromConfig({
+			? await BurrowClientPool.fromConfig({
 					repos,
 					workers: fileConfig.workers,
 					token: requireSharedBurrowToken(env),
 					...(opts.now !== undefined ? { now: opts.now } : {}),
 				})
-			: BurrowClientPool.fromEnv({
+			: await BurrowClientPool.fromEnv({
 					env,
 					repos,
 					...(opts.now !== undefined ? { now: opts.now } : {}),
@@ -114,7 +114,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	// Seed built-in agents (warren-d3e9). Idempotent: existing rows
 	// (whether seeded by an earlier boot or upserted by a refresh of a
 	// same-named library agent) are preserved.
-	const seedResult = seedBuiltinAgents(repos.agents, undefined, opts.now);
+	const seedResult = await seedBuiltinAgents(repos.agents, undefined, opts.now);
 	if (seedResult.seeded.length > 0) {
 		logger.info({ agents: seedResult.seeded }, "seeded built-in agents");
 	}
@@ -127,7 +127,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
-	const bridgesBoot = bootBridges({
+	const bridgesBoot = await bootBridges({
 		repos,
 		broker,
 		burrowClientPool,
@@ -252,7 +252,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			await workerProbe.stop();
 			await bridgesBoot.registry.stopAll();
 			await burrowClientPool.close();
-			closeDatabase(db);
+			await closeDatabase(db);
 		},
 	};
 }
@@ -301,9 +301,9 @@ const defaultSpawn: SpawnFn = async (
 	return { stdout, stderr, exitCode: exitCode ?? 0 };
 };
 
-function closeDatabase(db: WarrenDb): void {
+async function closeDatabase(db: WarrenDb): Promise<void> {
 	try {
-		db.close();
+		await db.close();
 	} catch {
 		// Closing twice during a panicked shutdown is fine.
 	}

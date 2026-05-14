@@ -15,13 +15,13 @@ describe("EventsRepo", () => {
 		const agents = new AgentsRepo(db.drizzle);
 		const projects = new ProjectsRepo(db.drizzle);
 		const runs = new RunsRepo(db.drizzle);
-		agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = projects.create({
+		await agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = runs.create({
+		const run = await runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "x",
@@ -32,8 +32,8 @@ describe("EventsRepo", () => {
 		events = new EventsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	function append(seq: number, kind = "text", stream: "stdout" | "stderr" | "system" = "stdout") {
@@ -47,63 +47,65 @@ describe("EventsRepo", () => {
 		});
 	}
 
-	test("append returns the inserted row with an autoincrement id and parsed payload", () => {
-		const row = append(1);
+	test("append returns the inserted row with an autoincrement id and parsed payload", async () => {
+		const row = await append(1);
 		expect(row.id).toBeGreaterThan(0);
 		expect(row.runId).toBe(runId);
 		expect(row.burrowEventSeq).toBe(1);
 		expect(row.payloadJson).toEqual({ seq: 1 });
 	});
 
-	test("listByRun returns events ordered by burrow_event_seq", () => {
-		append(3);
-		append(1);
-		append(2);
-		const got = events.listByRun(runId).map((e) => e.burrowEventSeq);
+	test("listByRun returns events ordered by burrow_event_seq", async () => {
+		await append(3);
+		await append(1);
+		await append(2);
+		const got = (await events.listByRun(runId)).map((e) => e.burrowEventSeq);
 		expect(got).toEqual([1, 2, 3]);
 	});
 
-	test("listByRun({ sinceSeq }) excludes events at or below the cursor", () => {
-		append(1);
-		append(2);
-		append(3);
-		const got = events.listByRun(runId, { sinceSeq: 1 }).map((e) => e.burrowEventSeq);
+	test("listByRun({ sinceSeq }) excludes events at or below the cursor", async () => {
+		await append(1);
+		await append(2);
+		await append(3);
+		const got = (await events.listByRun(runId, { sinceSeq: 1 })).map((e) => e.burrowEventSeq);
 		expect(got).toEqual([2, 3]);
 	});
 
-	test("listByRun({ limit }) caps the page size", () => {
-		for (let i = 1; i <= 10; i++) append(i);
-		expect(events.listByRun(runId, { limit: 3 }).map((e) => e.burrowEventSeq)).toEqual([1, 2, 3]);
+	test("listByRun({ limit }) caps the page size", async () => {
+		for (let i = 1; i <= 10; i++) await append(i);
+		expect((await events.listByRun(runId, { limit: 3 })).map((e) => e.burrowEventSeq)).toEqual([
+			1, 2, 3,
+		]);
 	});
 
-	test("listTail returns the last N in seq-ascending order", () => {
-		for (let i = 1; i <= 5; i++) append(i);
-		expect(events.listTail(runId, 2).map((e) => e.burrowEventSeq)).toEqual([4, 5]);
+	test("listTail returns the last N in seq-ascending order", async () => {
+		for (let i = 1; i <= 5; i++) await append(i);
+		expect((await events.listTail(runId, 2)).map((e) => e.burrowEventSeq)).toEqual([4, 5]);
 	});
 
-	test("listTail with limit <= 0 returns []", () => {
-		append(1);
-		expect(events.listTail(runId, 0)).toEqual([]);
-		expect(events.listTail(runId, -1)).toEqual([]);
+	test("listTail with limit <= 0 returns []", async () => {
+		await append(1);
+		expect(await events.listTail(runId, 0)).toEqual([]);
+		expect(await events.listTail(runId, -1)).toEqual([]);
 	});
 
-	test("maxSeqForRun returns null when no events exist, else the max seq", () => {
-		expect(events.maxSeqForRun(runId)).toBeNull();
-		append(1);
-		append(7);
-		append(3);
-		expect(events.maxSeqForRun(runId)).toBe(7);
+	test("maxSeqForRun returns null when no events exist, else the max seq", async () => {
+		expect(await events.maxSeqForRun(runId)).toBeNull();
+		await append(1);
+		await append(7);
+		await append(3);
+		expect(await events.maxSeqForRun(runId)).toBe(7);
 	});
 
-	test("countByRun reports the row count", () => {
-		expect(events.countByRun(runId)).toBe(0);
-		append(1);
-		append(2);
-		expect(events.countByRun(runId)).toBe(2);
+	test("countByRun reports the row count", async () => {
+		expect(await events.countByRun(runId)).toBe(0);
+		await append(1);
+		await append(2);
+		expect(await events.countByRun(runId)).toBe(2);
 	});
 
-	test("nullable stream column round-trips as null", () => {
-		const row = events.append({
+	test("nullable stream column round-trips as null", async () => {
+		const row = await events.append({
 			runId,
 			burrowEventSeq: 1,
 			ts: "2026-05-08T12:00:00.000Z",

@@ -97,7 +97,7 @@ export async function runInit(
 	args: InitArgs,
 ): Promise<InitResult> {
 	try {
-		const targetDir = resolveTargetDir(deps, args);
+		const targetDir = await resolveTargetDir(deps, args);
 		const warrenDir = join(targetDir, WARREN_CONFIG_DIR);
 		const triggersAbs = join(warrenDir, WARREN_CONFIG_FILES.triggers);
 		const defaultsAbs = join(warrenDir, WARREN_CONFIG_FILES.defaults);
@@ -115,7 +115,7 @@ export async function runInit(
 			);
 		}
 
-		const defaults = resolveDefaults(deps, args);
+		const defaults = await resolveDefaults(deps, args);
 		const defaultsJson = `${JSON.stringify(defaults, null, 2)}\n`;
 
 		await mkdir(warrenDir, { recursive: true });
@@ -137,7 +137,7 @@ export async function runInit(
 	}
 }
 
-function resolveTargetDir(deps: InitDeps, args: InitArgs): string {
+async function resolveTargetDir(deps: InitDeps, args: InitArgs): Promise<string> {
 	if (args.mode === "cwd") {
 		const cwd = args.cwd;
 		if (cwd === "") {
@@ -149,7 +149,7 @@ function resolveTargetDir(deps: InitDeps, args: InitArgs): string {
 		}
 		return abs;
 	}
-	const row = deps.projects.get(args.projectId);
+	const row = await deps.projects.get(args.projectId);
 	if (row === null) {
 		throw new NotFoundError(`project not found: ${args.projectId}`);
 	}
@@ -161,11 +161,11 @@ function resolveTargetDir(deps: InitDeps, args: InitArgs): string {
 	return row.localPath;
 }
 
-function resolveDefaults(deps: InitDeps, args: InitArgs): DefaultsConfig {
+async function resolveDefaults(deps: InitDeps, args: InitArgs): Promise<DefaultsConfig> {
 	const candidate: Record<string, string> = {};
 	const explicit = args.defaultRole;
 	if (explicit !== undefined && explicit !== "") {
-		const agent = deps.agents.get(explicit);
+		const agent = await deps.agents.get(explicit);
 		if (agent === null) {
 			throw new ValidationError(`unknown agent: ${explicit}`, {
 				recoveryHint: "run `warren register-agent <name>` first, or omit --default-role",
@@ -176,7 +176,7 @@ function resolveDefaults(deps: InitDeps, args: InitArgs): DefaultsConfig {
 		// No explicit pick — auto-fill only when there's exactly one agent
 		// registered. Multiple agents and we leave the field blank so the
 		// operator picks at edit time (the schema accepts empty defaults).
-		const agents = deps.agents.listAll();
+		const agents = await deps.agents.listAll();
 		if (agents.length === 1) {
 			const only = agents[0];
 			if (only !== undefined) {

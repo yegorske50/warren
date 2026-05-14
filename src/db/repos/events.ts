@@ -23,7 +23,7 @@ export interface AppendEventInput {
 export class EventsRepo {
 	constructor(private readonly db: DrizzleDb) {}
 
-	append(input: AppendEventInput): EventRow {
+	async append(input: AppendEventInput): Promise<EventRow> {
 		return this.db
 			.insert(events)
 			.values({
@@ -38,7 +38,10 @@ export class EventsRepo {
 			.get();
 	}
 
-	listByRun(runId: string, opts: { sinceSeq?: number; limit?: number } = {}): EventRow[] {
+	async listByRun(
+		runId: string,
+		opts: { sinceSeq?: number; limit?: number } = {},
+	): Promise<EventRow[]> {
 		const where =
 			opts.sinceSeq !== undefined
 				? and(eq(events.runId, runId), gt(events.burrowEventSeq, opts.sinceSeq))
@@ -52,7 +55,7 @@ export class EventsRepo {
 	 * within the window). Powers the UI's "tail buffer" — `listByRun({limit})`
 	 * returns the FIRST N which is the wrong end for live tail.
 	 */
-	listTail(runId: string, limit: number): EventRow[] {
+	async listTail(runId: string, limit: number): Promise<EventRow[]> {
 		if (limit <= 0) return [];
 		const rows = this.db
 			.select()
@@ -69,7 +72,7 @@ export class EventsRepo {
 	 * Used at warren startup to compute the resume offset for live runs
 	 * (SPEC §9 "MAX(events.burrow_event_seq) + 1").
 	 */
-	maxSeqForRun(runId: string): number | null {
+	async maxSeqForRun(runId: string): Promise<number | null> {
 		const row = this.db
 			.select({ max: sql<number | null>`max(${events.burrowEventSeq})` })
 			.from(events)
@@ -78,7 +81,7 @@ export class EventsRepo {
 		return row?.max ?? null;
 	}
 
-	countByRun(runId: string): number {
+	async countByRun(runId: string): Promise<number> {
 		const row = this.db
 			.select({ n: sql<number>`count(*)` })
 			.from(events)

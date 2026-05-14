@@ -12,13 +12,13 @@ describe("AgentsRepo", () => {
 		repo = new AgentsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("upsert inserts a new row with both timestamps equal", () => {
+	test("upsert inserts a new row with both timestamps equal", async () => {
 		const now = new Date("2026-05-08T12:00:00.000Z");
-		const row = repo.upsert({
+		const row = await repo.upsert({
 			name: "refactor-bot",
 			renderedJson: { sections: { system: "..." } },
 			now,
@@ -29,31 +29,31 @@ describe("AgentsRepo", () => {
 		expect(row.renderedJson).toEqual({ sections: { system: "..." } });
 	});
 
-	test("upsert on an existing row preserves registeredAt and bumps lastRefreshed", () => {
+	test("upsert on an existing row preserves registeredAt and bumps lastRefreshed", async () => {
 		const t0 = new Date("2026-05-08T12:00:00.000Z");
 		const t1 = new Date("2026-05-09T12:00:00.000Z");
-		repo.upsert({ name: "refactor-bot", renderedJson: { v: 1 }, now: t0 });
-		const row = repo.upsert({ name: "refactor-bot", renderedJson: { v: 2 }, now: t1 });
+		await repo.upsert({ name: "refactor-bot", renderedJson: { v: 1 }, now: t0 });
+		const row = await repo.upsert({ name: "refactor-bot", renderedJson: { v: 2 }, now: t1 });
 		expect(row.registeredAt).toBe(t0.toISOString());
 		expect(row.lastRefreshed).toBe(t1.toISOString());
 		expect(row.renderedJson).toEqual({ v: 2 });
 	});
 
-	test("get returns null for unknown names; require throws NotFoundError", () => {
-		expect(repo.get("missing")).toBeNull();
-		expect(() => repo.require("missing")).toThrow(NotFoundError);
+	test("get returns null for unknown names; require throws NotFoundError", async () => {
+		expect(await repo.get("missing")).toBeNull();
+		expect(repo.require("missing")).rejects.toThrow(NotFoundError);
 	});
 
-	test("listAll returns rows alphabetically by name", () => {
-		repo.upsert({ name: "zebra", renderedJson: {} });
-		repo.upsert({ name: "alpha", renderedJson: {} });
-		repo.upsert({ name: "mango", renderedJson: {} });
-		expect(repo.listAll().map((r) => r.name)).toEqual(["alpha", "mango", "zebra"]);
+	test("listAll returns rows alphabetically by name", async () => {
+		await repo.upsert({ name: "zebra", renderedJson: {} });
+		await repo.upsert({ name: "alpha", renderedJson: {} });
+		await repo.upsert({ name: "mango", renderedJson: {} });
+		expect((await repo.listAll()).map((r) => r.name)).toEqual(["alpha", "mango", "zebra"]);
 	});
 
-	test("delete removes the row", () => {
-		repo.upsert({ name: "refactor-bot", renderedJson: {} });
-		repo.delete("refactor-bot");
-		expect(repo.get("refactor-bot")).toBeNull();
+	test("delete removes the row", async () => {
+		await repo.upsert({ name: "refactor-bot", renderedJson: {} });
+		await repo.delete("refactor-bot");
+		expect(await repo.get("refactor-bot")).toBeNull();
 	});
 });

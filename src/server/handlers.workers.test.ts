@@ -62,17 +62,17 @@ function makeAdminClient(opts: {
 	});
 }
 
-function poolWith(
+async function poolWith(
 	repos: Repos,
 	workers: readonly {
 		name: string;
 		client: BurrowClient;
 		state?: "healthy" | "draining" | "unreachable";
 	}[],
-): BurrowClientPool {
+): Promise<BurrowClientPool> {
 	const pool = new BurrowClientPool({ repos });
 	for (const w of workers) {
-		repos.workers.upsert({
+		await repos.workers.upsert({
 			name: w.name,
 			url: `unix:///tmp/${w.name}.sock`,
 			...(w.state !== undefined ? { state: w.state } : {}),
@@ -120,21 +120,21 @@ describe("GET /workers", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("returns the full workers table with registration flag", async () => {
 		const calls: AdminCall[] = [];
 		const alpha = makeAdminClient({ calls });
 		const beta = makeAdminClient({ calls });
-		const pool = poolWith(repos, [
+		const pool = await poolWith(repos, [
 			{ name: "alpha", client: alpha },
 			{ name: "beta", client: beta, state: "draining" },
 		]);
 		// Add a row that's in the workers table but not in the pool — simulates
 		// drift between `[workers]` config and pool registration so the
 		// operator-facing list shows registered=false.
-		repos.workers.upsert({ name: "ghost", url: "unix:///tmp/ghost.sock" });
+		await repos.workers.upsert({ name: "ghost", url: "unix:///tmp/ghost.sock" });
 
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -185,13 +185,13 @@ describe("POST /workers/:name/drain", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("default body drains the worker: forwards /admin/drain and flips state to draining", async () => {
 		const calls: AdminCall[] = [];
 		const alpha = makeAdminClient({ calls });
-		const pool = poolWith(repos, [{ name: "alpha", client: alpha }]);
+		const pool = await poolWith(repos, [{ name: "alpha", client: alpha }]);
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -201,7 +201,7 @@ describe("POST /workers/:name/drain", () => {
 		const res = await fetch(`${tcpUrl(handle)}/workers/alpha/drain`, { method: "POST" });
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ name: "alpha", state: "draining", drain: true });
-		expect(repos.workers.require("alpha").state).toBe("draining");
+		expect((await repos.workers.require("alpha")).state).toBe("draining");
 		expect(calls).toHaveLength(1);
 		const call = calls[0];
 		if (!call) throw new Error("expected one admin call");
@@ -214,7 +214,7 @@ describe("POST /workers/:name/drain", () => {
 	test("`{drain: false}` un-drains: forwards drain=false and flips state to healthy", async () => {
 		const calls: AdminCall[] = [];
 		const alpha = makeAdminClient({ calls });
-		const pool = poolWith(repos, [{ name: "alpha", client: alpha, state: "draining" }]);
+		const pool = await poolWith(repos, [{ name: "alpha", client: alpha, state: "draining" }]);
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -228,14 +228,14 @@ describe("POST /workers/:name/drain", () => {
 		});
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ name: "alpha", state: "healthy", drain: false });
-		expect(repos.workers.require("alpha").state).toBe("healthy");
+		expect((await repos.workers.require("alpha")).state).toBe("healthy");
 		expect(calls[0]?.body).toEqual({ drain: false });
 	});
 
 	test("404 when warren has no row for the named worker", async () => {
 		const calls: AdminCall[] = [];
 		const alpha = makeAdminClient({ calls });
-		const pool = poolWith(repos, [{ name: "alpha", client: alpha }]);
+		const pool = await poolWith(repos, [{ name: "alpha", client: alpha }]);
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -256,7 +256,7 @@ describe("POST /workers/:name/drain", () => {
 					error: { code: "not_found", message: "no route matches /admin/drain" },
 				}),
 		});
-		const pool = poolWith(repos, [{ name: "alpha", client: alpha }]);
+		const pool = await poolWith(repos, [{ name: "alpha", client: alpha }]);
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -265,13 +265,13 @@ describe("POST /workers/:name/drain", () => {
 
 		const res = await fetch(`${tcpUrl(handle)}/workers/alpha/drain`, { method: "POST" });
 		expect(res.status).toBe(404);
-		expect(repos.workers.require("alpha").state).toBe("healthy");
+		expect((await repos.workers.require("alpha")).state).toBe("healthy");
 	});
 
 	test("400 when `drain` body field is not a boolean", async () => {
 		const calls: AdminCall[] = [];
 		const alpha = makeAdminClient({ calls });
-		const pool = poolWith(repos, [{ name: "alpha", client: alpha }]);
+		const pool = await poolWith(repos, [{ name: "alpha", client: alpha }]);
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,

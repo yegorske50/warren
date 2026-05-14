@@ -170,13 +170,13 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 		else input.signal.addEventListener("abort", onAbort, { once: true });
 	}
 
-	const resumeSeq = repos.events.maxSeqForRun(runId) ?? 0;
+	const resumeSeq = (await repos.events.maxSeqForRun(runId)) ?? 0;
 	// warren-c0c9: route the stream poll through the worker that owns this
 	// burrow. The source override (tests) bypasses the pool entirely.
 	const sourceClient =
 		input.source !== undefined
 			? null
-			: input.burrowClientPool.clientFor({ burrowId: input.burrowId }).client;
+			: (await input.burrowClientPool.clientFor({ burrowId: input.burrowId })).client;
 	const source = input.source ?? defaultSource(sourceClient as BurrowClient, burrowRunId);
 
 	let written = 0;
@@ -199,7 +199,7 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 		for await (const event of source(ctrl.signal)) {
 			if (ctrl.signal.aborted) break;
 			if (!claimed) {
-				const claimedRun = repos.runs.claimById(runId);
+				const claimedRun = await repos.runs.claimById(runId);
 				if (claimedRun !== null) {
 					input.logger?.info?.({ runId, burrowRunId }, "bridge transitioned run queued → running");
 				}
@@ -219,7 +219,7 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 				skipped += 1;
 				continue;
 			}
-			const row = repos.events.append({
+			const row = await repos.events.append({
 				runId,
 				burrowEventSeq: event.seq,
 				ts: toIsoString(event.ts),
@@ -245,7 +245,7 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 						logger: input.logger,
 					});
 				} else {
-					persistInStreamPiUsage({
+					await persistInStreamPiUsage({
 						usage: piUsage,
 						runId,
 						burrowRunId,
@@ -488,7 +488,7 @@ async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<void> {
 		tokensCacheWrite: terminal.tokensCacheWrite - base.tokensCacheWrite,
 	};
 	try {
-		input.repos.runs.attachStats(input.runId, delta);
+		await input.repos.runs.attachStats(input.runId, delta);
 		input.logger?.info?.(
 			{
 				runId: input.runId,
@@ -603,10 +603,10 @@ interface PersistInStreamUsageInput {
  * claude-code. attachStats throws on storage errors; we log + swallow
  * to match the PiStatsClient path's best-effort posture.
  */
-function persistInStreamPiUsage(input: PersistInStreamUsageInput): void {
+async function persistInStreamPiUsage(input: PersistInStreamUsageInput): Promise<void> {
 	if (!input.usage.seen) return;
 	try {
-		input.repos.runs.attachStats(input.runId, {
+		await input.repos.runs.attachStats(input.runId, {
 			costUsd: input.usage.costUsd,
 			tokensInput: input.usage.tokensInput,
 			tokensOutput: input.usage.tokensOutput,
@@ -671,12 +671,12 @@ export interface RecoverActiveRunStreamsResult {
  * never landed) which the spawn flow's rollback should already have
  * cancelled. Surfaced in `skipped` so the operator sees them.
  */
-export function recoverActiveRunStreams(
+export async function recoverActiveRunStreams(
 	input: RecoverActiveRunStreamsInput,
-): RecoverActiveRunStreamsResult {
+): Promise<RecoverActiveRunStreamsResult> {
 	const { repos, broker, burrowClientPool, logger } = input;
 	const bridge = input.bridge ?? bridgeRunStream;
-	const candidates = repos.runs.listByState(["queued", "running"]);
+	const candidates = await repos.runs.listByState(["queued", "running"]);
 
 	const bridges: ActiveBridge[] = [];
 	const skipped: { runId: string; reason: "no_burrow_run_id" | "no_burrow_id" }[] = [];

@@ -216,7 +216,7 @@ export async function runProbeTick(input: RunProbeTickInput): Promise<WorkerProb
 	const transitions: WorkerProbeTransition[] = [];
 
 	for (const probe of probes) {
-		const row = input.workers.get(probe.workerName);
+		const row = await input.workers.get(probe.workerName);
 		if (row === null) {
 			input.logger?.warn?.({ workerName: probe.workerName }, "worker_probe.missing_row");
 			continue;
@@ -229,7 +229,7 @@ export async function runProbeTick(input: RunProbeTickInput): Promise<WorkerProb
 		const next: WorkerState = probe.ok ? "healthy" : "unreachable";
 		if (next === row.state) continue;
 
-		input.workers.setState(probe.workerName, next);
+		await input.workers.setState(probe.workerName, next);
 		const transition: WorkerProbeTransition = {
 			workerName: probe.workerName,
 			from: row.state,

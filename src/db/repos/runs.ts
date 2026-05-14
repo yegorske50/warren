@@ -73,7 +73,7 @@ export interface AttachStatsInput {
 export class RunsRepo {
 	constructor(private readonly db: DrizzleDb) {}
 
-	create(input: CreateRunInput): RunRow {
+	async create(input: CreateRunInput): Promise<RunRow> {
 		const row: RunRow = {
 			id: input.id ?? generateId("run"),
 			agentName: input.agentName,
@@ -99,17 +99,17 @@ export class RunsRepo {
 		return row;
 	}
 
-	get(id: string): RunRow | null {
+	async get(id: string): Promise<RunRow | null> {
 		return this.db.select().from(runs).where(eq(runs.id, id)).get() ?? null;
 	}
 
-	require(id: string): RunRow {
-		const row = this.get(id);
+	async require(id: string): Promise<RunRow> {
+		const row = await this.get(id);
 		if (!row) throw new NotFoundError(`run not found: ${id}`);
 		return row;
 	}
 
-	listAll(limit = 100): RunRow[] {
+	async listAll(limit = 100): Promise<RunRow[]> {
 		return this.db
 			.select()
 			.from(runs)
@@ -118,7 +118,7 @@ export class RunsRepo {
 			.all();
 	}
 
-	listByProject(projectId: string, limit = 100): RunRow[] {
+	async listByProject(projectId: string, limit = 100): Promise<RunRow[]> {
 		return this.db
 			.select()
 			.from(runs)
@@ -128,7 +128,7 @@ export class RunsRepo {
 			.all();
 	}
 
-	listByAgent(agentName: string, limit = 100): RunRow[] {
+	async listByAgent(agentName: string, limit = 100): Promise<RunRow[]> {
 		return this.db
 			.select()
 			.from(runs)
@@ -138,7 +138,7 @@ export class RunsRepo {
 			.all();
 	}
 
-	listByState(state: RunState | RunState[]): RunRow[] {
+	async listByState(state: RunState | RunState[]): Promise<RunRow[]> {
 		const where = Array.isArray(state) ? inArray(runs.state, state) : eq(runs.state, state);
 		return this.db.select().from(runs).where(where).orderBy(asc(runs.id)).all();
 	}
@@ -149,7 +149,7 @@ export class RunsRepo {
 	 * second (`POST /burrows/:id/runs`), so each ID lands on a different turn.
 	 * Both fields are optional, but at least one must be set.
 	 */
-	attachBurrow(id: string, input: AttachBurrowInput): RunRow {
+	async attachBurrow(id: string, input: AttachBurrowInput): Promise<RunRow> {
 		if (
 			input.burrowId === undefined &&
 			input.burrowRunId === undefined &&
@@ -159,7 +159,7 @@ export class RunsRepo {
 				"attachBurrow requires at least one of burrowId, burrowRunId, or workerId",
 			);
 		}
-		const current = this.require(id);
+		const current = await this.require(id);
 		const patch: { burrowId?: string; burrowRunId?: string; workerId?: string } = {};
 		if (input.burrowId !== undefined) patch.burrowId = input.burrowId;
 		if (input.burrowRunId !== undefined) patch.burrowRunId = input.burrowRunId;
@@ -168,8 +168,8 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
-	markRunning(id: string, now: Date = new Date()): RunRow {
-		const current = this.require(id);
+	async markRunning(id: string, now: Date = new Date()): Promise<RunRow> {
+		const current = await this.require(id);
 		assertRunTransition(current.state, "running");
 		const patch = {
 			state: "running" as const,
@@ -179,13 +179,13 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
-	finalize(
+	async finalize(
 		id: string,
 		terminal: RunTerminalState,
 		now: Date = new Date(),
 		failureReason: RunFailureReason | null = null,
-	): RunRow {
-		const current = this.require(id);
+	): Promise<RunRow> {
+		const current = await this.require(id);
 		assertRunTransition(current.state, terminal);
 		const patch = {
 			state: terminal,
@@ -205,7 +205,7 @@ export class RunsRepo {
 	 * were supplied, matching `attachBurrow`. The columns are nullable so
 	 * non-pi runs (or pi runs whose stats RPC failed) leave them at null.
 	 */
-	attachStats(id: string, input: AttachStatsInput): RunRow {
+	async attachStats(id: string, input: AttachStatsInput): Promise<RunRow> {
 		const keys: (keyof AttachStatsInput)[] = [
 			"costUsd",
 			"tokensInput",
@@ -216,7 +216,7 @@ export class RunsRepo {
 		if (keys.every((k) => input[k] === undefined)) {
 			throw new ValidationError("attachStats requires at least one stat field");
 		}
-		const current = this.require(id);
+		const current = await this.require(id);
 		const patch: Partial<RunRow> = {};
 		for (const k of keys) {
 			if (input[k] !== undefined) {
@@ -233,8 +233,8 @@ export class RunsRepo {
 	 * `finalize` because reap fires this *before* the terminal transition
 	 * (so the URL lands on the `reap.completed` event payload too).
 	 */
-	setPrUrl(id: string, prUrl: string | null): RunRow {
-		const current = this.require(id);
+	async setPrUrl(id: string, prUrl: string | null): Promise<RunRow> {
+		const current = await this.require(id);
 		this.db.update(runs).set({ prUrl }).where(eq(runs.id, id)).run();
 		return { ...current, prUrl };
 	}
@@ -248,7 +248,7 @@ export class RunsRepo {
 	 * `endedAt` so a recent run wins over an older one even if the older
 	 * one started later in startedAt order.
 	 */
-	mostRecentSucceededWithWorker(projectId: string): RunRow | null {
+	async mostRecentSucceededWithWorker(projectId: string): Promise<RunRow | null> {
 		return (
 			this.db
 				.select()
@@ -269,7 +269,7 @@ export class RunsRepo {
 	 * unplaced) are excluded. Result is keyed by worker name; workers
 	 * with zero in-flight runs are absent (the caller defaults to 0).
 	 */
-	countInflightByWorker(): Map<string, number> {
+	async countInflightByWorker(): Promise<Map<string, number>> {
 		const rows = this.db
 			.select({
 				workerId: runs.workerId,
@@ -292,7 +292,7 @@ export class RunsRepo {
 	 * the warren-side state in sync with burrow's "the run loop just picked
 	 * this up" observation.
 	 */
-	claimById(id: string, now: Date = new Date()): RunRow | null {
+	async claimById(id: string, now: Date = new Date()): Promise<RunRow | null> {
 		return this.db.transaction((tx) => {
 			const row = tx.select().from(runs).where(eq(runs.id, id)).get();
 			if (!row || row.state !== "queued") return null;

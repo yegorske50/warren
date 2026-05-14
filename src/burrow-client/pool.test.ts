@@ -31,8 +31,8 @@ describe("BurrowClientPool", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("register / get / has / size / names round-trip a client by worker name", () => {
@@ -91,42 +91,46 @@ describe("BurrowClientPool.fromEnv", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("synthesizes a 'local' worker row with the default unix socket URL", () => {
-		const pool = BurrowClientPool.fromEnv({ env: {}, repos });
+	test("synthesizes a 'local' worker row with the default unix socket URL", async () => {
+		const pool = await BurrowClientPool.fromEnv({ env: {}, repos });
 		expect(pool.size).toBe(1);
 		expect(pool.names()).toEqual([LOCAL_WORKER_NAME]);
 
-		const row = repos.workers.require(LOCAL_WORKER_NAME);
+		const row = await repos.workers.require(LOCAL_WORKER_NAME);
 		expect(row.url).toBe(`unix://${DEFAULT_BURROW_SOCKET}`);
 		expect(row.state).toBe("healthy");
 	});
 
-	test("renders a TCP transport as an http://host:port URL on the worker row", () => {
-		const pool = BurrowClientPool.fromEnv({
+	test("renders a TCP transport as an http://host:port URL on the worker row", async () => {
+		const pool = await BurrowClientPool.fromEnv({
 			env: { WARREN_BURROW_HOST: "burrow.local", WARREN_BURROW_PORT: "9410" },
 			repos,
 		});
 		expect(pool.size).toBe(1);
 
-		const row = repos.workers.require(LOCAL_WORKER_NAME);
+		const row = await repos.workers.require(LOCAL_WORKER_NAME);
 		expect(row.url).toBe("http://burrow.local:9410");
 	});
 
-	test("stamps `addedAt` from the provided `now` clock", () => {
+	test("stamps `addedAt` from the provided `now` clock", async () => {
 		const frozen = new Date("2026-01-02T03:04:05.000Z");
-		BurrowClientPool.fromEnv({ env: {}, repos, now: () => frozen });
-		const row = repos.workers.require(LOCAL_WORKER_NAME);
+		await BurrowClientPool.fromEnv({ env: {}, repos, now: () => frozen });
+		const row = await repos.workers.require(LOCAL_WORKER_NAME);
 		expect(row.addedAt).toBe(frozen.toISOString());
 	});
 
-	test("preserves an existing worker's state across re-boots (probe-derived state wins)", () => {
-		repos.workers.upsert({ name: LOCAL_WORKER_NAME, url: "unix:///old.sock", state: "draining" });
-		BurrowClientPool.fromEnv({ env: {}, repos });
-		const row = repos.workers.require(LOCAL_WORKER_NAME);
+	test("preserves an existing worker's state across re-boots (probe-derived state wins)", async () => {
+		await repos.workers.upsert({
+			name: LOCAL_WORKER_NAME,
+			url: "unix:///old.sock",
+			state: "draining",
+		});
+		await BurrowClientPool.fromEnv({ env: {}, repos });
+		const row = await repos.workers.require(LOCAL_WORKER_NAME);
 		expect(row.state).toBe("draining");
 		expect(row.url).toBe(`unix://${DEFAULT_BURROW_SOCKET}`);
 	});
@@ -137,7 +141,7 @@ describe("BurrowClientPool.fromEnv", () => {
 			calls += 1;
 			return jsonResponse(200, { ok: true });
 		});
-		const pool = BurrowClientPool.fromEnv({ env: {}, repos, fetch: stubFetch });
+		const pool = await BurrowClientPool.fromEnv({ env: {}, repos, fetch: stubFetch });
 		await pool.get(LOCAL_WORKER_NAME).probe();
 		expect(calls).toBe(1);
 	});
@@ -152,12 +156,12 @@ describe("BurrowClientPool.fromConfig", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("registers one client per configured worker, upserting rows", () => {
-		const pool = BurrowClientPool.fromConfig({
+	test("registers one client per configured worker, upserting rows", async () => {
+		const pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			workers: [
@@ -176,16 +180,16 @@ describe("BurrowClientPool.fromConfig", () => {
 		expect(pool.size).toBe(2);
 		expect(pool.names()).toEqual(["alpha", "beta"]);
 
-		const alpha = repos.workers.require("alpha");
+		const alpha = await repos.workers.require("alpha");
 		expect(alpha.url).toBe("http://alpha.local:9410");
 		expect(alpha.state).toBe("healthy");
 
-		const beta = repos.workers.require("beta");
+		const beta = await repos.workers.require("beta");
 		expect(beta.url).toBe("unix:///var/run/burrow-beta.sock");
 	});
 
-	test("does NOT synthesize the 'local' worker (operator config defines the pool)", () => {
-		const pool = BurrowClientPool.fromConfig({
+	test("does NOT synthesize the 'local' worker (operator config defines the pool)", async () => {
+		const pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			workers: [
@@ -197,11 +201,11 @@ describe("BurrowClientPool.fromConfig", () => {
 			],
 		});
 		expect(pool.has(LOCAL_WORKER_NAME)).toBe(false);
-		expect(repos.workers.get(LOCAL_WORKER_NAME)).toBeNull();
+		expect(await repos.workers.get(LOCAL_WORKER_NAME)).toBeNull();
 	});
 
-	test("threads the shared token into every registered BurrowClient", () => {
-		const pool = BurrowClientPool.fromConfig({
+	test("threads the shared token into every registered BurrowClient", async () => {
+		const pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			workers: [
@@ -221,9 +225,9 @@ describe("BurrowClientPool.fromConfig", () => {
 		expect(pool.get("beta").config.token).toBe("shared-secret");
 	});
 
-	test("stamps `addedAt` from the provided `now` clock for new rows", () => {
+	test("stamps `addedAt` from the provided `now` clock for new rows", async () => {
 		const frozen = new Date("2026-02-03T04:05:06.000Z");
-		BurrowClientPool.fromConfig({
+		await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			now: () => frozen,
@@ -235,13 +239,13 @@ describe("BurrowClientPool.fromConfig", () => {
 				},
 			],
 		});
-		const row = repos.workers.require("alpha");
+		const row = await repos.workers.require("alpha");
 		expect(row.addedAt).toBe(frozen.toISOString());
 	});
 
-	test("preserves an existing worker's state across re-boots (probe-derived wins)", () => {
-		repos.workers.upsert({ name: "alpha", url: "http://old:1", state: "draining" });
-		BurrowClientPool.fromConfig({
+	test("preserves an existing worker's state across re-boots (probe-derived wins)", async () => {
+		await repos.workers.upsert({ name: "alpha", url: "http://old:1", state: "draining" });
+		await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			workers: [
@@ -252,15 +256,15 @@ describe("BurrowClientPool.fromConfig", () => {
 				},
 			],
 		});
-		const row = repos.workers.require("alpha");
+		const row = await repos.workers.require("alpha");
 		expect(row.state).toBe("draining");
 		expect(row.url).toBe("http://alpha.local:9410");
 	});
 
-	test("throws ValidationError on an empty workers array", () => {
-		expect(() =>
+	test("throws ValidationError on an empty workers array", async () => {
+		await expect(
 			BurrowClientPool.fromConfig({ repos, token: "shared-secret", workers: [] }),
-		).toThrow(ValidationError);
+		).rejects.toThrow(ValidationError);
 	});
 
 	test("forwards a fetch override into every constructed BurrowClient", async () => {
@@ -269,7 +273,7 @@ describe("BurrowClientPool.fromConfig", () => {
 			calls += 1;
 			return jsonResponse(200, { ok: true });
 		});
-		const pool = BurrowClientPool.fromConfig({
+		const pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: "shared-secret",
 			fetch: stubFetch,
@@ -300,8 +304,8 @@ describe("BurrowClientPool.placeFor / clientFor", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "claude-code", renderedJson: { sections: {} } });
-		const p = repos.projects.create({
+		await repos.agents.upsert({ name: "claude-code", renderedJson: { sections: {} } });
+		const p = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -309,50 +313,50 @@ describe("BurrowClientPool.placeFor / clientFor", () => {
 		projectId = p.id;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("placeFor delegates to placement and returns the matching client", () => {
-		repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
+	test("placeFor delegates to placement and returns the matching client", async () => {
+		await repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
 		const alpha = makeClient();
 		const pool = new BurrowClientPool({ repos });
 		pool.register("alpha", alpha);
-		const result = pool.placeFor({ projectId });
+		const result = await pool.placeFor({ projectId });
 		expect(result.workerName).toBe("alpha");
 		expect(result.client).toBe(alpha);
 	});
 
-	test("placeFor propagates NoEligibleWorkerError when nothing is healthy", () => {
+	test("placeFor propagates NoEligibleWorkerError when nothing is healthy", async () => {
 		const pool = new BurrowClientPool({ repos });
-		expect(() => pool.placeFor({ projectId })).toThrow(NoEligibleWorkerError);
+		await expect(pool.placeFor({ projectId })).rejects.toThrow(NoEligibleWorkerError);
 	});
 
-	test("placeFor surfaces WorkerClientUnregisteredError if placement returns an unregistered name", () => {
+	test("placeFor surfaces WorkerClientUnregisteredError if placement returns an unregistered name", async () => {
 		// Worker row exists but the pool was never told about it — drift scenario.
-		repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
+		await repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
 		const pool = new BurrowClientPool({ repos });
-		expect(() => pool.placeFor({ projectId })).toThrow(WorkerClientUnregisteredError);
+		await expect(pool.placeFor({ projectId })).rejects.toThrow(WorkerClientUnregisteredError);
 	});
 
-	test("clientFor returns the worker pinned to an existing burrow", () => {
-		repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
-		repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "alpha" });
+	test("clientFor returns the worker pinned to an existing burrow", async () => {
+		await repos.workers.upsert({ name: "alpha", url: "http://alpha:1" });
+		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "alpha" });
 		const alpha = makeClient();
 		const pool = new BurrowClientPool({ repos });
 		pool.register("alpha", alpha);
 
-		const result = pool.clientFor({ burrowId: "bur_aaaaaaaaaaaa" });
+		const result = await pool.clientFor({ burrowId: "bur_aaaaaaaaaaaa" });
 		expect(result.workerName).toBe("alpha");
 		expect(result.client).toBe(alpha);
 	});
 
-	test("clientFor propagates StickyWorkerUnreachableError when the pinned worker is unreachable", () => {
-		repos.workers.upsert({ name: "alpha", url: "http://alpha:1", state: "unreachable" });
-		repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "alpha" });
+	test("clientFor propagates StickyWorkerUnreachableError when the pinned worker is unreachable", async () => {
+		await repos.workers.upsert({ name: "alpha", url: "http://alpha:1", state: "unreachable" });
+		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "alpha" });
 		const pool = new BurrowClientPool({ repos });
 		pool.register("alpha", makeClient());
-		expect(() => pool.clientFor({ burrowId: "bur_aaaaaaaaaaaa" })).toThrow(
+		await expect(pool.clientFor({ burrowId: "bur_aaaaaaaaaaaa" })).rejects.toThrow(
 			StickyWorkerUnreachableError,
 		);
 	});
@@ -367,8 +371,8 @@ describe("BurrowClientPool.probe", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("returns ok=true for every reachable worker", async () => {
@@ -439,8 +443,8 @@ describe("BurrowClientPool.close", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("clears the client map", async () => {

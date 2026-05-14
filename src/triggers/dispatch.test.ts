@@ -49,7 +49,7 @@ function spawnRecorder(
 			trigger: input.trigger,
 			metadata: input.metadata,
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: input.agentName,
 			projectId,
 			prompt: input.prompt,
@@ -85,7 +85,7 @@ describe("dispatchCronTrigger", () => {
 			})
 			.run();
 		repos = createRepos(db);
-		const project = repos.projects.create({
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -93,8 +93,8 @@ describe("dispatchCronTrigger", () => {
 		projectId = project.id;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("first observation seeds the row at now and does NOT fire", async () => {
@@ -110,13 +110,13 @@ describe("dispatchCronTrigger", () => {
 
 		expect(result.kind).toBe("seeded");
 		expect(calls).toHaveLength(0);
-		const row = repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
+		const row = await repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
 		expect(row.lastFiredAt).toBe(now.toISOString());
 		expect(row.nextFireAt).toBe("2026-05-11T00:00:00.000Z");
 	});
 
 	test("subsequent tick fires once when previousRun > lastFiredAt", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: TRIGGER_ID,
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -144,14 +144,14 @@ describe("dispatchCronTrigger", () => {
 			},
 		]);
 
-		const row = repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
+		const row = await repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
 		expect(row.lastFiredAt).toBe(now.toISOString());
 		expect(row.lastRunId).toBe(lastRunId() ?? "");
 		expect(row.nextFireAt).toBe("2026-05-12T00:00:00.000Z");
 	});
 
 	test("no-catch-up: a 4-hour outage on an hourly trigger fires exactly once", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: TRIGGER_ID,
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -170,7 +170,7 @@ describe("dispatchCronTrigger", () => {
 
 		expect(result.kind).toBe("fired");
 		expect(calls).toHaveLength(1);
-		const row = repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
+		const row = await repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
 		expect(row.lastFiredAt).toBe(now.toISOString());
 	});
 
@@ -209,7 +209,7 @@ describe("dispatchCronTrigger", () => {
 	});
 
 	test("spawn failure leaves the warren row untouched so the next tick retries", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: TRIGGER_ID,
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -223,13 +223,13 @@ describe("dispatchCronTrigger", () => {
 		});
 		expect(result.kind).toBe("error");
 
-		const row = repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
+		const row = await repos.triggers.require({ projectId, triggerId: TRIGGER_ID });
 		expect(row.lastFiredAt).toBe("2026-05-10T12:00:00.000Z");
 		expect(row.lastRunId).toBeNull();
 	});
 
 	test("explicit trigger.prompt overrides the canonical fallback", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: TRIGGER_ID,
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -246,7 +246,7 @@ describe("dispatchCronTrigger", () => {
 	});
 
 	test("defaults.defaultPrompt is used when trigger has no explicit prompt", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: TRIGGER_ID,
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -282,7 +282,7 @@ describe("dispatchScheduledSeed", () => {
 			})
 			.run();
 		repos = createRepos(db);
-		const project = repos.projects.create({
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -290,8 +290,8 @@ describe("dispatchScheduledSeed", () => {
 		projectId = project.id;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	function seed(scheduledFor: string, status = "open", id = "warren-s1"): ScheduledSeed {

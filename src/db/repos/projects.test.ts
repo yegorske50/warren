@@ -13,13 +13,13 @@ describe("ProjectsRepo", () => {
 		repo = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("create assigns a prj_ id and stamps addedAt", () => {
+	test("create assigns a prj_ id and stamps addedAt", async () => {
 		const now = new Date("2026-05-08T12:00:00.000Z");
-		const row = repo.create({
+		const row = await repo.create({
 			gitUrl: "https://github.com/jayminwest/warren.git",
 			localPath: "/data/projects/jayminwest/warren",
 			defaultBranch: "main",
@@ -29,8 +29,8 @@ describe("ProjectsRepo", () => {
 		expect(row.addedAt).toBe(now.toISOString());
 	});
 
-	test("create accepts a caller-supplied id", () => {
-		const row = repo.create({
+	test("create accepts a caller-supplied id", async () => {
+		const row = await repo.create({
 			id: "prj_fixedfixed00",
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
@@ -39,45 +39,45 @@ describe("ProjectsRepo", () => {
 		expect(row.id).toBe("prj_fixedfixed00");
 	});
 
-	test("require throws NotFoundError for unknown id", () => {
-		expect(() => repo.require("prj_doesnotexist")).toThrow(NotFoundError);
+	test("require throws NotFoundError for unknown id", async () => {
+		expect(repo.require("prj_doesnotexist")).rejects.toThrow(NotFoundError);
 	});
 
-	test("findByGitUrl returns a matching row or null", () => {
-		repo.create({
+	test("findByGitUrl returns a matching row or null", async () => {
+		await repo.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		expect(repo.findByGitUrl("https://github.com/x/y.git")?.gitUrl).toBe(
+		expect((await repo.findByGitUrl("https://github.com/x/y.git"))?.gitUrl).toBe(
 			"https://github.com/x/y.git",
 		);
-		expect(repo.findByGitUrl("https://github.com/no/match.git")).toBeNull();
+		expect(await repo.findByGitUrl("https://github.com/no/match.git")).toBeNull();
 	});
 
-	test("listAll returns rows in insertion order", () => {
-		const a = repo.create({
+	test("listAll returns rows in insertion order", async () => {
+		const a = await repo.create({
 			gitUrl: "https://github.com/x/a.git",
 			localPath: "/data/projects/x/a",
 			defaultBranch: "main",
 			now: new Date("2026-05-08T12:00:00.000Z"),
 		});
-		const b = repo.create({
+		const b = await repo.create({
 			gitUrl: "https://github.com/x/b.git",
 			localPath: "/data/projects/x/b",
 			defaultBranch: "main",
 			now: new Date("2026-05-08T13:00:00.000Z"),
 		});
-		expect(repo.listAll().map((r) => r.id)).toEqual([a.id, b.id]);
+		expect((await repo.listAll()).map((r) => r.id)).toEqual([a.id, b.id]);
 	});
 
-	test("delete removes the row", () => {
-		const row = repo.create({
+	test("delete removes the row", async () => {
+		const row = await repo.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		repo.delete(row.id);
-		expect(repo.get(row.id)).toBeNull();
+		await repo.delete(row.id);
+		expect(await repo.get(row.id)).toBeNull();
 	});
 });

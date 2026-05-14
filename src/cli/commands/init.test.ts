@@ -43,13 +43,13 @@ describe("runInit (--cwd mode)", () => {
 	});
 
 	afterEach(async () => {
-		db.close();
+		await db.close();
 		await rm(tmp, { recursive: true, force: true });
 	});
 
 	test("scaffolds parseable triggers.yaml + defaults.json (round-trip)", async () => {
 		// One agent registered → auto-fills defaultRole.
-		agents.upsert({ name: "claude-code", renderedJson: {} });
+		await agents.upsert({ name: "claude-code", renderedJson: {} });
 		const { context, out } = captureContext();
 		const result = await runInit(context, { projects, agents }, { mode: "cwd", cwd: tmp });
 		expect(result.exitCode).toBe(0);
@@ -71,7 +71,7 @@ describe("runInit (--cwd mode)", () => {
 
 	test("omits defaultRole when multiple agents are registered", async () => {
 		// Mimic the real boot path — seedBuiltinAgents registers >1 agent.
-		seedBuiltinAgents(agents);
+		await seedBuiltinAgents(agents);
 		const { context, out } = captureContext();
 		const result = await runInit(context, { projects, agents }, { mode: "cwd", cwd: tmp });
 		expect(result.exitCode).toBe(0);
@@ -81,7 +81,7 @@ describe("runInit (--cwd mode)", () => {
 	});
 
 	test("honors --default-role when the agent exists", async () => {
-		seedBuiltinAgents(agents);
+		await seedBuiltinAgents(agents);
 		const { context } = captureContext();
 		const result = await runInit(
 			context,
@@ -142,13 +142,13 @@ describe("runInit (--project mode)", () => {
 	});
 
 	afterEach(async () => {
-		db.close();
+		await db.close();
 		await rm(tmp, { recursive: true, force: true });
 	});
 
 	test("scaffolds into the project's local clone", async () => {
-		agents.upsert({ name: "claude-code", renderedJson: {} });
-		const row = projects.create({
+		await agents.upsert({ name: "claude-code", renderedJson: {} });
+		const row = await projects.create({
 			gitUrl: "https://github.com/example/init-target",
 			localPath: tmp,
 			defaultBranch: "main",
@@ -177,7 +177,7 @@ describe("runInit (--project mode)", () => {
 
 	test("rejects a project whose clone is missing on disk with exit 2", async () => {
 		const missing = join(tmp, "vanished");
-		const row = projects.create({
+		const row = await projects.create({
 			gitUrl: "https://github.com/example/vanished",
 			localPath: missing,
 			defaultBranch: "main",

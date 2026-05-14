@@ -230,7 +230,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	const exec = input.exec ?? defaultExec;
 	const now = input.now ?? (() => new Date());
 
-	const run = input.repos.runs.require(input.runId);
+	const run = await input.repos.runs.require(input.runId);
 	if (isTerminal(run.state)) {
 		input.logger?.info?.(
 			{ runId: run.id, state: run.state },
@@ -263,11 +263,11 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// seeds-close, and branch-push sub-steps target the project clone on
 	// disk, which is gone. Skip them and emit a single system event so
 	// operators can see why reap was a no-op.
-	const project = run.projectId !== null ? input.repos.projects.get(run.projectId) : null;
-	const seq = createSeqAllocator(input.repos.events.maxSeqForRun(run.id) ?? 0);
+	const project = run.projectId !== null ? await input.repos.projects.get(run.projectId) : null;
+	const seq = createSeqAllocator((await input.repos.events.maxSeqForRun(run.id)) ?? 0);
 	const errors: ReapStepError[] = [];
-	const emit = (kind: string, payload: unknown): EventRow => {
-		const row = input.repos.events.append({
+	const emit = async (kind: string, payload: unknown): Promise<EventRow> => {
+		const row = await input.repos.events.append({
 			runId: run.id,
 			burrowEventSeq: seq.next(),
 			ts: now().toISOString(),
@@ -278,12 +278,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		input.broker?.publish(run.id, row);
 		return row;
 	};
-	const fail = (step: ReapStep, err: unknown, path?: string): void => {
+	const fail = async (step: ReapStep, err: unknown, path?: string): Promise<void> => {
 		const message = err instanceof Error ? err.message : String(err);
 		const stepError: ReapStepError =
 			path !== undefined ? { step, message, path } : { step, message };
 		errors.push(stepError);
-		emit("reap_failed", stepError);
+		await emit("reap_failed", stepError);
 		input.logger?.error?.({ runId: run.id, step, err: message, path }, "reap step failed");
 	};
 
@@ -299,17 +299,17 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	let branch: string | null = null;
 	let workerClient: BurrowClient | null = null;
 	if (run.burrowId === null) {
-		fail("workspace_lookup", new Error("run has no burrow_id; nothing to reap from"));
+		await fail("workspace_lookup", new Error("run has no burrow_id; nothing to reap from"));
 	} else {
 		try {
-			workerClient = input.burrowClientPool.clientFor({ burrowId: run.burrowId }).client;
+			workerClient = (await input.burrowClientPool.clientFor({ burrowId: run.burrowId })).client;
 			const burrow = await withTransportMapping(workerClient.config, () =>
 				(workerClient as BurrowClient).http.burrows.get(run.burrowId as string),
 			);
 			workspacePath = burrow.workspacePath;
 			branch = typeof burrow.branch === "string" && burrow.branch !== "" ? burrow.branch : null;
 		} catch (err) {
-			fail("workspace_lookup", err);
+			await fail("workspace_lookup", err);
 		}
 	}
 	// Base branch for the empty-push count comes from the project row, not
@@ -328,7 +328,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			mulchSkipped = result.skipped;
 			mulchAppended = result.appended;
 		} catch (err) {
-			fail("mulch_merge", err);
+			await fail("mulch_merge", err);
 		}
 
 		try {
@@ -342,7 +342,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 				emit,
 			});
 		} catch (err) {
-			fail("seeds_close", err);
+			await fail("seeds_close", err);
 		}
 
 		try {
@@ -352,7 +352,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			});
 			branchPushed = true;
 		} catch (err) {
-			fail("branch_push", err, workspacePath);
+			await fail("branch_push", err, workspacePath);
 		}
 
 		// Empty-push observability (warren-f3bb): branchPushed alone can't
@@ -377,7 +377,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 				);
 			}
 			if (commitsAhead === 0) {
-				emit("reap.empty_push", {
+				await emit("reap.empty_push", {
 					branch,
 					baseBranch,
 					message:
@@ -425,17 +425,17 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 				});
 				if (opened.ok) {
 					prUrl = opened.url;
-					input.repos.runs.setPrUrl(run.id, prUrl);
-					emit("reap.pr_opened", { prUrl, mode: opened.mode, branch, baseBranch });
+					await input.repos.runs.setPrUrl(run.id, prUrl);
+					await emit("reap.pr_opened", { prUrl, mode: opened.mode, branch, baseBranch });
 				} else {
-					fail("pr_open", new Error(`${opened.reason}: ${opened.message}`));
+					await fail("pr_open", new Error(`${opened.reason}: ${opened.message}`));
 				}
 			} catch (err) {
-				fail("pr_open", err);
+				await fail("pr_open", err);
 			}
 		}
 	} else if (workspacePath !== null && project === null) {
-		emit("reap.orphaned", {
+		await emit("reap.orphaned", {
 			projectId: run.projectId,
 			message: "project was deleted; skipping mulch merge, seeds close, and branch push",
 		});
@@ -443,10 +443,10 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 
 	const failureReason: RunFailureReason | null =
 		input.outcome === "failed"
-			? (input.failureReason ?? inferFailureReason(input.repos, run.id, stateOnEntry))
+			? (input.failureReason ?? (await inferFailureReason(input.repos, run.id, stateOnEntry)))
 			: null;
 
-	const finalState = transitionToTerminal(
+	const finalState = await transitionToTerminal(
 		input.repos,
 		run.id,
 		stateOnEntry,
@@ -455,7 +455,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		failureReason,
 	);
 
-	emit("reap.completed", {
+	await emit("reap.completed", {
 		state: finalState,
 		failureReason,
 		mulch: { updated: mulchUpdated, skipped: mulchSkipped, appended: mulchAppended },
@@ -684,8 +684,8 @@ async function mergeMulch(
 	workspacePath: string,
 	projectPath: string,
 	fs: ReapFs,
-	emit: (kind: string, payload: unknown) => EventRow,
-	fail: (step: ReapStep, err: unknown, path?: string) => void,
+	emit: (kind: string, payload: unknown) => Promise<EventRow>,
+	fail: (step: ReapStep, err: unknown, path?: string) => Promise<void>,
 ): Promise<MulchMergeResult> {
 	const burrowDir = join(workspacePath, ".mulch", "expertise");
 	const projectDir = join(projectPath, ".mulch", "expertise");
@@ -703,7 +703,7 @@ async function mergeMulch(
 			const incoming = await fs.readFile(burrowPath);
 			if (incoming === null) continue;
 			const existing = (await fs.readFile(projectPath2)) ?? "";
-			const result = mergeMulchFile(domain, existing, incoming, emit);
+			const result = await mergeMulchFile(domain, existing, incoming, emit);
 			if (result.changed) {
 				await fs.mkdirp(dirname(projectPath2));
 				await fs.writeFile(projectPath2, result.merged);
@@ -712,7 +712,7 @@ async function mergeMulch(
 			skipped += result.skipped;
 			appended += result.appended;
 		} catch (err) {
-			fail("mulch_merge", err, burrowPath);
+			await fail("mulch_merge", err, burrowPath);
 		}
 	}
 
@@ -735,12 +735,12 @@ interface MulchFileMergeResult {
  *
  * Exported for unit-testing in isolation from the disk + event surface.
  */
-export function mergeMulchFile(
+export async function mergeMulchFile(
 	domain: string,
 	existingBody: string,
 	incomingBody: string,
-	emit: (kind: string, payload: unknown) => EventRow,
-): MulchFileMergeResult {
+	emit: (kind: string, payload: unknown) => Promise<EventRow>,
+): Promise<MulchFileMergeResult> {
 	const entries: MulchEntry[] = [];
 	const idIndex = new Map<string, number>();
 
@@ -771,7 +771,7 @@ export function mergeMulchFile(
 		try {
 			const raw: unknown = JSON.parse(line);
 			if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-				emit("reap_failed", {
+				await emit("reap_failed", {
 					step: "mulch_merge",
 					message: `expertise/${domain}.jsonl: line is not a JSON object`,
 				});
@@ -779,7 +779,7 @@ export function mergeMulchFile(
 			}
 			parsed = raw as Record<string, unknown>;
 		} catch (err) {
-			emit("reap_failed", {
+			await emit("reap_failed", {
 				step: "mulch_merge",
 				message: `expertise/${domain}.jsonl: invalid JSON (${err instanceof Error ? err.message : String(err)})`,
 			});
@@ -796,7 +796,7 @@ export function mergeMulchFile(
 				if (recordedAt > existing.recordedAt) {
 					entries[existingIdx] = { raw: line, id, recordedAt };
 					updated += 1;
-					emit("mulch.record.updated", {
+					await emit("mulch.record.updated", {
 						domain,
 						id,
 						previousRecordedAt: existing.recordedAt || null,
@@ -804,7 +804,7 @@ export function mergeMulchFile(
 					});
 				} else {
 					skipped += 1;
-					emit("mulch.record.skipped", {
+					await emit("mulch.record.skipped", {
 						domain,
 						id,
 						incomingRecordedAt: recordedAt || null,
@@ -819,7 +819,7 @@ export function mergeMulchFile(
 		entries.push({ raw: line, id, recordedAt });
 		if (id !== null) idIndex.set(id, idx);
 		appended += 1;
-		emit("mulch.record.added", { domain, id });
+		await emit("mulch.record.added", { domain, id });
 	}
 
 	const merged = entries.length === 0 ? "" : `${entries.map((e) => e.raw).join("\n")}\n`;
@@ -843,7 +843,7 @@ interface MirrorClosedSeedsInput {
 	readonly burrowId: string;
 	readonly projectPath: string;
 	readonly fs: ReapFs;
-	readonly emit: (kind: string, payload: unknown) => EventRow;
+	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
 }
 
 async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number> {
@@ -880,7 +880,7 @@ async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number>
 			projectIndex.set(incoming.id, projectRows.length - 1);
 			closed += 1;
 			changed = true;
-			emit("seeds.closed", { id: incoming.id, mode: "added" });
+			await emit("seeds.closed", { id: incoming.id, mode: "added" });
 			continue;
 		}
 		const existing = projectRows[existingIdx];
@@ -890,7 +890,7 @@ async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number>
 		projectRows[existingIdx] = incoming;
 		closed += 1;
 		changed = true;
-		emit("seeds.closed", { id: incoming.id, mode: "updated" });
+		await emit("seeds.closed", { id: incoming.id, mode: "updated" });
 	}
 
 	if (changed) {
@@ -945,9 +945,13 @@ function parseSeeds(body: string): SeedRow[] {
  * minor false-negative in the rare case where claude-code prints non-
  * JSON to stdout before exiting.
  */
-function inferFailureReason(repos: Repos, runId: string, stateOnEntry: string): RunFailureReason {
+async function inferFailureReason(
+	repos: Repos,
+	runId: string,
+	stateOnEntry: string,
+): Promise<RunFailureReason> {
 	if (stateOnEntry === "queued") return "never_started";
-	const events = repos.events.listByRun(runId);
+	const events = await repos.events.listByRun(runId);
 	const sawModelTurn = events.some(
 		(ev) =>
 			ev.stream === "stdout" &&
@@ -956,18 +960,18 @@ function inferFailureReason(repos: Repos, runId: string, stateOnEntry: string): 
 	return sawModelTurn ? "crashed" : "no_model_response";
 }
 
-function transitionToTerminal(
+async function transitionToTerminal(
 	repos: Repos,
 	runId: string,
 	currentState: string,
 	outcome: RunTerminalState,
 	now: Date,
 	failureReason: RunFailureReason | null,
-): RunTerminalState {
+): Promise<RunTerminalState> {
 	if (currentState === "queued" && outcome !== "cancelled") {
-		repos.runs.markRunning(runId, now);
+		await repos.runs.markRunning(runId, now);
 	}
-	const finalized = repos.runs.finalize(runId, outcome, now, failureReason);
+	const finalized = await repos.runs.finalize(runId, outcome, now, failureReason);
 	return finalized.state as RunTerminalState;
 }
 

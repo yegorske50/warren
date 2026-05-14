@@ -61,8 +61,8 @@ describe("refreshAgentRegistry", () => {
 		agents = new AgentsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("registers every valid agent and caches its rendered definition", async () => {
@@ -92,7 +92,7 @@ describe("refreshAgentRegistry", () => {
 		expect(result.registered.map((r) => r.name).sort()).toEqual(["docs-bot", "refactor-bot"]);
 		expect(result.skipped).toEqual([]);
 		expect(result.removed).toEqual([]);
-		const refactor = agents.require("refactor-bot");
+		const refactor = await agents.require("refactor-bot");
 		expect((refactor.renderedJson as { sections: { system: string } }).sections.system).toBe(
 			"refactor",
 		);
@@ -202,7 +202,7 @@ describe("refreshAgentRegistry", () => {
 			now: () => new Date("2026-05-09T12:00:00.000Z"),
 		});
 
-		const row = agents.require("refactor-bot");
+		const row = await agents.require("refactor-bot");
 		expect(row.registeredAt).toBe("2026-05-08T12:00:00.000Z");
 		expect(row.lastRefreshed).toBe("2026-05-09T12:00:00.000Z");
 		expect((row.renderedJson as { version: number }).version).toBe(2);
@@ -210,8 +210,8 @@ describe("refreshAgentRegistry", () => {
 
 	test("prune: deletes warren rows missing from the canopy listing when prune=true", async () => {
 		// First populate the db with two agents.
-		agents.upsert({ name: "stale-bot", renderedJson: { sections: {} } });
-		agents.upsert({ name: "live-bot", renderedJson: { sections: { system: "x" } } });
+		await agents.upsert({ name: "stale-bot", renderedJson: { sections: {} } });
+		await agents.upsert({ name: "live-bot", renderedJson: { sections: { system: "x" } } });
 
 		const spawn = buildSpawn(
 			{
@@ -232,12 +232,12 @@ describe("refreshAgentRegistry", () => {
 		});
 
 		expect(result.removed).toEqual(["stale-bot"]);
-		expect(agents.get("stale-bot")).toBeNull();
-		expect(agents.get("live-bot")).not.toBeNull();
+		expect(await agents.get("stale-bot")).toBeNull();
+		expect(await agents.get("live-bot")).not.toBeNull();
 	});
 
 	test("prune defaults to off — stale rows are left alone", async () => {
-		agents.upsert({ name: "stale-bot", renderedJson: { sections: {} } });
+		await agents.upsert({ name: "stale-bot", renderedJson: { sections: {} } });
 
 		const spawn = buildSpawn({ success: true, command: "list", prompts: [] }, {});
 		const client = new CanopyClient({ config: CFG, spawn });
@@ -250,6 +250,6 @@ describe("refreshAgentRegistry", () => {
 		});
 
 		expect(result.removed).toEqual([]);
-		expect(agents.get("stale-bot")).not.toBeNull();
+		expect(await agents.get("stale-bot")).not.toBeNull();
 	});
 });

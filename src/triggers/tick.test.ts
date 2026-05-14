@@ -47,7 +47,7 @@ describe("runTick", () => {
 			})
 			.run();
 		repos = createRepos(db);
-		const project = repos.projects.create({
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -56,8 +56,8 @@ describe("runTick", () => {
 		localPath = project.localPath;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("returns an empty result for projects with no .warren/", async () => {
@@ -75,7 +75,7 @@ describe("runTick", () => {
 	});
 
 	test("dispatches cron triggers and persists last-fired state", async () => {
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: "nightly",
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -84,7 +84,7 @@ describe("runTick", () => {
 		let createdRunId: string | null = null;
 		const spawn: DispatchSpawnFn = async (input) => {
 			calls.push({ agentName: input.agentName, trigger: input.trigger });
-			const run = repos.runs.create({
+			const run = await repos.runs.create({
 				agentName: input.agentName,
 				projectId,
 				prompt: input.prompt,
@@ -121,7 +121,7 @@ describe("runTick", () => {
 		expect(calls).toEqual([{ agentName: "claude-code", trigger: "cron" }]);
 		expect(createdRunId).not.toBeNull();
 
-		const row = repos.triggers.require({ projectId, triggerId: "nightly" });
+		const row = await repos.triggers.require({ projectId, triggerId: "nightly" });
 		expect(row.lastRunId).toBe(createdRunId);
 	});
 
@@ -163,8 +163,8 @@ describe("runTick", () => {
 		// The system event is appended against the *warren-side* run row,
 		// so we need a real run row to satisfy the FK. Spawn returns an id
 		// the runs repo created.
-		const project = repos.projects.require(projectId);
-		const realRun = repos.runs.create({
+		const project = await repos.projects.require(projectId);
+		const realRun = await repos.runs.create({
 			agentName: "claude-code",
 			projectId: project.id,
 			prompt: "scheduled",
@@ -198,7 +198,7 @@ describe("runTick", () => {
 			logger,
 		});
 
-		const events = repos.events.listByRun(realRun.id);
+		const events = await repos.events.listByRun(realRun.id);
 		expect(events).toHaveLength(1);
 		expect(events[0]?.kind).toBe("trigger.cleared_extension_failed");
 		expect(events[0]?.stream).toBe("system");
@@ -208,7 +208,7 @@ describe("runTick", () => {
 	});
 
 	test("sd list failure on one project does not stop the tick", async () => {
-		const other = repos.projects.create({
+		const other = await repos.projects.create({
 			gitUrl: "https://github.com/x/z.git",
 			localPath: "/data/projects/x/z",
 			defaultBranch: "main",
@@ -237,7 +237,7 @@ describe("runTick", () => {
 	});
 
 	test("project loadWarrenConfig failure is captured per-project, not fatal", async () => {
-		repos.projects.create({
+		await repos.projects.create({
 			gitUrl: "https://github.com/x/z.git",
 			localPath: "/data/projects/x/z",
 			defaultBranch: "main",

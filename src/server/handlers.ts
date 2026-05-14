@@ -183,16 +183,16 @@ function withAgentSource(row: AgentRow): AgentRow & { source: AgentSource } {
 }
 
 function listAgents(deps: ServerDeps): RouteHandler {
-	return () =>
+	return async () =>
 		jsonResponse(200, {
-			agents: deps.repos.agents.listAll().map(withAgentSource),
+			agents: (await deps.repos.agents.listAll()).map(withAgentSource),
 		});
 }
 
 function getAgent(deps: ServerDeps): RouteHandler {
-	return (ctx) => {
+	return async (ctx) => {
 		const name = requireParam(ctx, "name");
-		return jsonResponse(200, withAgentSource(deps.repos.agents.require(name)));
+		return jsonResponse(200, withAgentSource(await deps.repos.agents.require(name)));
 	};
 }
 
@@ -232,7 +232,7 @@ function refreshAgents(deps: ServerDeps): RouteHandler {
 /* ----------------------------------------------------------------------- */
 
 function listProjectsHandler(deps: ServerDeps): RouteHandler {
-	return () => jsonResponse(200, { projects: listProjects(deps.repos.projects) });
+	return async () => jsonResponse(200, { projects: await listProjects(deps.repos.projects) });
 }
 
 function createProjectHandler(deps: ServerDeps): RouteHandler {
@@ -270,7 +270,7 @@ function getProjectWarrenConfigHandler(deps: ServerDeps): RouteHandler {
 		// `require` throws NotFoundError → 404 via renderError; the cache
 		// only knows ids it's been asked about, so the project lookup has
 		// to come first to keep the 404 contract honest.
-		const project = deps.repos.projects.require(id);
+		const project = await deps.repos.projects.require(id);
 		const loaded: LoadedWarrenConfig =
 			deps.warrenConfigs !== undefined
 				? await deps.warrenConfigs.get(project.id, project.localPath)
@@ -286,13 +286,13 @@ function getProjectWarrenConfigHandler(deps: ServerDeps): RouteHandler {
 function getProjectTriggersHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
-		const project = deps.repos.projects.require(id);
+		const project = await deps.repos.projects.require(id);
 		const loaded: LoadedWarrenConfig =
 			deps.warrenConfigs !== undefined
 				? await deps.warrenConfigs.get(project.id, project.localPath)
 				: await loadWarrenConfig({ projectPath: project.localPath });
 		const now = deps.now?.() ?? new Date();
-		const summaries = buildTriggerSummaries({
+		const summaries = await buildTriggerSummaries({
 			projectId: project.id,
 			triggers: loaded.triggers ?? [],
 			repo: deps.repos.triggers,
@@ -312,7 +312,7 @@ function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 
 		// Project 404 must come before warren-config load so a typo'd
 		// project id doesn't end up parsing some other project's YAML.
-		const project = deps.repos.projects.require(id);
+		const project = await deps.repos.projects.require(id);
 
 		const loaded: LoadedWarrenConfig =
 			deps.warrenConfigs !== undefined
@@ -364,7 +364,7 @@ function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 		};
 		const parsed = parseCron(parseInput);
 		if (parsed.ok) {
-			deps.repos.triggers.recordFire({
+			await deps.repos.triggers.recordFire({
 				projectId: project.id,
 				triggerId: trigger.id,
 				firedAt: now,
@@ -372,7 +372,7 @@ function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 				runId: result.run.id,
 			});
 		} else {
-			deps.repos.triggers.upsert({
+			await deps.repos.triggers.upsert({
 				projectId: project.id,
 				triggerId: trigger.id,
 				lastFiredAt: now.toISOString(),
@@ -502,13 +502,13 @@ function getBurrowHandler(deps: ServerDeps): RouteHandler {
 		// 404 fast for burrows warren never recorded — `placeForBurrow` would
 		// otherwise raise `NoEligibleWorkerError` and the generic 503 mapping
 		// would lose the not-found semantics.
-		if (deps.repos.burrows.get(id) === null) {
+		if ((await deps.repos.burrows.get(id)) === null) {
 			throw new NotFoundError(`burrow not found: ${id}`, {
 				recoveryHint:
 					"warren has no placement record for this burrow id; it may belong to another control plane",
 			});
 		}
-		const { client } = deps.burrowClientPool.clientFor({ burrowId: id });
+		const { client } = await deps.burrowClientPool.clientFor({ burrowId: id });
 		const burrow = await withTransportMapping(client.config, () => client.http.burrows.get(id));
 		return jsonResponse(200, burrow);
 	};
@@ -526,8 +526,8 @@ function getBurrowHandler(deps: ServerDeps): RouteHandler {
  * config entry.
  */
 function listWorkersHandler(deps: ServerDeps): RouteHandler {
-	return () => {
-		const rows = deps.repos.workers.listAll();
+	return async () => {
+		const rows = await deps.repos.workers.listAll();
 		const registered = new Set(deps.burrowClientPool.names());
 		const workers = rows.map((row) => ({
 			name: row.name,
@@ -567,13 +567,13 @@ function drainWorkerHandler(deps: ServerDeps): RouteHandler {
 		const body = await readJsonBodyOrEmpty(ctx);
 		const drain = body !== null ? parseDrainFlag(body) : true;
 
-		const row = deps.repos.workers.require(name);
+		const row = await deps.repos.workers.require(name);
 		const client = deps.burrowClientPool.get(row.name);
 
 		await withTransportMapping(client.config, () => client.setDrain(drain));
 
 		const nextState = drain ? "draining" : "healthy";
-		const updated = deps.repos.workers.setState(row.name, nextState);
+		const updated = await deps.repos.workers.setState(row.name, nextState);
 		return jsonResponse(200, {
 			name: updated.name,
 			state: updated.state,
@@ -601,26 +601,26 @@ function parseDrainFlag(body: Record<string, unknown>): boolean {
 /* ----------------------------------------------------------------------- */
 
 function listRunsHandler(deps: ServerDeps): RouteHandler {
-	return (ctx) => {
+	return async (ctx) => {
 		const project = ctx.url.searchParams.get("project");
 		const agent = ctx.url.searchParams.get("agent");
 		if (project !== null && agent !== null) {
 			throw new ValidationError("filter by either ?project=... or ?agent=..., not both");
 		}
 		if (project !== null) {
-			return jsonResponse(200, { runs: deps.repos.runs.listByProject(project) });
+			return jsonResponse(200, { runs: await deps.repos.runs.listByProject(project) });
 		}
 		if (agent !== null) {
-			return jsonResponse(200, { runs: deps.repos.runs.listByAgent(agent) });
+			return jsonResponse(200, { runs: await deps.repos.runs.listByAgent(agent) });
 		}
-		return jsonResponse(200, { runs: deps.repos.runs.listAll() });
+		return jsonResponse(200, { runs: await deps.repos.runs.listAll() });
 	};
 }
 
 function getRunHandler(deps: ServerDeps): RouteHandler {
-	return (ctx) => {
+	return async (ctx) => {
 		const id = requireParam(ctx, "id");
-		return jsonResponse(200, deps.repos.runs.require(id));
+		return jsonResponse(200, await deps.repos.runs.require(id));
 	};
 }
 
@@ -704,11 +704,11 @@ function cancelRunHandler(deps: ServerDeps): RouteHandler {
 }
 
 function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
-	return (ctx) => {
+	return async (ctx) => {
 		const id = requireParam(ctx, "id");
 		// 404 fast if the run isn't known — without this we'd happily
 		// stream an empty NDJSON forever for a typo'd id.
-		deps.repos.runs.require(id);
+		await deps.repos.runs.require(id);
 
 		const follow = parseBoolean(ctx.url.searchParams.get("follow"), "follow") ?? false;
 		const sinceSeq = parseNonNegativeInt(ctx.url.searchParams.get("since"), "since");
@@ -826,13 +826,13 @@ function readyz(deps: ServerDeps): RouteHandler {
 
 		const checks: DiagnosticCheck[] = [];
 		checks.push(await checkBurrowPoolReachable(deps.burrowClientPool));
-		checks.push(checkAgentsRegistered(deps));
+		checks.push(await checkAgentsRegistered(deps));
 		checks.push(checkCanopyClone({ env }));
 		checks.push(await checkCanopyClean({ env, spawn }));
 		checks.push(await checkBwrap({ spawn }));
 		checks.push(
 			await checkWarrenConfig({
-				projects: deps.repos.projects.listAll().map((p) => ({
+				projects: (await deps.repos.projects.listAll()).map((p) => ({
 					id: p.id,
 					localPath: p.localPath,
 				})),
@@ -848,8 +848,8 @@ function readyz(deps: ServerDeps): RouteHandler {
 	};
 }
 
-function checkAgentsRegistered(deps: ServerDeps): DiagnosticCheck {
-	const count = deps.repos.agents.listAll().length;
+async function checkAgentsRegistered(deps: ServerDeps): Promise<DiagnosticCheck> {
+	const count = (await deps.repos.agents.listAll()).length;
 	if (count === 0) {
 		// Built-ins seed on boot (warren-d3e9), so an empty registry here
 		// means seeding itself failed — an internal problem, not an

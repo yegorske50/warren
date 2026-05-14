@@ -80,37 +80,37 @@ describe("seedBuiltinAgents", () => {
 		repo = new AgentsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("inserts every builtin into an empty registry", () => {
+	test("inserts every builtin into an empty registry", async () => {
 		const now = () => new Date("2026-05-10T00:00:00.000Z");
-		const result = seedBuiltinAgents(repo, undefined, now);
+		const result = await seedBuiltinAgents(repo, undefined, now);
 		expect([...result.seeded].sort()).toEqual([...BUILTIN_AGENT_NAMES].sort());
 		expect(result.skipped).toEqual([]);
-		const stored = repo.get("claude-code");
+		const stored = await repo.get("claude-code");
 		expect(stored).not.toBeNull();
 		expect(readAgentSource(stored?.renderedJson)).toBe("builtin");
 	});
 
-	test("preserves existing rows (library override) and skips them", () => {
+	test("preserves existing rows (library override) and skips them", async () => {
 		// Simulate a prior refresh having installed a canopy 'claude-code' override.
-		repo.upsert({
+		await repo.upsert({
 			name: "claude-code",
 			renderedJson: { name: "claude-code", sections: { system: "library override" } },
 		});
-		const result = seedBuiltinAgents(repo);
+		const result = await seedBuiltinAgents(repo);
 		expect(result.skipped).toContain("claude-code");
 		// Library override is preserved; not overwritten by the builtin.
-		const stored = repo.get("claude-code");
+		const stored = await repo.get("claude-code");
 		expect(stored).not.toBeNull();
 		expect(readAgentSource(stored?.renderedJson)).toBe("library");
 	});
 
-	test("is idempotent — second call seeds nothing", () => {
-		seedBuiltinAgents(repo);
-		const second = seedBuiltinAgents(repo);
+	test("is idempotent — second call seeds nothing", async () => {
+		await seedBuiltinAgents(repo);
+		const second = await seedBuiltinAgents(repo);
 		expect(second.seeded).toEqual([]);
 		expect([...second.skipped].sort()).toEqual([...BUILTIN_AGENT_NAMES].sort());
 	});

@@ -135,13 +135,13 @@ describe("tailRunEvents", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -152,12 +152,12 @@ describe("tailRunEvents", () => {
 		broker = new RunEventBroker();
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	function appendRow(seq: number): EventRow {
-		return repos.events.append({
+	async function appendRow(seq: number): Promise<EventRow> {
+		return await repos.events.append({
 			runId,
 			burrowEventSeq: seq,
 			ts: new Date(2026, 4, 8, 12, 0, seq).toISOString(),
@@ -168,9 +168,9 @@ describe("tailRunEvents", () => {
 	}
 
 	test("follow=false replays history then returns", async () => {
-		appendRow(1);
-		appendRow(2);
-		appendRow(3);
+		await appendRow(1);
+		await appendRow(2);
+		await appendRow(3);
 		const tail = tailRunEvents({ runId, repos, broker, follow: false });
 		const out: EventRow[] = [];
 		for await (const ev of tail) out.push(ev);
@@ -178,9 +178,9 @@ describe("tailRunEvents", () => {
 	});
 
 	test("follow=false respects sinceSeq", async () => {
-		appendRow(1);
-		appendRow(2);
-		appendRow(3);
+		await appendRow(1);
+		await appendRow(2);
+		await appendRow(3);
 		const tail = tailRunEvents({ runId, repos, broker, follow: false, sinceSeq: 1 });
 		const out: EventRow[] = [];
 		for await (const ev of tail) out.push(ev);
@@ -188,8 +188,8 @@ describe("tailRunEvents", () => {
 	});
 
 	test("follow=true: history first, then live events, dedup at the seam", async () => {
-		appendRow(1);
-		appendRow(2);
+		await appendRow(1);
+		await appendRow(2);
 		const ctrl = new AbortController();
 		const tail = tailRunEvents({ runId, repos, broker, follow: true, signal: ctrl.signal });
 
@@ -206,9 +206,9 @@ describe("tailRunEvents", () => {
 
 		// Yield once so tailRunEvents subscribes + reads history.
 		await new Promise((r) => setTimeout(r, 5));
-		const dupRow = appendRow(2); // simulated overlap (would never happen in real bridge)
+		const dupRow = await appendRow(2); // simulated overlap (would never happen in real bridge)
 		broker.publish(runId, dupRow);
-		const freshRow = appendRow(3);
+		const freshRow = await appendRow(3);
 		broker.publish(runId, freshRow);
 
 		await consumer;
@@ -221,7 +221,7 @@ describe("tailRunEvents", () => {
 		// snapshot and the live tail by appending after the subscribe but
 		// before consuming. The dedup logic ensures the event appears
 		// exactly once.
-		appendRow(1);
+		await appendRow(1);
 		const ctrl = new AbortController();
 		const tail = tailRunEvents({ runId, repos, broker, follow: true, signal: ctrl.signal });
 		const out: EventRow[] = [];
@@ -232,14 +232,14 @@ describe("tailRunEvents", () => {
 			}
 		})();
 		await new Promise((r) => setTimeout(r, 5));
-		const row = appendRow(2);
+		const row = await appendRow(2);
 		broker.publish(runId, row);
 		await consumer;
 		expect(out.map((e) => e.burrowEventSeq)).toEqual([1, 2]);
 	});
 
 	test("follow=true returns when broker.close() is called and history is exhausted", async () => {
-		appendRow(1);
+		await appendRow(1);
 		const tail = tailRunEvents({ runId, repos, broker, follow: true });
 		const out: EventRow[] = [];
 		const done = (async () => {

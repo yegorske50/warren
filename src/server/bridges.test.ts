@@ -17,8 +17,12 @@ import { bootBridges, createBridgeRegistry } from "./bridges.ts";
  * additional `burrows` row pointing burrowId → local, which the per-test
  * setup handles inline.
  */
-function makePool(repos: Repos, client?: BurrowClient, workerName = "local"): BurrowClientPool {
-	repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
+async function makePool(
+	repos: Repos,
+	client?: BurrowClient,
+	workerName = "local",
+): Promise<BurrowClientPool> {
+	await repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
 	const pool = new BurrowClientPool({ repos });
 	pool.register(workerName, client ?? makeBurrowClient());
 	return pool;
@@ -67,16 +71,16 @@ describe("createBridgeRegistry", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	test("start() invokes the bridge factory once per runId", () => {
+	test("start() invokes the bridge factory once per runId", async () => {
 		const calls: BridgeRunStreamInput[] = [];
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async (input) => {
 				calls.push(input);
 				return { written: 0, skipped: 0, errored: false };
@@ -96,7 +100,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: () =>
 				new Promise<BridgeRunStreamResult>((resolve) => {
 					resolvers.push(() => resolve({ written: 0, skipped: 0, errored: false }));
@@ -116,7 +120,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: (input) =>
 				new Promise<BridgeRunStreamResult>((resolve) => {
 					input.signal?.addEventListener("abort", () => {
@@ -133,13 +137,13 @@ describe("createBridgeRegistry", () => {
 	});
 
 	test("reconnects after errored=true while run is still non-terminal (warren-b8fc)", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -153,7 +157,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => {
 				calls += 1;
 				// First two attempts fail mid-stream (e.g., burrow's 10s
@@ -172,13 +176,13 @@ describe("createBridgeRegistry", () => {
 	});
 
 	test("stops reconnecting once warren has finalized the run (mx-fadaa2)", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -192,14 +196,14 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => {
 				calls += 1;
 				// Simulate the reaper finalizing between the first errored
 				// bridge and the next reconnect attempt.
 				if (calls === 1) {
-					repos.runs.markRunning(run.id);
-					repos.runs.finalize(run.id, "succeeded");
+					await repos.runs.markRunning(run.id);
+					await repos.runs.finalize(run.id, "succeeded");
 				}
 				return { written: 0, skipped: 0, errored: true };
 			},
@@ -209,17 +213,17 @@ describe("createBridgeRegistry", () => {
 		registry.start(run.id, "rb_a", "bur_a");
 		while (registry.size() > 0) await new Promise((r) => setTimeout(r, 0));
 		expect(calls).toBe(1);
-		expect(repos.runs.require(run.id).state).toBe("succeeded");
+		expect((await repos.runs.require(run.id)).state).toBe("succeeded");
 	});
 
 	test("warren-a69a: bridge terminalDetected triggers reap and stops reconnect loop", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -234,7 +238,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => {
 				bridgeCalls += 1;
 				return {
@@ -258,13 +262,13 @@ describe("createBridgeRegistry", () => {
 	});
 
 	test("warren-a69a: reap throwing inside the registry does not crash the registry", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -277,7 +281,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => ({
 				written: 1,
 				skipped: 0,
@@ -297,13 +301,13 @@ describe("createBridgeRegistry", () => {
 	});
 
 	test("warren-018a: a synchronous throw inside bridge does not crash the registry", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -317,7 +321,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => {
 				throw new Error("burrow has no placement record: bur_a");
 			},
@@ -340,7 +344,7 @@ describe("createBridgeRegistry", () => {
 
 		// A `bridge_fatal` system event landed so the UI shows why the
 		// bridge stopped.
-		const tail = repos.events.listByRun(run.id);
+		const tail = await repos.events.listByRun(run.id);
 		expect(tail.length).toBe(1);
 		expect(tail[0]?.kind).toBe("bridge_fatal");
 		expect(tail[0]?.stream).toBe("system");
@@ -348,13 +352,13 @@ describe("createBridgeRegistry", () => {
 	});
 
 	test("stopAll() aborts a reconnect sleep so the loop exits promptly", async () => {
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
-		const project = repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: {} });
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -368,7 +372,7 @@ describe("createBridgeRegistry", () => {
 		const registry = createBridgeRegistry({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async () => {
 				calls += 1;
 				return { written: 0, skipped: 0, errored: true };
@@ -392,36 +396,36 @@ describe("bootBridges", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: { name: "refactor-bot" } });
-		repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: { name: "refactor-bot" } });
+		await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
 		});
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("resumes runs with a burrow_run_id; skips ones without", async () => {
-		const project = repos.projects.listAll()[0];
+		const project = (await repos.projects.listAll())[0];
 		if (!project) throw new Error("project missing");
 
-		const r1 = repos.runs.create({
+		const r1 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
 			renderedAgentJson: { sections: { system: "x" } },
 			trigger: "manual",
 		});
-		repos.runs.attachBurrow(r1.id, {
+		await repos.runs.attachBurrow(r1.id, {
 			burrowId: "bur_xxxxxxxxxxxx",
 			burrowRunId: "run_zzzzzzzzzzzz",
 		});
-		repos.burrows.create({ id: "bur_xxxxxxxxxxxx", workerId: "local" });
+		await repos.burrows.create({ id: "bur_xxxxxxxxxxxx", workerId: "local" });
 
-		const r2 = repos.runs.create({
+		const r2 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
@@ -431,10 +435,10 @@ describe("bootBridges", () => {
 		// r2 has no burrow_run_id — partial spawn
 
 		const calls: string[] = [];
-		const result = bootBridges({
+		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async (input) => {
 				calls.push(input.runId);
 				return { written: 0, skipped: 0, errored: false };
@@ -448,41 +452,41 @@ describe("bootBridges", () => {
 	});
 
 	test("warren-018a: skips runs whose burrow_id has no `burrows` placement row", async () => {
-		const project = repos.projects.listAll()[0];
+		const project = (await repos.projects.listAll())[0];
 		if (!project) throw new Error("project missing");
 
 		// r1 — placed: burrow row exists.
-		const r1 = repos.runs.create({
+		const r1 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
 			renderedAgentJson: { sections: { system: "x" } },
 			trigger: "manual",
 		});
-		repos.runs.attachBurrow(r1.id, {
+		await repos.runs.attachBurrow(r1.id, {
 			burrowId: "bur_aaaaaaaaaaaa",
 			burrowRunId: "rb_aaaaaaaaaa",
 		});
-		repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
+		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 
 		// r2 — pre-pl-9ba1 orphan: burrow_id is set but no `burrows` row.
-		const r2 = repos.runs.create({
+		const r2 = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId: project.id,
 			prompt: "p",
 			renderedAgentJson: { sections: { system: "x" } },
 			trigger: "manual",
 		});
-		repos.runs.attachBurrow(r2.id, {
+		await repos.runs.attachBurrow(r2.id, {
 			burrowId: "bur_orphanorphan",
 			burrowRunId: "rb_orphan_aaaa",
 		});
 
 		const calls: string[] = [];
-		const result = bootBridges({
+		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridge: async (input) => {
 				calls.push(input.runId);
 				return { written: 0, skipped: 0, errored: false };
@@ -496,10 +500,10 @@ describe("bootBridges", () => {
 	});
 
 	test("returns an empty registry when no active runs", async () => {
-		const result = bootBridges({
+		const result = await bootBridges({
 			repos,
 			broker: new RunEventBroker(),
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 		});
 		expect(result.resumed.length).toBe(0);
 		expect(result.skipped.length).toBe(0);

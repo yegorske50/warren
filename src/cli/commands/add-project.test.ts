@@ -39,8 +39,8 @@ describe("runAddProject", () => {
 		projects = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("rejects an empty git url with exit 2", async () => {

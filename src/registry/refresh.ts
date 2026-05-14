@@ -79,9 +79,9 @@ export async function refreshAgentRegistry(opts: RefreshOptions): Promise<Refres
 
 	const removed: string[] = [];
 	if (opts.prune === true) {
-		for (const existing of opts.agents.listAll()) {
+		for (const existing of await opts.agents.listAll()) {
 			if (!seen.has(existing.name)) {
-				opts.agents.delete(existing.name);
+				await opts.agents.delete(existing.name);
 				removed.push(existing.name);
 			}
 		}
@@ -127,7 +127,7 @@ async function registerOne(opts: RefreshOptions, summary: AgentSummary): Promise
 		throw err;
 	}
 
-	const row = opts.agents.upsert({
+	const row = await opts.agents.upsert({
 		name: definition.name,
 		renderedJson: definition,
 		now: opts.now?.(),

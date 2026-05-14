@@ -63,7 +63,7 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 		throw new ValidationError("steer body cannot be empty");
 	}
 
-	const run = input.repos.runs.require(input.runId);
+	const run = await input.repos.runs.require(input.runId);
 	if (isTerminal(run.state)) {
 		throw new ValidationError(`cannot steer a ${run.state} run`, {
 			recoveryHint: "steering is only valid while the run is queued or running",
@@ -76,7 +76,7 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 	}
 
 	const burrowId = run.burrowId;
-	const { client } = input.burrowClientPool.clientFor({ burrowId });
+	const { client } = await input.burrowClientPool.clientFor({ burrowId });
 	const message = await withTransportMapping(client.config, () =>
 		client.http.inbox.send({
 			burrowId,
@@ -86,14 +86,18 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 		}),
 	);
 
-	emitSteerEvent(input, run.id, message);
+	await emitSteerEvent(input, run.id, message);
 	return { message };
 }
 
-function emitSteerEvent(input: SteerRunInput, runId: string, message: Message): void {
+async function emitSteerEvent(
+	input: SteerRunInput,
+	runId: string,
+	message: Message,
+): Promise<void> {
 	const now = input.now ?? (() => new Date());
-	const seq = (input.repos.events.maxSeqForRun(runId) ?? 0) + 1;
-	const row = input.repos.events.append({
+	const seq = ((await input.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
+	const row = await input.repos.events.append({
 		runId,
 		burrowEventSeq: seq,
 		ts: now().toISOString(),

@@ -216,7 +216,7 @@ export async function* tailRunEvents(
 
 	if (!follow) {
 		const opts = sinceSeq > 0 ? { sinceSeq } : {};
-		for (const row of repos.events.listByRun(runId, opts)) yield row;
+		for (const row of await repos.events.listByRun(runId, opts)) yield row;
 		return;
 	}
 
@@ -225,7 +225,7 @@ export async function* tailRunEvents(
 	let lastYielded = sinceSeq;
 	try {
 		const opts = sinceSeq > 0 ? { sinceSeq } : {};
-		for (const row of repos.events.listByRun(runId, opts)) {
+		for (const row of await repos.events.listByRun(runId, opts)) {
 			yield row;
 			lastYielded = Math.max(lastYielded, row.burrowEventSeq);
 		}

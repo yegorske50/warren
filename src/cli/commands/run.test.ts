@@ -35,12 +35,12 @@ function fakeBurrowClient(): BurrowClient {
 	});
 }
 
-function fakeBurrowDeps(repos: Repos): {
+async function fakeBurrowDeps(repos: Repos): Promise<{
 	burrowClient: BurrowClient;
 	burrowClientPool: BurrowClientPool;
-} {
+}> {
 	const burrowClient = fakeBurrowClient();
-	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
 	const burrowClientPool = new BurrowClientPool({ repos });
 	burrowClientPool.register("local", burrowClient);
 	return { burrowClient, burrowClientPool };
@@ -48,7 +48,7 @@ function fakeBurrowDeps(repos: Repos): {
 
 function buildSpawnStub(repos: Repos, agentName: string, projectId: string) {
 	return async (): Promise<SpawnRunResult> => {
-		const run: RunRow = repos.runs.create({
+		const run: RunRow = await repos.runs.create({
 			agentName,
 			projectId,
 			prompt: "fix the bug",
@@ -86,7 +86,7 @@ function buildSpawnStub(repos: Repos, agentName: string, projectId: string) {
 			startedAt: null,
 			completedAt: null,
 		};
-		repos.runs.attachBurrow(run.id, { burrowId: burrow.id, burrowRunId: burrowRun.id });
+		await repos.runs.attachBurrow(run.id, { burrowId: burrow.id, burrowRunId: burrowRun.id });
 		return {
 			run,
 			burrow,
@@ -112,12 +112,12 @@ describe("runRun", () => {
 		// Seed an agent + project so referential checks would pass for spawnRun
 		// callers; the stubbed spawn we install below does not actually consult
 		// these, but inserting them documents the contract.
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: { name: "refactor-bot", version: 1, sections: { system: "x" } },
 			now: new Date("2026-05-08T12:00:00.000Z"),
 		});
-		repos.projects.create({
+		await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/tmp/p",
 			defaultBranch: "main",
@@ -125,22 +125,22 @@ describe("runRun", () => {
 		});
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("rejects missing args with exit 2", async () => {
 		const { context } = captureContext();
 		const result = await runRun(
 			context,
-			{ repos, ...fakeBurrowDeps(repos) },
+			{ repos, ...(await fakeBurrowDeps(repos)) },
 			{ agent: "", project: "", prompt: "" },
 		);
 		expect(result.exitCode).toBe(2);
 	});
 
 	test("orchestrates spawn → tail → reap and exits 0 on succeeded", async () => {
-		const projectId = repos.projects.listAll()[0]?.id as string;
+		const projectId = (await repos.projects.listAll())[0]?.id as string;
 		const broker = new RunEventBroker();
 		const { context, out, err } = captureContext();
 
@@ -153,8 +153,8 @@ describe("runRun", () => {
 		})) as never;
 
 		const reapStub = (async (input: { runId: string; outcome: RunTerminalState }) => {
-			repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
-			repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
+			await repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
+			await repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
 			return {
 				state: input.outcome,
 				mulchUpdated: 0,
@@ -171,7 +171,7 @@ describe("runRun", () => {
 			context,
 			{
 				repos,
-				...fakeBurrowDeps(repos),
+				...(await fakeBurrowDeps(repos)),
 				broker,
 				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
 				bridge: bridgeStub,
@@ -191,7 +191,7 @@ describe("runRun", () => {
 	});
 
 	test("exits 1 when reap reports a non-success terminal state", async () => {
-		const projectId = repos.projects.listAll()[0]?.id as string;
+		const projectId = (await repos.projects.listAll())[0]?.id as string;
 		const broker = new RunEventBroker();
 		const { context } = captureContext();
 
@@ -201,8 +201,8 @@ describe("runRun", () => {
 			errored: false,
 		})) as never;
 		const reapStub = (async (input: { runId: string; outcome: RunTerminalState }) => {
-			repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
-			repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
+			await repos.runs.markRunning(input.runId, new Date("2026-05-08T12:00:01.000Z"));
+			await repos.runs.finalize(input.runId, input.outcome, new Date("2026-05-08T12:00:02.000Z"));
 			return {
 				state: input.outcome,
 				mulchUpdated: 0,
@@ -219,7 +219,7 @@ describe("runRun", () => {
 			context,
 			{
 				repos,
-				...fakeBurrowDeps(repos),
+				...(await fakeBurrowDeps(repos)),
 				broker,
 				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
 				bridge: bridgeStub,

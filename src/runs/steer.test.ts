@@ -12,8 +12,12 @@ import { steerRun } from "./steer.ts";
  * `local` worker row so `pool.clientFor` resolves cleanly; the per-burrow
  * `burrows` row is seeded by the test that needs it.
  */
-function makePool(client: BurrowClient, repos: Repos, workerName = "local"): BurrowClientPool {
-	repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
+async function makePool(
+	client: BurrowClient,
+	repos: Repos,
+	workerName = "local",
+): Promise<BurrowClientPool> {
+	await repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
 	const pool = new BurrowClientPool({ repos });
 	pool.register(workerName, client);
 	return pool;
@@ -100,8 +104,11 @@ describe("steerRun", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: { sections: { system: "x" } } });
-		const project = repos.projects.create({
+		await repos.agents.upsert({
+			name: "refactor-bot",
+			renderedJson: { sections: { system: "x" } },
+		});
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -109,15 +116,15 @@ describe("steerRun", () => {
 		projectId = project.id;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
-	function createRunningRun(
+	async function createRunningRun(
 		opts: { burrowId?: string | null; burrowRunId?: string | null } = {},
-	): string {
+	): Promise<string> {
 		const burrowId = opts.burrowId === undefined ? "bur_aaaaaaaaaaaa" : opts.burrowId;
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId,
 			prompt: "p",
@@ -126,21 +133,21 @@ describe("steerRun", () => {
 			burrowId,
 			burrowRunId: opts.burrowRunId === undefined ? "run_zzzzzzzzzzzz" : opts.burrowRunId,
 		});
-		repos.runs.markRunning(run.id);
-		if (burrowId !== null && repos.burrows.get(burrowId) === null) {
-			repos.burrows.create({ id: burrowId, workerId: "local" });
+		await repos.runs.markRunning(run.id);
+		if (burrowId !== null && (await repos.burrows.get(burrowId)) === null) {
+			await repos.burrows.create({ id: burrowId, workerId: "local" });
 		}
 		return run.id;
 	}
 
 	test("rejects an empty body before touching db or burrow", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const { client, calls } = makeBurrowClient();
 		await expect(
-			steerRun({ runId, body: "   ", repos, burrowClientPool: makePool(client, repos) }),
+			steerRun({ runId, body: "   ", repos, burrowClientPool: await makePool(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
-		expect(repos.events.countByRun(runId)).toBe(0);
+		expect(await repos.events.countByRun(runId)).toBe(0);
 	});
 
 	test("throws NotFoundError when the run is not registered", async () => {
@@ -150,39 +157,41 @@ describe("steerRun", () => {
 				runId: "run_doesnotexist",
 				body: "hi",
 				repos,
-				burrowClientPool: makePool(client, repos),
+				burrowClientPool: await makePool(client, repos),
 			}),
 		).rejects.toBeInstanceOf(NotFoundError);
 		expect(calls).toHaveLength(0);
 	});
 
 	test("rejects when the run has no burrow_id (partial spawn window)", async () => {
-		const runId = repos.runs.create({
-			agentName: "refactor-bot",
-			projectId,
-			prompt: "p",
-			renderedAgentJson: {},
-			trigger: "manual",
-		}).id;
+		const runId = (
+			await repos.runs.create({
+				agentName: "refactor-bot",
+				projectId,
+				prompt: "p",
+				renderedAgentJson: {},
+				trigger: "manual",
+			})
+		).id;
 		const { client, calls } = makeBurrowClient();
 		await expect(
-			steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) }),
+			steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
 	});
 
 	test("rejects when the run is in a terminal state", async () => {
-		const runId = createRunningRun();
-		repos.runs.finalize(runId, "succeeded");
+		const runId = await createRunningRun();
+		await repos.runs.finalize(runId, "succeeded");
 		const { client, calls } = makeBurrowClient();
 		await expect(
-			steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) }),
+			steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
 	});
 
 	test("forwards body, priority, and fromActor onto the burrow inbox call", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const { client, calls } = makeBurrowClient({
 			message: { priority: "high", fromActor: "alice" },
 		});
@@ -192,7 +201,7 @@ describe("steerRun", () => {
 			priority: "high",
 			fromActor: "alice",
 			repos,
-			burrowClientPool: makePool(client, repos),
+			burrowClientPool: await makePool(client, repos),
 		});
 		expect(result.message.id).toBe("msg_aaaaaaaaaaaa");
 		expect(calls).toEqual([
@@ -209,16 +218,16 @@ describe("steerRun", () => {
 	});
 
 	test("appends a steer.sent system event to the run's event log", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const { client } = makeBurrowClient({ message: { priority: "urgent" } });
 		await steerRun({
 			runId,
 			body: "remember to lint",
 			priority: "urgent",
 			repos,
-			burrowClientPool: makePool(client, repos),
+			burrowClientPool: await makePool(client, repos),
 		});
-		const events = repos.events.listByRun(runId);
+		const events = await repos.events.listByRun(runId);
 		expect(events).toHaveLength(1);
 		const event = events[0];
 		expect(event).toBeDefined();
@@ -238,8 +247,8 @@ describe("steerRun", () => {
 	});
 
 	test("audit event seq starts at MAX(seq) + 1 when prior events exist", async () => {
-		const runId = createRunningRun();
-		repos.events.append({
+		const runId = await createRunningRun();
+		await repos.events.append({
 			runId,
 			burrowEventSeq: 7,
 			ts: "2026-05-08T12:00:00Z",
@@ -248,15 +257,15 @@ describe("steerRun", () => {
 			payload: {},
 		});
 		const { client } = makeBurrowClient();
-		await steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) });
-		const events = repos.events.listByRun(runId);
+		await steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) });
+		const events = await repos.events.listByRun(runId);
 		const sent = events.find((e) => e.kind === "steer.sent");
 		expect(sent).toBeDefined();
 		expect(sent?.burrowEventSeq).toBe(8);
 	});
 
 	test("publishes the audit event to the broker for live tailers", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const broker = new RunEventBroker();
 		const sub = broker.subscribe(runId);
 		const consumed: string[] = [];
@@ -267,20 +276,26 @@ describe("steerRun", () => {
 			}
 		})();
 		const { client } = makeBurrowClient();
-		await steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos), broker });
+		await steerRun({
+			runId,
+			body: "hi",
+			repos,
+			burrowClientPool: await makePool(client, repos),
+			broker,
+		});
 		await consumer;
 		expect(consumed).toEqual(["steer.sent"]);
 	});
 
 	test("does not change the run's state", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const { client } = makeBurrowClient();
-		await steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) });
-		expect(repos.runs.require(runId).state).toBe("running");
+		await steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) });
+		expect((await repos.runs.require(runId)).state).toBe("running");
 	});
 
 	test("steers a queued run that already has a burrow_id", async () => {
-		const run = repos.runs.create({
+		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId,
 			prompt: "p",
@@ -288,15 +303,20 @@ describe("steerRun", () => {
 			trigger: "manual",
 			burrowId: "bur_aaaaaaaaaaaa",
 		});
-		repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
+		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
 		const { client, calls } = makeBurrowClient();
-		await steerRun({ runId: run.id, body: "hi", repos, burrowClientPool: makePool(client, repos) });
+		await steerRun({
+			runId: run.id,
+			body: "hi",
+			repos,
+			burrowClientPool: await makePool(client, repos),
+		});
 		expect(calls[0]?.path).toBe("/burrows/bur_aaaaaaaaaaaa/inbox");
-		expect(repos.runs.require(run.id).state).toBe("queued");
+		expect((await repos.runs.require(run.id)).state).toBe("queued");
 	});
 
 	test("transport errors are mapped to BurrowUnreachableError", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const fetchImpl = stub(async () => {
 			throw new TypeError("fetch failed");
 		});
@@ -305,21 +325,21 @@ describe("steerRun", () => {
 			fetch: fetchImpl,
 		});
 		await expect(
-			steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) }),
+			steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) }),
 		).rejects.toBeInstanceOf(BurrowUnreachableError);
 		// No audit event was emitted for a failed forward.
-		expect(repos.events.countByRun(runId)).toBe(0);
+		expect(await repos.events.countByRun(runId)).toBe(0);
 	});
 
 	test("server-side burrow errors propagate without emitting an audit event", async () => {
-		const runId = createRunningRun();
+		const runId = await createRunningRun();
 		const { client } = makeBurrowClient({
 			status: 400,
 			body: { error: { code: "validation_error", message: "body too long" } },
 		});
 		await expect(
-			steerRun({ runId, body: "hi", repos, burrowClientPool: makePool(client, repos) }),
+			steerRun({ runId, body: "hi", repos, burrowClientPool: await makePool(client, repos) }),
 		).rejects.toThrow();
-		expect(repos.events.countByRun(runId)).toBe(0);
+		expect(await repos.events.countByRun(runId)).toBe(0);
 	});
 });

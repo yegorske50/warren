@@ -8,12 +8,12 @@ import { buildTriggerSummaries } from "./summary.ts";
 async function makeRepo(): Promise<{
 	repo: TriggersRepo;
 	projectId: string;
-	close: () => void;
+	close: () => Promise<void>;
 }> {
 	const db = await openDatabase({ path: ":memory:" });
 	const projects = new ProjectsRepo(db.drizzle);
 	const repo = new TriggersRepo(db.drizzle);
-	const p = projects.create({
+	const p = await projects.create({
 		gitUrl: "https://github.com/x/y.git",
 		localPath: "/data/projects/x/y",
 		defaultBranch: "main",
@@ -33,7 +33,7 @@ describe("buildTriggerSummaries", () => {
 	test("computes nextFireAt fresh from croner when the expression parses", async () => {
 		const { repo, projectId, close } = await makeRepo();
 		try {
-			const summaries = buildTriggerSummaries({
+			const summaries = await buildTriggerSummaries({
 				projectId,
 				triggers: [NIGHTLY],
 				repo,
@@ -47,14 +47,14 @@ describe("buildTriggerSummaries", () => {
 			expect(t?.lastRunId).toBeNull();
 			expect(t?.parseError).toBeNull();
 		} finally {
-			close();
+			await close();
 		}
 	});
 
 	test("joins persisted state from the triggers repo", async () => {
 		const { repo, projectId, close } = await makeRepo();
 		try {
-			repo.upsert({
+			await repo.upsert({
 				projectId,
 				triggerId: "nightly",
 				lastFiredAt: "2026-05-09T02:00:00.000Z",
@@ -63,7 +63,7 @@ describe("buildTriggerSummaries", () => {
 				// which this test doesn't need to assert on.
 			});
 
-			const summaries = buildTriggerSummaries({
+			const summaries = await buildTriggerSummaries({
 				projectId,
 				triggers: [NIGHTLY],
 				repo,
@@ -74,14 +74,14 @@ describe("buildTriggerSummaries", () => {
 			// Fresh-computed nextFireAt beats the stale persisted value.
 			expect(t?.nextFireAt).toBe("2026-05-11T02:00:00.000Z");
 		} finally {
-			close();
+			await close();
 		}
 	});
 
 	test("surfaces croner parse failure as parseError, falls back to persisted nextFireAt", async () => {
 		const { repo, projectId, close } = await makeRepo();
 		try {
-			repo.upsert({
+			await repo.upsert({
 				projectId,
 				triggerId: "bad",
 				lastFiredAt: null,
@@ -96,7 +96,7 @@ describe("buildTriggerSummaries", () => {
 				seed: "warren-1",
 				role: "refactor-bot",
 			};
-			const summaries = buildTriggerSummaries({
+			const summaries = await buildTriggerSummaries({
 				projectId,
 				triggers: [bad],
 				repo,
@@ -107,7 +107,7 @@ describe("buildTriggerSummaries", () => {
 			// Falls back to the persisted value rather than null.
 			expect(t?.nextFireAt).toBe("2026-05-10T02:00:00.000Z");
 		} finally {
-			close();
+			await close();
 		}
 	});
 });

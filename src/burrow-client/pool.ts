@@ -124,9 +124,9 @@ export class BurrowClientPool {
 	 * env-derived `BurrowClient` under that name. This is the zero-config
 	 * path: the steady state when no `[workers]` block has been configured.
 	 */
-	static fromEnv(opts: BurrowClientPoolFromEnvOptions): BurrowClientPool {
+	static async fromEnv(opts: BurrowClientPoolFromEnvOptions): Promise<BurrowClientPool> {
 		const config = loadBurrowClientConfigFromEnv(opts.env ?? process.env);
-		opts.repos.workers.upsert({
+		await opts.repos.workers.upsert({
 			name: LOCAL_WORKER_NAME,
 			url: transportToUrl(config.transport),
 			...(opts.now !== undefined ? { now: opts.now() } : {}),
@@ -156,7 +156,7 @@ export class BurrowClientPool {
 	 * throws here rather than silently producing a pool that fails every
 	 * `placeFor` with `NoEligibleWorkerError`.
 	 */
-	static fromConfig(opts: BurrowClientPoolFromConfigOptions): BurrowClientPool {
+	static async fromConfig(opts: BurrowClientPoolFromConfigOptions): Promise<BurrowClientPool> {
 		if (opts.workers.length === 0) {
 			throw new ValidationError("BurrowClientPool.fromConfig requires at least one worker", {
 				recoveryHint: "use BurrowClientPool.fromEnv for the zero-config path",
@@ -164,7 +164,7 @@ export class BurrowClientPool {
 		}
 		const pool = new BurrowClientPool({ repos: opts.repos });
 		for (const w of opts.workers) {
-			opts.repos.workers.upsert({
+			await opts.repos.workers.upsert({
 				name: w.name,
 				url: w.url,
 				...(opts.now !== undefined ? { now: opts.now() } : {}),
@@ -238,8 +238,8 @@ export class BurrowClientPool {
 	 * Pick a worker for a fresh burrow on `projectId`. See module doc and
 	 * {@link placeForProject} for the placement rules.
 	 */
-	placeFor(input: { projectId: string }): PlacementResult {
-		const workerName = placeForProject({ repos: this.deps.repos }, input);
+	async placeFor(input: { projectId: string }): Promise<PlacementResult> {
+		const workerName = await placeForProject({ repos: this.deps.repos }, input);
 		return { workerName, client: this.get(workerName) };
 	}
 
@@ -247,8 +247,8 @@ export class BurrowClientPool {
 	 * Look up the worker pinned to an existing burrow. Sticky-by-burrow; see
 	 * {@link placeForBurrow} for the unreachable-fails-loudly contract.
 	 */
-	clientFor(input: { burrowId: string }): PlacementResult {
-		const workerName = placeForBurrow({ repos: this.deps.repos }, input);
+	async clientFor(input: { burrowId: string }): Promise<PlacementResult> {
+		const workerName = await placeForBurrow({ repos: this.deps.repos }, input);
 		return { workerName, client: this.get(workerName) };
 	}
 

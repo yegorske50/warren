@@ -29,7 +29,7 @@ export interface RecordRefreshInput {
 export class ProjectsRepo {
 	constructor(private readonly db: DrizzleDb) {}
 
-	create(input: CreateProjectInput): ProjectRow {
+	async create(input: CreateProjectInput): Promise<ProjectRow> {
 		const row: ProjectRow = {
 			id: input.id ?? generateId("project"),
 			gitUrl: input.gitUrl,
@@ -43,7 +43,7 @@ export class ProjectsRepo {
 		return row;
 	}
 
-	recordRefresh(input: RecordRefreshInput): ProjectRow {
+	async recordRefresh(input: RecordRefreshInput): Promise<ProjectRow> {
 		const lastFetchedAt = (input.now ?? new Date()).toISOString();
 		this.db
 			.update(projects)
@@ -53,12 +53,12 @@ export class ProjectsRepo {
 		return this.require(input.id);
 	}
 
-	get(id: string): ProjectRow | null {
+	async get(id: string): Promise<ProjectRow | null> {
 		return this.db.select().from(projects).where(eq(projects.id, id)).get() ?? null;
 	}
 
-	require(id: string): ProjectRow {
-		const row = this.get(id);
+	async require(id: string): Promise<ProjectRow> {
+		const row = await this.get(id);
 		if (!row) {
 			throw new NotFoundError(`project not found: ${id}`, {
 				recoveryHint: "GET /projects to list known ids",
@@ -67,15 +67,15 @@ export class ProjectsRepo {
 		return row;
 	}
 
-	findByGitUrl(gitUrl: string): ProjectRow | null {
+	async findByGitUrl(gitUrl: string): Promise<ProjectRow | null> {
 		return this.db.select().from(projects).where(eq(projects.gitUrl, gitUrl)).get() ?? null;
 	}
 
-	listAll(): ProjectRow[] {
+	async listAll(): Promise<ProjectRow[]> {
 		return this.db.select().from(projects).orderBy(asc(projects.addedAt)).all();
 	}
 
-	delete(id: string): void {
+	async delete(id: string): Promise<void> {
 		this.db.delete(projects).where(eq(projects.id, id)).run();
 	}
 }

@@ -59,7 +59,7 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 	const { repo, config, gitUrl } = input;
 	const parsed = parseGitHubUrl(gitUrl);
 
-	const existing = repo.findByGitUrl(gitUrl);
+	const existing = await repo.findByGitUrl(gitUrl);
 	if (existing) {
 		throw new ValidationError(`project already exists: ${existing.id}`, {
 			recoveryHint: "DELETE /projects/:id first if you want to re-clone",
@@ -114,7 +114,7 @@ export interface RefreshProjectResult {
 
 export async function refreshProject(input: RefreshProjectInput): Promise<RefreshProjectResult> {
 	const { repo, config, id } = input;
-	const row = repo.require(id);
+	const row = await repo.require(id);
 	const ref = input.ref ?? row.defaultBranch;
 	if (ref === "") {
 		throw new ValidationError("ref must be a non-empty string");
@@ -138,7 +138,7 @@ export async function refreshProject(input: RefreshProjectInput): Promise<Refres
 		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 	});
 
-	const updated = repo.recordRefresh({
+	const updated = await repo.recordRefresh({
 		id: row.id,
 		headSha: result.headSha,
 		now: input.now?.(),
@@ -168,7 +168,7 @@ export async function deleteProject(input: DeleteProjectInput): Promise<ProjectR
 	const exists = input.exists ?? existsSync;
 	const rmrf = input.rmrf ?? defaultRmrf;
 
-	const row = repo.require(id);
+	const row = await repo.require(id);
 	assertPathUnderRoot(row.localPath, config.root);
 
 	// Row first. The FK on `runs.project_id` is `ON DELETE SET NULL`, so
@@ -177,7 +177,7 @@ export async function deleteProject(input: DeleteProjectInput): Promise<ProjectR
 	// never leave a `projects` row pointing at a missing directory —
 	// that combination wedged subsequent dispatches against the project
 	// (warren-5f19).
-	repo.delete(id);
+	await repo.delete(id);
 	input.warrenConfigs?.invalidate(id);
 
 	if (exists(row.localPath)) {
@@ -194,7 +194,7 @@ export async function deleteProject(input: DeleteProjectInput): Promise<ProjectR
 	return row;
 }
 
-export function listProjects(repo: ProjectsRepo): ProjectRow[] {
+export async function listProjects(repo: ProjectsRepo): Promise<ProjectRow[]> {
 	return repo.listAll();
 }
 

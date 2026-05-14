@@ -56,8 +56,8 @@ describe("addProject", () => {
 		repo = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("clones, persists a row, and returns it", async () => {
@@ -75,7 +75,7 @@ describe("addProject", () => {
 		expect(row.localPath).toBe("/data/projects/jayminwest/warren");
 		expect(row.defaultBranch).toBe("main");
 		expect(row.addedAt).toBe("2026-05-08T12:00:00.000Z");
-		expect(repo.listAll()).toHaveLength(1);
+		expect(await repo.listAll()).toHaveLength(1);
 	});
 
 	test("propagates an explicit defaultBranch into the cloner and the row", async () => {
@@ -114,7 +114,7 @@ describe("addProject", () => {
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(cloneCalled).toBe(false);
-		expect(repo.listAll()).toHaveLength(0);
+		expect(await repo.listAll()).toHaveLength(0);
 	});
 
 	test("rejects a duplicate gitUrl with ValidationError without re-cloning", async () => {
@@ -157,7 +157,7 @@ describe("addProject", () => {
 				},
 			}),
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
-		expect(repo.listAll()).toHaveLength(0);
+		expect(await repo.listAll()).toHaveLength(0);
 	});
 });
 
@@ -170,8 +170,8 @@ describe("listProjects", () => {
 		repo = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("returns rows in insertion order", async () => {
@@ -191,7 +191,7 @@ describe("listProjects", () => {
 			clone: fakeClone(),
 			now: () => new Date("2026-05-08T13:00:00.000Z"),
 		});
-		expect(listProjects(repo).map((r) => r.id)).toEqual([a.id, b.id]);
+		expect((await listProjects(repo)).map((r) => r.id)).toEqual([a.id, b.id]);
 	});
 });
 
@@ -204,8 +204,8 @@ describe("deleteProject", () => {
 		repo = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("removes the on-disk clone and the row, returning the deleted row", async () => {
@@ -230,7 +230,7 @@ describe("deleteProject", () => {
 
 		expect(deleted.id).toBe(row.id);
 		expect(rmCalls).toEqual(["/data/projects/x/y"]);
-		expect(repo.get(row.id)).toBeNull();
+		expect(await repo.get(row.id)).toBeNull();
 	});
 
 	test("skips rmrf when the directory no longer exists but still removes the row", async () => {
@@ -253,7 +253,7 @@ describe("deleteProject", () => {
 			},
 		});
 		expect(rmCalled).toBe(false);
-		expect(repo.get(row.id)).toBeNull();
+		expect(await repo.get(row.id)).toBeNull();
 	});
 
 	test("removes the row even when rmrf throws and surfaces a logger warning", async () => {
@@ -288,7 +288,7 @@ describe("deleteProject", () => {
 			},
 		});
 		expect(result.id).toBe(row.id);
-		expect(repo.get(row.id)).toBeNull();
+		expect(await repo.get(row.id)).toBeNull();
 		expect(warnings).toHaveLength(1);
 		expect(warnings[0]?.msg).toContain("stranded clone");
 	});
@@ -311,7 +311,7 @@ describe("deleteProject", () => {
 		db.raw.exec(
 			"INSERT INTO agents (name, rendered_json, registered_at, last_refreshed) VALUES ('claude-code', '{}', '2026-05-09T00:00:00.000Z', '2026-05-09T00:00:00.000Z')",
 		);
-		const created = runsRepo.create({
+		const created = await runsRepo.create({
 			agentName: "claude-code",
 			projectId: row.id,
 			prompt: "test",
@@ -327,15 +327,15 @@ describe("deleteProject", () => {
 			rmrf: async () => undefined,
 		});
 
-		expect(repo.get(row.id)).toBeNull();
-		const orphan = runsRepo.require(created.id);
+		expect(await repo.get(row.id)).toBeNull();
+		const orphan = await runsRepo.require(created.id);
 		expect(orphan.projectId).toBeNull();
 	});
 
 	test("refuses to delete a project whose localPath escaped the configured root", async () => {
 		// Forge a row by writing directly with the repo (defense-in-depth: bad data
 		// in the db should not let warren rm an arbitrary path).
-		const stranded = repo.create({
+		const stranded = await repo.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/etc/passwd",
 			defaultBranch: "main",
@@ -354,7 +354,7 @@ describe("deleteProject", () => {
 			}),
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
 		expect(rmCalled).toBe(false);
-		expect(repo.get(stranded.id)).not.toBeNull();
+		expect(await repo.get(stranded.id)).not.toBeNull();
 	});
 
 	test("throws NotFoundError when the id is unknown", async () => {
@@ -401,8 +401,8 @@ describe("refreshProject", () => {
 		repo = new ProjectsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("calls refresh with the row's localPath + default branch and stamps lastFetchedAt + lastHeadSha", async () => {
@@ -435,7 +435,7 @@ describe("refreshProject", () => {
 		expect(result.project.lastFetchedAt).toBe("2026-05-09T19:00:00.000Z");
 		expect(result.project.lastHeadSha).toBe("abcd1234abcd1234abcd1234abcd1234abcd1234");
 
-		const persisted = repo.require(row.id);
+		const persisted = await repo.require(row.id);
 		expect(persisted.lastFetchedAt).toBe("2026-05-09T19:00:00.000Z");
 		expect(persisted.lastHeadSha).toBe("abcd1234abcd1234abcd1234abcd1234abcd1234");
 	});
@@ -486,7 +486,7 @@ describe("refreshProject", () => {
 			}),
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
 
-		const persisted = repo.require(row.id);
+		const persisted = await repo.require(row.id);
 		expect(persisted.lastFetchedAt).toBeNull();
 		expect(persisted.lastHeadSha).toBeNull();
 	});

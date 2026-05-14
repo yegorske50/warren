@@ -94,7 +94,7 @@ export interface CancelRunResult {
 }
 
 export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult> {
-	const run = input.repos.runs.require(input.runId);
+	const run = await input.repos.runs.require(input.runId);
 
 	if (isTerminal(run.state)) {
 		return { state: run.state, burrowRun: null, alreadyTerminal: true };
@@ -110,8 +110,8 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
 				`run is in state '${run.state}' but has no burrow_run_id; cannot cancel`,
 			);
 		}
-		const updated = input.repos.runs.finalize(run.id, "cancelled", input.now?.());
-		emitCancelEvent(input, run.id, { reason: input.reason, mode: "warren_only" });
+		const updated = await input.repos.runs.finalize(run.id, "cancelled", input.now?.());
+		await emitCancelEvent(input, run.id, { reason: input.reason, mode: "warren_only" });
 		return { state: updated.state, burrowRun: null, alreadyTerminal: false };
 	}
 
@@ -123,7 +123,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
 			`run '${run.id}' has burrow_run_id but no burrow_id; cannot resolve worker`,
 		);
 	}
-	const { client } = input.burrowClientPool.clientFor({ burrowId: run.burrowId });
+	const { client } = await input.burrowClientPool.clientFor({ burrowId: run.burrowId });
 	const burrowRun = await withTransportMapping(client.config, () =>
 		client.http.runs.cancel(
 			burrowRunId,
@@ -131,7 +131,7 @@ export async function cancelRun(input: CancelRunInput): Promise<CancelRunResult>
 		),
 	);
 
-	emitCancelEvent(input, run.id, {
+	await emitCancelEvent(input, run.id, {
 		reason: input.reason,
 		mode: "forwarded",
 		burrowRunId,
@@ -177,10 +177,14 @@ function isTerminalRunState(state: RunState): state is RunTerminalState {
 	return (RUN_TERMINAL_STATES as readonly RunState[]).includes(state);
 }
 
-function emitCancelEvent(input: CancelRunInput, runId: string, payload: object): void {
+async function emitCancelEvent(
+	input: CancelRunInput,
+	runId: string,
+	payload: object,
+): Promise<void> {
 	const now = input.now ?? (() => new Date());
-	const seq = (input.repos.events.maxSeqForRun(runId) ?? 0) + 1;
-	const row = input.repos.events.append({
+	const seq = ((await input.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
+	const row = await input.repos.events.append({
 		runId,
 		burrowEventSeq: seq,
 		ts: now().toISOString(),

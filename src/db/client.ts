@@ -25,7 +25,7 @@ export type DrizzleDb = ReturnType<typeof drizzle<typeof schema>>;
 export interface WarrenDb {
 	drizzle: DrizzleDb;
 	raw: Database;
-	close(): void;
+	close(): Promise<void>;
 }
 
 export interface OpenDatabaseOptions {
@@ -61,7 +61,7 @@ export async function openDatabase(options: OpenDatabaseOptions): Promise<Warren
 	return {
 		drizzle: db,
 		raw,
-		close: () => raw.close(),
+		close: async () => raw.close(),
 	};
 }
 

@@ -90,7 +90,7 @@ export async function runTick(deps: TickDeps): Promise<RunTickResult> {
 	const scheduled: DispatchScheduledResult[] = [];
 	const projectErrors: { projectId: string; reason: string }[] = [];
 
-	for (const project of deps.repos.projects.listAll()) {
+	for (const project of await deps.repos.projects.listAll()) {
 		try {
 			await runProjectTick({
 				deps,
@@ -188,7 +188,7 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 			try {
 				await deps.clearScheduledFor(project.localPath, result.seedId, result.runId);
 			} catch (err) {
-				recordClearFailure(deps, result.runId, result.seedId, formatError(err));
+				await recordClearFailure(deps, result.runId, result.seedId, formatError(err));
 			}
 		}
 	}
@@ -228,11 +228,16 @@ function logScheduledResult(
 	}
 }
 
-function recordClearFailure(deps: TickDeps, runId: string, seedId: string, reason: string): void {
+async function recordClearFailure(
+	deps: TickDeps,
+	runId: string,
+	seedId: string,
+	reason: string,
+): Promise<void> {
 	try {
-		const seq = (deps.repos.events.maxSeqForRun(runId) ?? 0) + 1;
+		const seq = ((await deps.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
 		const now = deps.now?.() ?? new Date();
-		deps.repos.events.append({
+		await deps.repos.events.append({
 			runId,
 			burrowEventSeq: seq,
 			ts: now.toISOString(),

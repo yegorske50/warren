@@ -106,14 +106,17 @@ export function buildProgram(context: CliContext): Command {
 					// against a fresh DB without first registering the agent from
 					// a canopy library (warren-d3e9). Idempotent against existing
 					// rows.
-					seedBuiltinAgents(repos.agents, undefined, context.now);
+					await seedBuiltinAgents(repos.agents, undefined, context.now);
 					// warren-39c3 / warren-c0c9: build a single-worker pool from env
 					// so spawnRun can resolve placement and the bridge/reap/state-
 					// fetch paths can resolve per-burrow workers via `clientFor`.
 					// The pool registers a synthetic `local` row in `workers` and
 					// forwards the env-derived BurrowClient as its only entry,
 					// mirroring the zero-config bootServer path.
-					const burrowClientPool = BurrowClientPool.fromEnv({ env: context.env, repos });
+					const burrowClientPool = await BurrowClientPool.fromEnv({
+						env: context.env,
+						repos,
+					});
 					try {
 						const result = await runRun(
 							context,
@@ -182,7 +185,7 @@ export function buildProgram(context: CliContext): Command {
 			// openDatabase creates one on first use; an empty projects
 			// table produces an informational `ok: true`.
 			const exitCode = await withCliDb({ env: context.env }, async ({ repos }) => {
-				const projects = repos.projects.listAll().map((p) => ({
+				const projects = (await repos.projects.listAll()).map((p) => ({
 					id: p.id,
 					localPath: p.localPath,
 				}));

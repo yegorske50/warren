@@ -15,8 +15,12 @@ import { composeDispatchPrompt, spawnRun } from "./spawn.ts";
  * synthetic `local` worker row so `placeForProject` has a healthy
  * candidate to pick.
  */
-function makePool(repos: Repos, client: BurrowClient, workerName = "local"): BurrowClientPool {
-	repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
+async function makePool(
+	repos: Repos,
+	client: BurrowClient,
+	workerName = "local",
+): Promise<BurrowClientPool> {
+	await repos.workers.upsert({ name: workerName, url: "unix:///tmp/x.sock" });
 	const pool = new BurrowClientPool({ repos });
 	pool.register(workerName, client);
 	return pool;
@@ -179,8 +183,8 @@ describe("spawnRun", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({ name: "refactor-bot", renderedJson: makeAgentJson() });
-		repos.projects.create({
+		await repos.agents.upsert({ name: "refactor-bot", renderedJson: makeAgentJson() });
+		await repos.projects.create({
 			id: "prj_xxxxxxxxxxxx",
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
@@ -188,8 +192,8 @@ describe("spawnRun", () => {
 		});
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("rejects an empty prompt before touching db or burrow", async () => {
@@ -197,14 +201,14 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "   ",
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
-		expect(repos.runs.listAll()).toHaveLength(0);
+		expect(await repos.runs.listAll()).toHaveLength(0);
 	});
 
 	test("throws NotFoundError when the agent is not registered", async () => {
@@ -212,7 +216,7 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "no-such-agent",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "fix it",
@@ -226,7 +230,7 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_doesnotexist",
 				prompt: "fix it",
@@ -238,7 +242,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "fix the flaky test",
@@ -249,7 +253,7 @@ describe("spawnRun", () => {
 		expect(result.run.state).toBe("queued");
 		expect(result.run.burrowId).toBe("bur_aaaaaaaaaaaa");
 		expect(result.run.burrowRunId).toBe("run_zzzzzzzzzzzz");
-		const reread = repos.runs.require(result.run.id);
+		const reread = await repos.runs.require(result.run.id);
 		expect(reread.burrowId).toBe("bur_aaaaaaaaaaaa");
 		expect(reread.burrowRunId).toBe("run_zzzzzzzzzzzz");
 
@@ -290,13 +294,13 @@ describe("spawnRun", () => {
 		// mapping. runs.worker_id is the denormalized copy; burrows.worker_id is
 		// the source of truth that cancel/steer/reap resolve through clientFor.
 		expect(reread.workerId).toBe("local");
-		const burrowRow = repos.burrows.require("bur_aaaaaaaaaaaa");
+		const burrowRow = await repos.burrows.require("bur_aaaaaaaaaaaa");
 		expect(burrowRow.workerId).toBe("local");
 	});
 
 	test("placement: writes worker_id under a non-default worker name (warren-39c3)", async () => {
 		const { client } = makeBurrowClient();
-		const pool = makePool(repos, client, "alpha");
+		const pool = await makePool(repos, client, "alpha");
 		const result = await spawnRun({
 			repos,
 			burrowClientPool: pool,
@@ -304,8 +308,8 @@ describe("spawnRun", () => {
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
 		});
-		expect(repos.runs.require(result.run.id).workerId).toBe("alpha");
-		expect(repos.burrows.require(result.burrow.id).workerId).toBe("alpha");
+		expect((await repos.runs.require(result.run.id)).workerId).toBe("alpha");
+		expect((await repos.burrows.require(result.burrow.id)).workerId).toBe("alpha");
 	});
 
 	test("placement: raises NoEligibleWorkerError when no healthy worker exists (warren-39c3)", async () => {
@@ -324,11 +328,11 @@ describe("spawnRun", () => {
 			}),
 		).rejects.toThrow(/no_eligible_worker|no healthy/);
 		// No warren row created; placement happens before runs.create.
-		expect(repos.runs.listAll()).toHaveLength(0);
+		expect(await repos.runs.listAll()).toHaveLength(0);
 	});
 
 	test("forwards burrow_config network and metadata onto the burrow calls", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: makeAgentJson({
 				sections: {
@@ -341,7 +345,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -370,7 +374,7 @@ describe("spawnRun", () => {
 	});
 
 	test("forwards agent.frontmatter as burrow run metadata so piRuntime gets provider/model (warren-d34e)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -380,7 +384,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -395,7 +399,7 @@ describe("spawnRun", () => {
 	});
 
 	test("dispatch metadata frontmatter reflects per-run + project-default overrides (warren-d34e)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -405,7 +409,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -445,7 +449,7 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
@@ -453,7 +457,7 @@ describe("spawnRun", () => {
 		).rejects.toBeDefined();
 
 		// Warren row still exists in cancelled state with no burrow attached.
-		const rows = repos.runs.listAll();
+		const rows = await repos.runs.listAll();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.state).toBe("cancelled");
 		expect(rows[0]?.burrowId).toBeNull();
@@ -473,14 +477,14 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
 			}),
 		).rejects.toBeDefined();
 
-		const rows = repos.runs.listAll();
+		const rows = await repos.runs.listAll();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.state).toBe("cancelled");
 		expect(rows[0]?.burrowId).toBe("bur_aaaaaaaaaaaa");
@@ -502,14 +506,14 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
 			}),
 		).rejects.toBeInstanceOf(BurrowUnreachableError);
 
-		const rows = repos.runs.listAll();
+		const rows = await repos.runs.listAll();
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.state).toBe("cancelled");
 		expect(rows[0]?.burrowId).toBeNull();
@@ -519,7 +523,7 @@ describe("spawnRun", () => {
 		// Older registry refresh paths may have stored the raw envelope rather
 		// than the parsed AgentDefinition. The spawn flow re-parses on read so
 		// stale caches don't crash the flow.
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: {
 				success: true,
@@ -532,7 +536,7 @@ describe("spawnRun", () => {
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -542,7 +546,7 @@ describe("spawnRun", () => {
 	});
 
 	test("rejects a corrupted cached agent JSON with RunSpawnError", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: { name: "refactor-bot", version: 1, sections: { system: 42 } },
 		});
@@ -550,7 +554,7 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
@@ -564,7 +568,7 @@ describe("spawnRun", () => {
 		let refreshRef: string | undefined;
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -573,7 +577,7 @@ describe("spawnRun", () => {
 			refreshProjectFn: async (input) => {
 				refreshCalled = true;
 				refreshRef = input.ref;
-				const updated = repos.projects.recordRefresh({
+				const updated = await repos.projects.recordRefresh({
 					id: input.id,
 					headSha: "feedface".repeat(5),
 				});
@@ -587,7 +591,7 @@ describe("spawnRun", () => {
 		expect(calls[0]?.body).toMatchObject({ projectRoot: "/data/projects/x/y" });
 
 		// HEAD sha was persisted onto the project row
-		const persisted = repos.projects.require("prj_xxxxxxxxxxxx");
+		const persisted = await repos.projects.require("prj_xxxxxxxxxxxx");
 		expect(persisted.lastHeadSha).toBe("feedface".repeat(5));
 		expect(persisted.lastFetchedAt).not.toBeNull();
 	});
@@ -597,7 +601,7 @@ describe("spawnRun", () => {
 		let receivedRef: string | undefined;
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -606,7 +610,7 @@ describe("spawnRun", () => {
 			projectSpawn: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
 			refreshProjectFn: async (input) => {
 				receivedRef = input.ref;
-				const updated = repos.projects.recordRefresh({
+				const updated = await repos.projects.recordRefresh({
 					id: input.id,
 					headSha: "abcd".repeat(10),
 				});
@@ -621,7 +625,7 @@ describe("spawnRun", () => {
 		await expect(
 			spawnRun({
 				repos,
-				burrowClientPool: makePool(repos, client),
+				burrowClientPool: await makePool(repos, client),
 				agentName: "refactor-bot",
 				projectId: "prj_xxxxxxxxxxxx",
 				prompt: "p",
@@ -633,12 +637,12 @@ describe("spawnRun", () => {
 			}),
 		).rejects.toBeDefined();
 
-		expect(repos.runs.listAll()).toHaveLength(0);
+		expect(await repos.runs.listAll()).toHaveLength(0);
 		expect(calls).toHaveLength(0);
 	});
 
 	test("folds providerOverride + modelOverride onto frontmatter before freeze and seed (warren-f8c0)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -648,7 +652,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -666,14 +670,14 @@ describe("spawnRun", () => {
 		expect(seededFm.source).toBe("builtin");
 
 		// Frozen rendered_agent_json carries the overrides
-		const stored = repos.runs.require(result.run.id).renderedAgentJson as {
+		const stored = (await repos.runs.require(result.run.id)).renderedAgentJson as {
 			frontmatter: Record<string, unknown>;
 		};
 		expect(stored.frontmatter.provider).toBe("openai");
 		expect(stored.frontmatter.model).toBe("gpt-4o");
 
 		// Cached agent row is untouched — the override is per-run, not per-agent
-		const reread = repos.agents.require("pi").renderedJson as {
+		const reread = (await repos.agents.require("pi")).renderedJson as {
 			frontmatter: Record<string, unknown>;
 		};
 		expect(reread.frontmatter.provider).toBe("anthropic");
@@ -681,7 +685,7 @@ describe("spawnRun", () => {
 	});
 
 	test("falls back to .warren/defaults.json provider/model when no per-run override (warren-618b)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -691,7 +695,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -711,7 +715,7 @@ describe("spawnRun", () => {
 		expect(seededFm.provider).toBe("anthropic");
 		expect(seededFm.model).toBe("claude-opus-4-7");
 		expect(seededFm.source).toBe("builtin");
-		const stored = repos.runs.require(result.run.id).renderedAgentJson as {
+		const stored = (await repos.runs.require(result.run.id)).renderedAgentJson as {
 			frontmatter: Record<string, unknown>;
 		};
 		expect(stored.frontmatter.provider).toBe("anthropic");
@@ -719,7 +723,7 @@ describe("spawnRun", () => {
 	});
 
 	test("per-run override beats .warren/defaults.json beats agent frontmatter (warren-618b)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -729,7 +733,7 @@ describe("spawnRun", () => {
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -753,7 +757,7 @@ describe("spawnRun", () => {
 	});
 
 	test("leaves frontmatter alone when overrides are empty / whitespace (warren-f8c0)", async () => {
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "pi",
 			renderedJson: makeAgentJson({
 				name: "pi",
@@ -763,7 +767,7 @@ describe("spawnRun", () => {
 		const { client } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "pi",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "run",
@@ -779,7 +783,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -792,7 +796,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -806,7 +810,7 @@ describe("spawnRun", () => {
 		const { client, calls } = makeBurrowClient();
 		const result = await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
@@ -831,18 +835,22 @@ describe("spawnRun", () => {
 		let refreshCalled = false;
 		await spawnRun({
 			repos,
-			burrowClientPool: makePool(repos, client),
+			burrowClientPool: await makePool(repos, client),
 			agentName: "refactor-bot",
 			projectId: "prj_xxxxxxxxxxxx",
 			prompt: "p",
 			refreshProjectFn: async () => {
 				refreshCalled = true;
-				return { project: repos.projects.require("prj_xxxxxxxxxxxx"), headSha: "x", ref: "main" };
+				return {
+					project: await repos.projects.require("prj_xxxxxxxxxxxx"),
+					headSha: "x",
+					ref: "main",
+				};
 			},
 		});
 		expect(refreshCalled).toBe(false);
 		// Project row's lastHeadSha stays null
-		expect(repos.projects.require("prj_xxxxxxxxxxxx").lastHeadSha).toBeNull();
+		expect((await repos.projects.require("prj_xxxxxxxxxxxx")).lastHeadSha).toBeNull();
 		expect(calls.length).toBeGreaterThan(0);
 	});
 });

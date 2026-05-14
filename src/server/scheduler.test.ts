@@ -26,8 +26,8 @@ function makeBurrowClient(): BurrowClient {
 	});
 }
 
-function makePool(repos: Repos): BurrowClientPool {
-	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+async function makePool(repos: Repos): Promise<BurrowClientPool> {
+	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
 	const pool = new BurrowClientPool({ repos });
 	pool.register("local", makeBurrowClient());
 	return pool;
@@ -79,7 +79,7 @@ describe("bootScheduler", () => {
 			})
 			.run();
 		repos = createRepos(db);
-		const project = repos.projects.create({
+		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
 			localPath: "/data/projects/x/y",
 			defaultBranch: "main",
@@ -88,8 +88,8 @@ describe("bootScheduler", () => {
 		projectPath = project.localPath;
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("dispatch wraps spawnRun and hands the run off to bridges", async () => {
@@ -109,7 +109,7 @@ describe("bootScheduler", () => {
 				errors: [],
 			}),
 		});
-		repos.triggers.upsert({
+		await repos.triggers.upsert({
 			projectId,
 			triggerId: "nightly",
 			lastFiredAt: "2026-05-10T12:00:00.000Z",
@@ -118,7 +118,7 @@ describe("bootScheduler", () => {
 		const spawnRunCalls: SpawnRunInput[] = [];
 		const spawnRunFn = async (input: SpawnRunInput): Promise<SpawnRunResult> => {
 			spawnRunCalls.push(input);
-			const run = repos.runs.create({
+			const run = await repos.runs.create({
 				agentName: input.agentName,
 				projectId: input.projectId,
 				prompt: input.prompt,
@@ -135,7 +135,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -195,7 +195,7 @@ describe("bootScheduler", () => {
 		};
 
 		const spawnRunFn = async (input: SpawnRunInput): Promise<SpawnRunResult> => {
-			const run = repos.runs.create({
+			const run = await repos.runs.create({
 				agentName: input.agentName,
 				projectId: input.projectId,
 				prompt: input.prompt,
@@ -212,7 +212,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -242,7 +242,7 @@ describe("bootScheduler", () => {
 		const setIntervalCalls: { ms: number }[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({ triggers: null, defaults: null, errors: [] }),
@@ -266,7 +266,7 @@ describe("bootScheduler", () => {
 		const clearCalls: number[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClientPool: makePool(repos),
+			burrowClientPool: await makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({ triggers: null, defaults: null, errors: [] }),

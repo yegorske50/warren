@@ -36,7 +36,7 @@ export class BurrowsRepo {
 	 * `provisionBurrow` call), so we surface duplicates as the SQLite
 	 * constraint error rather than papering over with an upsert.
 	 */
-	create(input: CreateBurrowInput): BurrowRow {
+	async create(input: CreateBurrowInput): Promise<BurrowRow> {
 		const row: BurrowRow = {
 			id: input.id,
 			workerId: input.workerId,
@@ -46,12 +46,12 @@ export class BurrowsRepo {
 		return row;
 	}
 
-	get(id: string): BurrowRow | null {
+	async get(id: string): Promise<BurrowRow | null> {
 		return this.db.select().from(burrows).where(eq(burrows.id, id)).get() ?? null;
 	}
 
-	require(id: string): BurrowRow {
-		const row = this.get(id);
+	async require(id: string): Promise<BurrowRow> {
+		const row = await this.get(id);
 		if (!row) {
 			throw new NotFoundError(`burrow not found: ${id}`, {
 				recoveryHint: "warren has no placement record for this burrow id",
@@ -60,11 +60,11 @@ export class BurrowsRepo {
 		return row;
 	}
 
-	listAll(): BurrowRow[] {
+	async listAll(): Promise<BurrowRow[]> {
 		return this.db.select().from(burrows).orderBy(asc(burrows.addedAt), asc(burrows.id)).all();
 	}
 
-	listByWorker(workerId: string): BurrowRow[] {
+	async listByWorker(workerId: string): Promise<BurrowRow[]> {
 		return this.db
 			.select()
 			.from(burrows)
@@ -73,7 +73,7 @@ export class BurrowsRepo {
 			.all();
 	}
 
-	delete(id: string): void {
+	async delete(id: string): Promise<void> {
 		this.db.delete(burrows).where(eq(burrows.id, id)).run();
 	}
 }

@@ -66,8 +66,11 @@ export interface PlaceForBurrowInput {
  * Returns the worker name; the caller resolves it to a `BurrowClient` via
  * `BurrowClientPool` (step 3).
  */
-export function placeForProject(deps: PlacementDeps, input: PlaceForProjectInput): string {
-	const all = deps.repos.workers.listAll();
+export async function placeForProject(
+	deps: PlacementDeps,
+	input: PlaceForProjectInput,
+): Promise<string> {
+	const all = await deps.repos.workers.listAll();
 	const healthy = all.filter((w) => w.state === "healthy");
 	if (healthy.length === 0) {
 		throw new NoEligibleWorkerError(
@@ -79,7 +82,7 @@ export function placeForProject(deps: PlacementDeps, input: PlaceForProjectInput
 		);
 	}
 
-	const affinity = projectAffinity(deps, input.projectId, healthy);
+	const affinity = await projectAffinity(deps, input.projectId, healthy);
 	if (affinity !== null) return affinity;
 
 	return leastLoaded(deps, healthy);
@@ -90,15 +93,18 @@ export function placeForProject(deps: PlacementDeps, input: PlaceForProjectInput
  * re-placement, no migration. Raises if the burrow is not in `burrows` or
  * its worker is `unreachable`. `draining` is OK — see module doc.
  */
-export function placeForBurrow(deps: PlacementDeps, input: PlaceForBurrowInput): string {
-	const burrow = deps.repos.burrows.get(input.burrowId);
+export async function placeForBurrow(
+	deps: PlacementDeps,
+	input: PlaceForBurrowInput,
+): Promise<string> {
+	const burrow = await deps.repos.burrows.get(input.burrowId);
 	if (burrow === null) {
 		throw new NoEligibleWorkerError(`burrow has no placement record: ${input.burrowId}`, {
 			recoveryHint:
 				"warren has no `burrows` row for this id; it may have been provisioned before multi-worker placement landed (pl-9ba1)",
 		});
 	}
-	const worker = deps.repos.workers.get(burrow.workerId);
+	const worker = await deps.repos.workers.get(burrow.workerId);
 	if (worker === null) {
 		throw new StickyWorkerUnreachableError(
 			`burrow ${input.burrowId} is pinned to unknown worker '${burrow.workerId}'`,
@@ -120,19 +126,19 @@ export function placeForBurrow(deps: PlacementDeps, input: PlaceForBurrowInput):
 	return burrow.workerId;
 }
 
-function projectAffinity(
+async function projectAffinity(
 	deps: PlacementDeps,
 	projectId: string,
 	healthy: readonly WorkerRow[],
-): string | null {
-	const recent = deps.repos.runs.mostRecentSucceededWithWorker(projectId);
+): Promise<string | null> {
+	const recent = await deps.repos.runs.mostRecentSucceededWithWorker(projectId);
 	if (recent === null || recent.workerId === null) return null;
 	const stickyWorker = healthy.find((w) => w.name === recent.workerId);
 	return stickyWorker?.name ?? null;
 }
 
-function leastLoaded(deps: PlacementDeps, healthy: readonly WorkerRow[]): string {
-	const load = deps.repos.runs.countInflightByWorker();
+async function leastLoaded(deps: PlacementDeps, healthy: readonly WorkerRow[]): Promise<string> {
+	const load = await deps.repos.runs.countInflightByWorker();
 	const ranked = healthy
 		.map((w) => ({ name: w.name, load: load.get(w.name) ?? 0 }))
 		.sort((a, b) => a.load - b.load || a.name.localeCompare(b.name));

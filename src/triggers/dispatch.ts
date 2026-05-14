@@ -93,7 +93,7 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 		return { kind: "error", reason: `cron parse failed: ${parsed.message}` };
 	}
 
-	const row = input.repos.triggers.get({
+	const row = await input.repos.triggers.get({
 		projectId: input.projectId,
 		triggerId: input.trigger.id,
 	});
@@ -102,7 +102,7 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 	if (row === null || row.lastFiredAt === null) {
 		// First observation — seed the row at `now` so the prev/last
 		// comparison on the next tick can detect a genuine new slot.
-		input.repos.triggers.upsert({
+		await input.repos.triggers.upsert({
 			projectId: input.projectId,
 			triggerId: input.trigger.id,
 			lastFiredAt: input.now.toISOString(),
@@ -117,7 +117,7 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 		// No new slot has elapsed since the last fire — refresh nextFireAt
 		// in case the trigger expression changed and we need to roll the
 		// upcoming-fire indicator forward.
-		input.repos.triggers.upsert({
+		await input.repos.triggers.upsert({
 			projectId: input.projectId,
 			triggerId: input.trigger.id,
 			nextFireAt: nextFireAt?.toISOString() ?? null,
@@ -149,7 +149,7 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 
 	// Risk #4: stamp last_fired_at BEFORE any side-effect that might fail
 	// (here, none — but the same pattern applies for scheduled seeds).
-	input.repos.triggers.recordFire({
+	await input.repos.triggers.recordFire({
 		projectId: input.projectId,
 		triggerId: input.trigger.id,
 		firedAt: input.now,

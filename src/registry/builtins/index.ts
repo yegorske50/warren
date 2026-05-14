@@ -40,19 +40,19 @@ export interface SeedBuiltinAgentsResult {
  * by an earlier boot or upserted by a refresh of a same-named library
  * agent) are preserved.
  */
-export function seedBuiltinAgents(
+export async function seedBuiltinAgents(
 	repo: AgentsRepo,
 	builtins: readonly AgentDefinition[] = BUILTIN_AGENTS,
 	now?: () => Date,
-): SeedBuiltinAgentsResult {
+): Promise<SeedBuiltinAgentsResult> {
 	const seeded: string[] = [];
 	const skipped: string[] = [];
 	for (const builtin of builtins) {
-		if (repo.get(builtin.name) !== null) {
+		if ((await repo.get(builtin.name)) !== null) {
 			skipped.push(builtin.name);
 			continue;
 		}
-		repo.upsert({
+		await repo.upsert({
 			name: builtin.name,
 			renderedJson: builtin,
 			...(now !== undefined ? { now: now() } : {}),

@@ -70,8 +70,8 @@ describe("runRegisterAgent", () => {
 		agents = new AgentsRepo(db.drizzle);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("registers the named agent and exits 0", async () => {
@@ -103,7 +103,7 @@ describe("runRegisterAgent", () => {
 		expect(line.ok).toBe(true);
 		expect(line.agent).toBe("refactor-bot");
 		// docs-bot was filtered out by the proxy and never registered.
-		expect(agents.listAll().map((r) => r.name)).toEqual(["refactor-bot"]);
+		expect((await agents.listAll()).map((r) => r.name)).toEqual(["refactor-bot"]);
 	});
 
 	test("exits 1 with code 'agent_not_found' when the named prompt isn't tagged 'agent'", async () => {
@@ -128,7 +128,7 @@ describe("runRegisterAgent", () => {
 		expect(out).toHaveLength(0);
 		const line = JSON.parse(err[0] as string);
 		expect(line.code).toBe("agent_not_found");
-		expect(agents.listAll()).toHaveLength(0);
+		expect(await agents.listAll()).toHaveLength(0);
 	});
 
 	test("surfaces a per-agent schema error in skipped[]", async () => {

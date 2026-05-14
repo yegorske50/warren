@@ -49,7 +49,7 @@ export async function withCliDb<T>(
 		return await fn({ db, repos });
 	} finally {
 		try {
-			db.close();
+			await db.close();
 		} catch {
 			// Closing twice during a panicked teardown is fine.
 		}

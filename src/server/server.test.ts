@@ -48,13 +48,13 @@ const okSpawn: SpawnFn = async (cmd) => {
 	return { stdout: "", stderr: "", exitCode: 0 };
 };
 
-function depsFor(
+async function depsFor(
 	repos: Repos,
 	bridges?: BridgeRegistry,
 	overrides: { spawn?: SpawnFn; canopyDir?: string; uiDistDir?: string | null } = {},
-): ServerDeps {
+): Promise<ServerDeps> {
 	const burrowClient = makeBurrowClient();
-	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
 	const burrowClientPool = new BurrowClientPool({ repos });
 	burrowClientPool.register("local", burrowClient);
 	const broker = new RunEventBroker();
@@ -120,11 +120,11 @@ describe("startServer — lifecycle", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
-	test("binds an ephemeral port and exposes the resolved url", () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+	test("binds an ephemeral port and exposes the resolved url", async () => {
+		handle = startServer(await depsFor(repos), tcpOpts());
 		expect(handle.transport.kind).toBe("tcp");
 		if (handle.transport.kind === "tcp") {
 			expect(handle.transport.port).toBeGreaterThan(0);
@@ -132,21 +132,21 @@ describe("startServer — lifecycle", () => {
 	});
 
 	test("/healthz is auth-exempt and returns 200 ok", async () => {
-		handle = startServer(depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
+		handle = startServer(await depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
 		const res = await fetch(`${tcpUrl(handle)}/healthz`);
 		expect(res.status).toBe(200);
 		expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
 	});
 
 	test("auth required for non-healthz routes", async () => {
-		handle = startServer(depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
+		handle = startServer(await depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
 		const res = await fetch(`${tcpUrl(handle)}/agents`);
 		expect(res.status).toBe(401);
 		expect(res.headers.get("www-authenticate")).toContain('Bearer realm="warren"');
 	});
 
 	test("auth accepts the matching bearer token", async () => {
-		handle = startServer(depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
+		handle = startServer(await depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
 		const res = await fetch(`${tcpUrl(handle)}/agents`, {
 			headers: { authorization: "Bearer secret" },
 		});
@@ -154,7 +154,7 @@ describe("startServer — lifecycle", () => {
 	});
 
 	test("/readyz still requires auth (body reveals failed checks)", async () => {
-		handle = startServer(depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
+		handle = startServer(await depsFor(repos), tcpOpts({ auth: bearerAuth("secret") }));
 		const res = await fetch(`${tcpUrl(handle)}/readyz`);
 		expect(res.status).toBe(401);
 	});
@@ -165,7 +165,7 @@ describe("startServer — lifecycle", () => {
 		const distDir = setupUiDist();
 		try {
 			handle = startServer(
-				depsFor(repos, undefined, { uiDistDir: distDir }),
+				await depsFor(repos, undefined, { uiDistDir: distDir }),
 				tcpOpts({ auth: bearerAuth("secret") }),
 			);
 			const base = tcpUrl(handle);
@@ -193,7 +193,7 @@ describe("startServer — lifecycle", () => {
 	});
 
 	test("unknown path → 404 not_found envelope", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/nope`);
 		expect(res.status).toBe(404);
 		const body = (await res.json()) as { error: { code: string } };
@@ -201,7 +201,7 @@ describe("startServer — lifecycle", () => {
 	});
 
 	test("known path with wrong method → 405 method_not_allowed", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/agents`, { method: "PUT" });
 		expect(res.status).toBe(405);
 		const body = (await res.json()) as { error: { code: string } };
@@ -218,7 +218,7 @@ describe("startServer — lifecycle", () => {
 				},
 			},
 		];
-		handle = startServer(depsFor(repos), tcpOpts({ routes }));
+		handle = startServer(await depsFor(repos), tcpOpts({ routes }));
 		const res = await fetch(`${tcpUrl(handle)}/boom`);
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { error: { code: string; hint?: string } };
@@ -236,7 +236,7 @@ describe("startServer — lifecycle", () => {
 				},
 			},
 		];
-		handle = startServer(depsFor(repos), tcpOpts({ routes }));
+		handle = startServer(await depsFor(repos), tcpOpts({ routes }));
 		const res = await fetch(`${tcpUrl(handle)}/boom`);
 		expect(res.status).toBe(500);
 	});
@@ -265,7 +265,7 @@ describe("startServer — lifecycle", () => {
 					),
 			},
 		];
-		handle = startServer(depsFor(repos), tcpOpts({ routes }));
+		handle = startServer(await depsFor(repos), tcpOpts({ routes }));
 		const res = await fetch(`${tcpUrl(handle)}/slow`);
 		const body = await res.text();
 		expect(body).toBe("a\nb\n");
@@ -280,7 +280,7 @@ describe("startServer — routes", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		repos.agents.upsert({
+		await repos.agents.upsert({
 			name: "refactor-bot",
 			renderedJson: { name: "refactor-bot", sections: { system: "x" } },
 		});
@@ -291,11 +291,11 @@ describe("startServer — routes", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("GET /agents returns the agents list", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/agents`);
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { agents: Array<{ name: string }> };
@@ -304,7 +304,7 @@ describe("startServer — routes", () => {
 	});
 
 	test("GET /agents/:name returns the agent or 404", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 
 		const ok = await fetch(`${tcpUrl(handle)}/agents/refactor-bot`);
 		expect(ok.status).toBe(200);
@@ -314,7 +314,7 @@ describe("startServer — routes", () => {
 	});
 
 	test("GET /projects returns the (empty) projects list", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/projects`);
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { projects: unknown[] };
@@ -322,13 +322,13 @@ describe("startServer — routes", () => {
 	});
 
 	test("GET /runs returns the empty runs list", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/runs`);
 		expect(res.status).toBe(200);
 	});
 
 	test("GET /runs/:id 404s on unknown id", async () => {
-		handle = startServer(depsFor(repos), tcpOpts());
+		handle = startServer(await depsFor(repos), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/runs/run_unknown`);
 		expect(res.status).toBe(404);
 	});
@@ -339,7 +339,7 @@ describe("startServer — routes", () => {
 		const dbEmpty = await openDatabase({ path: ":memory:" });
 		const reposEmpty = createRepos(dbEmpty);
 		try {
-			handle = startServer(depsFor(reposEmpty), tcpOpts());
+			handle = startServer(await depsFor(reposEmpty), tcpOpts());
 			const res = await fetch(`${tcpUrl(handle)}/readyz`);
 			expect(res.status).toBe(503);
 			const body = (await res.json()) as {
@@ -359,7 +359,7 @@ describe("startServer — routes", () => {
 		} finally {
 			await handle?.stop();
 			handle = null;
-			dbEmpty.close();
+			await dbEmpty.close();
 		}
 	});
 
@@ -368,7 +368,7 @@ describe("startServer — routes", () => {
 		// probe succeeds (stubbed) + bwrap + canopy_clean stubbed clean.
 		const canopyDir = mkdtempSync(join(tmpdir(), "warren-readyz-"));
 		try {
-			handle = startServer(depsFor(repos, undefined, { canopyDir }), tcpOpts());
+			handle = startServer(await depsFor(repos, undefined, { canopyDir }), tcpOpts());
 			const res = await fetch(`${tcpUrl(handle)}/readyz`);
 			expect(res.status).toBe(200);
 			const body = (await res.json()) as {
@@ -393,7 +393,10 @@ describe("startServer — routes", () => {
 			return { stdout: "", stderr: "", exitCode: 0 };
 		};
 		try {
-			handle = startServer(depsFor(repos, undefined, { canopyDir, spawn: failBwrap }), tcpOpts());
+			handle = startServer(
+				await depsFor(repos, undefined, { canopyDir, spawn: failBwrap }),
+				tcpOpts(),
+			);
 			const res = await fetch(`${tcpUrl(handle)}/readyz`);
 			expect(res.status).toBe(503);
 			const body = (await res.json()) as {
@@ -414,7 +417,7 @@ describe("startServer — routes", () => {
 		// Strip canopyConfig — equivalent to booting without CANOPY_REPO_URL.
 		// canopy_clone / canopy_clean become informational `ok: true` and
 		// the agents check passes because the test fixture seeded one row.
-		const deps = depsFor(repos);
+		const deps = await depsFor(repos);
 		const noCanopyDeps: ServerDeps = {
 			repos: deps.repos,
 			burrowClientPool: deps.burrowClientPool,
@@ -450,7 +453,10 @@ describe("startServer — routes", () => {
 			return { stdout: "", stderr: "", exitCode: 0 };
 		};
 		try {
-			handle = startServer(depsFor(repos, undefined, { canopyDir, spawn: dirtySpawn }), tcpOpts());
+			handle = startServer(
+				await depsFor(repos, undefined, { canopyDir, spawn: dirtySpawn }),
+				tcpOpts(),
+			);
 			const res = await fetch(`${tcpUrl(handle)}/readyz`);
 			expect(res.status).toBe(503);
 			const body = (await res.json()) as {

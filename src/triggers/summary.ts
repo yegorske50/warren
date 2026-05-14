@@ -46,12 +46,17 @@ export interface BuildTriggerSummariesInput {
 	readonly now: Date;
 }
 
-export function buildTriggerSummaries(input: BuildTriggerSummariesInput): TriggerSummary[] {
-	return input.triggers.map((trigger) => summarize(trigger, input));
+export async function buildTriggerSummaries(
+	input: BuildTriggerSummariesInput,
+): Promise<TriggerSummary[]> {
+	return Promise.all(input.triggers.map((trigger) => summarize(trigger, input)));
 }
 
-function summarize(trigger: CronTrigger, input: BuildTriggerSummariesInput): TriggerSummary {
-	const row = input.repo.get({ projectId: input.projectId, triggerId: trigger.id });
+async function summarize(
+	trigger: CronTrigger,
+	input: BuildTriggerSummariesInput,
+): Promise<TriggerSummary> {
+	const row = await input.repo.get({ projectId: input.projectId, triggerId: trigger.id });
 
 	const parseInput: { expression: string; timezone?: string } = {
 		expression: trigger.cron,

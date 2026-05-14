@@ -18,8 +18,8 @@ describe("fanOutAcrossWorkers", () => {
 		repos = createRepos(db);
 	});
 
-	afterEach(() => {
-		db.close();
+	afterEach(async () => {
+		await db.close();
 	});
 
 	test("returns one fulfilled entry per worker in alphabetical name order", async () => {

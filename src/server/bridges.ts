@@ -132,15 +132,15 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 		// event so the UI shows why the bridge stopped; the run row stays
 		// in its current state for the reaper to finalize.
 		void done
-			.catch((err) => {
+			.catch(async (err) => {
 				const message = err instanceof Error ? err.message : String(err);
 				input.logger?.error?.(
 					{ runId, burrowRunId, burrowId, err: message },
 					"bridge crashed with unhandled error",
 				);
 				try {
-					const seq = (input.repos.events.maxSeqForRun(runId) ?? 0) + 1;
-					const row = input.repos.events.append({
+					const seq = ((await input.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
+					const row = await input.repos.events.append({
 						runId,
 						burrowEventSeq: seq,
 						ts: new Date().toISOString(),
@@ -259,7 +259,7 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 		// run-completion. If warren has already finalized the run (reaper
 		// won the race), stop — there's nothing left to courier. Else
 		// back off and reconnect.
-		const row = input.repos.runs.get(input.runId);
+		const row = await input.repos.runs.get(input.runId);
 		if (row === null || TERMINAL_RUN_STATES.has(row.state)) {
 			input.logger?.info?.(
 				{ runId: input.runId, burrowRunId: input.burrowRunId, state: row?.state ?? "unknown" },
@@ -325,9 +325,9 @@ export interface BootBridgesResult {
  * are partial spawns the spawn-rollback path should already have
  * cancelled. Surface them in `skipped` so the operator sees the count.
  */
-export function bootBridges(input: CreateBridgeRegistryInput): BootBridgesResult {
+export async function bootBridges(input: CreateBridgeRegistryInput): Promise<BootBridgesResult> {
 	const registry = createBridgeRegistry(input);
-	const candidates = input.repos.runs.listByState(["queued", "running"]);
+	const candidates = await input.repos.runs.listByState(["queued", "running"]);
 	const resumed: { runId: string; burrowRunId: string }[] = [];
 	const skipped: { runId: string; reason: string }[] = [];
 
@@ -352,7 +352,7 @@ export function bootBridges(input: CreateBridgeRegistryInput): BootBridgesResult
 		// burrow_id without a matching `burrows` row. Starting their bridge
 		// makes `pool.clientFor({burrowId})` throw NoEligibleWorkerError on
 		// the first stream call. Skip with a clean operator signal instead.
-		if (input.repos.burrows.get(run.burrowId) === null) {
+		if ((await input.repos.burrows.get(run.burrowId)) === null) {
 			skipped.push({ runId: run.id, reason: "no_placement" });
 			input.logger?.warn?.(
 				{

@@ -154,7 +154,7 @@ describe("BurrowClientPool — two healthy real burrows", () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
 
-		pool = BurrowClientPool.fromConfig({
+		pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: TOKEN,
 			workers: [unixWorker("alpha", alpha.socketPath), unixWorker("beta", beta.socketPath)],
@@ -164,7 +164,7 @@ describe("BurrowClientPool — two healthy real burrows", () => {
 	afterAll(async () => {
 		await pool?.close();
 		await Promise.all([alpha?.kill(), beta?.kill()]);
-		db?.close();
+		await db?.close();
 		rmSync(rootDir, { recursive: true, force: true });
 	});
 
@@ -248,7 +248,7 @@ describe("BurrowClientPool — one killed real burrow", () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
 
-		pool = BurrowClientPool.fromConfig({
+		pool = await BurrowClientPool.fromConfig({
 			repos,
 			token: TOKEN,
 			workers: [unixWorker("alpha", alpha.socketPath), unixWorker("beta", beta.socketPath)],
@@ -259,13 +259,13 @@ describe("BurrowClientPool — one killed real burrow", () => {
 		// dies and warren marks it unreachable (below), the sticky lookup
 		// must fail loudly with StickyWorkerUnreachableError rather than
 		// silently re-place onto beta (placement risk #5).
-		repos.burrows.create({ id: "bur_pinned_to_alpha", workerId: "alpha" });
+		await repos.burrows.create({ id: "bur_pinned_to_alpha", workerId: "alpha" });
 	});
 
 	afterAll(async () => {
 		await pool?.close();
 		await Promise.all([alpha?.kill(), beta?.kill()]);
-		db?.close();
+		await db?.close();
 		rmSync(rootDir, { recursive: true, force: true });
 	});
 
@@ -303,8 +303,8 @@ describe("BurrowClientPool — one killed real burrow", () => {
 		// raises rather than handing back a dead client. This is what the
 		// probe loop (src/server/probe.ts) would do in production after
 		// observing the kill.
-		repos.workers.setState("alpha", "unreachable");
-		expect(() => pool.clientFor({ burrowId: "bur_pinned_to_alpha" })).toThrow(
+		await repos.workers.setState("alpha", "unreachable");
+		await expect(pool.clientFor({ burrowId: "bur_pinned_to_alpha" })).rejects.toThrow(
 			StickyWorkerUnreachableError,
 		);
 	});

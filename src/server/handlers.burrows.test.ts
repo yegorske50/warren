@@ -113,10 +113,10 @@ interface PoolInput {
 	readonly workers: readonly { readonly name: string; readonly client: BurrowClient }[];
 }
 
-function poolOf(repos: Repos, input: PoolInput): BurrowClientPool {
+async function poolOf(repos: Repos, input: PoolInput): Promise<BurrowClientPool> {
 	const pool = new BurrowClientPool({ repos });
 	for (const w of input.workers) {
-		repos.workers.upsert({ name: w.name, url: `unix:///tmp/${w.name}.sock` });
+		await repos.workers.upsert({ name: w.name, url: `unix:///tmp/${w.name}.sock` });
 		pool.register(w.name, w.client);
 	}
 	return pool;
@@ -167,7 +167,7 @@ describe("GET /burrows — fan-out across workers (warren-14ad)", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("unions burrows from every worker and sorts by createdAt ascending", async () => {
@@ -180,7 +180,7 @@ describe("GET /burrows — fan-out across workers (warren-14ad)", () => {
 				{ id: "bur_b2", createdAt: "2026-05-10T02:00:00Z" },
 			],
 		});
-		const pool = poolOf(repos, {
+		const pool = await poolOf(repos, {
 			workers: [
 				{ name: "alpha", client: alpha },
 				{ name: "beta", client: beta },
@@ -218,7 +218,7 @@ describe("GET /burrows — fan-out across workers (warren-14ad)", () => {
 			error() {},
 		};
 
-		const pool = poolOf(repos, {
+		const pool = await poolOf(repos, {
 			workers: [
 				{ name: "alpha", client: alpha },
 				{ name: "beta", client: beta },
@@ -256,7 +256,7 @@ describe("GET /burrows — fan-out across workers (warren-14ad)", () => {
 			rows: [{ id: "bur_b1", createdAt: "2026-05-10T02:00:00Z", kind: "task", state: "active" }],
 			calls: betaCalls,
 		});
-		const pool = poolOf(repos, {
+		const pool = await poolOf(repos, {
 			workers: [
 				{ name: "alpha", client: alpha },
 				{ name: "beta", client: beta },
@@ -277,7 +277,7 @@ describe("GET /burrows — fan-out across workers (warren-14ad)", () => {
 
 	test("rejects an unknown ?kind value with 400 validation_error", async () => {
 		const alpha = makeWorkerClient({ rows: [] });
-		const pool = poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
+		const pool = await poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -322,7 +322,7 @@ describe("GET /burrows/:id — sticky-by-burrow (warren-14ad)", () => {
 			await handle.stop();
 			handle = null;
 		}
-		db.close();
+		await db.close();
 	});
 
 	test("routes to the worker pinned on burrows.worker_id", async () => {
@@ -336,13 +336,13 @@ describe("GET /burrows/:id — sticky-by-burrow (warren-14ad)", () => {
 			calls: betaCalls,
 		});
 
-		const pool = poolOf(repos, {
+		const pool = await poolOf(repos, {
 			workers: [
 				{ name: "alpha", client: alpha },
 				{ name: "beta", client: beta },
 			],
 		});
-		repos.burrows.create({ id: fix.id, workerId: "beta" });
+		await repos.burrows.create({ id: fix.id, workerId: "beta" });
 
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -360,7 +360,7 @@ describe("GET /burrows/:id — sticky-by-burrow (warren-14ad)", () => {
 
 	test("404 when warren has no placement row for the burrow id", async () => {
 		const alpha = makeWorkerClient({ rows: [] });
-		const pool = poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
+		const pool = await poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -374,9 +374,13 @@ describe("GET /burrows/:id — sticky-by-burrow (warren-14ad)", () => {
 
 	test("503 sticky_worker_unreachable when the pinned worker is unreachable", async () => {
 		const alpha = makeWorkerClient({ rows: [] });
-		const pool = poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
-		repos.workers.upsert({ name: "alpha", url: "unix:///tmp/alpha.sock", state: "unreachable" });
-		repos.burrows.create({ id: "bur_stranded", workerId: "alpha" });
+		const pool = await poolOf(repos, { workers: [{ name: "alpha", client: alpha }] });
+		await repos.workers.upsert({
+			name: "alpha",
+			url: "unix:///tmp/alpha.sock",
+			state: "unreachable",
+		});
+		await repos.burrows.create({ id: "bur_stranded", workerId: "alpha" });
 
 		handle = startServer(depsFor(repos, pool), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },

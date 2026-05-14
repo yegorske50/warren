@@ -146,8 +146,8 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		throw new ValidationError("prompt cannot be empty");
 	}
 
-	const agentRow = input.repos.agents.require(input.agentName);
-	const project = input.repos.projects.require(input.projectId);
+	const agentRow = await input.repos.agents.require(input.agentName);
+	const project = await input.repos.projects.require(input.projectId);
 	const baseAgent = readCachedAgent(agentRow.renderedJson, agentRow.name);
 	const burrowConfig = parseBurrowConfig(baseAgent.sections.burrow_config);
 
@@ -204,9 +204,9 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	// across `healthy` workers — and raises `NoEligibleWorkerError` if
 	// nothing is placeable, which the caller surfaces as a structured
 	// error.
-	const placement = input.burrowClientPool.placeFor({ projectId: projectAfterRefresh.id });
+	const placement = await input.burrowClientPool.placeFor({ projectId: projectAfterRefresh.id });
 
-	const run = input.repos.runs.create({
+	const run = await input.repos.runs.create({
 		agentName: agent.name,
 		projectId: projectAfterRefresh.id,
 		prompt: input.prompt,
@@ -244,12 +244,12 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		// worker via `pool.clientFor({burrowId})`. Created in the same turn as
 		// `attachBurrow` so a crash between the two windows leaves the row
 		// consistent: either both are missing or both are populated.
-		input.repos.burrows.create({
+		await input.repos.burrows.create({
 			id: burrow.id,
 			workerId: placement.workerName,
 			...(input.now !== undefined ? { now: input.now() } : {}),
 		});
-		input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
+		await input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
 
 		const burrowRun = await dispatchRun(
 			placement.client,
@@ -258,7 +258,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			composeDispatchPrompt(agent.sections.system, input.prompt),
 			composeBurrowMetadata(input.metadata, agent.frontmatter),
 		);
-		const updated = input.repos.runs.attachBurrow(run.id, { burrowRunId: burrowRun.id });
+		const updated = await input.repos.runs.attachBurrow(run.id, { burrowRunId: burrowRun.id });
 		return { run: updated, burrow, burrowRun, agent };
 	} catch (err) {
 		await rollback(input, run.id, burrow, placement.client);
@@ -345,7 +345,7 @@ async function rollback(
 	client: BurrowClient,
 ): Promise<void> {
 	try {
-		input.repos.runs.finalize(runId, "cancelled", input.now?.());
+		await input.repos.runs.finalize(runId, "cancelled", input.now?.());
 	} catch {
 		// Either the row was already terminal (shouldn't happen on this path)
 		// or the db handle is gone — either way, nothing to recover here.
