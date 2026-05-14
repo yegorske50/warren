@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+R-19 (per-run preview environments) ships. Plan `pl-2c59` closed all
+11 implementation steps on top of the SPEC §11.L design lock.
+Operators set `WARREN_PREVIEW_HOST=preview.<your-host>` and point a
+wildcard CNAME at warren; projects opt in by adding a `preview` block
+to `.warren/defaults.json`. Reap's 5th best-effort sub-step launches
+`preview.command` as a burrow sidecar in the same workspace, allocates
+a port from the SQLite-backed `WARREN_PREVIEW_PORT_RANGE`, and waits
+for readiness; a 6th sub-step patches the PR body's
+`<!-- warren:preview-start --> ... <!-- warren:preview-end -->`
+fragment with the live URL or the failure tail. The idle-TTL /
+max-lifetime / LRU eviction worker keeps long-tail dev servers from
+exhausting container memory. Browsers authenticate via a domain-scoped
+signed `warren_preview` cookie issued from
+`GET /runs/:id/preview/login?token=…&redirect=…`; the HMAC key is
+derived from `WARREN_API_TOKEN` so operators don't manage a second
+secret. RunDetail UI surfaces a status badge, an "Open ↗" link, the
+failure tail when applicable, and a manual teardown button.
+
+### Added
+
+- **`feat(preview)`** — per-run preview environments (R-19, `pl-2c59`).
+  Migration `0009_*.sql` adds five columns to `runs` (`preview_state`,
+  `preview_port`, `preview_started_at`, `preview_last_hit_at`,
+  `preview_failure_message`) in lockstep across SQLite and Postgres
+  schema modules; `RunsRepo.attachPreview` mirrors `attachStats`'s
+  partial-input semantics. New `PreviewConfigSchema` discriminated
+  union (`type: server | static`) lives in `src/warren-config/`;
+  `type: static` parses but the launcher returns a "not yet
+  implemented" error pointing to the follow-up seed.
+  `src/preview/port-allocator.ts` is SQLite-backed and restart-safe —
+  in-use ports are derived from
+  `runs.preview_state IN ('starting','live')` rather than in-memory
+  state. The reap-time `preview_launch` sub-step (`src/runs/reap.ts`)
+  mirrors `pr_open`'s `mx-05abb2` pattern (only `succeeded` runs,
+  never fails the run, best-effort `reap_failed` event on error);
+  the 6th sub-step `pr_annotate_preview` patches the PR body's
+  `preview_url_or_placeholder` fragment idempotently. Idle TTL,
+  max-lifetime ceiling, and global LRU cap drive the eviction worker
+  in `src/preview/eviction.ts`; all eviction paths emit
+  `preview_evicted` events with `reason` set. The host proxy preamble
+  in `src/preview/proxy.ts` runs before the API/UI routes; cookie
+  auth lives in `src/preview/cookie.ts` (HMAC key derived from
+  `WARREN_API_TOKEN`). `POST /runs/:id/preview/teardown` is
+  bearer-required + idempotent, emits a `preview_torn_down` audit
+  event, and releases the port via the same CAS the eviction worker
+  uses. RunDetail UI surfaces a `PreviewCard` keyed off `previewState`
+  (`starting | live | failed | torn-down`), with the failure tail
+  inlined when applicable. Acceptance scenario `20-preview.ts` runs
+  on Linux (happy-path + idle-TTL eviction, both DB backends per
+  `mx-1d31f0`); macOS skips per the same record. Doctor checks
+  `preview_port_allocator` saturation, `preview_max_live` headroom,
+  and `WARREN_PREVIEW_HOST` ↔ `WARREN_API_TOKEN` consistency. Cross-
+  host routing (R-12) is explicitly deferred — the proxy preamble
+  returns 501 with an R-12 deferral message for non-local workers.
+- **`docs(preview)`** — operator setup section in [README](README.md)
+  (wildcard CNAME, Caddy DNS-01 snippet, lifecycle knob table); SPEC
+  §11.L marked shipped with cross-references to README +
+  `.env.example`; ROADMAP R-19 transitioned `[in flight]` → `[shipped]`
+  with Wave 3 entry updated. New env vars documented in
+  `.env.example`: `WARREN_PREVIEW_PORT_RANGE`,
+  `WARREN_PREVIEW_IDLE_TTL`, `WARREN_PREVIEW_MAX_LIFETIME`,
+  `WARREN_PREVIEW_MAX_LIVE`, `WARREN_PREVIEW_EVICTION_TICK_MS`,
+  `WARREN_PREVIEW_EVICTION_DISABLED`.
+
 ## [0.3.2] — 2026-05-14
 
 R-13 ships: warren now supports Postgres as an opt-in backend via

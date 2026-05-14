@@ -97,6 +97,74 @@ If a project has a `.seeds/` directory, agents can `sd ready` for unblocked work
 
 The built-in `sapling` agent is a headless coding harness with proactive context management. Use it the same way you'd use `claude-code`. See [sapling](https://github.com/jayminwest/sapling).
 
+### Per-run preview environments — click the agent's branch instead of checking it out
+
+When a project ships a `preview` block in `.warren/defaults.json`, warren launches `preview.command` as a sidecar inside the same burrow workspace after a successful run, allocates a port, and exposes the running app at `https://run-<runId>.<WARREN_PREVIEW_HOST>`. Reviewers click the URL instead of `git checkout`-ing the branch. Idle sessions are reaped automatically; the run-detail page surfaces a status badge and a manual teardown button. Opt in with two pieces:
+
+1. **Operator side.** Set `WARREN_PREVIEW_HOST=preview.<your-host>` and point a wildcard CNAME at the warren box (see [Per-run previews — operator setup](#per-run-previews--operator-setup) below). Without `WARREN_PREVIEW_HOST` the launch sub-step is a no-op (the run still completes, the URL just has no listener).
+2. **Project side.** Add a `preview` block to `.warren/defaults.json`:
+
+   ```json
+   {
+     "preview": {
+       "type": "server",
+       "command": "bun run dev",
+       "port": 3000,
+       "readiness_path": "/healthz",
+       "idle_ttl": "30m",
+       "max_lifetime": "8h"
+     }
+   }
+   ```
+
+   Projects that don't opt in skip the preview sub-step entirely. See [SPEC §11.L](SPEC.md#11l-per-run-preview-environments-2026-05-14) for the full contract.
+
+## Per-run previews — operator setup
+
+Enable the preview proxy by giving warren a host suffix it can route on:
+
+```bash
+WARREN_PREVIEW_HOST=preview.warren.example.com
+```
+
+Warren then matches `Host: run-<runId>.preview.warren.example.com` as a preamble before its API/UI routes and forwards to the in-sandbox port allocated at reap time. The login route (`GET /runs/:id/preview/login?token=…&redirect=…`) accepts the warren bearer in the query and issues a domain-scoped signed cookie (`warren_preview`); the proxy rejects unauthenticated browser requests with 401 (not 502). The HMAC key is derived from `WARREN_API_TOKEN`, so there's no second secret to manage — `warren doctor` warns if the token is empty or matches a placeholder.
+
+**Wildcard DNS.** Point a wildcard CNAME at the warren box so every `run-*` subdomain resolves:
+
+```
+*.preview.warren.example.com   CNAME   warren.example.com
+```
+
+**TLS via Caddy with a wildcard cert.** TLS stays on the operator's edge (SPEC §8.1 / §11.D). Use Caddy's DNS-01 challenge to issue `*.preview.warren.example.com` (HTTP-01 cannot issue wildcards). Minimal Caddyfile snippet:
+
+```caddyfile
+*.preview.warren.example.com {
+    tls {
+        dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+    }
+    reverse_proxy localhost:8080
+}
+```
+
+DNS providers Caddy's DNS-01 plugin supports include Cloudflare, Route 53, DigitalOcean, Google Cloud DNS, Hetzner, Linode, OVH, Vultr, and several others — see [caddy-dns](https://github.com/caddy-dns) for the current list. Some providers charge for API access; check yours before adopting this path. If your DNS provider isn't on the list, an operator-controlled per-project subdomain pattern is the alternative (filed as a V2-of-R-19 follow-up).
+
+**Lifecycle knobs.** Defaults are tuned for a home server; tune for org-scale:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WARREN_PREVIEW_IDLE_TTL` | `30m` | Sweep evicts after this much idle time since `preview_last_hit_at`. |
+| `WARREN_PREVIEW_MAX_LIFETIME` | `8h` | Hard ceiling from launch time regardless of activity. |
+| `WARREN_PREVIEW_MAX_LIVE` | `20` | Global LRU cap — bounds container memory under load. |
+| `WARREN_PREVIEW_PORT_RANGE` | `30000-31000` | Allocator range; doctor warns at ≥80% saturation. |
+| `WARREN_PREVIEW_EVICTION_TICK_MS` | `60000` | Sweep cadence. |
+| `WARREN_PREVIEW_EVICTION_DISABLED` | unset | `1` to disable the eviction worker (testing only). |
+
+Per-project overrides for `idle_ttl` and `max_lifetime` live in the project's `.warren/defaults.json` preview block; missing values fall back to the env defaults. `/readyz` surfaces `preview_port_allocator` saturation and `preview_max_live` headroom warnings.
+
+**Remote workers (R-12) note.** When a run lands on a non-local worker, the proxy preamble returns **501** with an explicit R-12 deferral message — cross-host preview routing is V2 of this item. The acceptance scenario covers the assertion.
+
+See [SPEC §11.L](SPEC.md#11l-per-run-preview-environments-2026-05-14) for the full design (auth scope, port allocator persistence, eviction signals, schema, sub-step ordering).
+
 ## Architecture
 
 ```
@@ -154,6 +222,8 @@ GET    /runs/:id                     detail incl. rendered_agent_json
 GET    /runs/:id/events?follow=1     NDJSON tail (warren log + live)
 POST   /runs/:id/steer               proxy to runtime inbox
 POST   /runs/:id/cancel              proxy to runtime cancel
+GET    /runs/:id/preview/login       issue signed-cookie + 302 (auth-exempt, ?token=)
+POST   /runs/:id/preview/teardown    manual preview teardown (idempotent)
 
 GET    /healthz                      liveness (no auth)
 GET    /readyz                       runtime + first-render check

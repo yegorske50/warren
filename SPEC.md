@@ -1099,6 +1099,23 @@ Design lock for R-19. Tracked by plan `pl-2c59` (root seed
 `warren-1bcb`, design-lock step `warren-94d8`). Closes the R-19 open
 questions; the implementing steps assume this section as contract.
 
+**Status: shipped 2026-05-14.** All 11 implementation steps under
+`pl-2c59` closed in sequence — burrow's cross-repo inbound-networking
++ sidecar-exec change (`burrow-8647`) landed first; warren-side
+schema (migration 0009 + `RunsRepo.attachPreview`), SQLite-backed
+port allocator, reap-time `preview_launch` + `pr_annotate_preview`
+best-effort sub-steps, idle-TTL / max-lifetime / LRU eviction worker,
+host proxy preamble + signed-cookie auth, manual teardown route,
+RunDetail UI surface, and acceptance scenario `20-preview.ts`
+(happy-path + idle-TTL eviction; macOS skipped per `mx-1d31f0`)
+followed. Operator setup (wildcard CNAME, Caddy DNS-01 snippet, the
+full `WARREN_PREVIEW_*` knob table) is documented in
+[README](README.md#per-run-previews--operator-setup) and
+[`.env.example`](.env.example). Static-site previews
+(`type: static`), PR-template configurability, the `.warren/` YAML
+reorg, and a PR-close webhook → preview-teardown hook stay as
+sibling follow-ups under `pl-2c59`.
+
 **Burrow-side dependency.** Burrow's bwrap profile is outbound-only
 today (§8.1, `network: 'none' | 'restricted' | 'open'`), and the run
 API is shaped around single-shot agent runs — neither an inbound

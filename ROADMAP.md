@@ -1224,9 +1224,11 @@ deploy; GitHub App mode activates when `WARREN_GITHUB_APP_ID` +
 ---
 
 ## R-19 — Per-run preview environments
-Status: [in flight] — plan `pl-2c59` (root seed `warren-1bcb`); design
-lock landed 2026-05-14 in SPEC §11.L.
-Depends on: burrow-side inbound networking policy (filed as the
+Status: [shipped] — plan `pl-2c59` (root seed `warren-1bcb`); design
+lock SPEC §11.L (2026-05-14); all 11 implementation steps closed
+2026-05-14 across the warren↔burrow boundary (burrow inbound
+networking + sidecar exec endpoint shipped as `burrow-8647`).
+Depends on: burrow-side inbound networking policy (shipped as the
 cross-repo coordination seed under `pl-2c59` step 2). Plays well with
 R-12 (remote workers) but doesn't require it — proxy preamble returns
 501 for non-local workers with an explicit R-12 deferral message.
@@ -1280,6 +1282,25 @@ workspace's listening port. Roughly:
    `preview_state` per run (`starting | live | torn-down | failed`)
    and exposes the URL in the UI as a clickable link with a status
    badge.
+
+**Shipped 2026-05-14.** All 11 implementation steps under plan
+`pl-2c59` closed in sequence: design-lock + burrow coordination seed,
+burrow inbound-networking + sidecar exec (`burrow-8647`),
+`.warren/defaults.json` preview block schema, `runs` migration 0009
+(five columns) + `RunsRepo.attachPreview`, SQLite-backed port
+allocator (`30000-31000`, restart-safe), reap-time `preview_launch` +
+`pr_annotate_preview` best-effort sub-steps, idle-TTL / max-lifetime /
+LRU eviction worker, host proxy preamble + signed-cookie auth at
+`GET /runs/:id/preview/login`, manual teardown route
+`POST /runs/:id/preview/teardown`, RunDetail UI badge + URL +
+teardown affordance, acceptance scenario `20-preview.ts`
+(happy-path + idle-TTL eviction; macOS skip per `mx-1d31f0`).
+Operator setup (wildcard CNAME, Caddy DNS-01 snippet, all
+`WARREN_PREVIEW_*` env vars) is documented in [README](README.md#per-run-previews--operator-setup)
+and [`.env.example`](.env.example). Static-site previews
+(`type: static`), PR-template configurability, the `.warren/` YAML
+reorg, and a PR-close webhook → teardown hook stay as sibling
+follow-ups under `pl-2c59`.
 
 **Decisions locked in SPEC §11.L (2026-05-14 design pass).**
 
@@ -1571,10 +1592,16 @@ R-09 is repromoted and R-12 through R-18 are slotted in.
 
 **Wave 3 — perceived-realness (post-org-readiness, design-first).**
 
-19. **R-19** (per-run preview environments) — in flight as plan
-    `pl-2c59`. Design lock landed 2026-05-14 in SPEC §11.L; the
-    cross-repo burrow inbound-networking seed (`warren-83dc`) is on the
-    critical path. Cross-host routing (R-12) explicitly deferred — proxy
-    preamble returns 501 with an R-12 deferral message for non-local
-    workers and acceptance scenario 19 asserts it. High UX leverage:
-    collapses "diff + checkout-locally to verify" into "click the URL."
+19. **R-19** (per-run preview environments) — **shipped 2026-05-14
+    via plan `pl-2c59`**. Design lock landed in SPEC §11.L; all 11
+    implementation steps closed in sequence (cross-repo burrow
+    inbound-networking + sidecar exec landed first as `burrow-8647`,
+    then warren-side schema/allocator/reap-substeps/eviction/proxy/UI/
+    acceptance scenario `20-preview.ts`). Cross-host routing (R-12)
+    explicitly deferred — proxy preamble returns 501 with an R-12
+    deferral message for non-local workers and acceptance scenario
+    20 asserts it. High UX leverage: collapses "diff + checkout-
+    locally to verify" into "click the URL." Static-mode previews
+    (`type: static`), PR-template configurability, the `.warren/`
+    YAML reorg, and a PR-close → teardown webhook stay as sibling
+    follow-ups under `pl-2c59`.
