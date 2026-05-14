@@ -555,7 +555,7 @@ and gets richer over time.
 ---
 
 ## R-08 — Operator agent (chat surface for warren management)
-Status: [proposed]
+Status: [proposed — needs reframing, see note below]
 Depends on: a self-describing warren API (`GET /openapi.json` is the natural
 fit, mirroring burrow's `mx-f5d9c8` pattern); a long-running run that doesn't
 freeze on idle (today's runs are one-shot)
@@ -563,6 +563,36 @@ Unlocks: conversational warren management — "spawn a refactor run on the auth
 module," "create a triage seed for that error," "edit the docs-bot role" —
 without context-switching to other UI surfaces; meta-validation that warren's
 HTTP API is genuinely consumable by an agent
+
+**Reframing note (2026-05-13).** As specified below, the operator is "an agent
+that drives warren on the user's behalf via the HTTP API." That's a hierarchy
+pattern at smaller scale — operator on top, drives the rest of the system —
+which sits uneasily against the human-as-node / shared-substrate direction the
+broader product is moving toward. In a substrate framing, the operator is just
+another node: the human asks via a seed or chat artifact, the operator drops
+an answer / a draft PR / a proposed seed into the substrate, the human reads
+and curates. There's no "drives warren" verb; the substrate IS the medium of
+conversation, and the operator's tool surface is the same `.seeds/` / `.canopy/`
+/ `.mulch/` / `.warren/` that every other node reads and writes.
+
+Open questions this reframing raises before committing to the original sketch:
+- Does the operator need warren's HTTP API as a tool surface at all, or just
+  the os-eco CLI surface (`sd`, `cn`, `ml`) that any agent already uses?
+  HTTP API access is the hierarchy shape; substrate access is the node shape.
+- Is the chat-FAB UI the right primary surface, or is it the *escape hatch*
+  for cases where async-via-substrate breaks down? Lean: substrate-browser
+  (R-14 activity feed + per-seed conversations) is primary; chat is the
+  escape hatch.
+- If R-14 ships first, does R-08 collapse into "a built-in operator role that
+  appears in the activity feed alongside other agents' work," with no
+  bespoke chat UI or session primitive? Possibly — and that would be a
+  cheaper, more substrate-aligned shape.
+- Resolve this before sketching the session primitive, the chat UI, or the
+  "operator role with full HTTP access" capability. Probably defer R-08
+  behind R-14 so the substrate-browser shape lands first.
+
+The original V2 sketch follows for context; treat it as the hierarchy-flavored
+straw-man that the reframing is pushing against, not the committed direction.
 
 **Problem.** As the team's workflow gets richer (issues, roles, triggers,
 multiple projects), the cost of clicking through warren's UI to set up each
