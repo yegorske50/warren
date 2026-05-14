@@ -50,7 +50,7 @@ import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { ValidationError } from "../core/errors.ts";
 import type { WarrenDb } from "../db/client.ts";
 import type { Repos } from "../db/repos/index.ts";
-import { runs } from "../db/schema.ts";
+import { type PreviewState, runs } from "../db/schema.ts";
 import type { RunEventBroker } from "../runs/events.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import { parseDurationMs } from "./duration.ts";
@@ -166,6 +166,40 @@ export interface RunPreviewRow {
 	readonly previewLastHitAt: string | null;
 }
 
+/**
+ * Outcome of a manual teardown CAS (warren-d725). The route returns the
+ * shape verbatim in the response envelope so a client / UI can tell
+ * "we just tore it down" apart from "it was already gone" without a
+ * second round-trip — same posture as `cancelRun`'s `alreadyTerminal`
+ * flag (mx-… cancel handler).
+ *
+ *   - `torn-down`        — was `starting`/`live`; CAS flipped it to
+ *                          `torn-down`, port released. Caller emits a
+ *                          `preview_torn_down` audit event.
+ *   - `already-torn-down`— row was already `torn-down`; no event.
+ *   - `already-failed`   — row is in terminal `failed` state. Port is
+ *                          already null (set by the launcher on the
+ *                          fail transition); no work needed, no event.
+ *   - `never-launched`   — `preview_state` is null. The project never
+ *                          opted in or reap's preview sub-step never
+ *                          fired. No event.
+ *
+ * `previousState` mirrors the column the CAS read; `port` is the value
+ * that was cleared (null when the row never carried one).
+ */
+export type ManualTeardownStatus =
+	| "torn-down"
+	| "already-torn-down"
+	| "already-failed"
+	| "never-launched";
+
+export interface ManualTeardownClaim {
+	readonly status: ManualTeardownStatus;
+	readonly previousState: PreviewState | null;
+	readonly port: number | null;
+	readonly burrowId: string | null;
+}
+
 export interface RunPreviewsRepo {
 	listActivePreviews(): Promise<readonly RunPreviewRow[]>;
 	countActivePreviews(): Promise<number>;
@@ -174,6 +208,16 @@ export interface RunPreviewsRepo {
 		readonly reason: EvictionReason;
 		readonly now: Date;
 	}): Promise<boolean>;
+	/**
+	 * Atomically claim a `starting`/`live` preview for manual teardown
+	 * (R-19 / SPEC §11.L acceptance #8, warren-d725). BEGIN IMMEDIATE
+	 * serializes against the eviction worker's `evict` so a manual
+	 * teardown racing an LRU sweep deterministically lands in exactly
+	 * one of them — the loser sees `already-torn-down`. Returns the
+	 * shape `teardownPreview` shapes onto the wire response and emits
+	 * `preview_torn_down` against.
+	 */
+	claimTeardown(input: { readonly runId: string }): Promise<ManualTeardownClaim>;
 }
 
 export interface PreviewEvictionTickInput {
@@ -548,6 +592,69 @@ export function createRunPreviewsRepo(db: WarrenDb): RunPreviewsRepo {
 						.where(eq(runs.id, input.runId))
 						.run();
 					return true;
+				},
+				{ behavior: "immediate" },
+			);
+		},
+		async claimTeardown(input): Promise<ManualTeardownClaim> {
+			return db.drizzle.transaction(
+				(tx) => {
+					const current = tx
+						.select({
+							previewState: runs.previewState,
+							previewPort: runs.previewPort,
+							burrowId: runs.burrowId,
+						})
+						.from(runs)
+						.where(eq(runs.id, input.runId))
+						.get();
+					if (current === undefined) {
+						// `teardownPreview` already calls `repos.runs.require` before us,
+						// so a row vanishing between that check and this transaction is
+						// a deletion race the route surfaces as `never-launched` rather
+						// than re-raising 404 from inside a transaction.
+						return {
+							status: "never-launched",
+							previousState: null,
+							port: null,
+							burrowId: null,
+						};
+					}
+					const previousState = current.previewState;
+					if (previousState === "starting" || previousState === "live") {
+						tx.update(runs)
+							.set({ previewState: "torn-down", previewPort: null })
+							.where(eq(runs.id, input.runId))
+							.run();
+						return {
+							status: "torn-down",
+							previousState,
+							port: current.previewPort,
+							burrowId: current.burrowId,
+						};
+					}
+					if (previousState === "torn-down") {
+						return {
+							status: "already-torn-down",
+							previousState,
+							port: current.previewPort,
+							burrowId: current.burrowId,
+						};
+					}
+					if (previousState === "failed") {
+						return {
+							status: "already-failed",
+							previousState,
+							port: current.previewPort,
+							burrowId: current.burrowId,
+						};
+					}
+					return {
+						status: "never-launched",
+						previousState: null,
+						port: current.previewPort,
+						burrowId: current.burrowId,
+					};
 				},
 				{ behavior: "immediate" },
 			);

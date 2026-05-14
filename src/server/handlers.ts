@@ -51,6 +51,7 @@ import {
 } from "../diagnostics/checks.ts";
 import { createRunPreviewsRepo, DEFAULT_MAX_LIVE } from "../preview/eviction.ts";
 import { DEFAULT_PREVIEW_PORT_RANGE, PreviewPortAllocator } from "../preview/port-allocator.ts";
+import { teardownPreview } from "../preview/teardown.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
 import { addProject, deleteProject, listProjects, refreshProject } from "../projects/index.ts";
 import { type AgentSource, readAgentSource } from "../registry/builtins/index.ts";
@@ -793,6 +794,80 @@ function resolvePreviewRedirect(raw: string | null, runId: string, host: string)
 	return parsed.toString();
 }
 
+/**
+ * `POST /runs/:id/preview/teardown` (R-19 / SPEC §11.L acceptance #8,
+ * warren-d725).
+ *
+ * Idempotent operator-driven teardown of the per-run preview. Bearer-
+ * required (the global auth gate covers `/runs/*`; this route is not
+ * in `isAuthExempt`). The body is optional — `{actor}` is forwarded
+ * onto the audit event for attribution, defaulting to `"manual"`.
+ *
+ * Responds 200 on every CAS outcome (`torn-down`, `already-torn-down`,
+ * `already-failed`, `never-launched`); 404 on unknown runId; 503 when
+ * the deploy is postgres-dialect or `deps.db` is undefined (mirrors
+ * the port allocator / eviction worker posture, mx-b82a55). The route
+ * is `tornDown: true` only when the call actually flipped a
+ * `starting`/`live` row.
+ */
+function previewTeardownHandler(deps: ServerDeps): RouteHandler {
+	return async (ctx) => {
+		const runId = requireParam(ctx, "id");
+		const body = await readJsonBodyOrEmpty(ctx);
+		const actor = body !== null ? optionalString(body, "actor") : undefined;
+
+		if (deps.db === undefined || deps.db.dialect !== "sqlite") {
+			return jsonResponse(503, {
+				error: {
+					code: "preview_teardown_unavailable",
+					message:
+						deps.db === undefined
+							? "preview teardown requires the sqlite repo layer; this warren has no db handle wired"
+							: `preview teardown is sqlite-only today (dialect=${deps.db.dialect}); see SPEC §11.L pl-f17e follow-up`,
+				},
+			});
+		}
+
+		const previews = createRunPreviewsRepo(deps.db);
+		const result = await teardownPreview({
+			runId,
+			repos: deps.repos,
+			previews,
+			burrowClientPool: deps.burrowClientPool,
+			broker: deps.broker,
+			...(actor !== undefined ? { actor } : {}),
+			...(deps.now !== undefined ? { now: deps.now } : {}),
+			logger: teardownLoggerFor(deps),
+		});
+
+		return jsonResponse(200, {
+			status: result.status,
+			tornDown: result.tornDown,
+			previousState: result.previousState,
+			port: result.port,
+		});
+	};
+}
+
+/**
+ * Narrow `ServerDeps.logger` (the pino-shaped surface) onto the
+ * `Record<string, unknown>` signature the preview teardown / eviction
+ * code expects. Same shape the boot path already builds for the
+ * eviction worker — kept inline here to avoid threading another
+ * `*LoggerFromPino` adapter down through `ServerDeps`.
+ */
+function teardownLoggerFor(deps: ServerDeps): {
+	info(obj: Record<string, unknown>, msg?: string): void;
+	warn(obj: Record<string, unknown>, msg?: string): void;
+	error(obj: Record<string, unknown>, msg?: string): void;
+} {
+	return {
+		info: (obj, msg) => deps.logger.info(obj, msg),
+		warn: (obj, msg) => deps.logger.warn(obj, msg),
+		error: (obj, msg) => deps.logger.error(obj, msg),
+	};
+}
+
 function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
@@ -1057,6 +1132,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "POST", pattern: "/runs/:id/steer", build: steerRunHandler },
 	{ method: "POST", pattern: "/runs/:id/cancel", build: cancelRunHandler },
 	{ method: "GET", pattern: "/runs/:id/preview/login", build: previewLoginHandler },
+	{ method: "POST", pattern: "/runs/:id/preview/teardown", build: previewTeardownHandler },
 ];
 
 /**
