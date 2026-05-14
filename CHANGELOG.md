@@ -31,6 +31,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end-to-end against a real Postgres rather than skipping on missing
   `WARREN_TEST_PG_URL`. Closes `warren-5549`.
 
+- **`chore(dogfood)`** — Fly + Supabase dogfood (`warren-f451`,
+  `pl-f1be` step 10): `warren-deployed.fly.dev` redeployed with
+  `WARREN_DB_URL=postgres://...supabase.co` set as a Fly secret;
+  `/readyz` reports `db_reachable.dialect=postgres` and `ok:true`
+  across all 11 checks. Test run `run_3s5gx3t1d3t1` (claude-code on
+  `jayminwest/warren`) dispatched, completed in ~4s with
+  `state:succeeded`, `branchPushed:true`, `commitsAhead:0`, mulch
+  sync read 407 records, and `reap.empty_push` correctly surfaced
+  the no-commit shape (the observability fix from `warren-f3bb` /
+  §11.G). End-to-end pg path through `ProjectsRepo`, `RunsRepo`,
+  `EventsRepo`, `AgentsRepo`, `BurrowsRepo` validated against real
+  Supabase. Operator gotcha logged: `CANOPY_REPO_URL=file:///canopy-source`
+  carried over from local `docker-compose` had to be `fly secrets
+  unset` on the Fly app — that path only exists inside the compose
+  bind-mount, not on Fly Machines.
+
 ## [0.3.3] — 2026-05-14
 
 R-19 (per-run preview environments) ships. Plan `pl-2c59` closed all
