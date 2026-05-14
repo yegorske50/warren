@@ -20,6 +20,14 @@
  *
  *   3. Dispatch via `POST /burrows/:id/runs`.
  *
+ * Placement (warren-39c3 / pl-9ba1 step 4): `BurrowClientPool.placeFor`
+ * picks a worker BEFORE the warren row is created so `runs.worker_id`
+ * lands at row-creation time and the same `BurrowClient` services
+ * provision, dispatch, and rollback. A `burrows` row capturing the
+ * burrow → worker pinning is written in the same turn as
+ * `attachBurrow`, so sticky-by-burrow (cancel / steer / reap / fan-out
+ * reads via `pool.clientFor`) has a durable mapping to resolve against.
+ *
  * The warren run row is created BEFORE any burrow call, with both
  * burrow IDs nulled — `attachBurrow` writes them back as each call
  * succeeds. That lets us carry the warren `run_xxx` id through the
@@ -48,6 +56,7 @@ import type {
 } from "@os-eco/burrow-cli";
 import type { BurrowClient } from "../burrow-client/client.ts";
 import { withTransportMapping } from "../burrow-client/client.ts";
+import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { ValidationError } from "../core/errors.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { RunRow } from "../db/schema.ts";
@@ -68,7 +77,15 @@ import { buildSeedFiles } from "./seed.ts";
 
 export interface SpawnRunInput {
 	readonly repos: Repos;
-	readonly burrowClient: BurrowClient;
+	/**
+	 * Multi-worker successor to the legacy `burrowClient` parameter
+	 * (warren-39c3 / pl-9ba1 step 4, parent warren-6747). `spawnRun`
+	 * resolves placement via `pool.placeFor({projectId})` so the chosen
+	 * worker name lands on `runs.worker_id` AND `burrows.worker_id`
+	 * before any burrow HTTP call. The same client services provision +
+	 * dispatch + rollback so a single run never crosses workers.
+	 */
+	readonly burrowClientPool: BurrowClientPool;
 	readonly agentName: string;
 	readonly projectId: string;
 	readonly prompt: string;
@@ -181,12 +198,21 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	// burrow rejects later still rolls back via the try/catch below.
 	const seedResult = buildSeedFiles(agent);
 
+	// warren-39c3: resolve placement BEFORE creating the warren row so
+	// `runs.worker_id` lands at row-creation time. `placeFor` reads the
+	// `workers` table — affinity → least-loaded → alphabetical tiebreak
+	// across `healthy` workers — and raises `NoEligibleWorkerError` if
+	// nothing is placeable, which the caller surfaces as a structured
+	// error.
+	const placement = input.burrowClientPool.placeFor({ projectId: projectAfterRefresh.id });
+
 	const run = input.repos.runs.create({
 		agentName: agent.name,
 		projectId: projectAfterRefresh.id,
 		prompt: input.prompt,
 		renderedAgentJson: agent,
 		trigger: input.trigger ?? "manual",
+		workerId: placement.workerName,
 		now: input.now?.(),
 	});
 
@@ -205,7 +231,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	let burrow: Burrow | null = null;
 	try {
 		burrow = await provisionBurrow(
-			input.burrowClient,
+			placement.client,
 			projectAfterRefresh.localPath,
 			projectAfterRefresh.gitUrl,
 			burrowConfig.network,
@@ -213,10 +239,20 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			seedResult.files,
 			branch,
 		);
+		// warren-39c3: persist the burrow → worker mapping (sticky-by-burrow)
+		// so cancel / steer / reap / fan-out reads can resolve the owning
+		// worker via `pool.clientFor({burrowId})`. Created in the same turn as
+		// `attachBurrow` so a crash between the two windows leaves the row
+		// consistent: either both are missing or both are populated.
+		input.repos.burrows.create({
+			id: burrow.id,
+			workerId: placement.workerName,
+			...(input.now !== undefined ? { now: input.now() } : {}),
+		});
 		input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
 
 		const burrowRun = await dispatchRun(
-			input.burrowClient,
+			placement.client,
 			burrow.id,
 			agent.name,
 			composeDispatchPrompt(agent.sections.system, input.prompt),
@@ -225,7 +261,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		const updated = input.repos.runs.attachBurrow(run.id, { burrowRunId: burrowRun.id });
 		return { run: updated, burrow, burrowRun, agent };
 	} catch (err) {
-		await rollback(input, run.id, burrow);
+		await rollback(input, run.id, burrow, placement.client);
 		throw err;
 	}
 }
@@ -302,7 +338,12 @@ export function composeDispatchPrompt(systemBody: string | undefined, userPrompt
 	return `${trimmed}\n\n---\n\n${userPrompt}`;
 }
 
-async function rollback(input: SpawnRunInput, runId: string, burrow: Burrow | null): Promise<void> {
+async function rollback(
+	input: SpawnRunInput,
+	runId: string,
+	burrow: Burrow | null,
+	client: BurrowClient,
+): Promise<void> {
 	try {
 		input.repos.runs.finalize(runId, "cancelled", input.now?.());
 	} catch {
@@ -311,8 +352,8 @@ async function rollback(input: SpawnRunInput, runId: string, burrow: Burrow | nu
 	}
 	if (burrow !== null) {
 		try {
-			await withTransportMapping(input.burrowClient.config, () =>
-				input.burrowClient.http.burrows.destroy(burrow.id, { archive: false }),
+			await withTransportMapping(client.config, () =>
+				client.http.burrows.destroy(burrow.id, { archive: false }),
 			);
 		} catch {
 			// Best-effort cleanup. The operator can list stranded burrows via

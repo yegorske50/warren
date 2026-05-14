@@ -10,6 +10,7 @@
  */
 
 import type { BurrowClient } from "../burrow-client/client.ts";
+import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
@@ -98,6 +99,15 @@ export interface Logger {
 export interface ServerDeps {
 	readonly repos: Repos;
 	readonly burrowClient: BurrowClient;
+	/**
+	 * Multi-worker burrow client pool (warren-39c3 / pl-9ba1 step 4).
+	 * `POST /runs` and `POST /projects/:id/triggers/:triggerId/run` thread
+	 * this into `spawnRun` so placement (`placeFor`) picks the worker that
+	 * owns each new burrow. Cancel / steer / readyz still read from the
+	 * legacy `burrowClient` field until step 5 routes them through
+	 * `clientFor`.
+	 */
+	readonly burrowClientPool: BurrowClientPool;
 	readonly broker: RunEventBroker;
 	readonly bridges: BridgeRegistry;
 	/**

@@ -327,7 +327,7 @@ function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 
 		const result = await spawnRun({
 			repos: deps.repos,
-			burrowClient: deps.burrowClient,
+			burrowClientPool: deps.burrowClientPool,
 			agentName: trigger.role,
 			projectId: project.id,
 			prompt,
@@ -437,7 +437,7 @@ function createRunHandler(deps: ServerDeps): RouteHandler {
 		const modelOverride = optionalString(body, "modelOverride");
 		const result = await spawnRun({
 			repos: deps.repos,
-			burrowClient: deps.burrowClient,
+			burrowClientPool: deps.burrowClientPool,
 			agentName: requireString(body, "agent"),
 			projectId: requireString(body, "project"),
 			prompt: requireString(body, "prompt"),

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
-import { BurrowClient } from "../burrow-client/index.ts";
+import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
@@ -24,6 +24,13 @@ function makeBurrowClient(): BurrowClient {
 		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 		fetch: stubFetch(),
 	});
+}
+
+function makePool(repos: Repos): BurrowClientPool {
+	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	const pool = new BurrowClientPool({ repos });
+	pool.register("local", makeBurrowClient());
+	return pool;
 }
 
 interface BridgeCall {
@@ -128,7 +135,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClient: makeBurrowClient(),
+			burrowClientPool: makePool(repos),
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -205,7 +212,7 @@ describe("bootScheduler", () => {
 
 		const handle = bootScheduler({
 			repos,
-			burrowClient: makeBurrowClient(),
+			burrowClientPool: makePool(repos),
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
@@ -235,7 +242,7 @@ describe("bootScheduler", () => {
 		const setIntervalCalls: { ms: number }[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClient: makeBurrowClient(),
+			burrowClientPool: makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({ triggers: null, defaults: null, errors: [] }),
@@ -259,7 +266,7 @@ describe("bootScheduler", () => {
 		const clearCalls: number[] = [];
 		const handle = bootScheduler({
 			repos,
-			burrowClient: makeBurrowClient(),
+			burrowClientPool: makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
 				load: async () => ({ triggers: null, defaults: null, errors: [] }),

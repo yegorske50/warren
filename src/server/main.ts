@@ -145,7 +145,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const schedulerConfig = loadTriggerSchedulerConfigFromEnv(env);
 	const scheduler = bootScheduler({
 		repos,
-		burrowClient,
+		burrowClientPool,
 		bridges: bridgesBoot.registry,
 		warrenConfigs,
 		projectsConfig,
@@ -167,6 +167,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const deps: ServerDeps = {
 		repos,
 		burrowClient,
+		burrowClientPool,
 		broker,
 		bridges: bridgesBoot.registry,
 		...(canopyConfig !== null ? { canopyConfig } : {}),

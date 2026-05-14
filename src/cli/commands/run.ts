@@ -22,6 +22,7 @@
 
 import type { BurrowClient } from "../../burrow-client/client.ts";
 import { withTransportMapping } from "../../burrow-client/client.ts";
+import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunTerminalState } from "../../db/schema.ts";
 import {
@@ -59,6 +60,13 @@ export interface RunArgs {
 export interface RunDeps {
 	readonly repos: Repos;
 	readonly burrowClient: BurrowClient;
+	/**
+	 * Multi-worker burrow pool (warren-39c3 / pl-9ba1 step 4). `spawnRun`
+	 * consumes this for placement; the legacy `burrowClient` field is still
+	 * used by `bridgeRunStream`, `reapRun`, and `fetchBurrowRunState` until
+	 * step 5 routes them through `pool.clientFor`.
+	 */
+	readonly burrowClientPool: BurrowClientPool;
 	/** Optional broker injection — defaults to a fresh broker per run. */
 	readonly broker?: RunEventBroker;
 	/** Override the bridge factory (tests). Defaults to the live `bridgeRunStream`. */
@@ -126,7 +134,7 @@ export async function runRun(
 	try {
 		spawnResult = await spawn({
 			repos: deps.repos,
-			burrowClient: deps.burrowClient,
+			burrowClientPool: deps.burrowClientPool,
 			agentName: args.agent,
 			projectId: args.project,
 			prompt: args.prompt,

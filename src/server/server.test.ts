@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BurrowClient } from "../burrow-client/index.ts";
+import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { ValidationError } from "../core/errors.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
@@ -54,10 +54,14 @@ function depsFor(
 	overrides: { spawn?: SpawnFn; canopyDir?: string; uiDistDir?: string | null } = {},
 ): ServerDeps {
 	const burrowClient = makeBurrowClient();
+	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	const burrowClientPool = new BurrowClientPool({ repos });
+	burrowClientPool.register("local", burrowClient);
 	const broker = new RunEventBroker();
 	return {
 		repos,
 		burrowClient,
+		burrowClientPool,
 		broker,
 		bridges:
 			bridges ??
@@ -415,6 +419,7 @@ describe("startServer — routes", () => {
 		const noCanopyDeps: ServerDeps = {
 			repos: deps.repos,
 			burrowClient: deps.burrowClient,
+			burrowClientPool: deps.burrowClientPool,
 			broker: deps.broker,
 			bridges: deps.bridges,
 			projectsConfig: deps.projectsConfig,

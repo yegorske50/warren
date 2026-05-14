@@ -21,7 +21,7 @@
  * bridge.
  */
 
-import type { BurrowClient } from "../burrow-client/client.ts";
+import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
@@ -43,7 +43,7 @@ import type { BridgeRegistry } from "./types.ts";
 
 export interface BootSchedulerInput {
 	readonly repos: Repos;
-	readonly burrowClient: BurrowClient;
+	readonly burrowClientPool: BurrowClientPool;
 	readonly bridges: BridgeRegistry;
 	readonly warrenConfigs: WarrenConfigCache;
 	readonly projectsConfig: ProjectsConfig;
@@ -76,7 +76,7 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 	): Promise<DispatchSpawnResult> => {
 		const result = await spawnRunFn({
 			repos: input.repos,
-			burrowClient: input.burrowClient,
+			burrowClientPool: input.burrowClientPool,
 			agentName: args.agentName,
 			projectId: args.projectId,
 			prompt: args.prompt,

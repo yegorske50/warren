@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
 import { BurrowClient } from "../../burrow-client/client.ts";
+import { BurrowClientPool } from "../../burrow-client/pool.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { RunRow, RunTerminalState } from "../../db/schema.ts";
@@ -32,6 +33,17 @@ function fakeBurrowClient(): BurrowClient {
 		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
 		fetch: (async () => new Response(null, { status: 500 })) as unknown as typeof fetch,
 	});
+}
+
+function fakeBurrowDeps(repos: Repos): {
+	burrowClient: BurrowClient;
+	burrowClientPool: BurrowClientPool;
+} {
+	const burrowClient = fakeBurrowClient();
+	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	const burrowClientPool = new BurrowClientPool({ repos });
+	burrowClientPool.register("local", burrowClient);
+	return { burrowClient, burrowClientPool };
 }
 
 function buildSpawnStub(repos: Repos, agentName: string, projectId: string) {
@@ -121,7 +133,7 @@ describe("runRun", () => {
 		const { context } = captureContext();
 		const result = await runRun(
 			context,
-			{ repos, burrowClient: fakeBurrowClient() },
+			{ repos, ...fakeBurrowDeps(repos) },
 			{ agent: "", project: "", prompt: "" },
 		);
 		expect(result.exitCode).toBe(2);
@@ -159,7 +171,7 @@ describe("runRun", () => {
 			context,
 			{
 				repos,
-				burrowClient: fakeBurrowClient(),
+				...fakeBurrowDeps(repos),
 				broker,
 				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
 				bridge: bridgeStub,
@@ -207,7 +219,7 @@ describe("runRun", () => {
 			context,
 			{
 				repos,
-				burrowClient: fakeBurrowClient(),
+				...fakeBurrowDeps(repos),
 				broker,
 				spawn: buildSpawnStub(repos, "refactor-bot", projectId) as never,
 				bridge: bridgeStub,

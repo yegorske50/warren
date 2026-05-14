@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../burrow-client/index.ts";
+import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { RunEventBroker } from "../runs/index.ts";
@@ -7,6 +7,20 @@ import { NO_AUTH } from "./auth.ts";
 import { createBridgeRegistry } from "./bridges.ts";
 import { startServer } from "./server.ts";
 import type { BridgeRegistry, ServeHandle, ServerDeps } from "./types.ts";
+
+/**
+ * Build a single-worker `BurrowClientPool` from a stubbed `BurrowClient`
+ * so `POST /runs` and `POST /projects/:id/triggers/:triggerId/run` can
+ * route through `spawnRun`'s placement seam (warren-39c3). Upserts the
+ * synthetic `local` worker row so `placeForProject` has a healthy
+ * candidate.
+ */
+function poolFor(repos: Repos, client: BurrowClient): BurrowClientPool {
+	repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
+	const pool = new BurrowClientPool({ repos });
+	pool.register("local", client);
+	return pool;
+}
 
 const silentLogger = {
 	info() {},
@@ -95,6 +109,7 @@ function depsFor(repos: Repos, burrowClient: BurrowClient, bridges?: BridgeRegis
 	return {
 		repos,
 		burrowClient,
+		burrowClientPool: poolFor(repos, burrowClient),
 		broker,
 		bridges:
 			bridges ??
@@ -659,6 +674,7 @@ describe("POST /agents/refresh without canopy library (warren-d3e9)", () => {
 		const noCanopyDeps: ServerDeps = {
 			repos: deps.repos,
 			burrowClient: deps.burrowClient,
+			burrowClientPool: deps.burrowClientPool,
 			broker: deps.broker,
 			bridges: deps.bridges,
 			projectsConfig: deps.projectsConfig,
