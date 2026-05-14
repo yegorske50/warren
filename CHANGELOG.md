@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-14
+
+R-13 ships: warren now supports Postgres as an opt-in backend via
+`WARREN_DB_URL=postgres://...` (default stays sqlite). The work
+landed across nine sequenced steps in plan `pl-f17e` — async-everywhere
+repo layer, schema split into a shared columns module + parallel
+sqlite/postgres tables, per-dialect drizzle configs with an initial
+pg migration set, dialect-aware `openDatabase` + URL parsing, env
+plumbing through server / CLI / doctor / readyz, an env-gated
+`withDb()` test helper, acceptance scenario 19 (warren-on-postgres,
+twin of scenario 06), and a `warren db migrate-to-postgres` one-shot
+porter for existing sqlite operators. R-12 also picks up its real
+end-to-end acceptance harness in scenario 18 (multi-worker affinity,
+drain failover, cross-worker fan-out). R-19 (per-run preview
+environments) reaches design lock in SPEC §11.L; no runtime code
+yet.
+
+### Added
+
+- **`feat(db)`** — bring-your-own database backend (R-13, `pl-f17e`).
+  `WARREN_DB_URL` selects the dialect (`sqlite://path` or
+  `postgres://...`); the legacy `WARREN_DB_PATH` synthesizes into
+  `sqlite://` and a conflict between the two surfaces as a
+  `logger.warn` plus a `warren_db` doctor failure. `parseDatabaseUrl`
+  (`src/db/url.ts`) is the single seam — `openDatabase` now returns
+  the union `AnyWarrenDb` for `{ url }` callers and narrows on
+  `dialect`. SQLite stays the zero-config default; Postgres uses
+  `pg.Pool` with drizzle's `node-postgres` adapter. Schema lives in
+  parallel modules (`src/db/schema/sqlite.ts`,
+  `src/db/schema/postgres.ts`) over a shared `columns.ts` (enum
+  tuples, type unions, table + index name constants). Drift between
+  the two is enforced by `src/db/schema/drift.test.ts` — byte-
+  identical column lists, nullability, PKs, FK targets + onDelete,
+  and index names + columns; sanctioned dialect-specific bits
+  (`jsonb`, `doublePrecision`, `serial`) are intentionally not
+  compared. The repo layer (`src/db/repos/*`) is now async-everywhere
+  — every public method on the 7 repos plus `WarrenDb.close()`
+  returns a `Promise`; ~51 production call sites and ~30 test files
+  picked up `await`, and cascading consumers (placement,
+  `BurrowClientPool`, `bootBridges`, `recoverActiveRunStreams`,
+  `buildTriggerSummaries`, `mergeMulchFile`, `seedBuiltinAgents`,
+  `listProjects`) became async too.
+- **`feat(cli)`** — `warren db migrate-to-postgres --from <sqlite>
+  --to <pg-url>` (`warren-14ac`). Copies a populated sqlite
+  `warren.db` into a fresh Postgres database with `INSERT ... ON
+  CONFLICT DO NOTHING`, preserving PKs byte-for-byte and advancing
+  the events serial sequence so subsequent warren-on-pg appends
+  don't collide with seeded rows. FK-safe table walk:
+  `agents → projects → workers → burrows → runs → events → triggers`.
+  Source opens with `skipMigrations:true` (read-only intent); target
+  migrates on open so a fresh empty pg DB is a valid `--to` target.
+  Cross-dialect row passthrough works field-for-field because the
+  drift test keeps the schemas byte-identical at the column-list
+  level.
+- **`feat(diagnostics)`** — `db_reachable` check in `warren doctor`
+  and `/readyz` (`warren-e2ea`). `pingDatabase` issues a trivial
+  `SELECT 1` (sqlite) or `SELECT 1` over `pg.Pool` (postgres) and
+  reports the active dialect in the result. Replaces the implicit
+  "db is reachable iff openDatabase didn't throw at boot" posture.
+- **`feat(db,test)`** — dialect-aware `withDb()` helper
+  (`src/db/testing.ts`, `warren-c823`). Opens an isolated,
+  freshly-migrated database for one test and returns a handle with
+  `Symbol.asyncDispose`. SQLite path uses `:memory:`; Postgres path
+  mints a unique `warren_test_<8hex>` schema, appends `options=-c
+  search_path=<schema>` to the pool URL, and pins drizzle's
+  `__drizzle_migrations` into the same schema so `DROP SCHEMA
+  CASCADE` reaps everything on close. Env-gated on
+  `WARREN_TEST_PG_URL` — local dev stays on sqlite, CI matrix opts
+  in.
+- **`test(acceptance)`** — scenario 18: real multi-burrow R-12
+  acceptance (`warren-82ea`). Boots its own warren +
+  alpha-burrow + beta-burrow stack via a new `bootInProcMulti`
+  helper, then drives the three R-12 criteria through warren's HTTP
+  API end-to-end: project-affinity (P-affinity = alpha → next P
+  lands on alpha, unaffinitized Q goes to beta via least-loaded),
+  failover-on-drain (`POST /workers/alpha/drain` forwards
+  `/admin/drain`; the next P run fails over to beta; sticky-by-
+  burrow still routes `GET /burrows/<alpha-pinned>` to draining
+  alpha), and cross-worker fan-out (`GET /burrows` unions both
+  workers; SIGKILL alpha surfaces it in `workerErrors`). Stretch:
+  alpha-unreachable → `GET /burrows/<id>` returns 503
+  `sticky_worker_unreachable` instead of silent re-placement.
+- **`test(acceptance)`** — scenario 19: warren-on-postgres
+  (`warren-480a`). Twins scenario 06 (restart-recovery) but writes
+  to Postgres. Skip-gated on `WARREN_TEST_PG_URL` via a new
+  `ScenarioSkipped` + `skipScenario(reason)` harness primitive so
+  env-gated scenarios record as `status=skipped` (not `failed`).
+  Per-scenario isolation uses a fresh `CREATE DATABASE` on a
+  maintenance connection so warren's drizzle bookkeeping lives
+  inside the per-scenario DB and is reaped by `DROP DATABASE …
+  WITH (FORCE)`. Adds `bootInProc.dbUrl` so scenarios can point a
+  spawned warren at a non-default URL.
+
+### Changed
+
+- **`refactor(db)`** — schema split into shared columns + parallel
+  dialect tables (`warren-c8d1`). The runtime import surface is
+  unchanged — `src/db/schema.ts` re-exports `columns.ts` +
+  `sqlite.ts` so every existing repo / consumer import keeps
+  working. New code targets `src/db/schema/{sqlite,postgres}.ts`
+  directly via the per-dialect drizzle configs (`warren-373e`):
+  `db:generate:sqlite` and `db:generate:postgres` write under
+  `src/db/migrations/{sqlite,postgres}/` with independent histories
+  (sqlite walks 0000-0008 including the 12-step ALTER in 0003 with
+  no pg analogue; postgres starts at a single 0000_init that builds
+  the final state). `src/db/migrations/migrations.test.ts` is the
+  parity smoke test (journal well-formedness + idx contiguity).
+- **Docs**: SPEC §3.2 strikes the "no bring-your-own database" V1
+  non-goal; §6 Tech Stack lists both backends; §10.1 / §10.2 /
+  §11.J document the `WARREN_DB_URL` flip and the
+  migrate-to-postgres porter. README and ROADMAP flip R-13 to
+  shipped. `docker-compose.yml` and `fly.toml` comments call out
+  the dual-backend story so operators see Postgres as the org-
+  scale path.
+- **Docs (R-19 design lock)**: SPEC §11.L lands the per-run preview
+  environments design (`pl-2c59`) — same-sandbox not forked, signed-
+  cookie auth, in-process Bun proxy with `last_hit_at` update-
+  before-response, restart-safe SQLite port allocator keyed off
+  `runs.preview_state`, idle-TTL as primary kill-rule + max-lifetime
+  ceiling + global LRU + manual teardown, two best-effort reap sub-
+  steps (`preview_launch` + `pr_annotate_preview`) with a
+  `<!-- warren:preview-placeholder -->` fragment so PR open never
+  blocks on preview ready. No runtime code yet — implementation
+  follows in subsequent releases.
+
+### Build
+
+- **`deps`** — adds `pg ^8.13.1` and `@types/pg ^8.11.10` (R-13).
+  SQLite remains the default; the pg driver is loaded lazily by
+  `openDatabase` only when `WARREN_DB_URL` resolves to a postgres
+  URL, so sqlite-only installs incur no runtime cost.
+
 ## [0.3.1] — 2026-05-13
 
 Patch follow-through on the 0.3.0 multi-worker substrate plus a UI

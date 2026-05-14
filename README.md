@@ -17,7 +17,7 @@ Engineering teams self-hosting their own agent infrastructure — not a SaaS, no
 
 ## Status
 
-V1 (`0.1.7`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 16 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/). The cron half of the scheduler now ships in V1 ([SPEC §11.I](SPEC.md)); GitHub webhook triggers and library API exports remain deferred to V2. V1 is single-user / single-host as shipped; the [org-readiness cluster](ROADMAP.md#org-readiness-cluster-r-12--r-18) (SSO, remote burrow workers, Postgres backend, MCP, audit, budgets, GitHub App) is the active forward direction.
+V1 (`0.3.2`). The manual-run path is end-to-end validated against a deployed Fly.io instance ([SPEC §11.E](SPEC.md#11e-first-run-validation-2026-05-09)) and exercised by 19 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/) — including real multi-worker R-12 coverage (scenario 18) and an env-gated warren-on-postgres twin (scenario 19, R-13). The cron half of the scheduler now ships in V1 ([SPEC §11.I](SPEC.md)); GitHub webhook triggers and library API exports remain deferred to V2. V1 is single-user / single-host as shipped; the [org-readiness cluster](ROADMAP.md#org-readiness-cluster-r-12--r-18) (SSO, remote burrow workers, Postgres backend, MCP, audit, budgets, GitHub App) is the active forward direction.
 
 ## What you get
 
@@ -127,8 +127,9 @@ The `warren` (or `wr`) admin CLI is for ops; the web UI is daily.
 | `warren add-project <git-url>` | Clone a project under `/data/projects` |
 | `warren run <agent> <project> -p "..."` | One-shot run, no UI |
 | `warren init` | Scaffold a `.warren/` directory in a project |
-| `warren doctor` | Runtime reachable? Bwrap working? |
+| `warren doctor` | Runtime reachable? Bwrap working? DB reachable? |
 | `warren serve` | Start the HTTP server (default in entrypoint) |
+| `warren db migrate-to-postgres --from <sqlite> --to <pg-url>` | One-shot SQLite → Postgres porter ([R-13](ROADMAP.md)) |
 
 `warren run claude-code <project> -p "..."` does the full composition end-to-end: resolves the agent (built-in or library), provisions the sandbox, dispatches the run, streams events back, then pushes the branch. If the project has `.mulch/` or `.seeds/`, those round-trip too.
 
@@ -179,7 +180,7 @@ bun run ui:install
 bun run ui:dev
 ```
 
-The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 16 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, container-mode parity, `.warren/` config lifecycle, cron + scheduled-for trigger dispatch, and the pi built-in parity smoke. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
+The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 19 scenario-based end-to-end runs against a live container — covering boot health, agent refresh, project lifecycle, run spawn/stream/cancel/steer, restart recovery, mulch + seeds round-tripping, doctor exit codes, supervisor restart-budget, container-mode parity, `.warren/` config lifecycle, cron + scheduled-for trigger dispatch, the pi built-in parity smoke, init scaffold, multi-worker placement / drain / fan-out, and an env-gated warren-on-postgres twin of restart-recovery. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, testing conventions, and PR expectations.
 
