@@ -23,6 +23,7 @@ import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { ValidationError } from "../core/errors.ts";
 import { type AnyWarrenDb, pingDatabase } from "../db/client.ts";
 import { parseDatabaseUrl, sqliteUrlForPath } from "../db/url.ts";
+import { PREVIEW_MAX_LIVE_WARN_RATIO } from "../preview/eviction.ts";
 import { type PortUsage, PREVIEW_PORT_USAGE_WARN_RATIO } from "../preview/port-allocator.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import { type CanopyRegistryConfig, loadCanopyRegistryConfigFromEnv } from "../registry/config.ts";
@@ -428,6 +429,49 @@ export async function checkPreviewPortAllocator(deps: {
 		};
 	}
 	return { name: "preview_port_allocator", ok: true, message: summary };
+}
+
+/**
+ * Live-preview saturation against the global cap (R-19 / SPEC §11.L,
+ * warren-ea6b). Fails when the count of `starting`/`live` previews is at
+ * or above `warnRatio` of `WARREN_PREVIEW_MAX_LIVE`. Operators tighten
+ * `WARREN_PREVIEW_IDLE_TTL` / `WARREN_PREVIEW_MAX_LIFETIME` so the
+ * eviction worker reclaims faster, or raise the cap if the deploy needs
+ * more concurrent previews. Pure: takes a `count()` probe so tests don't
+ * need a live db handle.
+ */
+export interface PreviewLiveCountProbe {
+	count(): Promise<number>;
+}
+
+export async function checkPreviewMaxLive(deps: {
+	readonly probe: PreviewLiveCountProbe;
+	readonly maxLive: number;
+	readonly warnRatio?: number;
+}): Promise<DiagnosticCheck> {
+	const warnRatio = deps.warnRatio ?? PREVIEW_MAX_LIVE_WARN_RATIO;
+	let live: number;
+	try {
+		live = await deps.probe.count();
+	} catch (err) {
+		return {
+			name: "preview_max_live",
+			ok: false,
+			message: err instanceof Error ? err.message : String(err),
+			hint: "verify WARREN_DB_URL is reachable and the runs table has the preview columns (migration 0009)",
+		};
+	}
+	const ratio = deps.maxLive === 0 ? 1 : live / deps.maxLive;
+	const summary = `${live}/${deps.maxLive} live previews`;
+	if (ratio >= warnRatio) {
+		return {
+			name: "preview_max_live",
+			ok: false,
+			message: `${summary}, ≥ ${Math.round(warnRatio * 100)}% of WARREN_PREVIEW_MAX_LIVE`,
+			hint: "raise WARREN_PREVIEW_MAX_LIVE or tighten WARREN_PREVIEW_IDLE_TTL / WARREN_PREVIEW_MAX_LIFETIME so the eviction worker reclaims faster",
+		};
+	}
+	return { name: "preview_max_live", ok: true, message: summary };
 }
 
 /**

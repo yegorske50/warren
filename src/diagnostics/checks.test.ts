@@ -8,6 +8,7 @@ import {
 	checkCanopyClean,
 	checkCanopyClone,
 	checkDatabaseReachable,
+	checkPreviewMaxLive,
 	checkPreviewPortAllocator,
 	checkWarrenConfig,
 	checkWarrenDb,
@@ -434,6 +435,60 @@ describe("checkPreviewPortAllocator", () => {
 					throw new Error("db handle closed");
 				},
 			},
+		});
+		expect(result.ok).toBe(false);
+		expect(result.message).toBe("db handle closed");
+		expect(result.hint).toContain("migration 0009");
+	});
+});
+
+describe("checkPreviewMaxLive", () => {
+	test("ok under the warn threshold", async () => {
+		const result = await checkPreviewMaxLive({
+			probe: { count: async () => 10 },
+			maxLive: 20,
+		});
+		expect(result.name).toBe("preview_max_live");
+		expect(result.ok).toBe(true);
+		expect(result.message).toContain("10/20");
+	});
+
+	test("fails at exactly 80% saturation", async () => {
+		const result = await checkPreviewMaxLive({
+			probe: { count: async () => 16 },
+			maxLive: 20,
+		});
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("16/20");
+		expect(result.message).toContain("80%");
+		expect(result.hint).toContain("WARREN_PREVIEW_MAX_LIVE");
+	});
+
+	test("respects an override warnRatio", async () => {
+		const result = await checkPreviewMaxLive({
+			probe: { count: async () => 5 },
+			maxLive: 10,
+			warnRatio: 0.5,
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("clamps a zero-cap to fully saturated", async () => {
+		const result = await checkPreviewMaxLive({
+			probe: { count: async () => 0 },
+			maxLive: 0,
+		});
+		expect(result.ok).toBe(false);
+	});
+
+	test("fails with the probe error message when count() throws", async () => {
+		const result = await checkPreviewMaxLive({
+			probe: {
+				count: async () => {
+					throw new Error("db handle closed");
+				},
+			},
+			maxLive: 20,
 		});
 		expect(result.ok).toBe(false);
 		expect(result.message).toBe("db handle closed");

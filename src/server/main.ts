@@ -28,6 +28,10 @@ import { BurrowClientPool } from "../burrow-client/index.ts";
 import { type AnyWarrenDb, openDatabase, WARREN_DB_POOL_MAX_ENV } from "../db/client.ts";
 import { createRepos } from "../db/repos/index.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
+import {
+	loadPreviewEvictionConfigFromEnv,
+	startPreviewEvictionWorker,
+} from "../preview/eviction.ts";
 import { loadPreviewLaunchConfigFromEnv } from "../preview/launch.ts";
 import { loadPreviewPortRangeFromEnv, PreviewPortAllocator } from "../preview/port-allocator.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
@@ -154,6 +158,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const portAllocator =
 		db.dialect === "sqlite" ? new PreviewPortAllocator(db, previewPortRange) : undefined;
 	const previewLaunchConfig = loadPreviewLaunchConfigFromEnv(env);
+	const previewEvictionConfig = loadPreviewEvictionConfigFromEnv(env);
 
 	const bridgesBoot = await bootBridges({
 		repos,
@@ -240,6 +245,37 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
+	// Preview TTL + LRU eviction worker (R-19 / SPEC §11.L, warren-ea6b).
+	// Same sqlite-only gate as the port allocator: postgres deploys skip the
+	// worker until the repo layer becomes dialect-aware (pl-f17e follow-up).
+	const previewEvictionWorker =
+		db.dialect === "sqlite"
+			? startPreviewEvictionWorker({
+					db,
+					repos,
+					burrowClientPool,
+					warrenConfigs,
+					config: previewEvictionConfig,
+					logger: previewEvictionLoggerFromPino(logger),
+					...(opts.now !== undefined ? { now: opts.now } : {}),
+				})
+			: null;
+	if (previewEvictionWorker !== null) {
+		if (previewEvictionConfig.disabled) {
+			logger.info({}, "preview eviction disabled via WARREN_PREVIEW_EVICTION_DISABLED");
+		} else {
+			logger.info(
+				{
+					tickMs: previewEvictionConfig.tickMs,
+					idleTtlMs: previewEvictionConfig.idleTtlMs,
+					maxLifetimeMs: previewEvictionConfig.maxLifetimeMs,
+					maxLive: previewEvictionConfig.maxLive,
+				},
+				"preview eviction worker running",
+			);
+		}
+	}
+
 	const deps: ServerDeps = {
 		repos,
 		db,
@@ -255,6 +291,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		warrenConfigs,
 		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		previewPortRange,
+		previewMaxLive: previewEvictionConfig.maxLive,
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	};
 
@@ -279,6 +316,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			// spawnRun before bridges/burrow/db disappear under it.
 			await handle.stop();
 			await scheduler.stop();
+			if (previewEvictionWorker !== null) await previewEvictionWorker.stop();
 			await workerProbe.stop();
 			await bridgesBoot.registry.stopAll();
 			await burrowClientPool.close();
@@ -409,6 +447,18 @@ function bridgeLoggerFromPino(logger: Logger): {
 }
 
 function schedulerLoggerFromPino(logger: Logger): {
+	info(obj: Record<string, unknown>, msg?: string): void;
+	warn(obj: Record<string, unknown>, msg?: string): void;
+	error(obj: Record<string, unknown>, msg?: string): void;
+} {
+	return {
+		info: (obj, msg) => logger.info(obj, msg),
+		warn: (obj, msg) => logger.warn(obj, msg),
+		error: (obj, msg) => logger.error(obj, msg),
+	};
+}
+
+function previewEvictionLoggerFromPino(logger: Logger): {
 	info(obj: Record<string, unknown>, msg?: string): void;
 	warn(obj: Record<string, unknown>, msg?: string): void;
 	error(obj: Record<string, unknown>, msg?: string): void;

@@ -43,10 +43,12 @@ import {
 	checkCanopyClean,
 	checkCanopyClone,
 	checkDatabaseReachable,
+	checkPreviewMaxLive,
 	checkPreviewPortAllocator,
 	checkWarrenConfig,
 	type DiagnosticCheck,
 } from "../diagnostics/checks.ts";
+import { createRunPreviewsRepo, DEFAULT_MAX_LIVE } from "../preview/eviction.ts";
 import { DEFAULT_PREVIEW_PORT_RANGE, PreviewPortAllocator } from "../preview/port-allocator.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
 import { addProject, deleteProject, listProjects, refreshProject } from "../projects/index.ts";
@@ -846,6 +848,7 @@ function readyz(deps: ServerDeps): RouteHandler {
 			}),
 		);
 		checks.push(await previewPortAllocatorReadyzCheck(deps));
+		checks.push(await previewMaxLiveReadyzCheck(deps));
 
 		const allOk = checks.every((c) => c.ok);
 		return jsonResponse(allOk ? 200 : 503, {
@@ -876,6 +879,29 @@ async function previewPortAllocatorReadyzCheck(deps: ServerDeps): Promise<Diagno
 	}
 	const allocator = new PreviewPortAllocator(deps.db, range);
 	return checkPreviewPortAllocator({ probe: allocator });
+}
+
+async function previewMaxLiveReadyzCheck(deps: ServerDeps): Promise<DiagnosticCheck> {
+	const maxLive = deps.previewMaxLive ?? DEFAULT_MAX_LIVE;
+	if (deps.db === undefined) {
+		return {
+			name: "preview_max_live",
+			ok: true,
+			message: `no db handle wired (cap ${maxLive})`,
+		};
+	}
+	if (deps.db.dialect !== "sqlite") {
+		return {
+			name: "preview_max_live",
+			ok: true,
+			message: `dialect=${deps.db.dialect} (live-preview probe is sqlite-only today)`,
+		};
+	}
+	const previews = createRunPreviewsRepo(deps.db);
+	return checkPreviewMaxLive({
+		probe: { count: () => previews.countActivePreviews() },
+		maxLive,
+	});
 }
 
 async function checkAgentsRegistered(deps: ServerDeps): Promise<DiagnosticCheck> {

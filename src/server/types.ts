@@ -163,6 +163,14 @@ export interface ServerDeps {
 	 * an informational `ok: true`.
 	 */
 	readonly previewPortRange?: { readonly start: number; readonly end: number };
+	/**
+	 * Live-preview cap (R-19 / SPEC §11.L, warren-ea6b). Resolved from
+	 * `WARREN_PREVIEW_MAX_LIVE` at boot so `/readyz`'s `preview_max_live`
+	 * saturation probe matches the eviction worker's LRU cap. Tests may
+	 * omit; the probe falls back to `DEFAULT_MAX_LIVE` so the codepath
+	 * still exercises.
+	 */
+	readonly previewMaxLive?: number;
 }
 
 /**
