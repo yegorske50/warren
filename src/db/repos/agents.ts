@@ -9,8 +9,9 @@
 
 import { asc, eq } from "drizzle-orm";
 import { NotFoundError } from "../../core/errors.ts";
-import type { DrizzleDb } from "../client.ts";
-import { type AgentRow, agents } from "../schema.ts";
+import type { SqliteDrizzleDb } from "../client.ts";
+import type { AgentRow } from "../schema.ts";
+import type { DrizzleAdapter } from "./drizzle-adapter.ts";
 
 export interface UpsertAgentInput {
 	name: string;
@@ -19,18 +20,39 @@ export interface UpsertAgentInput {
 }
 
 export class AgentsRepo {
-	constructor(private readonly db: DrizzleDb) {}
+	constructor(private readonly adapter: DrizzleAdapter) {}
+
+	/**
+	 * The repo casts `adapter.drizzle` to `SqliteDrizzleDb` to satisfy
+	 * TypeScript — drizzle's per-dialect query builders share method names
+	 * (`.select()`, `.insert()`, `.update()`, `.delete()`) but their return
+	 * types are mutually incompatible at the union level. At runtime the
+	 * handle is the dialect-correct drizzle handle paired with the
+	 * dialect-correct schema (see `DrizzleAdapter.schema`), so the queries
+	 * built here generate the correct dialect SQL.
+	 */
+	private get db(): SqliteDrizzleDb {
+		return this.adapter.drizzle as SqliteDrizzleDb;
+	}
+
+	private get agents() {
+		return this.adapter.schema.agents;
+	}
 
 	async upsert(input: UpsertAgentInput): Promise<AgentRow> {
 		const ts = (input.now ?? new Date()).toISOString();
-		return this.db.transaction((tx) => {
-			const existing = tx.select().from(agents).where(eq(agents.name, input.name)).get();
+		return this.adapter.runInTransaction(async (tx) => {
+			const txDb = tx.drizzle as SqliteDrizzleDb;
+			const agents = tx.schema.agents;
+			const existing = await tx.pickOne(
+				txDb.select().from(agents).where(eq(agents.name, input.name)),
+			);
 			if (existing) {
 				const patch = {
 					renderedJson: input.renderedJson,
 					lastRefreshed: ts,
 				};
-				tx.update(agents).set(patch).where(eq(agents.name, input.name)).run();
+				await tx.runWrite(txDb.update(agents).set(patch).where(eq(agents.name, input.name)));
 				return { ...existing, ...patch };
 			}
 			const row: AgentRow = {
@@ -39,13 +61,16 @@ export class AgentsRepo {
 				registeredAt: ts,
 				lastRefreshed: ts,
 			};
-			tx.insert(agents).values(row).run();
+			await tx.runWrite(txDb.insert(agents).values(row));
 			return row;
 		});
 	}
 
 	async get(name: string): Promise<AgentRow | null> {
-		return this.db.select().from(agents).where(eq(agents.name, name)).get() ?? null;
+		const row = await this.adapter.pickOne(
+			this.db.select().from(this.agents).where(eq(this.agents.name, name)),
+		);
+		return row ?? null;
 	}
 
 	async require(name: string): Promise<AgentRow> {
@@ -59,10 +84,10 @@ export class AgentsRepo {
 	}
 
 	async listAll(): Promise<AgentRow[]> {
-		return this.db.select().from(agents).orderBy(asc(agents.name)).all();
+		return this.adapter.pickAll(this.db.select().from(this.agents).orderBy(asc(this.agents.name)));
 	}
 
 	async delete(name: string): Promise<void> {
-		this.db.delete(agents).where(eq(agents.name, name)).run();
+		await this.adapter.runWrite(this.db.delete(this.agents).where(eq(this.agents.name, name)));
 	}
 }

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NotFoundError, ValidationError } from "../core/errors.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { AgentsRepo } from "../db/repos/agents.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { ProjectsRepo } from "../db/repos/projects.ts";
 import { RunsRepo } from "../db/repos/runs.ts";
 import {
@@ -100,7 +101,7 @@ describe("PreviewPortAllocator", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		const agents = new AgentsRepo(db.drizzle);
+		const agents = new AgentsRepo(DrizzleAdapter.for(db));
 		const projects = new ProjectsRepo(db.drizzle);
 		const a = await agents.upsert({ name: "preview-bot", renderedJson: { sections: {} } });
 		const p = await projects.create({

@@ -17,8 +17,9 @@
 
 import { asc, eq } from "drizzle-orm";
 import { NotFoundError } from "../../core/errors.ts";
-import type { DrizzleDb } from "../client.ts";
-import { type BurrowRow, burrows } from "../schema.ts";
+import type { SqliteDrizzleDb } from "../client.ts";
+import type { BurrowRow } from "../schema.ts";
+import type { DrizzleAdapter } from "./drizzle-adapter.ts";
 
 export interface CreateBurrowInput {
 	id: string;
@@ -27,14 +28,22 @@ export interface CreateBurrowInput {
 }
 
 export class BurrowsRepo {
-	constructor(private readonly db: DrizzleDb) {}
+	constructor(private readonly adapter: DrizzleAdapter) {}
+
+	private get db(): SqliteDrizzleDb {
+		return this.adapter.drizzle as SqliteDrizzleDb;
+	}
+
+	private get burrows() {
+		return this.adapter.schema.burrows;
+	}
 
 	/**
 	 * Record a freshly-provisioned burrow's owning worker. `id` is burrow's
 	 * `bur_xxx` handle returned by `POST /burrows`; collisions are an
 	 * invariant violation (warren only ever sees a burrow id once per
-	 * `provisionBurrow` call), so we surface duplicates as the SQLite
-	 * constraint error rather than papering over with an upsert.
+	 * `provisionBurrow` call), so we surface duplicates as the constraint
+	 * error rather than papering over with an upsert.
 	 */
 	async create(input: CreateBurrowInput): Promise<BurrowRow> {
 		const row: BurrowRow = {
@@ -42,12 +51,15 @@ export class BurrowsRepo {
 			workerId: input.workerId,
 			addedAt: (input.now ?? new Date()).toISOString(),
 		};
-		this.db.insert(burrows).values(row).run();
+		await this.adapter.runWrite(this.db.insert(this.burrows).values(row));
 		return row;
 	}
 
 	async get(id: string): Promise<BurrowRow | null> {
-		return this.db.select().from(burrows).where(eq(burrows.id, id)).get() ?? null;
+		const row = await this.adapter.pickOne(
+			this.db.select().from(this.burrows).where(eq(this.burrows.id, id)),
+		);
+		return row ?? null;
 	}
 
 	async require(id: string): Promise<BurrowRow> {
@@ -61,19 +73,22 @@ export class BurrowsRepo {
 	}
 
 	async listAll(): Promise<BurrowRow[]> {
-		return this.db.select().from(burrows).orderBy(asc(burrows.addedAt), asc(burrows.id)).all();
+		return this.adapter.pickAll(
+			this.db.select().from(this.burrows).orderBy(asc(this.burrows.addedAt), asc(this.burrows.id)),
+		);
 	}
 
 	async listByWorker(workerId: string): Promise<BurrowRow[]> {
-		return this.db
-			.select()
-			.from(burrows)
-			.where(eq(burrows.workerId, workerId))
-			.orderBy(asc(burrows.addedAt), asc(burrows.id))
-			.all();
+		return this.adapter.pickAll(
+			this.db
+				.select()
+				.from(this.burrows)
+				.where(eq(this.burrows.workerId, workerId))
+				.orderBy(asc(this.burrows.addedAt), asc(this.burrows.id)),
+		);
 	}
 
 	async delete(id: string): Promise<void> {
-		this.db.delete(burrows).where(eq(burrows.id, id)).run();
+		await this.adapter.runWrite(this.db.delete(this.burrows).where(eq(this.burrows.id, id)));
 	}
 }

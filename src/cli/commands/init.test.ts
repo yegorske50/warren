@@ -6,6 +6,7 @@ import { join } from "node:path";
 import yaml from "js-yaml";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { AgentsRepo } from "../../db/repos/agents.ts";
+import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import { ProjectsRepo } from "../../db/repos/projects.ts";
 import { seedBuiltinAgents } from "../../registry/builtins/index.ts";
 import { parseConfigFile, parseTriggersConfig } from "../../warren-config/schema.ts";
@@ -38,7 +39,7 @@ describe("runInit (--cwd mode)", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		projects = new ProjectsRepo(db.drizzle);
-		agents = new AgentsRepo(db.drizzle);
+		agents = new AgentsRepo(DrizzleAdapter.for(db));
 		tmp = await mkdtemp(join(tmpdir(), "warren-init-test-"));
 	});
 
@@ -151,7 +152,7 @@ describe("runInit (--project mode)", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		projects = new ProjectsRepo(db.drizzle);
-		agents = new AgentsRepo(db.drizzle);
+		agents = new AgentsRepo(DrizzleAdapter.for(db));
 		tmp = await mkdtemp(join(tmpdir(), "warren-init-prj-"));
 	});
 

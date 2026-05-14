@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../client.ts";
 import { AgentsRepo } from "./agents.ts";
+import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { EventsRepo } from "./events.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunsRepo } from "./runs.ts";
@@ -12,7 +13,7 @@ describe("EventsRepo", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		const agents = new AgentsRepo(db.drizzle);
+		const agents = new AgentsRepo(DrizzleAdapter.for(db));
 		const projects = new ProjectsRepo(db.drizzle);
 		const runs = new RunsRepo(db.drizzle);
 		await agents.upsert({ name: "refactor-bot", renderedJson: {} });

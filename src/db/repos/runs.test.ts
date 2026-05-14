@@ -3,6 +3,7 @@ import { NotFoundError, StateTransitionError, ValidationError } from "../../core
 import { isId } from "../../core/ids.ts";
 import { openDatabase, type WarrenDb } from "../client.ts";
 import { AgentsRepo } from "./agents.ts";
+import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { assertRunTransition, RunsRepo } from "./runs.ts";
 
@@ -39,7 +40,7 @@ describe("RunsRepo", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		const agents = new AgentsRepo(db.drizzle);
+		const agents = new AgentsRepo(DrizzleAdapter.for(db));
 		const projects = new ProjectsRepo(db.drizzle);
 		const a = await agents.upsert({ name: "refactor-bot", renderedJson: { sections: {} } });
 		const p = await projects.create({

@@ -39,6 +39,20 @@
 import type { Database } from "bun:sqlite";
 import type { Pool } from "pg";
 import type { AnyWarrenDb, PostgresDrizzleDb, SqliteDrizzleDb, WarrenDialect } from "../client.ts";
+import * as pgSchema from "../schema/postgres.ts";
+import * as sqliteSchema from "../schema/sqlite.ts";
+
+/**
+ * Canonical schema type repos build queries against. Typed as the sqlite
+ * shape because the existing repos pre-R-13 imported sqlite tables; both
+ * dialect modules export the same identifiers (agents, projects, runs,
+ * events, triggers, workers, burrows) with structurally identical column
+ * shapes. The runtime object returned by `DrizzleAdapter.schema` is the
+ * dialect-correct module (sqliteTable for sqlite, pgTable for pg) — drizzle
+ * dispatches `db.insert(table)` against the table class's `entityKind`, so
+ * the actual runtime table MUST match the handle's dialect.
+ */
+export type WarrenSchema = typeof sqliteSchema;
 
 /**
  * Drizzle handle accepted by the adapter at each scope. Outside a transaction
@@ -120,6 +134,24 @@ export class DrizzleAdapter {
 	 */
 	get drizzle(): AnyDrizzleHandle {
 		return this.handle.drizzle;
+	}
+
+	/**
+	 * Dialect-correct schema module. The runtime object is `sqliteSchema`
+	 * when dialect=sqlite (SQLiteTable instances) and `pgSchema` when
+	 * dialect=postgres (PgTable instances) — drizzle's `db.insert(table)` /
+	 * `db.select().from(table)` dispatch on the table's `entityKind` at
+	 * runtime, so the table class MUST match the handle's dialect. Typed as
+	 * `WarrenSchema` (the sqlite shape) because both modules export the
+	 * same identifiers with structurally identical column shapes; this cast
+	 * is the only place in the codebase where the dialect-incorrect type is
+	 * tolerated, and it's safe because every consumer treats the schema as
+	 * a bag of opaque table references that flow back through `drizzle.*`
+	 * calls.
+	 */
+	get schema(): WarrenSchema {
+		const mod = this.handle.dialect === "sqlite" ? sqliteSchema : pgSchema;
+		return mod as unknown as WarrenSchema;
 	}
 
 	/**

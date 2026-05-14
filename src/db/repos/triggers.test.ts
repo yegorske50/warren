@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NotFoundError } from "../../core/errors.ts";
 import { openDatabase, type WarrenDb } from "../client.ts";
 import { AgentsRepo } from "./agents.ts";
+import { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunsRepo } from "./runs.ts";
 import { TriggersRepo } from "./triggers.ts";
@@ -16,7 +17,7 @@ describe("TriggersRepo", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		const agents = new AgentsRepo(db.drizzle);
+		const agents = new AgentsRepo(DrizzleAdapter.for(db));
 		projects = new ProjectsRepo(db.drizzle);
 		runs = new RunsRepo(db.drizzle);
 		repo = new TriggersRepo(db.drizzle);

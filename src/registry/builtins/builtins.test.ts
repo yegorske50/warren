@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { AgentsRepo } from "../../db/repos/agents.ts";
+import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import { parseRenderedAgent, type RenderResponse } from "../schema.ts";
 import {
 	BUILTIN_AGENT_NAMES,
@@ -77,7 +78,7 @@ describe("seedBuiltinAgents", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		repo = new AgentsRepo(db.drizzle);
+		repo = new AgentsRepo(DrizzleAdapter.for(db));
 	});
 
 	afterEach(async () => {

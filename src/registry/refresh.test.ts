@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { AgentsRepo } from "../db/repos/agents.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { CanopyClient, type SpawnFn, type SpawnResult } from "./canopy.ts";
 import type { CanopyRegistryConfig } from "./config.ts";
 import { refreshAgentRegistry } from "./refresh.ts";
@@ -58,7 +59,7 @@ describe("refreshAgentRegistry", () => {
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		agents = new AgentsRepo(db.drizzle);
+		agents = new AgentsRepo(DrizzleAdapter.for(db));
 	});
 
 	afterEach(async () => {
