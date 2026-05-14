@@ -1,10 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CircleStop, Send } from "lucide-react";
+import { CircleStop, ExternalLink, Send, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { runsApi } from "@/api/client.ts";
-import type { CancelRunResponse, ReapCompletedPayload, RunEvent, RunRow } from "@/api/types.ts";
-import { RUN_TERMINAL_STATES } from "@/api/types.ts";
+import { buildPreviewLoginUrl, runsApi } from "@/api/client.ts";
+import type {
+	CancelRunResponse,
+	PreviewState,
+	PreviewTeardownResponse,
+	ReapCompletedPayload,
+	RunEvent,
+	RunRow,
+} from "@/api/types.ts";
+import { PREVIEW_ACTIVE_STATES, RUN_TERMINAL_STATES } from "@/api/types.ts";
 import { StateBadge } from "@/components/StateBadge.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
@@ -25,6 +32,13 @@ const REFETCH_TRIGGER_KINDS: ReadonlySet<string> = new Set([
 	"cancel.requested",
 	"reap.completed",
 	"reap_failed",
+	// Preview lifecycle events (R-19 / SPEC §11.L, warren-c0b9) — each
+	// flips one of the `previewState` / `previewPort` / `previewStartedAt`
+	// columns on the run row, so refresh the query to surface the new
+	// badge + URL + teardown affordance.
+	"preview_launched",
+	"preview_evicted",
+	"preview_torn_down",
 ]);
 
 export function RunDetailPage() {
@@ -181,6 +195,8 @@ export function RunDetailPage() {
 				) : null}
 			</div>
 
+			{r.previewState !== null ? <PreviewCard run={r} /> : null}
+
 			<Card>
 				<CardHeader>
 					<CardTitle>Prompt</CardTitle>
@@ -268,6 +284,145 @@ function CostCard({ run }: { run: RunRow }) {
 			</CardContent>
 		</Card>
 	);
+}
+
+/**
+ * Per-run preview environment surface (R-19 / SPEC §11.L, warren-c0b9).
+ * Renders one of four states populated by reap's `preview_launch` sub-
+ * step + the eviction / teardown paths:
+ *
+ *   - `starting`  — readiness probe pending; teardown is allowed (lets
+ *                    the operator abort a hung sidecar).
+ *   - `live`      — proxy can route; surface an "Open Preview ↗" link
+ *                    that goes through the auth-exempt login handshake
+ *                    (signs a `warren_preview` cookie, 302s to the
+ *                    `run-<id>.<host>` subdomain) and a teardown button.
+ *   - `failed`    — `previewFailureMessage` holds the stderr tail; no
+ *                    URL, no teardown (already released).
+ *   - `torn-down` — informational only; the port was released and the
+ *                    sidecar killed. Workspace stays for repush.
+ *
+ * Visible only when the run row has a non-null `previewState` — the
+ * caller guards on that.
+ */
+function PreviewCard({ run }: { run: RunRow }) {
+	const state = run.previewState;
+	if (state === null) return null;
+	const isActive = PREVIEW_ACTIVE_STATES.includes(state);
+	const loginUrl = state === "live" ? buildPreviewLoginUrl(run.id) : null;
+
+	return (
+		<Card>
+			<CardHeader className="flex-row items-center justify-between space-y-0">
+				<CardTitle className="flex items-center gap-2">
+					Preview
+					<PreviewStateBadge state={state} />
+				</CardTitle>
+				{loginUrl !== null ? (
+					<a
+						href={loginUrl}
+						target="_blank"
+						rel="noreferrer noopener"
+						className="inline-flex items-center gap-1 font-mono text-xs underline underline-offset-2 hover:text-(--color-primary)"
+						title="Open the live preview via the signed-cookie handshake (R-19 / SPEC §11.L)"
+					>
+						Open <ExternalLink className="h-3.5 w-3.5" />
+					</a>
+				) : null}
+			</CardHeader>
+			<CardContent className="space-y-3">
+				<div className="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2">
+					{run.previewPort !== null ? (
+						<PreviewMetaLine label="Port" value={String(run.previewPort)} />
+					) : null}
+					{run.previewStartedAt !== null ? (
+						<PreviewMetaLine label="Started" value={formatTimestamp(run.previewStartedAt)} />
+					) : null}
+					{run.previewLastHitAt !== null ? (
+						<PreviewMetaLine label="Last hit" value={relativeTime(run.previewLastHitAt)} />
+					) : null}
+				</div>
+				{state === "failed" && run.previewFailureMessage !== null ? (
+					<pre
+						className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md bg-(--color-muted) p-2 font-mono text-xs text-(--color-destructive)"
+						title="Sidecar stderr / readiness-probe failure tail"
+					>
+						{run.previewFailureMessage}
+					</pre>
+				) : null}
+				{isActive ? <PreviewTeardownButton runId={run.id} /> : null}
+			</CardContent>
+		</Card>
+	);
+}
+
+function PreviewMetaLine({ label, value }: { label: string; value: string }) {
+	return (
+		<div className="flex items-baseline gap-2">
+			<span className="uppercase tracking-wide text-(--color-muted-foreground)">{label}</span>
+			<span className="font-mono">{value}</span>
+		</div>
+	);
+}
+
+function PreviewStateBadge({ state }: { state: PreviewState }) {
+	const variant: "queued" | "succeeded" | "failed" | "cancelled" =
+		state === "starting"
+			? "queued"
+			: state === "live"
+				? "succeeded"
+				: state === "failed"
+					? "failed"
+					: "cancelled";
+	return (
+		<Badge variant={variant} className="font-mono text-xs">
+			{state}
+		</Badge>
+	);
+}
+
+function PreviewTeardownButton({ runId }: { runId: string }) {
+	const qc = useQueryClient();
+	const teardown = useMutation({
+		mutationFn: () => runsApi.previewTeardown(runId, { actor: "ui" }),
+		onSettled: () => qc.invalidateQueries({ queryKey: ["runs", runId] }),
+	});
+	return (
+		<div className="flex flex-col items-start gap-1">
+			<Button
+				variant="destructive"
+				size="sm"
+				onClick={() => teardown.mutate()}
+				disabled={teardown.isPending}
+			>
+				<Trash2 className="h-4 w-4" />
+				{teardown.isPending ? "Tearing down…" : "Tear down"}
+			</Button>
+			<PreviewTeardownStatusLine mutation={teardown} />
+		</div>
+	);
+}
+
+function PreviewTeardownStatusLine({
+	mutation,
+}: {
+	mutation: ReturnType<typeof useMutation<PreviewTeardownResponse, Error, void>>;
+}) {
+	if (mutation.isError) {
+		return (
+			<p className="text-xs text-(--color-destructive)">
+				{mutation.error instanceof Error ? mutation.error.message : String(mutation.error)}
+			</p>
+		);
+	}
+	if (mutation.isSuccess && mutation.data !== undefined) {
+		const d = mutation.data;
+		const tone = d.tornDown
+			? "text-emerald-700 dark:text-emerald-300"
+			: "text-(--color-muted-foreground)";
+		return <p className={`text-xs ${tone}`}>{d.status}</p>;
+	}
+	return null;
 }
 
 function MetaCard({ label, children }: { label: string; children: React.ReactNode }) {

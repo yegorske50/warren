@@ -8,6 +8,7 @@ import type {
 	ApiErrorEnvelope,
 	CancelRunResponse,
 	CreateRunInput,
+	PreviewTeardownResponse,
 	ProjectRow,
 	ReadyzResponse,
 	RefreshAgentsResponse,
@@ -178,7 +179,26 @@ export const runsApi = {
 			method: "POST",
 			body: input,
 		}),
+	previewTeardown: (id: string, input: { actor?: string } = {}) =>
+		request<PreviewTeardownResponse>(`/runs/${encodeURIComponent(id)}/preview/teardown`, {
+			method: "POST",
+			body: input,
+		}),
 };
+
+/**
+ * Build the URL of the auth-exempt preview login handshake
+ * (`GET /runs/:id/preview/login?token=...`) so the UI can render a
+ * clickable link. The server redirects to `https://run-<id>.<host>/`
+ * after validating the token and setting the `warren_preview` cookie
+ * (R-19 / SPEC §11.L, warren-8a10). Returns null when no bearer is
+ * cached — the link would 401 without it.
+ */
+export function buildPreviewLoginUrl(runId: string): string | null {
+	const token = getApiToken();
+	if (token === null || token.length === 0) return null;
+	return `/runs/${encodeURIComponent(runId)}/preview/login?token=${encodeURIComponent(token)}`;
+}
 
 /* ----------------------------------------------------------------------- */
 /* NDJSON event stream — `GET /runs/:id/events?follow=1` (SPEC §8.1).      */

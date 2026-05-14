@@ -15,6 +15,15 @@ export type RunFailureReason =
 	| "crashed"
 	| "timed_out";
 
+/**
+ * Preview environment lifecycle (R-19 / SPEC §11.L). Null on rows whose
+ * project hasn't opted into previews; non-null once reap's
+ * `preview_launch` sub-step has fired. See `src/db/schema/columns.ts`.
+ */
+export type PreviewState = "starting" | "live" | "failed" | "torn-down";
+
+export const PREVIEW_ACTIVE_STATES: readonly PreviewState[] = ["starting", "live"];
+
 export interface AgentRow {
 	name: string;
 	renderedJson: unknown;
@@ -79,6 +88,37 @@ export interface RunRow {
 	tokensCacheRead: number | null;
 	/** Cache-write tokens (warren-a7dc); see `costUsd` for nullability. */
 	tokensCacheWrite: number | null;
+	/**
+	 * Per-run preview environment columns (R-19 / SPEC §11.L). All null on
+	 * runs whose project hasn't opted into previews; populated by reap's
+	 * `preview_launch` sub-step, the readiness probe, the host reverse
+	 * proxy (`previewLastHitAt`), and the eviction worker / manual
+	 * teardown route.
+	 */
+	previewState: PreviewState | null;
+	previewPort: number | null;
+	previewStartedAt: string | null;
+	previewLastHitAt: string | null;
+	previewFailureMessage: string | null;
+}
+
+/**
+ * Wire envelope of `POST /runs/:id/preview/teardown` (R-19 / SPEC §11.L,
+ * warren-d725). The handler is idempotent and always 200s with a CAS-
+ * outcome discriminator: `tornDown: true` only when the call flipped a
+ * `starting`/`live` row.
+ */
+export type PreviewTeardownStatus =
+	| "torn-down"
+	| "already-torn-down"
+	| "already-failed"
+	| "never-launched";
+
+export interface PreviewTeardownResponse {
+	status: PreviewTeardownStatus;
+	tornDown: boolean;
+	previousState: PreviewState | null;
+	port: number | null;
 }
 
 export interface BurrowSummary {
