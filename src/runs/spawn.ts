@@ -61,6 +61,7 @@ import {
 	withProviderOverrides,
 } from "../registry/schema.ts";
 import type { DefaultsConfig, WarrenConfigCache } from "../warren-config/index.ts";
+import { composeRunBranch, resolveRunBranchPrefix } from "./branch.ts";
 import { parseBurrowConfig } from "./burrow_config.ts";
 import { RunSpawnError } from "./errors.ts";
 import { buildSeedFiles } from "./seed.ts";
@@ -106,6 +107,14 @@ export interface SpawnRunInput {
 	 * the cache can omit.
 	 */
 	readonly warrenConfigs?: WarrenConfigCache;
+	/**
+	 * Deployment-wide run-branch prefix fallback (warren-9993), resolved
+	 * from `WARREN_RUN_BRANCH_PREFIX` by the caller. Project-default
+	 * (`.warren/defaults.json.runBranchPrefix`) wins over this when both
+	 * are set; if neither is set, spawnRun falls back to "burrow" so
+	 * existing deployments are unchanged.
+	 */
+	readonly runBranchPrefixDefault?: string;
 }
 
 export interface SpawnRunResult {
@@ -181,6 +190,18 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		now: input.now?.(),
 	});
 
+	// warren-9993: compose the burrow workspace branch as `${prefix}/${run.id}`
+	// so the branch traces back to the warren run on `git log` / PR review.
+	// Precedence project default > env > "burrow" (the legacy default,
+	// preserved for backward compatibility).
+	const branch = composeRunBranch(
+		resolveRunBranchPrefix({
+			projectDefault: projectDefaults?.runBranchPrefix,
+			envDefault: input.runBranchPrefixDefault,
+		}),
+		run.id,
+	);
+
 	let burrow: Burrow | null = null;
 	try {
 		burrow = await provisionBurrow(
@@ -190,6 +211,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			burrowConfig.network,
 			agent.name,
 			seedResult.files,
+			branch,
 		);
 		input.repos.runs.attachBurrow(run.id, { burrowId: burrow.id });
 
@@ -215,6 +237,7 @@ async function provisionBurrow(
 	network: NetworkPolicy | undefined,
 	agentId: string,
 	seedFiles: readonly HttpWorkspaceFile[],
+	branch: string,
 ): Promise<Burrow> {
 	// Warren's canopy agent name is the burrow runtime id by convention
 	// (claude-code → claude-code). Forwarding it as a `[[agents]]` patch row
@@ -227,11 +250,18 @@ async function provisionBurrow(
 	// `.canopy/`/`.mulch/`/`.seeds/`/`.pi/` drops are atomic: a failed seed
 	// rolls the burrow back on burrow's side before this promise resolves,
 	// so the caller never observes a half-seeded workspace.
+	//
+	// `branch` is composed by spawnRun (warren-9993) as `${prefix}/${run.id}`
+	// so the burrow workspace branch traces back to the warren run row even
+	// when the burrow id is stripped from logs. Burrow accepts `branch` on
+	// `POST /burrows`; passing it always (rather than letting burrow default
+	// to `burrow/<bur-id>`) keeps the suffix on the warren id no matter what.
 	return withTransportMapping(client.config, () =>
 		client.http.burrows.up({
 			projectRoot,
 			originUrl,
 			agents: [agentId],
+			branch,
 			...(network !== undefined ? { network } : {}),
 			...(seedFiles.length > 0 ? { seed: { files: seedFiles } } : {}),
 		}),

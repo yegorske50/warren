@@ -134,6 +134,13 @@ export interface ServerDeps {
 	 * `bootServer` always wires a fresh cache; tests may omit.
 	 */
 	readonly warrenConfigs?: WarrenConfigCache;
+	/**
+	 * Deployment-wide run-branch prefix fallback (warren-9993). Resolved
+	 * from `WARREN_RUN_BRANCH_PREFIX` at boot and threaded into every
+	 * `spawnRun` call so a per-project default in `.warren/defaults.json`
+	 * still wins. Unset → spawnRun falls back to "burrow".
+	 */
+	readonly runBranchPrefixDefault?: string;
 }
 
 /**

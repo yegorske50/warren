@@ -361,6 +361,12 @@ function DefaultsBlock({ defaults }: { defaults: DefaultsConfig | null }) {
 							<dd className="break-words">{defaults.defaultPrompt}</dd>
 						</>
 					) : null}
+					{defaults.runBranchPrefix !== undefined ? (
+						<>
+							<dt className="text-(--color-muted-foreground)">runBranchPrefix</dt>
+							<dd className="font-mono">{defaults.runBranchPrefix}</dd>
+						</>
+					) : null}
 				</dl>
 			)}
 		</section>

@@ -722,6 +722,57 @@ describe("spawnRun", () => {
 		expect(stored.frontmatter.model).toBeUndefined();
 	});
 
+	test("composes burrow branch as '<default-prefix>/<run.id>' when no override is set (warren-9993)", async () => {
+		const { client, calls } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClient: client,
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "p",
+		});
+		const upBody = calls.find((c) => c.path === "/burrows")?.body as { branch?: string };
+		expect(upBody.branch).toBe(`burrow/${result.run.id}`);
+	});
+
+	test("env-level runBranchPrefixDefault overrides the built-in 'burrow' default (warren-9993)", async () => {
+		const { client, calls } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClient: client,
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "p",
+			runBranchPrefixDefault: "warren",
+		});
+		const upBody = calls.find((c) => c.path === "/burrows")?.body as { branch?: string };
+		expect(upBody.branch).toBe(`warren/${result.run.id}`);
+	});
+
+	test("project default runBranchPrefix beats env-level fallback (warren-9993)", async () => {
+		const { client, calls } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClient: client,
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "p",
+			runBranchPrefixDefault: "warren",
+			warrenConfigs: {
+				get: async () => ({
+					triggers: null,
+					defaults: { runBranchPrefix: "bot" },
+					errors: [],
+				}),
+				invalidate: () => undefined,
+				clear: () => undefined,
+				size: () => 0,
+			},
+		});
+		const upBody = calls.find((c) => c.path === "/burrows")?.body as { branch?: string };
+		expect(upBody.branch).toBe(`bot/${result.run.id}`);
+	});
+
 	test("skips refresh when projectsConfig is not wired (back-compat for tests)", async () => {
 		const { client, calls } = makeBurrowClient();
 		let refreshCalled = false;

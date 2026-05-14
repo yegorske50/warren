@@ -51,6 +51,12 @@ export interface BootSchedulerInput {
 	readonly config: TriggerSchedulerConfig;
 	readonly logger?: TickLogger;
 	readonly now?: () => Date;
+	/**
+	 * Deployment-wide run-branch prefix fallback (warren-9993). Forwarded
+	 * onto every scheduled `spawnRun` so cron/scheduled-for dispatches honor
+	 * the same `WARREN_RUN_BRANCH_PREFIX` the HTTP `POST /runs` path uses.
+	 */
+	readonly runBranchPrefixDefault?: string;
 	/** Override the spawnRun seam (tests). Defaults to the live `spawnRun`. */
 	readonly spawnRunFn?: typeof spawnRun;
 	/** Test override for setInterval (forwarded to `startScheduler`). */
@@ -79,6 +85,9 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
 			warrenConfigs: input.warrenConfigs,
+			...(input.runBranchPrefixDefault !== undefined
+				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
+				: {}),
 			...(input.now !== undefined ? { now: input.now } : {}),
 		});
 		// Same hand-off as POST /runs — bridge the dispatched run so its

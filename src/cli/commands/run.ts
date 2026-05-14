@@ -29,6 +29,7 @@ import {
 	type BridgeRunStreamResult,
 	bridgeRunStream,
 	loadAutoOpenPrConfigFromEnv,
+	loadRunBranchPrefixFromEnv,
 	RunEventBroker,
 	reapRun,
 	type SpawnRunResult,
@@ -82,6 +83,14 @@ export interface RunDeps {
 	 * defaults the same way the HTTP server does; tests inject their own.
 	 */
 	readonly warrenConfigs?: WarrenConfigCache;
+	/**
+	 * Deployment-wide run-branch prefix fallback (warren-9993). Defaults to
+	 * `loadRunBranchPrefixFromEnv(process.env)` so the CLI honors
+	 * `WARREN_RUN_BRANCH_PREFIX` the same way the HTTP server does. Tests
+	 * pass an explicit value (or `null` to force the built-in "burrow"
+	 * default).
+	 */
+	readonly runBranchPrefixDefault?: string | null;
 }
 
 export interface RunResult {
@@ -106,6 +115,10 @@ export async function runRun(
 	const reap = deps.reap ?? reapRun;
 	const autoOpenPr = deps.autoOpenPr ?? loadAutoOpenPrConfigFromEnv();
 	const warrenConfigs = deps.warrenConfigs ?? createWarrenConfigCache();
+	const runBranchPrefixDefault =
+		deps.runBranchPrefixDefault === null
+			? undefined
+			: (deps.runBranchPrefixDefault ?? loadRunBranchPrefixFromEnv());
 	const fetchBurrowRunState =
 		deps.fetchBurrowRunState ?? defaultFetchBurrowRunState(deps.burrowClient);
 
@@ -121,6 +134,7 @@ export async function runRun(
 			warrenConfigs,
 			...(args.providerOverride !== undefined ? { providerOverride: args.providerOverride } : {}),
 			...(args.modelOverride !== undefined ? { modelOverride: args.modelOverride } : {}),
+			...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 			...(context.now !== undefined ? { now: context.now } : {}),
 		});
 	} catch (err) {

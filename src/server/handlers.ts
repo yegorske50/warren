@@ -337,6 +337,9 @@ function runProjectTriggerHandler(deps: ServerDeps): RouteHandler {
 			projectsConfig: deps.projectsConfig,
 			projectSpawn: deps.spawn ?? defaultSpawn,
 			...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
+			...(deps.runBranchPrefixDefault !== undefined
+				? { runBranchPrefixDefault: deps.runBranchPrefixDefault }
+				: {}),
 		});
 
 		// Hand off to the bridge so events start flowing into warren.events —
@@ -446,6 +449,9 @@ function createRunHandler(deps: ServerDeps): RouteHandler {
 			...(providerOverride !== undefined ? { providerOverride } : {}),
 			...(modelOverride !== undefined ? { modelOverride } : {}),
 			...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
+			...(deps.runBranchPrefixDefault !== undefined
+				? { runBranchPrefixDefault: deps.runBranchPrefixDefault }
+				: {}),
 		});
 		// Hand off to the bridge so events start flowing into warren.events
 		// — without this the dispatched run would emit events into burrow

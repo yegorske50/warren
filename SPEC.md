@@ -165,7 +165,7 @@ Inheritance solves the "thousand repos" problem: `base-coding-agent` defines def
 When warren spawns a run:
 
 1. **Resolve agent** — `cn render <agent-name>` against the canopy repo. Returns a single object with all sections expanded after inheritance/mixin resolution. The rendered JSON is persisted on the run row (`runs.rendered_agent_json`) and **frozen for the lifetime of the run** — mid-run edits to canopy do not affect in-flight runs. Run-time agent identity always reads from `runs.rendered_agent_json`, never from a re-render.
-2. **Provision burrow** — `POST /burrows` to burrow with `{ projectRoot, branch?, baseBranch?, network?, ... }` derived from the agent's `burrow_config` and the project's local clone path. Burrow returns 201 + `Burrow` (id, workspace path, branch, state). Warren records `burrow_id` on the run.
+2. **Provision burrow** — `POST /burrows` to burrow with `{ projectRoot, branch?, baseBranch?, network?, ... }` derived from the agent's `burrow_config` and the project's local clone path. Burrow returns 201 + `Burrow` (id, workspace path, branch, state). Warren records `burrow_id` on the run. The `branch` field is composed by warren as `${prefix}/${run.id}` where the prefix resolves project default (`.warren/defaults.json.runBranchPrefix`) > `WARREN_RUN_BRANCH_PREFIX` env > built-in `"burrow"` (warren-9993; the legacy default preserves backward compatibility). The warren `run_xxx` suffix makes the branch back-reference the warren run row on `git log` / PR review without a separate lookup.
 3. **Seed the burrow** — `buildSeedFiles(agent)` returns an `HttpWorkspaceFile[]` covering the five workspace drops (`.canopy/agent.json`, `.mulch/expertise/<domain>.jsonl` from `expertise_seed`, `.seeds/workflow.txt`, `.pi/skills/<name>/SKILL.md` from `pi_skills`, `.pi/prompts/<name>.md` from `pi_prompts`). The list rides along on the step-2 `POST /burrows` as `seed.files`, so provision-and-seed is a single atomic round-trip — burrow rolls the burrow back on its side if any file fails validation, and warren never observes a half-seeded workspace (R-07; see §11.A).
 4. **Dispatch** — `POST /burrows/:burrow_id/runs` with `{ agentId, prompt, metadata? }`. Burrow returns 201 + `Run` in `state='queued'`; its run loop picks it up. Warren records the burrow run id in `runs.burrow_run_id`.
 5. **Stream** — `GET /runs/:burrow_run_id/stream?follow=1` (NDJSON, chunked HTTP). Warren persists every event into its own `events` table (see §9) keyed by warren run id, then fans out to UI subscribers. UI clients hit warren's own `/runs/:id/events?follow=1`, which serves history from the warren log + tails the live stream concurrently. If warren restarts mid-run, on boot it re-subscribes to burrow's stream from `MAX(events.burrow_event_seq)+1` to backfill anything missed.
@@ -614,7 +614,10 @@ entries can land without a breaking schema rev — `mx-3636de`). Cron-token
 validation is intentionally loose (5 or 6 whitespace-separated fields,
 non-empty); R-06 owns full grammar checking when it wires in croner
 (`mx-40fe51`). `defaults.json` is `{ defaultRole?, defaultBranch?,
-defaultPrompt? }` — all optional, all strict.
+defaultPrompt?, defaultProvider?, defaultModel?, runBranchPrefix? }` — all
+optional, all strict. `runBranchPrefix` (warren-9993) overrides the prefix
+warren composes the burrow branch from (`${prefix}/${run.id}`); precedence
+project default > `WARREN_RUN_BRANCH_PREFIX` env > built-in `"burrow"`.
 
 **Loader contract** (`src/warren-config/load.ts`):
 

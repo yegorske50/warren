@@ -4,6 +4,13 @@
  * out to call sites.
  */
 
+export {
+	composeRunBranch,
+	DEFAULT_RUN_BRANCH_PREFIX,
+	loadRunBranchPrefixFromEnv,
+	type RunBranchEnvLike,
+	resolveRunBranchPrefix,
+} from "./branch.ts";
 export { type ParsedBurrowConfig, parseBurrowConfig } from "./burrow_config.ts";
 export { type CancelRunInput, type CancelRunResult, cancelRun } from "./cancel.ts";
 export { RunSpawnError } from "./errors.ts";

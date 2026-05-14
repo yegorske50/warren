@@ -218,6 +218,13 @@ export interface DefaultsConfig {
 	 */
 	defaultProvider?: string;
 	defaultModel?: string;
+	/**
+	 * warren-9993: per-project run-branch prefix override. Warren composes
+	 * the burrow workspace branch as `${prefix}/${run.id}`; this field is
+	 * surfaced read-only on the ProjectDetail config panel so operators can
+	 * verify which prefix is in effect.
+	 */
+	runBranchPrefix?: string;
 }
 
 export interface WarrenConfigResponse {

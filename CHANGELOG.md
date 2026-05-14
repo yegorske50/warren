@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(runs)`** — Configurable run-branch prefix (warren-9993). Warren now
+  composes the burrow workspace branch as `${prefix}/${run.id}` where the
+  prefix resolves with the precedence project default
+  (`.warren/defaults.json.runBranchPrefix`) > `WARREN_RUN_BRANCH_PREFIX` env
+  > built-in `"burrow"` (the legacy default, preserved for backward
+  compatibility). Using the warren `run_xxxxxxxxxxxx` as the branch suffix
+  makes the branch back-reference the warren run row on `git log` / PR
+  review, so agents stop mistaking `burrow/<id>` branches for branches
+  living in the burrow repo. `runBranchPrefix` is surfaced read-only on the
+  ProjectDetail config panel.
+
 ## [0.2.0] — 2026-05-13
 
 Closes the last warren↔burrow disk-seam violations on the spawn and reap

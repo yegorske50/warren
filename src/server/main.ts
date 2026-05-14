@@ -31,7 +31,11 @@ import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
 import { loadProjectsConfigFromEnv } from "../projects/config.ts";
 import { seedBuiltinAgents } from "../registry/builtins/index.ts";
 import { loadCanopyRegistryConfigFromEnv } from "../registry/config.ts";
-import { loadAutoOpenPrConfigFromEnv, RunEventBroker } from "../runs/index.ts";
+import {
+	loadAutoOpenPrConfigFromEnv,
+	loadRunBranchPrefixFromEnv,
+	RunEventBroker,
+} from "../runs/index.ts";
 import { loadTriggerSchedulerConfigFromEnv } from "../triggers/index.ts";
 import { createWarrenConfigCache } from "../warren-config/index.ts";
 import { NO_AUTH, resolveAuth } from "./auth.ts";
@@ -124,6 +128,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	});
 
 	const warrenConfigs = createWarrenConfigCache();
+	const runBranchPrefixDefault = loadRunBranchPrefixFromEnv(env);
 
 	const schedulerConfig = loadTriggerSchedulerConfigFromEnv(env);
 	const scheduler = bootScheduler({
@@ -135,6 +140,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		projectSpawn: defaultSpawn,
 		config: schedulerConfig,
 		logger: schedulerLoggerFromPino(logger),
+		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
 	if (schedulerConfig.disabled) {
@@ -158,6 +164,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		spawn: defaultSpawn,
 		autoOpenPr,
 		warrenConfigs,
+		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	};
 

@@ -84,6 +84,7 @@ describe("DefaultsConfigSchema", () => {
 			defaultPrompt: "Read the issue, plan, execute.",
 			defaultProvider: "anthropic",
 			defaultModel: "claude-opus-4-7",
+			runBranchPrefix: "warren",
 		});
 		expect(parsed.success).toBe(true);
 	});
@@ -104,11 +105,25 @@ describe("DefaultsConfigSchema", () => {
 		expect(DefaultsConfigSchema.safeParse({ defaultPrompt: "" }).success).toBe(false);
 		expect(DefaultsConfigSchema.safeParse({ defaultProvider: "" }).success).toBe(false);
 		expect(DefaultsConfigSchema.safeParse({ defaultModel: "" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "" }).success).toBe(false);
 	});
 
 	test("rejects role names that aren't canopy-shaped", () => {
 		const parsed = DefaultsConfigSchema.safeParse({ defaultRole: "Refactor Bot" });
 		expect(parsed.success).toBe(false);
+	});
+
+	test("rejects runBranchPrefix that contains slashes or other invalid chars (warren-9993)", () => {
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "bot/agent" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "Warren" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: ".warren" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "warren agent" }).success).toBe(false);
+	});
+
+	test("accepts kebab-case runBranchPrefix (warren-9993)", () => {
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "warren" }).success).toBe(true);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "agent-1" }).success).toBe(true);
+		expect(DefaultsConfigSchema.safeParse({ runBranchPrefix: "bot.fix" }).success).toBe(true);
 	});
 });
 

@@ -17,9 +17,12 @@
  * when the project declares one. `defaultProvider` / `defaultModel`
  * (warren-618b) are folded into the agent's frontmatter at spawn time, in
  * the same precedence slot as per-run overrides — operator override >
- * project default > agent frontmatter. CLI `warren run` consumption of
- * `defaultRole`, scheduled-run prompt fallback for `defaultPrompt`, and
- * any template substitution are deferred to R-04 / R-06.
+ * project default > agent frontmatter. `runBranchPrefix` (warren-9993)
+ * overrides the prefix warren uses when composing the burrow branch as
+ * `${prefix}/${run.id}`; precedence is project default >
+ * WARREN_RUN_BRANCH_PREFIX env > built-in "burrow". CLI `warren run`
+ * consumption of `defaultRole`, scheduled-run prompt fallback for
+ * `defaultPrompt`, and any template substitution are deferred to R-04 / R-06.
  *
  * `parseTriggersConfig` and `parseDefaultsConfig` return discriminated
  * results — the loader collects `{ ok: false }` shapes into the per-file
@@ -44,6 +47,19 @@ const RoleNameSchema = z
 	.regex(
 		/^[a-z0-9][a-z0-9._-]*$/,
 		"role must be a canopy agent name (lowercase, digits, dots, dashes, underscores)",
+	);
+
+// warren-9993: the branch warren passes to `burrows.up` is `<prefix>/<run.id>`,
+// where the run id is the warren `run_xxxxxxxxxxxx` so the branch traces back
+// to the warren run on `git log` / PR review. Same kebab/snake-case grammar
+// as RoleNameSchema; slashes inside the prefix are disallowed so the
+// `<prefix>/<id>` shape stays a single ref segment under the prefix.
+const RunBranchPrefixSchema = z
+	.string()
+	.min(1, "runBranchPrefix must be non-empty")
+	.regex(
+		/^[a-z0-9][a-z0-9._-]*$/,
+		"runBranchPrefix must be kebab/snake-case (lowercase, digits, dots, dashes, underscores)",
 	);
 
 const CronExpressionSchema = z
@@ -107,6 +123,11 @@ export const DefaultsConfigSchema = z
 		// .provider/.model just ignore them — same shape as the per-run override.
 		defaultProvider: z.string().min(1, "defaultProvider must be non-empty if provided").optional(),
 		defaultModel: z.string().min(1, "defaultModel must be non-empty if provided").optional(),
+		// warren-9993: per-project override of the run branch prefix. spawnRun
+		// composes the branch as `${runBranchPrefix}/${run.id}` and passes it
+		// to burrows.up. Precedence project default > WARREN_RUN_BRANCH_PREFIX
+		// env > built-in "burrow" (kept as the default for backward compat).
+		runBranchPrefix: RunBranchPrefixSchema.optional(),
 	})
 	.strict();
 
