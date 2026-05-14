@@ -123,6 +123,7 @@ The `warren` (or `wr`) admin CLI is for ops; the web UI is daily.
 | `warren register-agent <name>` | Refresh canopy + register one agent |
 | `warren add-project <git-url>` | Clone a project under `/data/projects` |
 | `warren run <agent> <project> -p "..."` | One-shot run, no UI |
+| `warren init` | Scaffold a `.warren/` directory in a project |
 | `warren doctor` | Runtime reachable? Bwrap working? |
 | `warren serve` | Start the HTTP server (default in entrypoint) |
 

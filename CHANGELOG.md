@@ -7,18 +7,145 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-13
+
+Lands the multi-worker placement substrate (`pl-9ba1`, parent
+`warren-6747`) end-to-end — workers + burrows tables, a placement helper,
+`BurrowClientPool` replacing the `fromEnv` singleton, fan-out + sticky
+reads, a probe loop with a `/workers/:name/drain` admin API, a TOML
+`[workers]` block in `warren.toml`, and a two-worker integration test
+asserting the full round-trip. Pi gains real per-run cost + token
+accounting via in-stream `turn_end` usage extraction (warren-17a4) — no
+out-of-band RPC fetch. Spawn now composes the burrow workspace branch as
+`${prefix}/${run.id}` so PR-review breadcrumbs back-reference the warren
+run row instead of an opaque `burrow/<id>` (warren-9993). The pi
+`agent_end` predicate is repaired to match burrow's real wire shape
+(warren-36c0).
+
 ### Added
 
-- **`feat(runs)`** — Configurable run-branch prefix (warren-9993). Warren now
-  composes the burrow workspace branch as `${prefix}/${run.id}` where the
-  prefix resolves with the precedence project default
-  (`.warren/defaults.json.runBranchPrefix`) > `WARREN_RUN_BRANCH_PREFIX` env
-  > built-in `"burrow"` (the legacy default, preserved for backward
-  compatibility). Using the warren `run_xxxxxxxxxxxx` as the branch suffix
-  makes the branch back-reference the warren run row on `git log` / PR
-  review, so agents stop mistaking `burrow/<id>` branches for branches
-  living in the burrow repo. `runBranchPrefix` is surfaced read-only on the
-  ProjectDetail config panel.
+- **`feat(db)`** — `workers` table (drizzle migration 0007) keyed by
+  `name`, with `url`, `state` enum (`healthy` / `draining` /
+  `unreachable`, default `healthy`), and `addedAt`. Bearer token
+  intentionally omitted — the pool shares a single `BURROW_API_TOKEN`
+  across every worker (`pl-9ba1` alternative #3). `WorkersRepo` gains
+  `upsert` / `setState` / `get` / `require` / `listAll` / `delete`;
+  `upsert` preserves existing state when the patch omits it so config
+  reloads don't clobber probe / drain-derived liveness, and preserves
+  `addedAt` while updating `url` (`warren-b0a3`, `pl-9ba1` step 1).
+- **`feat(placement)`** — `burrows` table as the source of truth for
+  `{burrow_id → worker_id}`, plus a denormalized `runs.worker_id`
+  column for join-free routing on stream / cancel / steer paths. Two
+  pure helpers in `src/runs/placement.ts`: `placeForProject` runs
+  project-affinity → least-loaded round-robin with alphabetical
+  tiebreak, excluding `draining` + `unreachable` workers;
+  `placeForBurrow` is sticky-by-burrow and fails loudly on an
+  unreachable pin rather than silently migrating (`pl-9ba1` risk #5).
+  `RunsRepo` grows the column-family for `worker_id` (`warren-135b`,
+  `pl-9ba1` step 2).
+- **`feat(burrow-client)`** — `BurrowClientPool` replaces
+  `BurrowClient.fromEnv()` as the multi-worker successor. Holds
+  `Map<workerName, BurrowClient>`; `placeFor({projectId})` and
+  `clientFor({burrowId})` wrap the placement primitives from step 2.
+  Today's zero-config boot synthesizes a single `local` worker row
+  from `WARREN_BURROW_*` env vars; `[workers]` blocks register
+  additional entries. `pool.singleton()` is back-compat scaffolding
+  `bootServer` uses to derive the legacy `burrowClient` variable for
+  bridges / scheduler until subsequent steps migrate them off
+  (`warren-41a2`, `pl-9ba1` step 3).
+- **`feat(runs)`** — `SpawnRunInput.burrowClient` becomes
+  `burrowClientPool: BurrowClientPool` so each new burrow is placed on
+  a worker **before** the warren run row is created. `spawnRun`
+  persists `runs.worker_id` and the `burrows` row mapping in the same
+  atomic flow so sticky-by-burrow (cancel / steer / reap / fan-out
+  via `pool.clientFor`) has a durable record. `ServerDeps` +
+  `bootScheduler` + CLI `runRun` thread the pool through; legacy
+  single-client callers continue to work via `pool.singleton()`
+  (`warren-39c3`, `pl-9ba1` step 4).
+- **`feat(burrows)`** — `GET /burrows` fans out across every healthy
+  worker in the pool (parallel, with partial-failure tolerance);
+  `GET /burrows/:id` resolves the owning worker via the `burrows`
+  table and routes through `pool.clientFor` so the read is sticky and
+  hops at most once. Unreachable owners surface as a clean 502 rather
+  than a 500 (`warren-14ad`, `pl-9ba1` step 5).
+- **`feat(workers)`** — background probe loop pings every registered
+  worker on a configurable cadence (`WARREN_WORKER_PROBE_MS`), flipping
+  state between `healthy` and `unreachable` based on a successful
+  `GET /healthz`. A new admin route `POST /workers/:name/drain` marks
+  a worker `draining` so `placeForProject` stops routing new burrows
+  there while existing burrows continue to be reachable via
+  sticky-by-burrow. `POST /workers/:name/undrain` reverses the
+  transition. Probes coexist with the supervisor single-flight
+  scheduler guard already in place (`warren-0f0c`, `pl-9ba1` step 6).
+- **`feat(server-config)`** — new `src/server-config/` module loads a
+  per-deployment `warren.toml` (no project clone involved; sits next
+  to the SQLite file). Mirrors `src/warren-config/`'s layout
+  (`errors` / `config` / `schema` / `load` / `index`); the loader
+  emits the same missing-vs-malformed envelope so a half-written
+  config never throws at boot. `[workers]` blocks register additional
+  worker rows with `name` / `url` and require the deployment-wide
+  shared bearer token to be set; sole-`[workers]` deployments without
+  a shared token fail loud at boot (`warren-3909` + `warren-272c`,
+  `pl-9ba1` step 7).
+- **`feat(runs)`** — `bridgeRunStream` extracts pi cost + token totals
+  directly from the event stream. Pi v0.74 emits per-turn usage inline
+  on every `turn_end` envelope
+  (`message.usage.{input,output,cacheRead,cacheWrite,cost.total}`); the
+  bridge accumulates them across the run and persists run-level totals
+  via `RunsRepo.attachStats` at the first `agent_end` /
+  `terminalDetected`. `PiStatsClient` remains as an explicit override
+  for sources warren can't observe in-stream; when both paths produce
+  data the explicit client wins. Closes the cost/tokens column gap
+  without an out-of-band `get_session_stats` RPC (`warren-17a4`).
+- **`feat(runs)`** — configurable run-branch prefix (`warren-9993`).
+  Warren composes the burrow workspace branch as `${prefix}/${run.id}`
+  where the prefix resolves with the precedence project default
+  (`.warren/defaults.json.runBranchPrefix`) > `WARREN_RUN_BRANCH_PREFIX`
+  env > built-in `"burrow"` (preserved as the legacy default so
+  existing deployments are unchanged). Using the warren
+  `run_xxxxxxxxxxxx` as the branch suffix makes the branch
+  back-reference the warren run row on `git log` / PR review, so
+  agents stop mistaking `burrow/<id>` branches for branches living in
+  the burrow repo. Schema validation uses the same kebab/snake-case
+  grammar as `RoleNameSchema`; invalid values silently downgrade to
+  the next slot rather than aborting the spawn. `runBranchPrefix` is
+  surfaced read-only on the ProjectDetail config panel.
+- **`test(server)`** — `integration.multi-worker.test.ts` drives the
+  full pool round-trip against two in-process workers: `POST /runs`
+  places, `GET /burrows` fans out across both, `GET /burrows/:id` is
+  sticky to the owning worker, draining one worker excludes it from
+  new placements while existing burrows remain reachable, and an
+  unreachable owner surfaces as a clean 502 (`warren-a801`,
+  `pl-9ba1` step 8).
+
+### Fixed
+
+- **`fix(runs)`** — the `piStats` terminal-snapshot branch in
+  `bridgeRunStream` fired on `event.kind === "agent_end"`, but burrow's
+  pi parser maps every pi lifecycle envelope to `kind="state_change"`,
+  `stream="system"`, `payload.type=<event>`. The predicate never
+  matched on real pi runs, so cost / token columns silently stayed
+  null when `PiStatsClient` is wired. New `isPiAgentEnd(event)` wire-
+  shape inspector (same as `detectRuntimeTerminal`) gates the
+  snapshot; both branches converge on the same envelope, persist
+  once, and the bridge breaks immediately after. Tests rewritten to
+  use a `piAgentEnd(burrowRunId, seq)` helper that builds the real
+  wire shape (`warren-36c0`).
+
+### Docs
+
+- **`docs(spec)`** — new `SPEC.md` §5.4 pins the multi-worker model
+  into the V1 record: pool topology, placement rules (project-
+  affinity round-robin + sticky-by-burrow), drain semantics, the
+  `[workers]` config surface, and the deployment-wide shared bearer
+  token constraint. §3.2's "multi-worker is a non-goal" line is
+  removed — the substrate now ships (`warren-dd64`).
+- **`docs(roadmap)`** — `ROADMAP.md` adds an R-08 reframing note
+  recasting the multi-worker direction as a substrate concern (the
+  placement / pool / probe primitives) rather than a workload-
+  hierarchy concern (workers as a tier above agents). The substrate
+  framing leaves room for the planned remote-burrow topology (R-12)
+  without forcing a workload model.
 
 ## [0.2.0] — 2026-05-13
 
