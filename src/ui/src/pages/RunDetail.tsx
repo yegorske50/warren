@@ -132,15 +132,6 @@ export function RunDetailPage() {
 								PR ↗
 							</a>
 						) : null}
-						{r.costUsd !== null ? (
-							<Badge
-								variant="succeeded"
-								className="font-mono text-xs"
-								title={formatStatsTooltip(r)}
-							>
-								{formatCostUsd(r.costUsd)}
-							</Badge>
-						) : null}
 					</div>
 					<p className="mt-1 text-sm text-(--color-muted-foreground)">
 						<span className="font-medium">{r.agentName}</span> ·{" "}
@@ -165,6 +156,7 @@ export function RunDetailPage() {
 			</header>
 
 			<div className="grid gap-4 md:grid-cols-3">
+				<CostCard run={r} />
 				<MetaCard label="Started">{formatTimestamp(r.startedAt)}</MetaCard>
 				<MetaCard label="Ended">{formatTimestamp(r.endedAt)}</MetaCard>
 				<MetaCard label="Trigger">{r.trigger}</MetaCard>
@@ -244,6 +236,38 @@ function CancelStatus({
 		);
 	}
 	return null;
+}
+
+/**
+ * Cost + token breakdown card for /runs/:id (warren-a7ec). Promoted out
+ * of a header badge with a hover-only tooltip so the token totals are
+ * visible without interaction. Renders "—" when the run has no recorded
+ * cost (pre-pi-extraction runs or non-pi runtimes); the breakdown line
+ * is omitted when no token counters are populated.
+ */
+function CostCard({ run }: { run: RunRow }) {
+	const tokens = formatTokenBreakdown(run);
+	return (
+		<Card>
+			<CardContent className="space-y-1 p-4">
+				<div className="text-xs uppercase tracking-wide text-(--color-muted-foreground)">
+					Cost
+				</div>
+				<div className="font-mono text-lg">
+					{run.costUsd !== null ? (
+						formatCostUsd(run.costUsd)
+					) : (
+						<span className="text-(--color-muted-foreground)">—</span>
+					)}
+				</div>
+				{tokens !== null ? (
+					<div className="font-mono text-xs text-(--color-muted-foreground)">
+						{tokens}
+					</div>
+				) : null}
+			</CardContent>
+		</Card>
+	);
 }
 
 function MetaCard({ label, children }: { label: string; children: React.ReactNode }) {
@@ -375,7 +399,7 @@ function formatTokens(n: number): string {
 	return String(n);
 }
 
-function formatStatsTooltip(r: RunRow): string {
+function formatTokenBreakdown(r: RunRow): string | null {
 	const parts: string[] = [];
 	if (r.tokensInput !== null) parts.push(`${formatTokens(r.tokensInput)} in`);
 	if (r.tokensOutput !== null) parts.push(`${formatTokens(r.tokensOutput)} out`);
@@ -385,7 +409,7 @@ function formatStatsTooltip(r: RunRow): string {
 	if (r.tokensCacheWrite !== null && r.tokensCacheWrite > 0) {
 		parts.push(`${formatTokens(r.tokensCacheWrite)} cache-w`);
 	}
-	return parts.length === 0 ? "session cost from pi get_session_stats" : parts.join(" · ");
+	return parts.length === 0 ? null : parts.join(" · ");
 }
 
 function statusVariant(

@@ -16,10 +16,11 @@ import {
 import { relativeTime } from "@/lib/utils.ts";
 import { formatCostUsd } from "./RunDetail.tsx";
 
-// Opt-in cost column (warren-a7dc). The localStorage key persists the
-// operator's choice across navigations — pi runs are the only ones that
-// carry costUsd today, so for non-pi-heavy installs the column is mostly
-// noise and stays hidden by default.
+// Cost column is on by default (warren-a7ec): pi runs are the common
+// runtime today and hydrate `costUsd` via in-stream extraction
+// (warren-17a4), so the column carries signal for most installs. The
+// toggle remains as a hide option for operators who want to recover the
+// horizontal space; localStorage persists the choice.
 const COST_COLUMN_LS_KEY = "warren.runsList.showCostColumn";
 
 type Filter = "all" | { kind: "agent"; value: string } | { kind: "project"; value: string };
@@ -27,8 +28,10 @@ type Filter = "all" | { kind: "agent"; value: string } | { kind: "project"; valu
 export function RunsPage() {
 	const [filter, setFilter] = useState<Filter>("all");
 	const [showCost, setShowCost] = useState<boolean>(() => {
-		if (typeof window === "undefined") return false;
-		return window.localStorage.getItem(COST_COLUMN_LS_KEY) === "1";
+		if (typeof window === "undefined") return true;
+		const stored = window.localStorage.getItem(COST_COLUMN_LS_KEY);
+		// Default to on; only "0" hides the column.
+		return stored !== "0";
 	});
 
 	useEffect(() => {
@@ -56,6 +59,18 @@ export function RunsPage() {
 		for (const p of projects.data?.projects ?? []) m.set(p.id, p.gitUrl);
 		return m;
 	}, [projects.data]);
+
+	const costTotals = useMemo(() => {
+		let total = 0;
+		let priced = 0;
+		for (const r of runs.data?.runs ?? []) {
+			if (r.costUsd !== null) {
+				total += r.costUsd;
+				priced += 1;
+			}
+		}
+		return { total, priced };
+	}, [runs.data]);
 
 	return (
 		<div className="space-y-6">
@@ -109,8 +124,16 @@ export function RunsPage() {
 			</div>
 
 			<Card>
-				<CardHeader>
+				<CardHeader className="flex-row items-center justify-between space-y-0">
 					<CardTitle>{runs.data?.runs.length ?? 0} runs</CardTitle>
+					{showCost && costTotals.priced > 0 ? (
+						<span
+							className="font-mono text-xs text-(--color-muted-foreground)"
+							title={`${costTotals.priced} of ${runs.data?.runs.length ?? 0} runs have a recorded cost`}
+						>
+							total: {formatCostUsd(costTotals.total)}
+						</span>
+					) : null}
 				</CardHeader>
 				<CardContent className="p-0">
 					{runs.isLoading ? (
