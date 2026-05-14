@@ -46,6 +46,7 @@ import {
 	type RunEventBroker,
 	reapRun,
 } from "../runs/index.ts";
+import type { PrTemplateOverrides } from "../runs/pr-template.ts";
 import type { ServerPreviewConfig, WarrenConfigCache } from "../warren-config/index.ts";
 import type { BridgeRegistry } from "./types.ts";
 
@@ -260,6 +261,10 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 				result.terminalDetected.outcome === "succeeded"
 					? await resolveProjectPreviewConfig(input)
 					: undefined;
+			const prTemplate =
+				result.terminalDetected.outcome === "succeeded"
+					? await resolveProjectPrTemplate(input)
+					: undefined;
 			try {
 				await input.reap({
 					runId: input.runId,
@@ -274,6 +279,7 @@ async function runWithReconnect(input: RunWithReconnectInput): Promise<BridgeRun
 					...(input.previewLaunchConfig !== undefined
 						? { previewLaunchConfig: input.previewLaunchConfig }
 						: {}),
+					...(prTemplate !== undefined ? { prTemplate } : {}),
 				});
 			} catch (err) {
 				input.logger?.error?.(
@@ -371,6 +377,43 @@ async function resolveProjectPreviewConfig(
 				err: err instanceof Error ? err.message : String(err),
 			},
 			"preview config load failed; skipping preview launch",
+		);
+		return undefined;
+	}
+}
+
+/**
+ * Resolve the project's `.warren/pr-template.md` fragment overrides
+ * (warren-bd49) for the run the bridge just observed reach terminal.
+ * Returns `undefined` when the project ships no template, when the
+ * warren-config seam isn't wired (tests), or when the parsed envelope
+ * has no overrides. Errors from the per-project loader surface as
+ * a `null` prTemplate in the envelope, so this just falls through to
+ * `undefined` and reap uses the built-in defaults. Operators see the
+ * underlying error via `/projects/:id/warren-config`.
+ */
+async function resolveProjectPrTemplate(
+	input: RunWithReconnectInput,
+): Promise<PrTemplateOverrides | undefined> {
+	if (input.warrenConfigs === undefined) return undefined;
+	const run = await input.repos.runs.get(input.runId);
+	if (run === null || run.projectId === null) return undefined;
+	const project = await input.repos.projects.get(run.projectId);
+	if (project === null) return undefined;
+	try {
+		const config = await input.warrenConfigs.get(project.id, project.localPath);
+		const overrides = config.prTemplate;
+		if (overrides === null || overrides === undefined) return undefined;
+		if (Object.keys(overrides).length === 0) return undefined;
+		return overrides;
+	} catch (err) {
+		input.logger?.warn?.(
+			{
+				runId: input.runId,
+				projectId: project.id,
+				err: err instanceof Error ? err.message : String(err),
+			},
+			"pr-template load failed; falling back to built-in defaults",
 		);
 		return undefined;
 	}

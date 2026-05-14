@@ -310,6 +310,42 @@ describe("buildPrContent", () => {
 		expect(a.body).not.toContain("warren:preview-start");
 		expect(b.body).not.toContain("warren:preview-start");
 	});
+
+	test("templateOverrides replaces individual fragments (warren-bd49)", () => {
+		const c = buildPrContent({
+			prompt: "do x",
+			runId: "run_abc",
+			agentName: "pi",
+			templateOverrides: {
+				trailer: "Reviewed-by: @team",
+			},
+		});
+		expect(c.body).toContain("Reviewed-by: @team");
+		expect(c.body).not.toContain("🤖 Opened by warren run");
+		expect(c.body).toContain("## Summary"); // default still applies
+	});
+
+	test("templateOverrides.title beats the seed-title precedence (warren-bd49)", () => {
+		const c = buildPrContent({
+			prompt: "do x",
+			runId: "run_abc",
+			agentName: "pi",
+			seed: { id: "warren-1234", title: "Seed title" },
+			templateOverrides: { title: "Custom Title" },
+		});
+		expect(c.title).toBe("Custom Title");
+	});
+
+	test("whitespace-only override removes the fragment entirely (warren-bd49)", () => {
+		const c = buildPrContent({
+			prompt: "do x",
+			runId: "run_abc",
+			agentName: "pi",
+			templateOverrides: { prompt: "" },
+		});
+		expect(c.body).not.toContain("## Prompt");
+		expect(c.body).toContain("## Summary"); // other defaults survive
+	});
 });
 
 describe("loadAutoOpenPrConfigFromEnv", () => {

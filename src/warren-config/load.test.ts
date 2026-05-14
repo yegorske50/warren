@@ -7,6 +7,7 @@ import { type ExistsFn, loadWarrenConfig, type ReadFileFn } from "./load.ts";
 const PROJECT = "/data/projects/owner/repo";
 const TRIGGERS_PATH = join(PROJECT, WARREN_CONFIG_DIR, WARREN_CONFIG_FILES.triggers);
 const DEFAULTS_PATH = join(PROJECT, WARREN_CONFIG_DIR, WARREN_CONFIG_FILES.defaults);
+const PR_TEMPLATE_PATH = join(PROJECT, WARREN_CONFIG_DIR, WARREN_CONFIG_FILES.prTemplate);
 const DIR_PATH = join(PROJECT, WARREN_CONFIG_DIR);
 
 interface FsHarness {
@@ -213,6 +214,53 @@ describe("loadWarrenConfig", () => {
 			expect(result.defaults.preview.port).toBe(3000);
 			expect(result.defaults.preview.idle_ttl).toBe("30m");
 		}
+	});
+
+	// warren-bd49: .warren/pr-template.md overrides PR-body fragments.
+	test("no pr-template.md → prTemplate null, no errors", async () => {
+		const result = await loadWarrenConfig({
+			projectPath: PROJECT,
+			...fs({}, { withDir: true }),
+		});
+		expect(result.prTemplate).toBeNull();
+		expect(result.errors).toEqual([]);
+	});
+
+	test("valid pr-template.md → prTemplate populated with overrides", async () => {
+		const result = await loadWarrenConfig({
+			projectPath: PROJECT,
+			...fs({
+				[PR_TEMPLATE_PATH]: "## trailer\n\nReviewed-by: @team\n",
+			}),
+		});
+		expect(result.errors).toEqual([]);
+		expect(result.prTemplate).toEqual({ trailer: "Reviewed-by: @team" });
+	});
+
+	test("malformed pr-template.md (unknown fragment) → schemaError entry, prTemplate still parsed", async () => {
+		const result = await loadWarrenConfig({
+			projectPath: PROJECT,
+			...fs({
+				[PR_TEMPLATE_PATH]: "## summary\nok\n\n## summery\ntypo\n",
+			}),
+		});
+		expect(result.prTemplate).toEqual({ summary: "ok" });
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0]?.file).toBe(`${WARREN_CONFIG_DIR}/${WARREN_CONFIG_FILES.prTemplate}`);
+		expect(result.errors[0]?.code).toBe(WARREN_CONFIG_FILE_ERROR_CODES.schemaError);
+		expect(result.errors[0]?.message).toContain("summery");
+	});
+
+	test("unclosed preview markers in pr-template.md → schemaError entry", async () => {
+		const result = await loadWarrenConfig({
+			projectPath: PROJECT,
+			...fs({
+				[PR_TEMPLATE_PATH]: "## preview_url_or_placeholder\n<!-- warren:preview-start -->\nhello\n",
+			}),
+		});
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0]?.code).toBe(WARREN_CONFIG_FILE_ERROR_CODES.schemaError);
+		expect(result.errors[0]?.message).toContain("warren:preview-");
 	});
 
 	test("readFile throws (e.g. EACCES) → recorded as parseError, no throw", async () => {

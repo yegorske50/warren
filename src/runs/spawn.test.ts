@@ -418,6 +418,7 @@ describe("spawnRun", () => {
 				get: async () => ({
 					triggers: null,
 					defaults: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-7" },
+					prTemplate: null,
 					errors: [],
 				}),
 				invalidate: () => undefined,
@@ -703,6 +704,7 @@ describe("spawnRun", () => {
 				get: async () => ({
 					triggers: null,
 					defaults: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-7" },
+					prTemplate: null,
 					errors: [],
 				}),
 				invalidate: () => undefined,
@@ -742,6 +744,7 @@ describe("spawnRun", () => {
 				get: async () => ({
 					triggers: null,
 					defaults: { defaultProvider: "anthropic", defaultModel: "claude-opus-4-7" },
+					prTemplate: null,
 					errors: [],
 				}),
 				invalidate: () => undefined,
@@ -819,6 +822,7 @@ describe("spawnRun", () => {
 				get: async () => ({
 					triggers: null,
 					defaults: { runBranchPrefix: "bot" },
+					prTemplate: null,
 					errors: [],
 				}),
 				invalidate: () => undefined,

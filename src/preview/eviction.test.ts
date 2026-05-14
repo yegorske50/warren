@@ -176,6 +176,7 @@ describe("runPreviewEvictionTick", () => {
 							},
 						}
 					: null,
+			prTemplate: null,
 			errors: [],
 		});
 		const cache = createWarrenConfigCache({ load });
@@ -447,6 +448,7 @@ describe("startPreviewEvictionWorker", () => {
 			load: async () => ({
 				triggers: null,
 				defaults: null,
+				prTemplate: null,
 				errors: [],
 			}),
 		});
@@ -475,6 +477,7 @@ describe("startPreviewEvictionWorker", () => {
 				load: async () => ({
 					triggers: null,
 					defaults: null,
+					prTemplate: null,
 					errors: [],
 				}),
 			}),

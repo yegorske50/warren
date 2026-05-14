@@ -1,3 +1,10 @@
+import {
+	composeBody,
+	composeTitle,
+	type PrFragmentContext,
+	type PrTemplateOverrides,
+} from "./pr-template.ts";
+
 /**
  * `openPullRequest` — open a GitHub PR for a branch reap just pushed
  * (warren-f6af). Fourth best-effort sub-step of `reapRun`, gated by
@@ -19,9 +26,12 @@
  *   - `network`      — fetch threw or non-2xx response that isn't a
  *                       known idempotent shape.
  *
- * The body and title format is fixed in V1 — first prompt line as title,
- * full prompt + run id + warren UI link as body. Per-project templating
- * is out of scope (file a follow-up if needed).
+ * The body and title format is template-driven (warren-bd49): the body
+ * comes from the named-fragment registry in `src/runs/pr-template.ts`,
+ * and projects override individual fragments via
+ * `.warren/pr-template.md`. Title follows the same registry: a project
+ * `title` override wins; otherwise the seed/commit/prompt precedence
+ * chain applies.
  */
 
 export interface OpenPullRequestInput {
@@ -222,6 +232,15 @@ export interface BuildPrContentInput {
 	 * scaffolding in their PR body.
 	 */
 	readonly previewOptedIn?: boolean;
+	/**
+	 * Per-project PR-template overrides (warren-bd49). Loaded from
+	 * `.warren/pr-template.md` by `loadPrTemplate` and threaded through
+	 * `reapRun`. Each key is a fragment name from `PR_FRAGMENT_NAMES`
+	 * (`src/runs/pr-template.ts`); the value replaces the default body
+	 * for that fragment. Whitespace-only values remove the fragment
+	 * from the output. Omitted / undefined → defaults apply.
+	 */
+	readonly templateOverrides?: PrTemplateOverrides;
 }
 
 /**
@@ -241,155 +260,65 @@ export interface PrContent {
 /**
  * Build the PR title and body (warren-9ee3).
  *
- * Title precedence — first non-empty wins:
- *   1. Resolved seed title (`seed.title`) when the prompt referenced a seed.
- *   2. First commit subject on the branch.
- *   3. First non-empty line of the prompt.
- *   4. `warren run <id> (<agent>)` fallback for empty prompts.
+ * Body is composed from named fragments via the registry in
+ * `src/runs/pr-template.ts` (warren-bd49); project overrides from
+ * `.warren/pr-template.md` thread through `input.templateOverrides`
+ * and replace individual fragments by name.
  *
- * Body sections (omitted when their data is absent):
- *   - Summary — first commit subject or `Agent <name> ran for <duration>; no commits.`
- *   - Run — warren UI link / agent / duration / cost
- *   - Seeds — `<id> — <title>` when a seed was resolved
- *   - Commits (N) — short-sha + subject bullets
- *   - Files changed — fenced block of `git diff --stat`
- *   - Prompt — collapsed `<details>` so the audit trail survives without dominating
+ * Title precedence — first non-empty wins:
+ *   1. Project `title` override (when supplied via templateOverrides).
+ *   2. Resolved seed title (`seed.title`) when the prompt referenced a seed.
+ *   3. First commit subject on the branch.
+ *   4. First non-empty line of the prompt.
+ *   5. `warren run <id> (<agent>)` fallback for empty prompts.
+ *
+ * Body fragments (in order, omitted when their data is absent and
+ * the project hasn't overridden):
+ *   - summary, run, seeds, preview_url_or_placeholder, commits,
+ *     files_changed, prompt, trailer
  */
 export function buildPrContent(input: BuildPrContentInput): PrContent {
-	return { title: formatTitle(input), body: formatBody(input) };
+	const ctx: PrFragmentContext = buildContext(input);
+	const overrides = input.templateOverrides ?? {};
+	return {
+		title: composeTitle(ctx, overrides, TITLE_MAX_LENGTH),
+		body: composeBody(ctx, overrides),
+	};
 }
 
-function formatTitle(input: BuildPrContentInput): string {
-	const raw = chooseTitleSource(input);
-	return raw.length <= TITLE_MAX_LENGTH ? raw : `${raw.slice(0, TITLE_MAX_LENGTH - 1)}…`;
-}
-
-function chooseTitleSource(input: BuildPrContentInput): string {
-	if (input.seed !== undefined && input.seed.title !== "") return input.seed.title;
-	const firstCommit = input.commits?.[0];
-	if (firstCommit !== undefined && firstCommit.subject !== "") return firstCommit.subject;
-	const firstLine = input.prompt
-		.split("\n")
-		.map((l) => l.trim())
-		.find((l) => l !== "");
-	return firstLine ?? `warren run ${input.runId} (${input.agentName})`;
-}
-
-function formatBody(input: BuildPrContentInput): string {
-	const sections: string[] = [];
-	sections.push(formatSummarySection(input));
-	sections.push(formatRunSection(input));
-	if (input.seed !== undefined) sections.push(formatSeedsSection(input.seed));
-	if (input.previewOptedIn === true) sections.push(formatPreviewSection());
-	if (input.commits !== undefined && input.commits.length > 0) {
-		sections.push(formatCommitsSection(input.commits));
-	}
-	if (input.diffStat !== undefined && input.diffStat.trim() !== "") {
-		sections.push(formatFilesSection(input.diffStat));
-	}
-	sections.push(formatPromptSection(input.prompt));
-	sections.push(formatFooter(input.runId));
-	return sections.join("\n\n");
-}
-
-function formatPreviewSection(): string {
-	return `## Preview\n\n${PREVIEW_FRAGMENT_START}\nPreview launching…\n${PREVIEW_FRAGMENT_END}`;
-}
-
-function formatSummarySection(input: BuildPrContentInput): string {
-	const commits = input.commits;
-	if (commits !== undefined && commits.length > 0) {
-		return `## Summary\n\n${commits[0]?.subject ?? ""}`;
-	}
-	const duration = formatDuration(input.startedAt, input.endedAt);
-	const tail = duration === null ? "no commits." : `for ${duration}; no commits.`;
-	return `## Summary\n\nAgent \`${input.agentName}\` ran ${tail}`;
-}
-
-function formatRunSection(input: BuildPrContentInput): string {
-	const lines = ["## Run", ""];
-	const link =
-		input.warrenBaseUrl !== undefined && input.warrenBaseUrl !== ""
-			? `${input.warrenBaseUrl.replace(/\/+$/, "")}/#/runs/${input.runId}`
-			: `\`${input.runId}\``;
-	lines.push(`- **Warren run:** ${link}`);
-	lines.push(`- **Agent:** ${input.agentName}`);
-	const duration = formatDuration(input.startedAt, input.endedAt);
-	if (duration !== null) lines.push(`- **Duration:** ${duration}`);
-	const cost = formatCostLine(input);
-	if (cost !== null) lines.push(`- **Cost:** ${cost}`);
-	return lines.join("\n");
-}
-
-function formatSeedsSection(seed: PrSeed): string {
-	return `## Seeds\n\n- ${seed.id} — ${seed.title}`;
-}
-
-function formatCommitsSection(commits: readonly PrCommit[]): string {
-	const lines = [`## Commits (${commits.length})`, ""];
-	for (const c of commits) {
-		lines.push(`- ${shortSha(c.sha)} ${c.subject}`);
-	}
-	return lines.join("\n");
-}
-
-function formatFilesSection(diffStat: string): string {
-	return `## Files changed\n\n\`\`\`\n${diffStat.trim()}\n\`\`\``;
-}
-
-function formatPromptSection(prompt: string): string {
-	const body = prompt === "" ? "(empty prompt)" : prompt;
-	return `## Prompt\n\n<details><summary>Show prompt</summary>\n\n\`\`\`\n${body}\n\`\`\`\n\n</details>`;
-}
-
-function formatFooter(runId: string): string {
-	return `---\n\n🤖 Opened by warren run \`${runId}\``;
-}
-
-function shortSha(sha: string): string {
-	return sha.length > 7 ? sha.slice(0, 7) : sha;
-}
-
-function formatDuration(startedAt: string | undefined, endedAt: string | undefined): string | null {
-	if (startedAt === undefined || endedAt === undefined) return null;
-	const start = Date.parse(startedAt);
-	const end = Date.parse(endedAt);
-	if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return null;
-	const secs = Math.round((end - start) / 1000);
-	if (secs < 60) return `${secs}s`;
-	const m = Math.floor(secs / 60);
-	const s = secs % 60;
-	if (m < 60) return `${m}m ${s}s`;
-	const h = Math.floor(m / 60);
-	return `${h}h ${m % 60}m ${s}s`;
-}
-
-function formatCostLine(input: BuildPrContentInput): string | null {
-	const parts: string[] = [];
-	if (input.costUsd !== undefined) parts.push(formatCostUsd(input.costUsd));
-	const tokens: string[] = [];
-	if (input.tokensInput !== undefined) tokens.push(`${formatTokens(input.tokensInput)} in`);
-	if (input.tokensOutput !== undefined) tokens.push(`${formatTokens(input.tokensOutput)} out`);
-	if (input.tokensCacheRead !== undefined && input.tokensCacheRead > 0) {
-		tokens.push(`${formatTokens(input.tokensCacheRead)} cache-r`);
-	}
-	if (tokens.length > 0) {
-		const joined = tokens.join(" / ");
-		parts.push(parts.length === 0 ? joined : `(${joined})`);
-	}
-	return parts.length === 0 ? null : parts.join(" ");
-}
-
-function formatCostUsd(cost: number): string {
-	if (cost >= 1) return `$${cost.toFixed(2)}`;
-	if (cost === 0) return "$0.00";
-	return `$${cost.toFixed(3)}`;
-}
-
-function formatTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-	return String(n);
+function buildContext(input: BuildPrContentInput): PrFragmentContext {
+	const ctx: {
+		prompt: string;
+		runId: string;
+		agentName: string;
+		warrenBaseUrl?: string;
+		commits?: readonly PrCommit[];
+		diffStat?: string;
+		seed?: PrSeed;
+		startedAt?: string;
+		endedAt?: string;
+		costUsd?: number;
+		tokensInput?: number;
+		tokensOutput?: number;
+		tokensCacheRead?: number;
+		previewOptedIn?: boolean;
+	} = {
+		prompt: input.prompt,
+		runId: input.runId,
+		agentName: input.agentName,
+	};
+	if (input.warrenBaseUrl !== undefined) ctx.warrenBaseUrl = input.warrenBaseUrl;
+	if (input.commits !== undefined) ctx.commits = input.commits;
+	if (input.diffStat !== undefined) ctx.diffStat = input.diffStat;
+	if (input.seed !== undefined) ctx.seed = input.seed;
+	if (input.startedAt !== undefined) ctx.startedAt = input.startedAt;
+	if (input.endedAt !== undefined) ctx.endedAt = input.endedAt;
+	if (input.costUsd !== undefined) ctx.costUsd = input.costUsd;
+	if (input.tokensInput !== undefined) ctx.tokensInput = input.tokensInput;
+	if (input.tokensOutput !== undefined) ctx.tokensOutput = input.tokensOutput;
+	if (input.tokensCacheRead !== undefined) ctx.tokensCacheRead = input.tokensCacheRead;
+	if (input.previewOptedIn !== undefined) ctx.previewOptedIn = input.previewOptedIn;
+	return ctx;
 }
 
 /* ----------------------------------------------------------------------- */

@@ -106,6 +106,7 @@ describe("bootScheduler", () => {
 					},
 				],
 				defaults: null,
+				prTemplate: null,
 				errors: [],
 			}),
 		});
@@ -167,6 +168,7 @@ describe("bootScheduler", () => {
 			load: async () => ({
 				triggers: null,
 				defaults: { defaultRole: "claude-code" },
+				prTemplate: null,
 				errors: [],
 			}),
 		});
@@ -245,7 +247,7 @@ describe("bootScheduler", () => {
 			burrowClientPool: await makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
-				load: async () => ({ triggers: null, defaults: null, errors: [] }),
+				load: async () => ({ triggers: null, defaults: null, prTemplate: null, errors: [] }),
 			}),
 			projectsConfig: PROJECTS_CONFIG,
 			projectSpawn: (async () => ({ stdout: "", stderr: "", exitCode: 0 })) as SpawnFn,
@@ -269,7 +271,7 @@ describe("bootScheduler", () => {
 			burrowClientPool: await makePool(repos),
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
-				load: async () => ({ triggers: null, defaults: null, errors: [] }),
+				load: async () => ({ triggers: null, defaults: null, prTemplate: null, errors: [] }),
 			}),
 			projectsConfig: PROJECTS_CONFIG,
 			projectSpawn: (async () => ({ stdout: "", stderr: "", exitCode: 0 })) as SpawnFn,

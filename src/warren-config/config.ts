@@ -20,6 +20,7 @@ export const WARREN_CONFIG_DIR = ".warren";
 export const WARREN_CONFIG_FILES = {
 	triggers: "triggers.yaml",
 	defaults: "defaults.json",
+	prTemplate: "pr-template.md",
 } as const;
 
 export type WarrenConfigFileKey = keyof typeof WARREN_CONFIG_FILES;

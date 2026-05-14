@@ -174,10 +174,16 @@ describe("checkCanopyClean", () => {
 });
 
 describe("checkWarrenConfig", () => {
-	const empty: LoadedWarrenConfig = { triggers: null, defaults: null, errors: [] };
+	const empty: LoadedWarrenConfig = {
+		triggers: null,
+		defaults: null,
+		prTemplate: null,
+		errors: [],
+	};
 	const valid: LoadedWarrenConfig = {
 		triggers: [],
 		defaults: { defaultBranch: "main" },
+		prTemplate: null,
 		errors: [],
 	};
 
@@ -209,6 +215,7 @@ describe("checkWarrenConfig", () => {
 		const malformed: LoadedWarrenConfig = {
 			triggers: null,
 			defaults: { defaultBranch: "main" },
+			prTemplate: null,
 			errors: [
 				{
 					file: ".warren/triggers.yaml",
@@ -246,6 +253,7 @@ describe("checkWarrenConfig", () => {
 		const malformed: LoadedWarrenConfig = {
 			triggers: null,
 			defaults: null,
+			prTemplate: null,
 			errors: [
 				{
 					file: ".warren/defaults.json",

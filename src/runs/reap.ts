@@ -109,6 +109,7 @@ import {
 	type AnnotatePrPreviewResult,
 	annotatePrPreview,
 } from "./pr-annotate.ts";
+import type { PrTemplateOverrides } from "./pr-template.ts";
 import type { BridgeLogger } from "./stream.ts";
 
 const execFileAsync = promisify(execFile);
@@ -199,6 +200,14 @@ export interface ReapRunInput {
 	readonly previewConfig?: ServerPreviewConfig;
 	readonly portAllocator?: PreviewPortAllocator;
 	readonly previewLaunchConfig?: PreviewLaunchConfig;
+	/**
+	 * PR-body template overrides parsed from `.warren/pr-template.md`
+	 * (warren-bd49). Threaded into `buildPrContent`'s named-fragment
+	 * composer; missing-or-empty keeps the built-in defaults. Caller
+	 * (bridges.ts / scheduler) loads this from the per-project warren
+	 * config cache the same way it resolves `previewConfig`.
+	 */
+	readonly prTemplate?: PrTemplateOverrides;
 	/**
 	 * Override the preview-launch mechanics (tests). Defaults to
 	 * `launchPreview`. Receives the resolved input shape, including the
@@ -501,6 +510,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 					prContext,
 					previewOptedIn: input.previewConfig !== undefined,
 					openPr: input.openPr ?? openPullRequest,
+					...(input.prTemplate !== undefined ? { prTemplate: input.prTemplate } : {}),
 				});
 				if (opened.ok) {
 					prUrl = opened.url;
@@ -720,6 +730,7 @@ interface TryOpenPrInput {
 	readonly prContext: PrContext;
 	readonly previewOptedIn: boolean;
 	readonly openPr: (input: OpenPullRequestInput) => Promise<OpenPullRequestResult>;
+	readonly prTemplate?: PrTemplateOverrides;
 }
 
 async function tryOpenPr(input: TryOpenPrInput): Promise<OpenPullRequestResult> {
@@ -748,6 +759,7 @@ async function tryOpenPr(input: TryOpenPrInput): Promise<OpenPullRequestResult> 
 		...(input.run.tokensInput !== null ? { tokensInput: input.run.tokensInput } : {}),
 		...(input.run.tokensOutput !== null ? { tokensOutput: input.run.tokensOutput } : {}),
 		...(input.run.tokensCacheRead !== null ? { tokensCacheRead: input.run.tokensCacheRead } : {}),
+		...(input.prTemplate !== undefined ? { templateOverrides: input.prTemplate } : {}),
 	};
 	const content = buildPrContent(contentInput);
 	return input.openPr({

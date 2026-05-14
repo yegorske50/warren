@@ -27,7 +27,7 @@ function recordingCache(): RecordingCache {
 		get invalidations() {
 			return invalidations;
 		},
-		get: async () => ({ triggers: null, defaults: null, errors: [] }),
+		get: async () => ({ triggers: null, defaults: null, prTemplate: null, errors: [] }),
 		invalidate: (id: string) => {
 			invalidations.push(id);
 		},

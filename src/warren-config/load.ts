@@ -22,6 +22,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import yaml from "js-yaml";
+import { type PrTemplateOverrides, parsePrTemplate } from "../runs/pr-template.ts";
 import { WARREN_CONFIG_DIR, WARREN_CONFIG_FILES, warrenConfigRelativePath } from "./config.ts";
 import {
 	WARREN_CONFIG_FILE_ERROR_CODES,
@@ -40,6 +41,14 @@ export interface LoadedWarrenConfig {
 	readonly triggers: TriggersConfig | null;
 	/** Parsed defaults, or `null` when the file is absent or malformed. */
 	readonly defaults: DefaultsConfig | null;
+	/**
+	 * Per-fragment overrides parsed from `.warren/pr-template.md`
+	 * (warren-bd49). `null` when the file is absent or its read failed;
+	 * an empty object means the file exists but had no recognized
+	 * fragments. Warnings (unknown fragment names, unclosed preview
+	 * markers) surface via `errors` with `code: schemaError`.
+	 */
+	readonly prTemplate: PrTemplateOverrides | null;
 	/** Per-file failures collected during this load. Empty on full success. */
 	readonly errors: readonly WarrenConfigFileError[];
 }
@@ -73,14 +82,15 @@ export async function loadWarrenConfig(input: LoadWarrenConfigInput): Promise<Lo
 
 	if (!exists(dirPath)) {
 		// No `.warren/` at all is the bootstrap shape — existing projects keep
-		// working unchanged. Both fields null, no errors.
-		return { triggers: null, defaults: null, errors };
+		// working unchanged. All fields null, no errors.
+		return { triggers: null, defaults: null, prTemplate: null, errors };
 	}
 
 	const triggers = await loadTriggers({ projectPath, exists, read, errors });
 	const defaults = await loadDefaults({ projectPath, exists, read, errors });
+	const prTemplate = await loadPrTemplate({ projectPath, exists, read, errors });
 
-	return { triggers, defaults, errors };
+	return { triggers, defaults, prTemplate, errors };
 }
 
 interface LoadOneInput {
@@ -181,6 +191,37 @@ async function loadDefaults(input: LoadOneInput): Promise<DefaultsConfig | null>
 		return null;
 	}
 	return result.value;
+}
+
+async function loadPrTemplate(input: LoadOneInput): Promise<PrTemplateOverrides | null> {
+	const relPath = warrenConfigRelativePath("prTemplate");
+	const absPath = join(input.projectPath, WARREN_CONFIG_DIR, WARREN_CONFIG_FILES.prTemplate);
+
+	if (!input.exists(absPath)) {
+		return null;
+	}
+
+	let raw: string;
+	try {
+		raw = await input.read(absPath);
+	} catch (err) {
+		input.errors.push({
+			file: relPath,
+			code: WARREN_CONFIG_FILE_ERROR_CODES.parseError,
+			message: `failed to read file: ${formatError(err)}`,
+		});
+		return null;
+	}
+
+	const parsed = parsePrTemplate(raw);
+	for (const warning of parsed.warnings) {
+		input.errors.push({
+			file: relPath,
+			code: WARREN_CONFIG_FILE_ERROR_CODES.schemaError,
+			message: warning.message,
+		});
+	}
+	return parsed.overrides;
 }
 
 function defaultReadFile(path: string): Promise<string> {

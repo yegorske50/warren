@@ -10,6 +10,7 @@ function envelope(overrides: Partial<LoadedWarrenConfig> = {}): LoadedWarrenConf
 	return {
 		triggers: overrides.triggers ?? null,
 		defaults: overrides.defaults ?? null,
+		prTemplate: overrides.prTemplate ?? null,
 		errors: overrides.errors ?? [],
 	};
 }

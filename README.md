@@ -97,6 +97,20 @@ If a project has a `.seeds/` directory, agents can `sd ready` for unblocked work
 
 The built-in `sapling` agent is a headless coding harness with proactive context management. Use it the same way you'd use `claude-code`. See [sapling](https://github.com/jayminwest/sapling).
 
+### PR-body template — per-project overrides for the PR warren opens
+
+After a successful run, warren opens a PR with a generated body (summary, run link, commits, files-changed, prompt, etc.). Projects override individual sections by shipping a `.warren/pr-template.md` file: every `## <fragment_name>` heading replaces the default body for that fragment. Unspecified fragments keep the built-in defaults — partial-override is the point.
+
+```markdown
+## trailer
+
+Reviewed-by: @platform-team
+
+Please follow our [PR checklist](https://example.com/checklist) before merging.
+```
+
+Recognized fragment names: `title`, `summary`, `run`, `seeds`, `preview_url_or_placeholder`, `commits`, `files_changed`, `prompt`, `trailer`. A whitespace-only body removes the fragment entirely. Unknown names + unbalanced preview markers surface via `warren doctor` so typos are loud. See [SPEC §11.L](SPEC.md) for the full fragment contract.
+
 ### Per-run preview environments — click the agent's branch instead of checking it out
 
 When a project ships a `preview` block in `.warren/defaults.json`, warren launches `preview.command` as a sidecar inside the same burrow workspace after a successful run, allocates a port, and exposes the running app at `https://run-<runId>.<WARREN_PREVIEW_HOST>`. Reviewers click the URL instead of `git checkout`-ing the branch. Idle sessions are reaped automatically; the run-detail page surfaces a status badge and a manual teardown button. Opt in with two pieces:

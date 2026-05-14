@@ -9,7 +9,7 @@ import { runTick, startScheduler } from "./tick.ts";
 const NOW = new Date("2026-05-11T00:05:00.000Z");
 
 function emptyConfig(): LoadedWarrenConfig {
-	return { triggers: null, defaults: null, errors: [] };
+	return { triggers: null, defaults: null, prTemplate: null, errors: [] };
 }
 
 interface SilentLogger {
@@ -109,6 +109,7 @@ describe("runTick", () => {
 					},
 				],
 				defaults: null,
+				prTemplate: null,
 				errors: [],
 			}),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
@@ -133,6 +134,7 @@ describe("runTick", () => {
 			loadWarrenConfig: async () => ({
 				triggers: null,
 				defaults: { defaultRole: "claude-code" },
+				prTemplate: null,
 				errors: [],
 			}),
 			listScheduledSeeds: async (path) => {
@@ -179,6 +181,7 @@ describe("runTick", () => {
 			loadWarrenConfig: async () => ({
 				triggers: null,
 				defaults: { defaultRole: "claude-code" },
+				prTemplate: null,
 				errors: [],
 			}),
 			listScheduledSeeds: async () => ({

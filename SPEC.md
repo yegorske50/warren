@@ -723,18 +723,19 @@ V2 phase opens. Worth pinning in V1's frozen record because the warren ↔
 project-repo seam now has a third tier alongside `.canopy/` (prompts) and
 `.mulch/` (expertise).
 
-**Layout.** Each project repo may contain a `.warren/` directory with two
-optional files:
+**Layout.** Each project repo may contain a `.warren/` directory with up
+to three optional files:
 
 ```
 .warren/
   triggers.yaml      # array of trigger entries (cron today; webhooks future)
-  defaults.json      # per-project default role / branch / prompt
+  defaults.json      # per-project default role / branch / prompt / preview
+  pr-template.md     # per-fragment PR-body overrides (warren-bd49)
 ```
 
-Both files are optional; the loader's envelope returns `null` for missing
-files instead of erroring (`mx-66d478`), so existing project repos keep
-working unchanged.
+All three files are optional; the loader's envelope returns `null` for
+missing files instead of erroring (`mx-66d478`), so existing project
+repos keep working unchanged.
 
 **Format choice.** `triggers.yaml` is YAML (cron expressions read better;
 arrays-of-objects are noisier in TOML/JSON). `defaults.json` is JSON despite
@@ -757,10 +758,14 @@ project default > `WARREN_RUN_BRANCH_PREFIX` env > built-in `"burrow"`.
 **Loader contract** (`src/warren-config/load.ts`):
 
 - Returns `LoadedWarrenConfig = { triggers: TriggersConfig | null,
-  defaults: DefaultsConfig | null, errors: WarrenConfigFileError[] }`.
+  defaults: DefaultsConfig | null, prTemplate: PrTemplateOverrides | null,
+  errors: WarrenConfigFileError[] }`.
 - Missing file → entry is `null`, no error.
 - Present-but-malformed file → entry is `null`, error appended with code
   (`yaml_parse | json_parse | schema_invalid`) and message.
+- `pr-template.md` (warren-bd49) is loaded the same way: missing → `null`;
+  unknown fragment names / unbalanced preview markers surface as
+  `schemaError` entries that flow through doctor + readyz.
 - Per-project cache (`src/warren-config/cache.ts`) is invalidated inside
   `refreshProject` and `deleteProject` (`mx-61c0e6`) so the next request
   reparses; this avoids the stale-config race called out in pl-5d74 risk #4.
@@ -1266,14 +1271,14 @@ values; explicit `null` does not clear. Migration-parity CI lint
 
 **PR-template fragment contract.** The preview footer is a **named
 template fragment** in the PR body that no-ops when the project hasn't
-opted in. Today `buildPrContent` (`src/runs/reap.ts:552`) hardcodes the
-body shape; the broader move to user-configurable PR-body templates is
-a sibling seed filed under the same plan
-(`.warren/pr-template.md`-driven, parallel to canopy's section system).
-R-19 only locks the fragment contract: a `preview_url_or_placeholder`
-fragment that renders either nothing, a placeholder comment, or the
-final URL, and is the integration point the broader PR-template seed
-will pluralize.
+opted in. The full named-fragment registry shipped in `warren-bd49`:
+`buildPrContent` (`src/runs/pr.ts`) composes its body from the
+`PR_FRAGMENT_NAMES` registry in `src/runs/pr-template.ts`, and projects
+override any fragment by shipping `.warren/pr-template.md` with `## name`
+H2s. The `preview_url_or_placeholder` fragment is one entry in the
+registry — same start/end markers, same idempotent annotate path. The
+broader `.warren/` YAML reorg (one file per concern) is filed under the
+same plan as a follow-up.
 
 **Remote-worker (R-12) explicit deferral.** Cross-host preview routing
 is out of scope. The proxy preamble asserts local-worker-only and
@@ -1295,6 +1300,68 @@ for V1 of R-19. The broader move toward a clean, human-friendly
 defaults, `preview.yaml`, `triggers.yaml`, `pr-template.md`) is filed
 as a follow-up under the same plan with a backcompat path so existing
 `defaults.json` installs don't break.
+
+### 11.M PR-body template (warren-bd49, 2026-05-14)
+
+`buildPrContent` (`src/runs/pr.ts`) composes the PR body from a fixed
+registry of **named fragments** (`PR_FRAGMENT_NAMES` in
+`src/runs/pr-template.ts`):
+
+```
+title                         → drives the PR title (truncated to 72 chars)
+summary                       → first commit subject or "agent ran for X; no commits."
+run                           → warren UI link, agent, duration, cost
+seeds                         → "id — title" when the prompt referenced a seed
+preview_url_or_placeholder    → §11.L preview footer (start/end markers)
+commits                       → "## Commits (N)" bullet list
+files_changed                 → `git diff --stat` fenced block
+prompt                        → collapsed `<details>` audit trail
+trailer                       → footer / signature
+```
+
+The registry — not inline string concatenation — is what assembles the
+body. Each fragment has a default renderer that no-ops when its data
+isn't present (e.g. the `seeds` fragment renders nothing when no seed
+was resolved). The `preview_url_or_placeholder` fragment is one entry
+in the same list; the §11.L `pr_annotate_preview` step patches it
+later using the same `<!-- warren:preview-start -->` /
+`<!-- warren:preview-end -->` markers it always has.
+
+**Project overrides.** A project ships `.warren/pr-template.md` with
+H2 headings whose names match fragment names:
+
+```markdown
+## trailer
+
+Reviewed-by: @platform-team
+
+Please follow our [PR checklist](https://example.com/checklist) before merging.
+```
+
+Override semantics:
+
+- Fragment-by-fragment: missing keys keep the default; explicit body
+  replaces it wholesale.
+- Whitespace-only body removes the fragment from output entirely.
+- Names are normalized to snake_case so `## Files Changed`,
+  `## files-changed`, and `## files_changed` all match `files_changed`.
+- Variable interpolation is **not** supported in V1 — overrides are
+  literal markdown. Projects that need per-run dynamic data keep the
+  default fragment for that section.
+
+**Doctor / readyz coverage.** Unknown fragment names and unbalanced
+preview markers (one of `<!-- warren:preview-start -->` /
+`<!-- warren:preview-end -->` without the other) surface as
+`warren_config_schema_error` entries on `.warren/pr-template.md`. The
+existing `checkWarrenConfig` probe aggregates them across projects —
+no new diagnostic check needed.
+
+**Wire-up.** `bridges.ts` resolves the project's parsed overrides via
+the same `WarrenConfigCache` it uses for `previewConfig`, then threads
+them into `reapRun({ prTemplate })` on succeeded-outcome reaps.
+`buildPrContent` accepts `templateOverrides` and forwards into
+`composeBody` / `composeTitle`. Failures from the loader fall through
+to the built-in defaults — the PR still gets opened.
 
 ---
 
