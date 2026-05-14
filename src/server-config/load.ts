@@ -1,0 +1,108 @@
+/**
+ * Loader for warren's server-level TOML config
+ * (pl-9ba1 step 7 / warren-3909).
+ *
+ * Contract:
+ *   WARREN_CONFIG_FILE unset  → empty config; identical to env-only boot.
+ *   path set, file missing    → `ValidationError` (operator misconfig).
+ *   file empty                → empty config (Bun.TOML.parse("") returns {}).
+ *   malformed TOML            → `ValidationError` with parse-error detail.
+ *   schema rejection          → `ValidationError` with field-level detail.
+ *   valid file                → parsed `WarrenServerFileConfig`.
+ *
+ * I/O is injected so tests don't touch disk and so the boot path can
+ * swap to a different reader if `warren.toml` ever needs to load from
+ * a non-disk source (e.g. a k8s ConfigMap mount where atomic-swap
+ * semantics matter). Defaults to `node:fs/promises` + `Bun.TOML.parse`.
+ *
+ * The loader does NOT merge with env vars — the merge precedence
+ * (operator override > file > built-in) is per-consumer and lives next
+ * to the consumer (step 8's `[workers]` block will add the workers-side
+ * merge in `src/burrow-client/pool.ts`). Returning the parsed file
+ * config as a structured value keeps the loader honest and easy to
+ * reuse for future blocks beyond `[workers]`.
+ */
+
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { ValidationError } from "../core/errors.ts";
+import { type EnvLike, resolveWarrenConfigFilePath, WARREN_CONFIG_FILE_ENV } from "./config.ts";
+import { parseWarrenServerFileConfig, type WarrenServerFileConfig } from "./schema.ts";
+
+export type ReadFileFn = (path: string) => Promise<string>;
+export type ExistsFn = (path: string) => boolean;
+
+export interface LoadWarrenServerConfigInput {
+	/** Explicit path; overrides the env-var lookup when provided. */
+	readonly path?: string;
+	/** Defaults to `process.env`. */
+	readonly env?: EnvLike;
+	readonly readFile?: ReadFileFn;
+	readonly exists?: ExistsFn;
+}
+
+export interface LoadedWarrenServerConfig {
+	/** Absolute path the loader read from, or `null` for the no-file path. */
+	readonly path: string | null;
+	readonly config: WarrenServerFileConfig;
+}
+
+export async function loadWarrenServerConfigFromFile(
+	input: LoadWarrenServerConfigInput = {},
+): Promise<LoadedWarrenServerConfig> {
+	const env = input.env ?? process.env;
+	const exists = input.exists ?? existsSync;
+	const read = input.readFile ?? defaultReadFile;
+
+	const path = input.path ?? resolveWarrenConfigFilePath(env);
+	if (path === null || path === "") {
+		return { path: null, config: {} };
+	}
+
+	if (!exists(path)) {
+		throw new ValidationError(
+			`${WARREN_CONFIG_FILE_ENV} points at a file that does not exist: ${path}`,
+			{
+				recoveryHint: `create ${path} (an empty file is valid) or unset ${WARREN_CONFIG_FILE_ENV}`,
+			},
+		);
+	}
+
+	let raw: string;
+	try {
+		raw = await read(path);
+	} catch (err) {
+		throw new ValidationError(`failed to read ${path}: ${formatError(err)}`, {
+			recoveryHint: `check filesystem permissions on ${path}`,
+			cause: err,
+		});
+	}
+
+	let document: unknown;
+	try {
+		document = Bun.TOML.parse(raw);
+	} catch (err) {
+		throw new ValidationError(`failed to parse ${path} as TOML: ${formatError(err)}`, {
+			recoveryHint: `fix the TOML syntax in ${path}; run \`bun -e 'Bun.TOML.parse(require("fs").readFileSync("${path}", "utf8"))'\` to reproduce`,
+			cause: err,
+		});
+	}
+
+	const result = parseWarrenServerFileConfig(document);
+	if (!result.ok) {
+		throw new ValidationError(`invalid config in ${path}: ${result.message}`, {
+			recoveryHint: `fix the offending field(s) in ${path}`,
+		});
+	}
+
+	return { path, config: result.value };
+}
+
+function defaultReadFile(path: string): Promise<string> {
+	return readFile(path, "utf8");
+}
+
+function formatError(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	return String(err);
+}
