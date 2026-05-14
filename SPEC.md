@@ -1099,6 +1099,22 @@ Design lock for R-19. Tracked by plan `pl-2c59` (root seed
 `warren-1bcb`, design-lock step `warren-94d8`). Closes the R-19 open
 questions; the implementing steps assume this section as contract.
 
+**Burrow-side dependency.** Burrow's bwrap profile is outbound-only
+today (§8.1, `network: 'none' | 'restricted' | 'open'`), and the run
+API is shaped around single-shot agent runs — neither an inbound
+loopback port-forward nor a long-lived sidecar lifecycle exists on
+burrow's HTTP surface. The cross-repo coordination seed is filed as
+`burrow-8647` (consumed by warren-side step `warren-83dc`): warren
+declares `inboundPortForwards: [{hostPort, sandboxPort}]` on the
+sandbox profile and calls `POST /burrows/:id/sidecars` (with
+parallel `GET / DELETE` and a `logs` endpoint) to spawn
+`preview.command` alongside the finished agent run. Warren
+orchestrates allocation, eviction, and TTLs; burrow enforces the
+per-burrow forward + a small sidecar cap. Acceptance scenario 20's
+Linux path exercises the full warren↔burrow seam; macOS skips per
+`mx-1d31f0` because sandbox-exec doesn't isolate the network
+namespace the same way.
+
 **Project opt-in shape.** A project drops a `preview` block into
 `.warren/defaults.json` (or, post-reorg, `.warren/preview.yaml`). The
 schema carries a `type` discriminator from day one so we don't have to

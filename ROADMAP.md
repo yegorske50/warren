@@ -1291,8 +1291,9 @@ workspace's listening port. Roughly:
   Bearer-in-header is impossible for a browser hitting `run-<id>.<host>`.
   GitHub OAuth defers to R-18; per-run basic-auth and no-auth rejected.
 - **Inbound burrow networking** filed as a cross-repo coordination seed
-  under `pl-2c59` step 2 (`warren-83dc` → burrow-side seed).
-  Per-burrow loopback port-forward, same architectural seam as the
+  under `pl-2c59` step 2 (`warren-83dc` → burrow-side seed `burrow-8647`).
+  Per-burrow loopback port-forward + sidecar exec endpoint
+  (`POST /burrows/:id/sidecars`), same architectural seam as the
   `.gitconfig`-mount / per-run secret mount in R-15 and §11.G.
 - **Port allocation.** SQLite-backed allocator, in-use ports derived
   from `runs.preview_state IN ('starting','live')` on startup so the
