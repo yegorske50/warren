@@ -3,7 +3,15 @@ import { LOCAL_WORKER_NAME } from "../burrow-client/pool.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { COOKIE_NAME, createPreviewAuth, type PreviewAuth } from "./cookie.ts";
-import { createPreviewProxyHandler, parsePreviewPathPrefix, parseRunIdFromHost } from "./proxy.ts";
+import {
+	createPreviewProxyHandler,
+	HTML_HEAD_LOOKAHEAD_BYTES,
+	injectBaseHref,
+	isHtmlContentType,
+	parsePreviewPathPrefix,
+	parseRunIdFromHost,
+	rewriteLocationHeader,
+} from "./proxy.ts";
 
 function fetchStub(
 	impl: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>,
@@ -688,5 +696,451 @@ describe("createPreviewProxyHandler (path mode)", () => {
 		});
 		const res = await handler(request, url);
 		expect(res?.status).toBe(502);
+	});
+});
+
+describe("isHtmlContentType", () => {
+	test("matches bare text/html", () => {
+		expect(isHtmlContentType("text/html")).toBe(true);
+	});
+
+	test("matches text/html with charset parameter", () => {
+		expect(isHtmlContentType("text/html; charset=utf-8")).toBe(true);
+		expect(isHtmlContentType("text/html;charset=UTF-8")).toBe(true);
+		expect(isHtmlContentType("TEXT/HTML")).toBe(true);
+	});
+
+	test("rejects other content types", () => {
+		expect(isHtmlContentType("application/json")).toBe(false);
+		expect(isHtmlContentType("application/xhtml+xml")).toBe(false);
+		expect(isHtmlContentType("text/plain")).toBe(false);
+		expect(isHtmlContentType("text/css")).toBe(false);
+		expect(isHtmlContentType("application/javascript")).toBe(false);
+	});
+
+	test("rejects null", () => {
+		expect(isHtmlContentType(null)).toBe(false);
+	});
+});
+
+describe("rewriteLocationHeader", () => {
+	const PREFIX = "/p/run_abc";
+
+	test("prefixes a same-origin absolute path", () => {
+		expect(rewriteLocationHeader("/signin", PREFIX)).toBe("/p/run_abc/signin");
+		expect(rewriteLocationHeader("/", PREFIX)).toBe("/p/run_abc/");
+		expect(rewriteLocationHeader("/api/v1/list?x=1", PREFIX)).toBe("/p/run_abc/api/v1/list?x=1");
+	});
+
+	test("leaves an absolute URL untouched", () => {
+		expect(rewriteLocationHeader("https://example.com/foo", PREFIX)).toBe(
+			"https://example.com/foo",
+		);
+		expect(rewriteLocationHeader("http://other/path", PREFIX)).toBe("http://other/path");
+	});
+
+	test("leaves a scheme-relative URL untouched", () => {
+		expect(rewriteLocationHeader("//cdn.example.com/asset.js", PREFIX)).toBe(
+			"//cdn.example.com/asset.js",
+		);
+	});
+
+	test("does not double-prefix a value already under the path prefix", () => {
+		expect(rewriteLocationHeader("/p/run_abc/", PREFIX)).toBe("/p/run_abc/");
+		expect(rewriteLocationHeader("/p/run_abc/foo", PREFIX)).toBe("/p/run_abc/foo");
+		expect(rewriteLocationHeader("/p/run_abc", PREFIX)).toBe("/p/run_abc");
+	});
+
+	test("does prefix a path that incidentally starts with a different /p/ run id", () => {
+		// `/p/run_other/foo` is a different run's prefix; from this run's
+		// proxy view it's just an opaque absolute path that should escape
+		// into `/p/<this-run>/p/run_other/foo`. The 404 from the upstream is
+		// the safer failure than smuggling a request into the sibling run.
+		expect(rewriteLocationHeader("/p/run_other/foo", PREFIX)).toBe("/p/run_abc/p/run_other/foo");
+	});
+
+	test("leaves empty string untouched", () => {
+		expect(rewriteLocationHeader("", PREFIX)).toBe("");
+	});
+
+	test("leaves non-absolute paths untouched (relative or fragment)", () => {
+		// Per SPEC §11.L only same-origin absolute paths (start with `/`)
+		// are rewritten. Relative / fragment values stay verbatim.
+		expect(rewriteLocationHeader("foo/bar", PREFIX)).toBe("foo/bar");
+		expect(rewriteLocationHeader("#anchor", PREFIX)).toBe("#anchor");
+	});
+});
+
+describe("injectBaseHref", () => {
+	const PREFIX = "/p/run_abc";
+	const enc = new TextEncoder();
+	const dec = new TextDecoder();
+
+	function inject(html: string): string {
+		const out = injectBaseHref(enc.encode(html), PREFIX);
+		if (out === null) throw new Error("expected injectBaseHref to rewrite, got null");
+		return dec.decode(out);
+	}
+
+	test("injects <base> immediately after the opening <head> tag", () => {
+		expect(inject("<!doctype html><html><head><title>x</title></head><body>y</body></html>")).toBe(
+			'<!doctype html><html><head><base href="/p/run_abc/"><title>x</title></head><body>y</body></html>',
+		);
+	});
+
+	test("tolerates attributes on the <head> tag", () => {
+		expect(inject('<html><head lang="en" dir="ltr"><title>x</title></head></html>')).toBe(
+			'<html><head lang="en" dir="ltr"><base href="/p/run_abc/"><title>x</title></head></html>',
+		);
+	});
+
+	test("is case-insensitive on the head tag", () => {
+		expect(inject("<HTML><HEAD><TITLE>x</TITLE></HEAD></HTML>")).toBe(
+			'<HTML><HEAD><base href="/p/run_abc/"><TITLE>x</TITLE></HEAD></HTML>',
+		);
+	});
+
+	test("returns null (no-op) when a <base> element is already present", () => {
+		const html = '<html><head><base href="/whatever/"><title>x</title></head></html>';
+		expect(injectBaseHref(enc.encode(html), PREFIX)).toBeNull();
+	});
+
+	test("returns null (no-op) when the document already has the path-mode <base>", () => {
+		// Re-proxying a warren-served document must be idempotent.
+		const html = '<html><head><base href="/p/run_abc/"></head></html>';
+		expect(injectBaseHref(enc.encode(html), PREFIX)).toBeNull();
+	});
+
+	test("recognizes self-closing <base /> as already present", () => {
+		const html = '<html><head><base href="/x/" /></head></html>';
+		expect(injectBaseHref(enc.encode(html), PREFIX)).toBeNull();
+	});
+
+	test("returns null when there is no <head> in the lookahead window", () => {
+		const html = "<html><body>no head here</body></html>";
+		expect(injectBaseHref(enc.encode(html), PREFIX)).toBeNull();
+	});
+
+	test("does not match <basefont> as a <base> element", () => {
+		// Deprecated tag — but if the upstream uses it, we still want to
+		// inject our own <base>.
+		expect(inject("<html><head><basefont color=red><title>x</title></head></html>")).toContain(
+			'<head><base href="/p/run_abc/"><basefont',
+		);
+	});
+
+	test("does nothing when <head> sits beyond the 64 KiB lookahead window", () => {
+		// Pad with a giant HTML comment so the <head> tag is past the
+		// lookahead bound.
+		const pad = "x".repeat(HTML_HEAD_LOOKAHEAD_BYTES);
+		const html = `<!--${pad}--><html><head></head></html>`;
+		expect(injectBaseHref(enc.encode(html), PREFIX)).toBeNull();
+	});
+
+	test("preserves arbitrary UTF-8 bytes in the body verbatim", () => {
+		expect(inject("<html><head></head><body>héllo 🌳 こんにちは</body></html>")).toBe(
+			'<html><head><base href="/p/run_abc/"></head><body>héllo 🌳 こんにちは</body></html>',
+		);
+	});
+});
+
+describe("createPreviewProxyHandler (path mode) — HTML rewrites (warren-ab3a)", () => {
+	let db: WarrenDb;
+	let repos: Repos;
+	let auth: PreviewAuth;
+	let runId: string;
+	let projectId: string;
+
+	beforeEach(async () => {
+		db = await openDatabase({ path: ":memory:" });
+		repos = createRepos(db);
+		auth = createPreviewAuth(TOKEN, { secure: false, cookieDomain: null });
+		await repos.agents.upsert({ name: "agent", renderedJson: { sections: {} } });
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+		});
+		projectId = project.id;
+		const run = await repos.runs.create({
+			agentName: "agent",
+			projectId,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_x",
+			workerId: LOCAL_WORKER_NAME,
+		});
+		runId = run.id;
+		await repos.runs.attachPreview(runId, {
+			previewState: "live",
+			previewPort: 30200,
+			previewStartedAt: "2026-01-01T00:00:00Z",
+			previewLastHitAt: "2026-01-01T00:00:00Z",
+		});
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	function pathHandler(upstreamFetch: typeof fetch) {
+		return createPreviewProxyHandler({
+			repos,
+			previewAuth: auth,
+			config: { mode: "path" },
+			fetch: upstreamFetch,
+		});
+	}
+
+	function buildPathRequest(path: string): { request: Request; url: URL } {
+		const c = auth.signCookie(runId, new Date());
+		const request = new Request(`http://warren.example.com${path}`, {
+			headers: {
+				host: "warren.example.com",
+				cookie: `${COOKIE_NAME}=${c.value}`,
+			},
+		});
+		return { request, url: new URL(request.url) };
+	}
+
+	test("injects <base href> into a text/html response", async () => {
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response("<html><head><title>x</title></head><body>ok</body></html>", {
+						status: 200,
+						headers: { "content-type": "text/html; charset=utf-8" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/`);
+		const res = await handler(request, url);
+		expect(res?.status).toBe(200);
+		const body = await res?.text();
+		expect(body).toBe(
+			`<html><head><base href="/p/${runId}/"><title>x</title></head><body>ok</body></html>`,
+		);
+		// content-length is stripped so the consumer doesn't honor a stale value.
+		expect(res?.headers.get("content-length")).toBeNull();
+	});
+
+	test("leaves a non-HTML response (JSON) byte-for-byte", async () => {
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response('{"hello":"/world"}', {
+						status: 200,
+						headers: { "content-type": "application/json" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/api/x`);
+		const res = await handler(request, url);
+		expect(await res?.text()).toBe('{"hello":"/world"}');
+	});
+
+	test("leaves CSS / JS / images alone", async () => {
+		const cases = ["text/css", "application/javascript", "image/png"];
+		for (const ct of cases) {
+			const handler = pathHandler(
+				fetchStub(
+					async () =>
+						new Response("/* :root { } */ /not/rewritten", {
+							status: 200,
+							headers: { "content-type": ct },
+						}),
+				),
+			);
+			const { request, url } = buildPathRequest(`/p/${runId}/asset`);
+			const res = await handler(request, url);
+			expect(await res?.text()).toBe("/* :root { } */ /not/rewritten");
+		}
+	});
+
+	test("does not re-inject when upstream HTML already declares <base>", async () => {
+		const html = '<html><head><base href="/elsewhere/"></head><body>ok</body></html>';
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response(html, {
+						status: 200,
+						headers: { "content-type": "text/html" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/`);
+		const res = await handler(request, url);
+		expect(await res?.text()).toBe(html);
+	});
+
+	test("skips rewriting when the upstream sets Content-Encoding", async () => {
+		// Best-effort posture: with a Content-Encoding header in play we
+		// cannot safely splice into the byte stream, so we pass through
+		// rather than smuggle plaintext under a gzip label.
+		const html = "<html><head></head><body>raw</body></html>";
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response(html, {
+						status: 200,
+						headers: {
+							"content-type": "text/html",
+							"content-encoding": "gzip",
+						},
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/`);
+		const res = await handler(request, url);
+		expect(await res?.text()).toBe(html);
+	});
+
+	test("rewrites a same-origin Location: header on 302", async () => {
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response("", {
+						status: 302,
+						headers: { location: "/signin" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/private`);
+		const res = await handler(request, url);
+		expect(res?.status).toBe(302);
+		expect(res?.headers.get("location")).toBe(`/p/${runId}/signin`);
+	});
+
+	test("leaves an absolute Location: untouched", async () => {
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response("", {
+						status: 301,
+						headers: { location: "https://example.com/elsewhere" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/`);
+		const res = await handler(request, url);
+		expect(res?.headers.get("location")).toBe("https://example.com/elsewhere");
+	});
+
+	test("leaves a Location: already prefixed with /p/<id>/ untouched", async () => {
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response("", {
+						status: 302,
+						headers: { location: `/p/${runId}/already-there` },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/`);
+		const res = await handler(request, url);
+		expect(res?.headers.get("location")).toBe(`/p/${runId}/already-there`);
+	});
+
+	test("does not rewrite Location: on a non-3xx status", async () => {
+		// Location may legally appear on 201 Created — leave it alone.
+		const handler = pathHandler(
+			fetchStub(
+				async () =>
+					new Response("{}", {
+						status: 201,
+						headers: { location: "/things/42", "content-type": "application/json" },
+					}),
+			),
+		);
+		const { request, url } = buildPathRequest(`/p/${runId}/things`);
+		const res = await handler(request, url);
+		expect(res?.headers.get("location")).toBe("/things/42");
+	});
+});
+
+describe("createPreviewProxyHandler (subdomain mode) — leaves HTML untouched", () => {
+	let db: WarrenDb;
+	let repos: Repos;
+	let auth: PreviewAuth;
+	let runId: string;
+
+	beforeEach(async () => {
+		db = await openDatabase({ path: ":memory:" });
+		repos = createRepos(db);
+		auth = createPreviewAuth(TOKEN, { secure: false });
+		await repos.agents.upsert({ name: "agent", renderedJson: { sections: {} } });
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+		});
+		const run = await repos.runs.create({
+			agentName: "agent",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_x",
+			workerId: LOCAL_WORKER_NAME,
+		});
+		runId = run.id;
+		await repos.runs.attachPreview(runId, {
+			previewState: "live",
+			previewPort: 30300,
+			previewStartedAt: "2026-01-01T00:00:00Z",
+			previewLastHitAt: "2026-01-01T00:00:00Z",
+		});
+	});
+
+	afterEach(async () => {
+		await db.close();
+	});
+
+	test("subdomain mode passes text/html through byte-for-byte (no <base> injection)", async () => {
+		const html = "<html><head><title>x</title></head><body>ok</body></html>";
+		const handler = createPreviewProxyHandler({
+			repos,
+			previewAuth: auth,
+			config: { mode: "subdomain", host: HOST },
+			fetch: fetchStub(
+				async () =>
+					new Response(html, {
+						status: 200,
+						headers: { "content-type": "text/html" },
+					}),
+			),
+		});
+		const c = auth.signCookie(runId, new Date());
+		const request = new Request(`http://run-${runId}.${HOST}/`, {
+			headers: {
+				host: `run-${runId}.${HOST}`,
+				cookie: `${COOKIE_NAME}=${c.value}`,
+			},
+		});
+		const url = new URL(request.url);
+		const res = await handler(request, url);
+		expect(await res?.text()).toBe(html);
+	});
+
+	test("subdomain mode passes Location: through verbatim on 302", async () => {
+		const handler = createPreviewProxyHandler({
+			repos,
+			previewAuth: auth,
+			config: { mode: "subdomain", host: HOST },
+			fetch: fetchStub(
+				async () => new Response("", { status: 302, headers: { location: "/signin" } }),
+			),
+		});
+		const c = auth.signCookie(runId, new Date());
+		const request = new Request(`http://run-${runId}.${HOST}/private`, {
+			headers: {
+				host: `run-${runId}.${HOST}`,
+				cookie: `${COOKIE_NAME}=${c.value}`,
+			},
+		});
+		const url = new URL(request.url);
+		const res = await handler(request, url);
+		expect(res?.headers.get("location")).toBe("/signin");
 	});
 });

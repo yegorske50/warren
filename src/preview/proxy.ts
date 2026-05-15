@@ -1,6 +1,7 @@
 /**
  * Reverse proxy preamble for per-run previews (R-19 / SPEC §11.L,
- * warren-8a10; path-mode addendum warren-8085 / pl-f4ea).
+ * warren-8a10; path-mode addendum warren-8085 + HTML rewrite warren-ab3a
+ * / pl-f4ea).
  *
  * The proxy is an in-process Bun route, not a separate reverse proxy.
  * `tryHandlePreviewProxy` runs *before* the normal auth gate and route
@@ -50,11 +51,29 @@
  *      `http://127.0.0.1:<preview_port>` preserving the (mode-specific)
  *      upstream path + query string, strip the inbound `Host` /
  *      `Cookie` / `Authorization` headers (preview app should not see
- *      warren's auth state), and stream the body through. The
- *      upstream response is returned as-is so the browser sees the
- *      preview content + headers verbatim. Path-mode HTML rewriting
- *      (`<base>` injection + `Location:` rewrite) lands in a
- *      follow-up step (warren-ab3a); this module is content-agnostic.
+ *      warren's auth state), and stream the body through.
+ *
+ *   6. **Path-mode response rewrites (best-effort).** SPEC §11.L
+ *      addendum: root-relative URLs from the upstream would escape the
+ *      `/p/<runId>/` prefix. Two transforms apply only when mode=path:
+ *
+ *      a. `<base href="/p/<runId>/">` is injected immediately after the
+ *         opening `<head>` tag when `Content-Type` is `text/html`
+ *         (parameters tolerated). Idempotent: skipped when the lookahead
+ *         window already contains a `<base>` element so re-proxying
+ *         warren-served HTML is a no-op. The lookahead is bounded to
+ *         `HTML_HEAD_LOOKAHEAD_BYTES` (64 KiB); larger documents without
+ *         a parseable `<head>` in the first chunk pass through untouched.
+ *         The byte after the lookahead streams unchanged.
+ *
+ *      b. `Location:` headers on 3xx responses are prefixed with
+ *         `/p/<runId>` when they parse as same-origin absolute paths
+ *         (`/signin` → `/p/<runId>/signin`). Absolute URLs, scheme-
+ *         relative URLs (`//host/foo`), and values already under
+ *         `/p/<runId>/` pass through untouched.
+ *
+ *      Other content types (JSON, JS, CSS, fonts, images) and subdomain
+ *      mode skip both transforms entirely.
  *
  * WebSocket upgrades are not yet supported: Bun.serve's WS surface is
  * accept-then-handle, not transparent-proxy, so a true `Upgrade: websocket`
@@ -85,6 +104,11 @@ export const LOGIN_PATH_PREFIX = "/runs/";
 
 /** URL path prefix the path-mode matcher anchors to (`/p/<runId>/...`). */
 export const PREVIEW_PATH_PREFIX = "/p";
+
+/** SPEC §11.L addendum (warren-ab3a): cap the lookahead for `<head>` /
+ *  `<base>` detection to the first 64 KiB of body. Documents without a
+ *  parseable `<head>` in that window pass through untouched. */
+export const HTML_HEAD_LOOKAHEAD_BYTES = 64 * 1024;
 
 interface PreviewProxyConfigBase {
 	/** Local-worker name. Defaults to the pool's `LOCAL_WORKER_NAME`
@@ -258,7 +282,8 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 		// SPEC §11.L: update last_hit_at BEFORE forwarding (debounced).
 		await maybeFlushLastHit(deps.repos, run, lastFlush, debounceMs, now());
 
-		return forwardToUpstream(fetchImpl, request, upstreamPath, url.search, port);
+		const pathPrefix = mode === "path" ? `${PREVIEW_PATH_PREFIX}/${runId}` : null;
+		return forwardToUpstream(fetchImpl, request, upstreamPath, url.search, port, pathPrefix);
 	};
 }
 
@@ -289,6 +314,7 @@ async function forwardToUpstream(
 	upstreamPath: string,
 	search: string,
 	port: number,
+	pathPrefix: string | null,
 ): Promise<Response> {
 	const upstreamUrl = `http://127.0.0.1:${port}${upstreamPath}${search}`;
 	const headers = new Headers(request.headers);
@@ -314,13 +340,9 @@ async function forwardToUpstream(
 		(init as RequestInit & { duplex?: string }).duplex = "half";
 	}
 
+	let upstream: Response;
 	try {
-		const upstream = await fetchImpl(upstreamUrl, init);
-		return new Response(upstream.body, {
-			status: upstream.status,
-			statusText: upstream.statusText,
-			headers: upstream.headers,
-		});
+		upstream = await fetchImpl(upstreamUrl, init);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		return previewError(
@@ -329,6 +351,229 @@ async function forwardToUpstream(
 			`could not reach preview upstream at ${upstreamUrl}: ${message}`,
 		);
 	}
+
+	if (pathPrefix === null) {
+		return new Response(upstream.body, {
+			status: upstream.status,
+			statusText: upstream.statusText,
+			headers: upstream.headers,
+		});
+	}
+	return applyPathModeRewrites(upstream, pathPrefix);
+}
+
+/**
+ * Path-mode response transforms (SPEC §11.L addendum, warren-ab3a).
+ * Rewrites a same-origin `Location:` on 3xx responses, and best-effort
+ * injects `<base href="<pathPrefix>/">` after the opening `<head>` tag
+ * on `text/html` bodies. All other content types and statuses stream
+ * through unchanged.
+ */
+async function applyPathModeRewrites(upstream: Response, pathPrefix: string): Promise<Response> {
+	const headers = new Headers(upstream.headers);
+	if (upstream.status >= 300 && upstream.status < 400) {
+		const loc = headers.get("location");
+		if (loc !== null) {
+			const rewritten = rewriteLocationHeader(loc, pathPrefix);
+			if (rewritten !== loc) headers.set("location", rewritten);
+		}
+	}
+
+	if (!isHtmlContentType(headers.get("content-type")) || upstream.body === null) {
+		return new Response(upstream.body, {
+			status: upstream.status,
+			statusText: upstream.statusText,
+			headers,
+		});
+	}
+
+	// Re-encoding the head may change byte length; strip content-length so
+	// the consumer doesn't see a stale value. Content-Encoding (gzip/br) is
+	// passed through unchanged — Bun's fetch auto-decompresses, so the body
+	// we read is already plaintext; preserving the header would mislead the
+	// browser. Skip injection (and clear the header) when an encoding was
+	// applied so we don't smuggle plaintext under a gzip label.
+	headers.delete("content-length");
+	const encoding = headers.get("content-encoding");
+	if (encoding !== null && encoding.toLowerCase() !== "identity") {
+		return new Response(upstream.body, {
+			status: upstream.status,
+			statusText: upstream.statusText,
+			headers,
+		});
+	}
+
+	const reader = upstream.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let collected = 0;
+	let exhausted = false;
+	while (collected < HTML_HEAD_LOOKAHEAD_BYTES) {
+		const { value, done } = await reader.read();
+		if (done) {
+			exhausted = true;
+			break;
+		}
+		chunks.push(value);
+		collected += value.byteLength;
+	}
+	const head = concatChunks(chunks, collected);
+	const rewritten = injectBaseHref(head, pathPrefix);
+	const startBytes = rewritten ?? head;
+
+	if (exhausted) {
+		// Cast: TS's BodyInit shape excludes the parameterized
+		// Uint8Array<ArrayBufferLike> Bun's lib emits, but the runtime
+		// accepts Uint8Array everywhere a BufferSource is allowed.
+		return new Response(startBytes as unknown as BodyInit, {
+			status: upstream.status,
+			statusText: upstream.statusText,
+			headers,
+		});
+	}
+
+	const stream = new ReadableStream<Uint8Array>({
+		async start(controller) {
+			controller.enqueue(startBytes);
+			try {
+				while (true) {
+					const { value, done } = await reader.read();
+					if (done) break;
+					if (value !== undefined) controller.enqueue(value);
+				}
+				controller.close();
+			} catch (err) {
+				controller.error(err);
+			}
+		},
+	});
+	return new Response(stream, {
+		status: upstream.status,
+		statusText: upstream.statusText,
+		headers,
+	});
+}
+
+function concatChunks(chunks: readonly Uint8Array[], total: number): Uint8Array {
+	if (chunks.length === 1) {
+		const single = chunks[0];
+		if (single !== undefined) return single;
+	}
+	const out = new Uint8Array(total);
+	let offset = 0;
+	for (const c of chunks) {
+		out.set(c, offset);
+		offset += c.byteLength;
+	}
+	return out;
+}
+
+/**
+ * Match `Content-Type: text/html` (parameters tolerated, e.g.
+ * `text/html; charset=utf-8`). Other media types pass through the
+ * rewriter untouched.
+ */
+export function isHtmlContentType(value: string | null): boolean {
+	if (value === null) return false;
+	const semi = value.indexOf(";");
+	const media = (semi === -1 ? value : value.slice(0, semi)).trim().toLowerCase();
+	return media === "text/html";
+}
+
+/**
+ * Inject `<base href="<pathPrefix>/">` immediately after the opening
+ * `<head>` tag. Idempotent: returns `null` (no rewrite) when an existing
+ * `<base>` element is already present anywhere in the lookahead window,
+ * or when no `<head>` tag is found in the first
+ * `HTML_HEAD_LOOKAHEAD_BYTES` bytes. Operates on bytes so the head
+ * portion of arbitrary UTF-8 documents round-trips losslessly — we only
+ * splice ASCII bytes in at an ASCII-tag boundary.
+ */
+export function injectBaseHref(body: Uint8Array, pathPrefix: string): Uint8Array | null {
+	const window = body.subarray(0, Math.min(body.length, HTML_HEAD_LOOKAHEAD_BYTES));
+	const headStart = indexOfAsciiCaseInsensitive(window, HEAD_OPEN_BYTES);
+	if (headStart === -1) return null;
+	// Find the next `>` that closes the opening tag. The tag may have
+	// attributes (`<head lang="en">`); attributes are bounded by the same
+	// `>` rule HTML uses, so we just scan for it.
+	let cursor = headStart + HEAD_OPEN_BYTES.length;
+	while (cursor < window.length && window[cursor] !== 0x3e /* > */) cursor++;
+	if (cursor >= window.length) return null;
+	const insertAt = cursor + 1;
+	if (hasBaseElement(window, insertAt)) return null;
+	const inject = TEXT_ENCODER.encode(`<base href="${pathPrefix}/">`);
+	const out = new Uint8Array(body.length + inject.length);
+	out.set(body.subarray(0, insertAt), 0);
+	out.set(inject, insertAt);
+	out.set(body.subarray(insertAt), insertAt + inject.length);
+	return out;
+}
+
+/**
+ * Rewrite a `Location:` header value into the path-mode prefix when it
+ * names a same-origin absolute path. Returns the input unchanged when:
+ *   - the value is empty;
+ *   - the value is an absolute URL (`http://...`, `https://...`);
+ *   - the value is a scheme-relative URL (`//host/path`);
+ *   - the value already lives under `<pathPrefix>/`.
+ *
+ * Only path-mode callers invoke this; subdomain mode preserves URL
+ * semantics already.
+ */
+export function rewriteLocationHeader(value: string, pathPrefix: string): string {
+	if (value.length === 0) return value;
+	// Same-origin absolute paths start with a single `/`; protocol-relative
+	// `//host/path` and absolute URLs (`http(s)://...`) are out of scope.
+	if (!value.startsWith("/") || value.startsWith("//")) return value;
+	if (value === pathPrefix) return value;
+	if (value.startsWith(`${pathPrefix}/`)) return value;
+	return `${pathPrefix}${value}`;
+}
+
+const TEXT_ENCODER = new TextEncoder();
+const HEAD_OPEN_BYTES = TEXT_ENCODER.encode("<head");
+const BASE_OPEN_BYTES = TEXT_ENCODER.encode("<base");
+
+function indexOfAsciiCaseInsensitive(haystack: Uint8Array, needle: Uint8Array, start = 0): number {
+	if (needle.length === 0) return start;
+	const end = haystack.length - needle.length;
+	outer: for (let i = start; i <= end; i++) {
+		for (let j = 0; j < needle.length; j++) {
+			const h = haystack[i + j];
+			const n = needle[j];
+			if (h === undefined || n === undefined) continue outer;
+			const hLower = h >= 0x41 && h <= 0x5a ? h + 0x20 : h;
+			const nLower = n >= 0x41 && n <= 0x5a ? n + 0x20 : n;
+			if (hLower !== nLower) continue outer;
+		}
+		return i;
+	}
+	return -1;
+}
+
+/**
+ * Return true iff the buffer contains a `<base>` element (i.e. `<base`
+ * followed by whitespace, `/`, or `>`) — `<basefont>` is the only other
+ * element starting with `<base` and is deprecated enough we ignore it.
+ */
+function hasBaseElement(buf: Uint8Array, from: number): boolean {
+	let cursor = from;
+	while (cursor < buf.length) {
+		const idx = indexOfAsciiCaseInsensitive(buf, BASE_OPEN_BYTES, cursor);
+		if (idx === -1) return false;
+		const next = buf[idx + BASE_OPEN_BYTES.length];
+		if (
+			next === 0x20 || // space
+			next === 0x09 || // tab
+			next === 0x0a || // LF
+			next === 0x0d || // CR
+			next === 0x2f || // /
+			next === 0x3e // >
+		) {
+			return true;
+		}
+		cursor = idx + BASE_OPEN_BYTES.length;
+	}
+	return false;
 }
 
 function previewError(status: number, code: string, message: string): Response {
