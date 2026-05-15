@@ -285,8 +285,12 @@ describe("GET /runs/:id/preview/login", () => {
 			const origin = tcpUrl(handle);
 			expect(res.headers.get("location")).toBe(`${origin}/p/${runId}/`);
 			const setCookie = res.headers.get("set-cookie");
-			expect(setCookie).toContain(`${COOKIE_NAME}=`);
-			expect(setCookie).toContain(`Path=/p/${runId}/`);
+			// Path-mode cookie name carries the runId suffix (warren-63e1) and
+			// is scoped Path=/ so the browser ships it on every same-origin
+			// request — needed for referer-based asset routing.
+			expect(setCookie).toContain(`${COOKIE_NAME}_${runId}=`);
+			expect(setCookie).toContain("Path=/");
+			expect(setCookie).not.toContain(`Path=/p/${runId}/`);
 			expect(setCookie).not.toContain("Domain=");
 		});
 

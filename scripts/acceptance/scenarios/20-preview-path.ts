@@ -26,14 +26,22 @@
  *   2. Anonymous `GET <warrenUrl>/p/<runId>/` is rejected with 401 by
  *      the path-mode proxy preamble (cookie required).
  *   3. `GET /runs/<runId>/preview/login?token=…&redirect=…` returns 302
- *      with a `Set-Cookie: warren_preview=…; Path=/p/<runId>/` —
- *      per-run path scope is what mitigates SPEC §11.L risk 4 (sibling
- *      preview sessions in the same browser).
+ *      with a `Set-Cookie: warren_preview_<runId>=…; Path=/` —
+ *      per-run cookie name + root `Path` (warren-63e1) is what makes
+ *      referer-based asset routing authenticate `/_next/static/...`
+ *      sub-resource loads and isolates sibling-run sessions in the same
+ *      browser (SPEC §11.L risk 4 mitigation).
  *   4. Authenticated `GET <warrenUrl>/p/<runId>/` returns 200, the body
  *      carries the upstream `preview-ok` marker (proves the proxy hit
  *      the sidecar, not a sibling port) AND the path-mode HTML
  *      rewriter injected `<base href="/p/<runId>/">` (proves the
  *      response-side transform from warren-ab3a fires in path mode).
+ *   5. Referer-routed asset (warren-63e1): `GET <warrenUrl>/asset.txt`
+ *      with `Referer: <warrenUrl>/p/<runId>/` AND the per-run cookie
+ *      returns the sidecar's content for `/asset.txt` — proves the
+ *      proxy preamble extracts the runId from `Referer` when the path
+ *      itself doesn't start with `/p/<id>/`, and that the per-run
+ *      `Path=/` cookie was actually shipped on the asset request.
  *
  * Skip conditions match scenario 20:
  *
@@ -88,6 +96,8 @@ const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
 
 const PREVIEW_SANDBOX_PORT = 3000;
 const PREVIEW_OK_MARKER = "warren-preview-ok";
+const PREVIEW_ASSET_MARKER = "warren-asset-ok";
+const PREVIEW_ASSET_FILENAME = "asset.txt";
 /** A real HTML doc (with a `<head>` tag) so the path-mode response
  *  rewriter has somewhere to splice the injected `<base>` element. The
  *  subdomain-mode scenario doesn't need this — its index can be a bare
@@ -187,25 +197,29 @@ async function runPathHappyPath(ctx: ScenarioCtx): Promise<void> {
 			);
 		}
 
-		// 2. Login handshake — assert 302 + Path-scoped cookie.
+		// 2. Login handshake — assert 302 + per-run-named cookie at Path=/.
+		const expectedCookieName = `warren_preview_${runId}`;
 		const login = await loginAndIssueCookie({
 			warrenUrl: handle.warrenUrl,
 			token: handle.token,
 			runId,
+			cookieName: expectedCookieName,
 		});
 		assertEqual(
 			login.cookiePath,
-			previewPath,
-			"Set-Cookie scopes warren_preview to Path=/p/<runId>/ in path mode (SPEC §11.L risk 4 mitigation)",
+			"/",
+			"Set-Cookie scopes the path-mode cookie to Path=/ in path mode (warren-63e1: enables referer-based asset routing on every same-origin request)",
 		);
 		assertTrue(
 			login.cookieDomain === undefined,
 			`path-mode cookie must be host-only (no Domain attribute); got Domain=${JSON.stringify(login.cookieDomain)}`,
 		);
 
+		const cookieHeader = `${expectedCookieName}=${login.cookieValue}`;
+
 		// 3. Authenticated → 200 with upstream marker AND injected <base>.
 		const withCookie = await fetchRaw(handle.warrenUrl, previewPath, {
-			cookie: `warren_preview=${login.cookieValue}`,
+			cookie: cookieHeader,
 		});
 		if (withCookie.status !== 200) {
 			throw new AcceptanceError(
@@ -220,6 +234,25 @@ async function runPathHappyPath(ctx: ScenarioCtx): Promise<void> {
 		assertTrue(
 			withCookie.bodySnippet.includes(expectedBase),
 			`expected path-mode HTML rewrite to inject ${JSON.stringify(expectedBase)}, got ${JSON.stringify(withCookie.bodySnippet)}`,
+		);
+
+		// 4. Referer-routed asset (warren-63e1): no /p/<id>/ in path, but
+		//    Referer points at the preview page → proxy preamble routes the
+		//    request to the sidecar and the per-run cookie at Path=/
+		//    authenticates it.
+		const assetReferer = `${handle.warrenUrl}${previewPath}`;
+		const assetRes = await fetchRaw(handle.warrenUrl, `/${PREVIEW_ASSET_FILENAME}`, {
+			cookie: cookieHeader,
+			referer: assetReferer,
+		});
+		if (assetRes.status !== 200) {
+			throw new AcceptanceError(
+				`referer-routed asset GET /${PREVIEW_ASSET_FILENAME}: expected 200, got ${assetRes.status} body=${assetRes.bodySnippet}`,
+			);
+		}
+		assertTrue(
+			assetRes.bodySnippet.includes(PREVIEW_ASSET_MARKER),
+			`expected referer-routed asset response to include ${JSON.stringify(PREVIEW_ASSET_MARKER)}, got ${JSON.stringify(assetRes.bodySnippet)}`,
 		);
 
 		// Cleanup: manual teardown so the eviction worker doesn't have to
@@ -280,6 +313,12 @@ async function buildPreviewProjectFixture(input: BuildFixtureInput): Promise<Bui
 	);
 	await Bun.write(join(sourceRepoPath, ".warren", "defaults.json"), defaultsJson);
 	await Bun.write(join(sourceRepoPath, ".warren", "preview-www", "index.html"), PREVIEW_INDEX_HTML);
+	// Asset served by the sidecar's static file server at /asset.txt — the
+	// referer-routing assertion (warren-63e1) hits this through the proxy.
+	await Bun.write(
+		join(sourceRepoPath, ".warren", "preview-www", PREVIEW_ASSET_FILENAME),
+		PREVIEW_ASSET_MARKER,
+	);
 
 	const suffix = `p-${randomBytes(3).toString("hex")}`;
 	const fakeUrl = `https://github.com/warren-acceptance/preview-path-sample-${suffix}.git`;
@@ -417,10 +456,11 @@ interface RawResponse {
 async function fetchRaw(
 	warrenUrl: string,
 	path: string,
-	init: { cookie?: string } = {},
+	init: { cookie?: string; referer?: string } = {},
 ): Promise<RawResponse> {
 	const headers: Record<string, string> = {};
 	if (init.cookie !== undefined) headers.cookie = init.cookie;
+	if (init.referer !== undefined) headers.referer = init.referer;
 	const res = await fetch(`${warrenUrl}${path}`, {
 		method: "GET",
 		headers,
@@ -437,6 +477,7 @@ interface LoginInput {
 	readonly warrenUrl: string;
 	readonly token: string;
 	readonly runId: string;
+	readonly cookieName: string;
 }
 
 interface LoginResult {
@@ -447,9 +488,9 @@ interface LoginResult {
 
 /**
  * Walk `/runs/:id/preview/login?token=…&redirect=…` in path mode and
- * return the issued cookie + its Path / Domain attributes so the
- * caller can verify the scope contract (warren-edff: path mode emits
- * `Path=/p/<runId>/` with no Domain).
+ * return the issued cookie + its Path / Domain attributes so the caller
+ * can verify the scope contract (warren-63e1: path mode emits a per-run
+ * `warren_preview_<runId>` cookie at `Path=/` with no Domain).
  */
 async function loginAndIssueCookie(input: LoginInput): Promise<LoginResult> {
 	const redirect = `${input.warrenUrl}/p/${input.runId}/`;
@@ -465,10 +506,10 @@ async function loginAndIssueCookie(input: LoginInput): Promise<LoginResult> {
 	if (setCookie === null || setCookie.length === 0) {
 		throw new AcceptanceError("path-mode preview login: missing Set-Cookie on 302");
 	}
-	const parsed = parseSetCookie(setCookie, "warren_preview");
+	const parsed = parseSetCookie(setCookie, input.cookieName);
 	if (parsed === null) {
 		throw new AcceptanceError(
-			`path-mode preview login: Set-Cookie did not carry a warren_preview entry: ${setCookie}`,
+			`path-mode preview login: Set-Cookie did not carry a ${input.cookieName} entry: ${setCookie}`,
 		);
 	}
 	return {

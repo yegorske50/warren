@@ -3,9 +3,9 @@ import {
 	COOKIE_NAME,
 	COOKIE_VERSION,
 	createPreviewAuth,
-	DEFAULT_COOKIE_PATH_PREFIX,
 	DEFAULT_COOKIE_TTL_MS,
 	extractCookieValue,
+	previewCookieName,
 } from "./cookie.ts";
 
 const TOKEN = "test-token-very-secret-1234567890abcdef";
@@ -37,7 +37,7 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		const cookie = auth.signCookie("run_abc", now);
 		expect(cookie.name).toBe(COOKIE_NAME);
 		expect(cookie.value.startsWith(`${COOKIE_VERSION}.run_abc.`)).toBe(true);
-		expect(auth.verifyCookie(`${COOKIE_NAME}=${cookie.value}`, "run_abc", now)).toBe(true);
+		expect(auth.verifyCookie(`${cookie.name}=${cookie.value}`, "run_abc", now)).toBe(true);
 	});
 
 	test("Set-Cookie header includes scoped attributes when subdomain mode pins a Domain", () => {
@@ -54,41 +54,38 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		expect(cookie.setCookieHeader).toContain("Max-Age=");
 	});
 
-	test("path mode emits Path=/p/<runId>/ with no Domain attribute", () => {
+	test("path mode emits Path=/ with a per-run cookie name and no Domain attribute (warren-63e1)", () => {
 		const auth = createPreviewAuth(TOKEN, { scope: { mode: "path" } });
 		const cookie = auth.signCookie("run_abc", new Date());
-		expect(cookie.setCookieHeader).toContain(`${COOKIE_NAME}=`);
-		expect(cookie.setCookieHeader).toContain(`Path=${DEFAULT_COOKIE_PATH_PREFIX}/run_abc/`);
+		expect(cookie.name).toBe(`${COOKIE_NAME}_run_abc`);
+		expect(cookie.setCookieHeader).toContain(`${COOKIE_NAME}_run_abc=`);
+		expect(cookie.setCookieHeader).toContain("Path=/");
+		expect(cookie.setCookieHeader).not.toContain("Path=/p/");
 		expect(cookie.setCookieHeader).not.toContain("Domain=");
-		expect(cookie.setCookieHeader).not.toContain("Path=/;");
 		expect(cookie.setCookieHeader).toContain("HttpOnly");
 		expect(cookie.setCookieHeader).toContain("SameSite=Lax");
 		expect(cookie.setCookieHeader).toContain("Secure");
 		expect(cookie.setCookieHeader).toContain("Max-Age=");
 	});
 
-	test("path mode honors a custom pathPrefix", () => {
-		const auth = createPreviewAuth(TOKEN, {
-			scope: { mode: "path", pathPrefix: "/preview" },
-		});
-		const cookie = auth.signCookie("run_abc", new Date());
-		expect(cookie.setCookieHeader).toContain("Path=/preview/run_abc/");
-	});
-
-	test("path mode rejects an invalid pathPrefix", () => {
-		expect(() => createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "" } })).toThrow();
-		expect(() => createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "p" } })).toThrow();
-		expect(() =>
-			createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "/p/" } }),
-		).toThrow();
-	});
-
-	test("two runs scoped under the same path-mode auth get disjoint Path attributes", () => {
+	test("two runs scoped under the same path-mode auth get disjoint cookie names", () => {
 		const auth = createPreviewAuth(TOKEN, { scope: { mode: "path" } });
 		const a = auth.signCookie("run_abc", new Date());
 		const b = auth.signCookie("run_xyz", new Date());
-		expect(a.setCookieHeader).toContain("Path=/p/run_abc/");
-		expect(b.setCookieHeader).toContain("Path=/p/run_xyz/");
+		expect(a.name).toBe(`${COOKIE_NAME}_run_abc`);
+		expect(b.name).toBe(`${COOKIE_NAME}_run_xyz`);
+		// Per-run name isolation: a's cookie value must not authenticate b's runId.
+		const header = `${a.name}=${a.value}; ${b.name}=${b.value}`;
+		expect(auth.verifyCookie(header, "run_abc", new Date())).toBe(true);
+		expect(auth.verifyCookie(header, "run_xyz", new Date())).toBe(true);
+		// `warren_preview_run_abc` is not `warren_preview_run_xyz`, so a stray
+		// sibling cookie can't satisfy verification for the other run.
+		expect(auth.verifyCookie(`${a.name}=${a.value}`, "run_xyz", new Date())).toBe(false);
+	});
+
+	test("previewCookieName returns per-run name in path mode, bare name in subdomain mode", () => {
+		expect(previewCookieName("run_abc", "path")).toBe(`${COOKIE_NAME}_run_abc`);
+		expect(previewCookieName("run_abc", "subdomain")).toBe(COOKIE_NAME);
 	});
 
 	test("default scope (no options) stays host-only subdomain — no Domain attribute", () => {
@@ -109,14 +106,14 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		const issuedAt = new Date("2026-01-01T00:00:00Z");
 		const cookie = auth.signCookie("run_abc", issuedAt, 60_000);
 		const later = new Date(issuedAt.getTime() + 120_000);
-		expect(auth.verifyCookie(`${COOKIE_NAME}=${cookie.value}`, "run_abc", later)).toBe(false);
+		expect(auth.verifyCookie(`${cookie.name}=${cookie.value}`, "run_abc", later)).toBe(false);
 	});
 
 	test("verifying with the wrong runId fails", () => {
 		const auth = createPreviewAuth(TOKEN);
 		const now = new Date();
 		const cookie = auth.signCookie("run_abc", now);
-		expect(auth.verifyCookie(`${COOKIE_NAME}=${cookie.value}`, "run_xyz", now)).toBe(false);
+		expect(auth.verifyCookie(`${cookie.name}=${cookie.value}`, "run_xyz", now)).toBe(false);
 	});
 
 	test("a tampered signature fails", () => {
@@ -124,7 +121,7 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		const now = new Date();
 		const cookie = auth.signCookie("run_abc", now);
 		const tampered = `${cookie.value.slice(0, -1)}X`;
-		expect(auth.verifyCookie(`${COOKIE_NAME}=${tampered}`, "run_abc", now)).toBe(false);
+		expect(auth.verifyCookie(`${cookie.name}=${tampered}`, "run_abc", now)).toBe(false);
 	});
 
 	test("a tampered runId in payload fails (sig won't match)", () => {
@@ -134,7 +131,9 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		const parts = cookie.value.split(".");
 		parts[1] = "run_xyz";
 		const forged = parts.join(".");
-		expect(auth.verifyCookie(`${COOKIE_NAME}=${forged}`, "run_xyz", now)).toBe(false);
+		// In subdomain mode the cookie name doesn't change with runId, so this
+		// still tests the sig check (the payload runId differs from the verified runId).
+		expect(auth.verifyCookie(`${cookie.name}=${forged}`, "run_xyz", now)).toBe(false);
 	});
 
 	test("missing or absent cookie header fails", () => {
@@ -150,7 +149,7 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		const auth2 = createPreviewAuth(`${TOKEN}-other`);
 		const now = new Date();
 		const cookie = auth1.signCookie("run_abc", now);
-		expect(auth2.verifyCookie(`${COOKIE_NAME}=${cookie.value}`, "run_abc", now)).toBe(false);
+		expect(auth2.verifyCookie(`${cookie.name}=${cookie.value}`, "run_abc", now)).toBe(false);
 	});
 
 	test("ttlMs default is 24h", () => {

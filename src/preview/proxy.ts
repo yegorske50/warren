@@ -1,7 +1,7 @@
 /**
  * Reverse proxy preamble for per-run previews (R-19 / SPEC §11.L,
  * warren-8a10; path-mode addendum warren-8085 + HTML rewrite warren-ab3a
- * / pl-f4ea).
+ * / pl-f4ea; SPA out-of-the-box revision warren-63e1).
  *
  * The proxy is an in-process Bun route, not a separate reverse proxy.
  * `tryHandlePreviewProxy` runs *before* the normal auth gate and route
@@ -16,6 +16,21 @@
  *     `^/p/<runId>(/<rest>)?$` on the request path. The `/p/<runId>`
  *     prefix is stripped before forwarding so the upstream sees a
  *     request rooted at `<rest>` (or `/` when `rest` is empty).
+ *
+ *     **Referer-based asset routing (warren-63e1):** when the request
+ *     path does NOT match `/p/<runId>/...` but the `Referer` header's
+ *     pathname does, the proxy treats the request as a sub-resource of
+ *     that preview (e.g. `GET /_next/static/foo.js` referred from
+ *     `https://warren.example.com/p/<id>/`) and forwards `url.pathname`
+ *     to the preview's upstream port. Modern SPA bundlers (Next.js,
+ *     Vite, SvelteKit, Astro) emit root-relative asset URLs that the
+ *     HTML `<base>` rewrite can't redirect; without referer routing
+ *     those assets fall through to warren's SPA shell and the browser
+ *     parses warren's `index.html` as JS / CSS / woff2. Referer is the
+ *     reliable browser-default signal (same-origin sub-resources
+ *     always send it); requests for well-known warren API paths
+ *     (`/runs`, `/projects`, …) skip referer routing so a stray click
+ *     from a preview into warren's own API still hits the real handler.
  *
  * In either mode the rest of the seam is identical:
  *
@@ -72,8 +87,17 @@
  *         relative URLs (`//host/foo`), and values already under
  *         `/p/<runId>/` pass through untouched.
  *
+ *      c. Root-relative `href`, `src`, and `srcset` attribute values
+ *         inside the same `HTML_HEAD_LOOKAHEAD_BYTES` window are
+ *         prefixed with `/p/<runId>` (warren-63e1) — defense in depth
+ *         for referer-based asset routing, and the path that catches
+ *         server-rendered HTML with absolute URLs computed before the
+ *         `<base>` rewrite saw them. Protocol-relative (`//host/...`),
+ *         absolute (`http://...`), data, and already-prefixed values
+ *         pass through.
+ *
  *      Other content types (JSON, JS, CSS, fonts, images) and subdomain
- *      mode skip both transforms entirely.
+ *      mode skip every transform entirely.
  *
  * WebSocket upgrades are not yet supported: Bun.serve's WS surface is
  * accept-then-handle, not transparent-proxy, so a true `Upgrade: websocket`
@@ -107,8 +131,44 @@ export const PREVIEW_PATH_PREFIX = "/p";
 
 /** SPEC §11.L addendum (warren-ab3a): cap the lookahead for `<head>` /
  *  `<base>` detection to the first 64 KiB of body. Documents without a
- *  parseable `<head>` in that window pass through untouched. */
+ *  parseable `<head>` in that window pass through untouched. The same
+ *  cap bounds the root-relative URL attribute rewrite (warren-63e1)
+ *  so neither transform pays for a hostile multi-megabyte upstream. */
 export const HTML_HEAD_LOOKAHEAD_BYTES = 64 * 1024;
+
+/**
+ * Warren API path prefixes (warren-63e1). Mirrors
+ * `src/server/handlers.ts::API_PREFIXES` — duplicated here so referer-
+ * based asset routing can skip "looks like a warren API call" without
+ * pulling the whole handlers module into the preview/ tree. The
+ * `warren-api-prefixes-stay-in-sync` test in `proxy.test.ts` asserts
+ * parity so a future API surface addition surfaces here too.
+ */
+const WARREN_API_PATH_PREFIXES: readonly string[] = [
+	"/runs",
+	"/projects",
+	"/agents",
+	"/burrows",
+	"/workers",
+	"/healthz",
+	"/readyz",
+	"/version",
+	"/preview",
+];
+
+/**
+ * True iff `pathname` matches a warren API prefix. The referer-based
+ * routing path consults this so a click from inside a preview into
+ * (e.g.) `/runs/<id>/cancel` reaches the real handler rather than the
+ * preview's upstream port. The `/p/...` prefix is left out — the
+ * direct path-mode match upstream of this check already routes those.
+ */
+export function isWarrenApiPath(pathname: string): boolean {
+	for (const prefix of WARREN_API_PATH_PREFIXES) {
+		if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true;
+	}
+	return false;
+}
 
 interface PreviewProxyConfigBase {
 	/** Local-worker name. Defaults to the pool's `LOCAL_WORKER_NAME`
@@ -199,6 +259,30 @@ export function parsePreviewPathPrefix(pathname: string): { runId: string; rest:
 }
 
 /**
+ * Extract a runId from a `Referer:` header (warren-63e1). Parses the
+ * header value as a URL and matches `parsePreviewPathPrefix` on the
+ * pathname. Returns null when the header is missing, malformed, or
+ * does not point at a `/p/<runId>/...` page — the proxy preamble
+ * falls through to the regular pipeline in those cases.
+ *
+ * Origin is not constrained: a same-host referer is the common path
+ * (browser default policy), but a cross-origin referer that still
+ * names `/p/<runId>/...` is acceptable because the cookie check
+ * downstream still anchors on the runId-bound signature.
+ */
+export function parseRunIdFromReferer(refererHeader: string | null): string | null {
+	if (refererHeader === null || refererHeader.length === 0) return null;
+	let url: URL;
+	try {
+		url = new URL(refererHeader);
+	} catch {
+		return null;
+	}
+	const parsed = parsePreviewPathPrefix(url.pathname);
+	return parsed === null ? null : parsed.runId;
+}
+
+/**
  * Build the proxy handler. The returned function is wired into the
  * server preamble; it returns a `Response` to short-circuit the
  * request, or `null` to fall through to the regular auth + route
@@ -224,9 +308,22 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 			upstreamPath = url.pathname;
 		} else {
 			const parsed = parsePreviewPathPrefix(url.pathname);
-			if (parsed === null) return null;
-			runId = parsed.runId;
-			upstreamPath = parsed.rest;
+			if (parsed !== null) {
+				runId = parsed.runId;
+				upstreamPath = parsed.rest;
+			} else {
+				// Referer-based asset routing (warren-63e1). Skip when the
+				// path looks like a warren API call so a click from inside a
+				// preview into `/runs/<id>/cancel` (etc.) still reaches the
+				// real handler.
+				if (isWarrenApiPath(url.pathname)) return null;
+				const refererRunId = parseRunIdFromReferer(request.headers.get("referer"));
+				if (refererRunId === null) return null;
+				runId = refererRunId;
+				// Asset request: forward the original pathname verbatim so the
+				// upstream sees e.g. `/_next/static/foo.js`, not `/p/<id>/...`.
+				upstreamPath = url.pathname;
+			}
 		}
 
 		const run = await deps.repos.runs.get(runId);
@@ -421,8 +518,10 @@ async function applyPathModeRewrites(
 		collected += value.byteLength;
 	}
 	const head = concatChunks(chunks, collected);
-	const rewritten = injectBaseHref(head, pathPrefix);
-	const startBytes = rewritten ?? head;
+	const baseInjected = injectBaseHref(head, pathPrefix);
+	const afterBase = baseInjected ?? head;
+	const attrsRewritten = rewriteRootRelativeAttrs(afterBase, pathPrefix);
+	const startBytes = attrsRewritten ?? afterBase;
 
 	if (exhausted) {
 		// Cast: TS's BodyInit shape excludes the parameterized
@@ -510,6 +609,191 @@ export function injectBaseHref(body: Uint8Array, pathPrefix: string): Uint8Array
 	out.set(inject, insertAt);
 	out.set(body.subarray(insertAt), insertAt + inject.length);
 	return out;
+}
+
+/**
+ * Rewrite root-relative `href`, `src`, and `srcset` attribute values
+ * (warren-63e1) so root-relative URLs emitted by Next.js / Vite /
+ * SvelteKit / Astro asset pipelines land back under the preview's
+ * `/p/<runId>/...` prefix. Operates byte-wise over the same
+ * `HTML_HEAD_LOOKAHEAD_BYTES` window the `<base>` injection uses so
+ * the post-window stream still passes through unchanged.
+ *
+ * Returns the modified buffer, or `null` when nothing in the window
+ * needed rewriting (caller falls back to the original bytes). The
+ * scanner is conservative: it only fires on a `<attr>=<quote>/<value><quote>`
+ * pattern where the attribute name is preceded by an HTML attribute
+ * boundary (whitespace, `<`, or `/`), the value begins with a single
+ * `/` (protocol-relative `//host` and absolute URLs are left alone),
+ * and the value is not already prefixed with `<pathPrefix>/`. `srcset`
+ * is split on commas and each entry's leading URL is rewritten in
+ * place.
+ */
+export function rewriteRootRelativeAttrs(body: Uint8Array, pathPrefix: string): Uint8Array | null {
+	const limit = Math.min(body.length, HTML_HEAD_LOOKAHEAD_BYTES);
+	const prefixBytes = TEXT_ENCODER.encode(pathPrefix);
+	const parts: Uint8Array[] = [];
+	let segmentStart = 0;
+	let cursor = 0;
+	let mutated = false;
+
+	while (cursor < limit) {
+		const m = matchAttributeAt(body, cursor, limit);
+		if (m === null) {
+			cursor++;
+			continue;
+		}
+		const value = body.subarray(m.valueStart, m.valueEnd);
+		const rewritten = m.isSrcset
+			? rewriteSrcsetValue(value, prefixBytes)
+			: rewriteUrlValue(value, prefixBytes);
+		if (rewritten !== null) {
+			parts.push(body.subarray(segmentStart, m.valueStart));
+			parts.push(rewritten);
+			segmentStart = m.valueEnd;
+			mutated = true;
+		}
+		cursor = m.valueEnd;
+	}
+
+	if (!mutated) return null;
+	parts.push(body.subarray(segmentStart));
+	let total = 0;
+	for (const p of parts) total += p.byteLength;
+	return concatChunks(parts, total);
+}
+
+interface AttributeMatch {
+	readonly valueStart: number;
+	readonly valueEnd: number;
+	readonly isSrcset: boolean;
+}
+
+/**
+ * Find a `<attr>=<quote>...<quote>` pattern at exactly `i`, where attr is
+ * one of `href`, `src`, `srcset`. Returns the inclusive byte range of the
+ * attribute value (without the surrounding quotes) on a hit, null otherwise.
+ *
+ * The preceding byte must be a known HTML attribute boundary so we don't
+ * match `xhref=` inside another word or a string literal — the realistic
+ * non-match risk is matching attribute names that are substrings of other
+ * tokens inside an inline `<script>`/`<style>` block. We accept that risk
+ * inside the 64 KiB head window because (a) inline scripts in the head are
+ * rare on production bundlers, (b) substring matches inside JS string
+ * literals would have to be quoted with `"`/`'` to trigger, and (c) the
+ * rewrite only fires on values starting with `/`.
+ */
+function matchAttributeAt(body: Uint8Array, i: number, limit: number): AttributeMatch | null {
+	for (const attr of ATTR_PATTERNS) {
+		if (i + attr.name.length + 2 > body.length) continue;
+		if (!matchesAsciiCi(body, i, attr.name)) continue;
+		// Boundary check: previous byte must be whitespace, `<`, or `/`.
+		if (i > 0) {
+			const prev = body[i - 1];
+			if (
+				prev !== 0x20 /* space */ &&
+				prev !== 0x09 /* tab */ &&
+				prev !== 0x0a /* LF */ &&
+				prev !== 0x0d /* CR */ &&
+				prev !== 0x3c /* < */ &&
+				prev !== 0x2f /* / */
+			) {
+				continue;
+			}
+		}
+		const eqPos = i + attr.name.length;
+		if (body[eqPos] !== 0x3d /* = */) continue;
+		const quotePos = eqPos + 1;
+		const quote = body[quotePos];
+		if (quote !== 0x22 /* " */ && quote !== 0x27 /* ' */) continue;
+		const valueStart = quotePos + 1;
+		let valueEnd = valueStart;
+		while (valueEnd < body.length && body[valueEnd] !== quote) valueEnd++;
+		// Unterminated quoted value → bail. valueEnd at limit/end is OK only when
+		// the closing quote exists; otherwise the rewrite is unsafe.
+		if (valueEnd >= body.length) continue;
+		if (valueStart > limit) continue;
+		return { valueStart, valueEnd, isSrcset: attr.isSrcset };
+	}
+	return null;
+}
+
+const ATTR_PATTERNS: ReadonlyArray<{ name: Uint8Array; isSrcset: boolean }> = [
+	{ name: new TextEncoder().encode("srcset"), isSrcset: true },
+	{ name: new TextEncoder().encode("href"), isSrcset: false },
+	{ name: new TextEncoder().encode("src"), isSrcset: false },
+];
+
+function matchesAsciiCi(haystack: Uint8Array, at: number, needle: Uint8Array): boolean {
+	if (at + needle.length > haystack.length) return false;
+	for (let j = 0; j < needle.length; j++) {
+		const h = haystack[at + j];
+		const n = needle[j];
+		if (h === undefined || n === undefined) return false;
+		const hLower = h >= 0x41 && h <= 0x5a ? h + 0x20 : h;
+		const nLower = n >= 0x41 && n <= 0x5a ? n + 0x20 : n;
+		if (hLower !== nLower) return false;
+	}
+	return true;
+}
+
+/**
+ * Rewrite a single root-relative URL value. Returns null when the value
+ * doesn't qualify (empty, doesn't start with `/`, starts with `//`,
+ * already prefixed). On a hit returns a new buffer with `prefix`
+ * prepended.
+ */
+function rewriteUrlValue(value: Uint8Array, prefix: Uint8Array): Uint8Array | null {
+	if (value.length === 0) return null;
+	if (value[0] !== 0x2f /* / */) return null;
+	// Protocol-relative `//host/...` — out of scope.
+	if (value.length >= 2 && value[1] === 0x2f) return null;
+	if (startsWithPrefix(value, prefix)) {
+		// Already at the prefix root or under the prefix. `/p/<id>` exactly
+		// and `/p/<id>/...` both pass through.
+		if (value.length === prefix.length) return null;
+		if (value[prefix.length] === 0x2f) return null;
+	}
+	const out = new Uint8Array(prefix.length + value.length);
+	out.set(prefix, 0);
+	out.set(value, prefix.length);
+	return out;
+}
+
+/**
+ * Rewrite a `srcset` attribute value. Splits on commas at the top level
+ * (commas inside data: URLs are not handled — those skip the rewrite
+ * anyway because they don't start with `/`). For each entry, the URL is
+ * the leading whitespace-trimmed run up to the next whitespace; only
+ * that URL portion is rewritten via `rewriteUrlValue`.
+ */
+function rewriteSrcsetValue(value: Uint8Array, prefix: Uint8Array): Uint8Array | null {
+	const text = new TextDecoder("utf-8", { fatal: false }).decode(value);
+	const entries = text.split(",");
+	let changed = false;
+	const rewrittenEntries = entries.map((entry) => {
+		const leading = entry.match(/^\s*/)?.[0] ?? "";
+		const rest = entry.slice(leading.length);
+		const urlEnd = rest.search(/\s/);
+		const url = urlEnd === -1 ? rest : rest.slice(0, urlEnd);
+		const tail = urlEnd === -1 ? "" : rest.slice(urlEnd);
+		if (url.length === 0) return entry;
+		const urlBytes = new TextEncoder().encode(url);
+		const rewritten = rewriteUrlValue(urlBytes, prefix);
+		if (rewritten === null) return entry;
+		changed = true;
+		return `${leading}${new TextDecoder().decode(rewritten)}${tail}`;
+	});
+	if (!changed) return null;
+	return new TextEncoder().encode(rewrittenEntries.join(","));
+}
+
+function startsWithPrefix(value: Uint8Array, prefix: Uint8Array): boolean {
+	if (value.length < prefix.length) return false;
+	for (let i = 0; i < prefix.length; i++) {
+		if (value[i] !== prefix[i]) return false;
+	}
+	return true;
 }
 
 /**

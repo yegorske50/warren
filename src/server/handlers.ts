@@ -874,20 +874,24 @@ function cancelRunHandler(deps: ServerDeps): RouteHandler {
 
 /**
  * `GET /runs/:id/preview/login?token=<bearer>&redirect=<absolute-url>`
- * (R-19 / SPEC §11.L, warren-8a10; path-mode redirect warren-edff).
+ * (R-19 / SPEC §11.L, warren-8a10; path-mode redirect warren-edff;
+ * per-run cookie name warren-63e1).
  *
  * The signed-cookie handshake the preview proxy depends on. A browser
  * hitting a preview origin directly can't carry an Authorization header,
  * so the operator opens this URL on the warren host, the handler
- * validates the bearer in the query, sets a scoped `warren_preview`
+ * validates the bearer in the query, sets a scoped `warren_preview*`
  * cookie, and 302s to the preview.
  *
- *   - **Subdomain mode** (`deps.previewMode === "subdomain"`): cookie is
- *     `Domain=.<host>; Path=/`; redirect must be
+ *   - **Subdomain mode** (`deps.previewMode === "subdomain"`): cookie name
+ *     `warren_preview`, `Domain=.<host>; Path=/`; redirect must be
  *     `https://run-<id>.<previewHost>/...`.
- *   - **Path mode** (default; `deps.previewMode === "path"`): cookie is
- *     `Path=/p/<id>/`; redirect must be same-origin as the inbound
- *     request and live under `/p/<id>/`. No `previewHost` is required.
+ *   - **Path mode** (default; `deps.previewMode === "path"`): cookie name
+ *     `warren_preview_<runId>` (per-run literal suffix, warren-63e1),
+ *     `Path=/` with no `Domain`; redirect must be same-origin as the
+ *     inbound request and live under `/p/<id>/`. The cookie ships on
+ *     every same-origin request so referer-based asset routing in the
+ *     proxy preamble can authenticate sub-resource loads.
  *
  * This route is auth-exempt (`isAuthExempt` whitelists `/preview/login`)
  * because the standard bearer gate would 401 the browser before the

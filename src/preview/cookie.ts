@@ -1,6 +1,7 @@
 /**
  * Signed-cookie auth for the preview reverse proxy (R-19 / SPEC §11.L,
- * warren-8a10; path-mode scope addendum warren-edff / pl-f4ea).
+ * warren-8a10; path-mode scope addendum warren-edff / pl-f4ea; per-run
+ * name + `Path=/` revision warren-63e1).
  *
  * Bearer-in-header is impossible for a browser hitting a preview origin
  * directly — the cookie scope is the only way to keep a private-code
@@ -19,21 +20,26 @@
  *   - `signCookie(runId, now)` — produces a `<runId>.<expiresMs>.<sig>`
  *     payload and a `Set-Cookie` header value scoped per the
  *     `CreatePreviewAuthOptions.scope` discriminator:
- *       - `subdomain`: `Path=/; Domain=.<host>` so the same cookie is
- *         presented on every `run-*.<host>` subdomain.
- *       - `path`: `Path=/p/<runId>/` with NO `Domain` (cookie stays
- *         host-only). Per-run path scope means a reviewer can hold
- *         simultaneous sessions for sibling runs on the same browser
- *         (SPEC §11.L risk 4) — the browser stores one cookie per Path,
- *         each addressed to its own `/p/<runId>/` scope.
+ *       - `subdomain`: cookie name is `warren_preview`, `Path=/; Domain=.<host>`
+ *         so the same cookie is presented on every `run-*.<host>` subdomain.
+ *       - `path`: cookie name is `warren_preview_<runId>` (per-run literal
+ *         suffix), `Path=/`, no `Domain` (cookie stays host-only). The
+ *         per-run name + `Path=/` is what makes referer-based asset
+ *         routing (warren-63e1) work: the browser ships the cookie on
+ *         every same-origin request (including `/_next/static/...` asset
+ *         loads with a `/p/<id>/...` Referer), and the per-run name keeps
+ *         sibling preview sessions isolated on the same browser
+ *         (SPEC §11.L risk 4 mitigation). Earlier revisions scoped
+ *         `Path=/p/<runId>/` but that blocked the cookie on the asset
+ *         requests referer routing needs to authenticate.
  *     Both modes set `HttpOnly`, `Secure` (unless overridden), `SameSite=Lax`,
  *     and a `Max-Age` matching the embedded `expiresMs`.
  *
- *   - `verifyCookie(cookieHeader, runId, now)` — extracts the
- *     `warren_preview` cookie from a `Cookie:` header, verifies the
- *     HMAC in constant time, checks the runId matches and expiry hasn't
- *     elapsed. Returns true iff every check passes. Identical between
- *     modes — `Path` scope is browser-enforced, not signed.
+ *   - `verifyCookie(cookieHeader, runId, now)` — extracts the mode-scoped
+ *     cookie (`warren_preview` in subdomain mode, `warren_preview_<runId>`
+ *     in path mode) from a `Cookie:` header, verifies the HMAC in
+ *     constant time, checks the runId matches and expiry hasn't elapsed.
+ *     Returns true iff every check passes.
  *
  * No state lives in this module beyond the derived key. Cookies are
  * self-describing (runId + expiresMs inside the signed payload) so the
@@ -55,11 +61,16 @@ export const DEFAULT_COOKIE_TTL_MS = 24 * 3_600_000;
 export const COOKIE_NAME = "warren_preview";
 export const COOKIE_VERSION = "v1";
 
-/** Default URL path prefix path-mode cookies are scoped under
- *  (`Path=<prefix>/<runId>/`). Must match `PREVIEW_PATH_PREFIX` in
- *  `src/preview/proxy.ts` so a cookie signed at login lands on the
- *  same path the proxy preamble routes off of. */
-export const DEFAULT_COOKIE_PATH_PREFIX = "/p";
+/**
+ * Path-mode cookie name. Concatenates `warren_preview_` with the runId
+ * (warren-63e1) so each preview gets its own cookie addressed to a
+ * distinct browser slot, independent of `Path` scope. The proxy preamble
+ * picks the cookie by name once it has the runId from `/p/<id>/` or
+ * from the `Referer` header.
+ */
+export function previewCookieName(runId: string, mode: "subdomain" | "path"): string {
+	return mode === "path" ? `${COOKIE_NAME}_${runId}` : COOKIE_NAME;
+}
 
 /** Label mixed into the HMAC key derivation so a future rotation can be
  *  decoupled from `WARREN_API_TOKEN`. */
@@ -84,24 +95,31 @@ export interface PreviewAuth {
 }
 
 export interface SignedCookie {
-	readonly name: typeof COOKIE_NAME;
+	/** The cookie's name as emitted on the wire. In path mode this carries
+	 *  the runId suffix (`warren_preview_<runId>`); subdomain mode keeps
+	 *  the bare `warren_preview`. Tests that build a `Cookie:` header from
+	 *  a `signCookie` result should read this rather than hard-coding
+	 *  `COOKIE_NAME`. */
+	readonly name: string;
 	readonly value: string;
 	readonly expiresAt: Date;
 	readonly setCookieHeader: string;
 }
 
 /**
- * Cookie-scope discriminator (warren-edff / pl-f4ea step 5). Two
- * orthogonal schemes:
+ * Cookie-scope discriminator (warren-edff / pl-f4ea step 5; per-run name
+ * + `Path=/` revision warren-63e1).
  *
- *  - `subdomain` — `Path=/` with an optional `Domain=<cookieDomain>` so
- *    the browser presents the cookie across every `run-*.<host>`
- *    preview origin.
+ *  - `subdomain` — cookie name `warren_preview`, `Path=/` with an optional
+ *    `Domain=<cookieDomain>` so the browser presents the cookie across
+ *    every `run-*.<host>` preview origin.
  *
- *  - `path` — `Path=<pathPrefix>/<runId>/` with no `Domain`. Cookies
- *    stay host-only and per-run, which is what enables sibling-run
- *    sessions on the same browser without cross-contamination
- *    (SPEC §11.L risk 4 mitigation).
+ *  - `path` — cookie name `warren_preview_<runId>`, `Path=/` with no
+ *    `Domain`. Per-run name keeps sibling preview sessions isolated on
+ *    the same browser (SPEC §11.L risk 4 mitigation); `Path=/` ships the
+ *    cookie on every same-origin request so referer-based asset routing
+ *    in the proxy preamble can authenticate `/_next/static/...`-style
+ *    sub-resource loads.
  */
 export type PreviewCookieScope =
 	| {
@@ -113,10 +131,6 @@ export type PreviewCookieScope =
 	  }
 	| {
 			readonly mode: "path";
-			/** URL path prefix the cookie is scoped under, sans trailing slash.
-			 *  Defaults to `DEFAULT_COOKIE_PATH_PREFIX` (`/p`) and must mirror
-			 *  the proxy preamble's `PREVIEW_PATH_PREFIX` constant. */
-			readonly pathPrefix?: string;
 	  };
 
 /** Default scope when `CreatePreviewAuthOptions.scope` is omitted — host-only
@@ -142,9 +156,6 @@ export function createPreviewAuth(token: string, opts: CreatePreviewAuthOptions 
 		throw new Error("createPreviewAuth: token must be a non-empty string");
 	}
 	const scope = opts.scope ?? DEFAULT_SCOPE;
-	if (scope.mode === "path") {
-		validatePathPrefix(scope.pathPrefix ?? DEFAULT_COOKIE_PATH_PREFIX);
-	}
 	const secure = opts.secure ?? true;
 	const tokenBytes = new TextEncoder().encode(token);
 	const cookieKey = deriveCookieKey(tokenBytes);
@@ -167,20 +178,15 @@ export function createPreviewAuth(token: string, opts: CreatePreviewAuthOptions 
 			const sig = sign(cookieKey, payload);
 			const value = `${payload}.${sig}`;
 			const maxAgeSec = Math.max(1, Math.floor(ttlMs / 1_000));
-			const attrs: string[] = [`${COOKIE_NAME}=${value}`];
-			if (scope.mode === "path") {
-				const prefix = scope.pathPrefix ?? DEFAULT_COOKIE_PATH_PREFIX;
-				// Trailing slash narrows scope to `<prefix>/<runId>/...` only;
-				// a sibling request to `<prefix>/<otherRunId>/...` gets no cookie.
-				attrs.push(`Path=${prefix}/${runId}/`);
-			} else {
-				attrs.push("Path=/");
-				if (scope.cookieDomain !== null) attrs.push(`Domain=${scope.cookieDomain}`);
+			const name = previewCookieName(runId, scope.mode);
+			const attrs: string[] = [`${name}=${value}`, "Path=/"];
+			if (scope.mode === "subdomain" && scope.cookieDomain !== null) {
+				attrs.push(`Domain=${scope.cookieDomain}`);
 			}
 			attrs.push(`Max-Age=${maxAgeSec}`, "HttpOnly", "SameSite=Lax");
 			if (secure) attrs.push("Secure");
 			return {
-				name: COOKIE_NAME,
+				name,
 				value,
 				expiresAt: new Date(expiresMs),
 				setCookieHeader: attrs.join("; "),
@@ -191,7 +197,7 @@ export function createPreviewAuth(token: string, opts: CreatePreviewAuthOptions 
 			if (cookieHeader === null || cookieHeader === undefined || cookieHeader.length === 0) {
 				return false;
 			}
-			const raw = extractCookieValue(cookieHeader, COOKIE_NAME);
+			const raw = extractCookieValue(cookieHeader, previewCookieName(runId, scope.mode));
 			if (raw === null) return false;
 			const parts = raw.split(".");
 			if (parts.length !== 4) return false;
@@ -222,14 +228,6 @@ export function extractCookieValue(header: string, name: string): string | null 
 		if (key === name) return trimmed.slice(eq + 1);
 	}
 	return null;
-}
-
-function validatePathPrefix(prefix: string): void {
-	if (prefix.length === 0 || !prefix.startsWith("/") || prefix.endsWith("/")) {
-		throw new Error(
-			`createPreviewAuth: path-mode pathPrefix must start with '/' and have no trailing slash; got ${JSON.stringify(prefix)}`,
-		);
-	}
 }
 
 function sign(key: Uint8Array, payload: string): string {
