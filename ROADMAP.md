@@ -44,7 +44,8 @@ New items follow this shape so the format doesn't drift:
 ---
 
 ## R-01 — Seeds `extensions` field for runtime metadata
-Status: [partially shipped] — seeds side landed v0.4.3 (2026-05-10); warren consumer not yet wired up
+Status: [shipped] — seeds side landed v0.4.3 (2026-05-10); warren consumer side
+landed 2026-05-15 via plan `pl-bb70` (parent seed `warren-5a9c`).
 Depends on: — (cross-repo: lands first in `seeds`, then warren consumes)
 Unlocks: R-04 (issues UI needs role/schedule/trigger metadata on each seed); R-06
 (cron scheduler reads `extensions.scheduledFor` / `extensions.trigger`)
@@ -259,7 +260,7 @@ copied into `runs.renderedAgentJson` and never re-rendered mid-run.
 
 ## R-04 — Project + Issues UI (the multica pattern)
 Status: [proposed]
-Depends on: R-01 (seeds `extensions` field — **seeds side shipped v0.4.3 2026-05-10**, warren-consumer side is the only remaining blocker)
+Depends on: R-01 (seeds `extensions` field — **shipped 2026-05-15 via pl-bb70**: seeds side v0.4.3, warren producer side wired through `src/seeds-cli/` + spawn + cron)
 Unlocks: team-of-ICs workflow — file work today, run tonight, batch-assign a
 sprint; deferred dispatch; per-project organization in the UI
 
@@ -1536,10 +1537,16 @@ R-09 is repromoted and R-12 through R-18 are slotted in.
    Establishes the config pattern R-06 builds on. R-06 now unblocked.
 2. **R-03** (per-project canopy tier) — small, scoped to the registry module.
    Independent of R-02; can land in parallel.
-3. **R-01 consumer-side** — seeds half is shipped; warren needs to wire
-   `sd update --extensions` calls into the spawn / reap paths and start
-   reading `extensions.{role,scheduledFor,trigger,lastRunId}` in the UI.
-   Small; folds naturally into R-04.
+3. **R-01 consumer-side** — ✅ shipped 2026-05-15 (plan `pl-bb70`).
+   Producer side: `src/seeds-cli/` owns the warren-namespaced
+   `WarrenExtensionsSchema`; spawn + cron tick both write
+   `{role,trigger,lastRunId,lastRunAt}` (cron also clears
+   `scheduledFor`/sets `lastScheduledRun`) via `updateExtensions` after
+   a successful dispatch, with failures degrading to a
+   `seeds_extension_write_failed` system event. The runs row gained a
+   nullable `seed_id`; RunDetail surfaces a back-link when present.
+   Issues-side reads of `extensions.{role,trigger,scheduledFor,lastRunId}`
+   ride R-04.
 4. **R-04** (project + issues UI) — biggest item. The team-of-ICs UX unlock.
    All seeds-side prereqs satisfied.
 5. **R-06** (cron scheduler) — ✅ shipped 2026-05-11 (plan `pl-2f15`). In-process
