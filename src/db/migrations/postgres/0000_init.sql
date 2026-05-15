@@ -69,11 +69,11 @@ CREATE TABLE "workers" (
 	"added_at" text NOT NULL
 );
 --> statement-breakpoint
-ALTER TABLE "events" ADD CONSTRAINT "events_run_id_runs_id_fk" FOREIGN KEY ("run_id") REFERENCES "public"."runs"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "runs" ADD CONSTRAINT "runs_agent_name_agents_name_fk" FOREIGN KEY ("agent_name") REFERENCES "public"."agents"("name") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "runs" ADD CONSTRAINT "runs_project_id_projects_id_fk" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "triggers" ADD CONSTRAINT "triggers_project_id_projects_id_fk" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
-ALTER TABLE "triggers" ADD CONSTRAINT "triggers_last_run_id_runs_id_fk" FOREIGN KEY ("last_run_id") REFERENCES "public"."runs"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "events" ADD CONSTRAINT "events_run_id_runs_id_fk" FOREIGN KEY ("run_id") REFERENCES "runs"("id") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "runs" ADD CONSTRAINT "runs_agent_name_agents_name_fk" FOREIGN KEY ("agent_name") REFERENCES "agents"("name") ON DELETE no action ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "runs" ADD CONSTRAINT "runs_project_id_projects_id_fk" FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "triggers" ADD CONSTRAINT "triggers_project_id_projects_id_fk" FOREIGN KEY ("project_id") REFERENCES "projects"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "triggers" ADD CONSTRAINT "triggers_last_run_id_runs_id_fk" FOREIGN KEY ("last_run_id") REFERENCES "runs"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "burrows_worker_idx" ON "burrows" USING btree ("worker_id");--> statement-breakpoint
 CREATE INDEX "events_run_seq_idx" ON "events" USING btree ("run_id","burrow_event_seq");--> statement-breakpoint
 CREATE INDEX "events_run_ts_idx" ON "events" USING btree ("run_id","ts");--> statement-breakpoint
