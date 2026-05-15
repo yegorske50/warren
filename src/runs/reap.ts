@@ -556,6 +556,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 						input.previewConfig.readiness_timeout !== undefined
 							? parseDurationMs(input.previewConfig.readiness_timeout)
 							: undefined;
+					// warren-d9e7: same plumb-through for the setup pre-step. The
+					// launcher applies setupTimeoutMs only when previewConfig.setup
+					// is also set, so projects without a setup command see the
+					// existing single-sidecar path unchanged.
+					const setupTimeoutMs =
+						input.previewConfig.setup_timeout !== undefined
+							? parseDurationMs(input.previewConfig.setup_timeout)
+							: undefined;
 					const result = await (input.launchPreview ?? launchPreview)({
 						runId: run.id,
 						burrowId: run.burrowId,
@@ -565,6 +573,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 						sidecars: workerClient.http.sidecars,
 						now,
 						...(readinessTimeoutMs !== undefined ? { readinessTimeoutMs } : {}),
+						...(setupTimeoutMs !== undefined ? { setupTimeoutMs } : {}),
 					});
 					if (result.ok) {
 						previewLaunchState = "live";

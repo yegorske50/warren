@@ -39,6 +39,16 @@
 #                           # of routing mode. WARREN_PREVIEW_MODE env wins
 #                           # on conflict. Default when neither set: path.
 # command: bun run dev      # required — shell command the sandbox runs
+# setup: pnpm install       # optional — runs once before `command` as its own
+#                           # sidecar. Non-zero exit fails the preview before
+#                           # the dev server is attempted; stderr tail is
+#                           # captured into preview_failure_message with
+#                           # reason=setup_failed. Skip when the command
+#                           # already chains install + dev itself.
+# setup_timeout: 5m         # optional — duration, 1s..1h, default 5m. Sized
+#                           # for cold pnpm/npm installs. A hang past this
+#                           # surfaces as reason=setup_timeout (distinct from
+#                           # readiness_timeout, which covers dev-server bind).
 # port: 3000                # required — int 1..65535. Privileged ports ok;
 #                           # the sandbox is unprivileged-by-namespace.
 # readiness_path: /healthz  # optional; must start with '/'. Launcher probes

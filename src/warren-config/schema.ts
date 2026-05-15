@@ -121,6 +121,19 @@ const PreviewReadinessPathSchema = z
 	.min(1, "preview.readiness_path must be non-empty if provided")
 	.regex(/^\//, "preview.readiness_path must start with '/'");
 
+// Try-parse a duration string and return null when the shape doesn't match.
+// Used by bounded duration refines (readiness_timeout, setup_timeout) — zod
+// runs `.refine()` even after a sibling `.regex()` check fails, so the refine
+// must tolerate inputs the upstream regex would have rejected without
+// re-raising parseDurationMs's ValidationError as an uncaught throw.
+function tryParseDurationMs(value: string): number | null {
+	try {
+		return parseDurationMs(value);
+	} catch {
+		return null;
+	}
+}
+
 // warren-0928: per-project override of the readiness probe wall clock. Bounds
 // rule out pathological config (sub-second polls aren't meaningful given the
 // 500ms default poll interval, and >1h is almost certainly a typo since the
@@ -129,11 +142,25 @@ const PreviewReadinessPathSchema = z
 // gets revisited with a concrete use case.
 const PreviewReadinessTimeoutSchema = DurationStringSchema.refine(
 	(value) => {
-		const ms = parseDurationMs(value);
-		return ms >= 1_000 && ms <= 3_600_000;
+		const ms = tryParseDurationMs(value);
+		return ms !== null && ms >= 1_000 && ms <= 3_600_000;
 	},
 	{ message: "preview.readiness_timeout must be between 1s and 1h" },
 );
+
+// warren-d9e7: setup runs as its own sidecar before the dev-server sidecar so
+// dependency install ("pnpm install") and dev-server bind no longer share a
+// readiness_timeout. Same 1s..1h bounds as readiness_timeout — sized to cover
+// a cold pnpm/npm install but tight enough that a runaway install fails fast.
+const PreviewSetupTimeoutSchema = DurationStringSchema.refine(
+	(value) => {
+		const ms = tryParseDurationMs(value);
+		return ms !== null && ms >= 1_000 && ms <= 3_600_000;
+	},
+	{ message: "preview.setup_timeout must be between 1s and 1h" },
+);
+
+const PreviewSetupSchema = z.string().min(1, "preview.setup must be non-empty");
 
 // warren-fcb7 / SPEC §11.L (path-mode addendum, pl-f4ea): per-project pin of
 // the preview routing mode. Operator-facing surface is `WARREN_PREVIEW_MODE`
@@ -158,6 +185,11 @@ const ServerPreviewConfigSchema = z
 		type: z.literal("server"),
 		mode: PreviewModeSchema.optional(),
 		command: PreviewCommandSchema,
+		// warren-d9e7: optional pre-step. Runs to completion before the dev
+		// server sidecar spawns; non-zero exit fails the preview before the
+		// readiness probe is attempted. See `src/preview/launch.ts`.
+		setup: PreviewSetupSchema.optional(),
+		setup_timeout: PreviewSetupTimeoutSchema.optional(),
 		port: PreviewPortSchema,
 		readiness_path: PreviewReadinessPathSchema.optional(),
 		readiness_timeout: PreviewReadinessTimeoutSchema.optional(),

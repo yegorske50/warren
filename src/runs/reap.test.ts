@@ -1134,6 +1134,47 @@ describe("reapRun", () => {
 		expect(launch.calls[0]?.readinessTimeoutMs).toBe(600_000);
 	});
 
+	// warren-d9e7: per-project setup + setup_timeout flow through reap the
+	// same way readiness_timeout does — schema validates the duration shape
+	// at load time, reap parses to ms before handing off to the launcher.
+	test("forwards previewConfig.setup_timeout as launcher setupTimeoutMs", async () => {
+		const e = fakeExec({ revListCount: "2" });
+		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);
+		await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			previewConfig: { ...SERVER_PREVIEW, setup: "pnpm install", setup_timeout: "10m" },
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
+			launchPreview: launch.launch,
+		});
+		expect(launch.calls).toHaveLength(1);
+		expect(launch.calls[0]?.previewConfig.setup).toBe("pnpm install");
+		expect(launch.calls[0]?.setupTimeoutMs).toBe(600_000);
+	});
+
+	test("omits launcher setupTimeoutMs when previewConfig.setup_timeout absent", async () => {
+		const e = fakeExec({ revListCount: "2" });
+		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);
+		await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			previewConfig: { ...SERVER_PREVIEW, setup: "pnpm install" },
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
+			launchPreview: launch.launch,
+		});
+		expect(launch.calls[0]?.setupTimeoutMs).toBeUndefined();
+	});
+
 	test("skips preview launch when project did not opt in (no previewConfig)", async () => {
 		const e = fakeExec({ revListCount: "2" });
 		const launch = fakeLaunch([]);

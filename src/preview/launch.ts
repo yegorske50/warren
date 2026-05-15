@@ -69,6 +69,17 @@ export interface PreviewSidecarsClient {
 		opts?: { tailBytes?: number },
 	): Promise<{ readonly stdout: string; readonly stderr: string }>;
 	delete(burrowId: string, sidecarId: string): Promise<void>;
+	/**
+	 * Observe sidecar lifecycle state (warren-d9e7). Used by the setup
+	 * pre-step to poll for completion before the dev-server sidecar
+	 * spawns. Mirrors `GET /burrows/:id/sidecars/:sidecarId` over the
+	 * facade; warren must not talk to the burrow socket directly
+	 * (CLAUDE.md "Relationship to burrow").
+	 */
+	get(
+		burrowId: string,
+		sidecarId: string,
+	): Promise<{ readonly state: string; readonly exitCode: number | null }>;
 }
 
 export interface LaunchPreviewInput {
@@ -89,6 +100,13 @@ export interface LaunchPreviewInput {
 	readinessPollMs?: number;
 	/** Per-call AbortController timeout. Defaults to `PROBE_PER_CALL_TIMEOUT_MS`. */
 	readonly probePerCallTimeoutMs?: number;
+	/**
+	 * Cap on the setup pre-step (warren-d9e7). Applied only when
+	 * `previewConfig.setup` is set. Defaults to `DEFAULT_SETUP_TIMEOUT_MS`.
+	 */
+	readonly setupTimeoutMs?: number;
+	/** Pause between setup status polls. Defaults to `DEFAULT_SETUP_POLL_MS`. */
+	readonly setupPollMs?: number;
 }
 
 export type LaunchPreviewResult =
@@ -111,7 +129,9 @@ export type LaunchFailureReason =
 	| "port_exhausted"
 	| "create_failed"
 	| "readiness_timeout"
-	| "sidecar_exited";
+	| "sidecar_exited"
+	| "setup_failed"
+	| "setup_timeout";
 
 /**
  * Default readiness probe wall clock. Sized to cover a cold `pnpm install` +
@@ -123,6 +143,22 @@ export type LaunchFailureReason =
 export const DEFAULT_READINESS_TIMEOUT_MS = 300_000;
 /** Default pause between probe attempts. */
 export const DEFAULT_READINESS_POLL_MS = 500;
+/**
+ * Default cap on the setup pre-step (warren-d9e7). Sized to cover a cold
+ * pnpm/npm install for projects with hundreds of deps; tunable per-project
+ * via `.warren/preview.yaml`'s `setup_timeout`. The current
+ * `DEFAULT_READINESS_TIMEOUT_MS` was inflated to absorb install + bind
+ * under one ceiling; splitting setup into its own pre-step lets the
+ * readiness probe drop back to a tight value in a follow-up.
+ */
+export const DEFAULT_SETUP_TIMEOUT_MS = 300_000;
+/**
+ * Default pause between setup-status polls. Setup commands typically run
+ * for seconds-to-minutes, so 1s strikes a balance between staleness and
+ * unix-socket chatter. Tighter polling buys no useful latency at
+ * setup-step granularity; looser polling delays failure reporting.
+ */
+export const DEFAULT_SETUP_POLL_MS = 1_000;
 /**
  * Per-call probe timeout (warren-33eb). The outer `readinessTimeoutMs` is a
  * wall-clock bound on the loop *between* attempts; without a per-call
@@ -170,6 +206,8 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 	const timeoutMs = input.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
 	const pollMs = input.readinessPollMs ?? DEFAULT_READINESS_POLL_MS;
 	const perCallTimeoutMs = input.probePerCallTimeoutMs ?? PROBE_PER_CALL_TIMEOUT_MS;
+	const setupTimeoutMs = input.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
+	const setupPollMs = input.setupPollMs ?? DEFAULT_SETUP_POLL_MS;
 
 	const allocation = await input.allocator.allocate(input.runId, now());
 	if (allocation.status === "exhausted") {
@@ -181,6 +219,29 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 		return { ok: false, reason: "port_exhausted", message, failureTail: "", port: null };
 	}
 	const port = allocation.port;
+
+	// warren-d9e7: setup pre-step. Runs to completion (no inbound forward) so
+	// dependency install fails fast and surfaces a distinct failure reason
+	// instead of degrading into readiness_timeout. Skipped when no setup
+	// command is configured — existing single-command projects keep working.
+	if (input.previewConfig.setup !== undefined) {
+		const setupResult = await runSetupStep({
+			input,
+			now,
+			sleep,
+			setupCommand: input.previewConfig.setup,
+			setupTimeoutMs,
+			setupPollMs,
+		});
+		if (!setupResult.ok) {
+			await input.repos.runs.attachPreview(input.runId, {
+				previewState: "failed",
+				previewPort: null,
+				previewFailureMessage: composeFailureMessage(setupResult.message, setupResult.failureTail),
+			});
+			return { ...setupResult, port };
+		}
+	}
 
 	let sidecarId: string;
 	try {
@@ -242,6 +303,97 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 			};
 		}
 		await sleep(pollMs);
+	}
+}
+
+interface SetupStepFailure {
+	readonly ok: false;
+	readonly reason: "setup_failed" | "setup_timeout";
+	readonly message: string;
+	readonly failureTail: string;
+}
+
+async function runSetupStep(args: {
+	input: LaunchPreviewInput;
+	now: () => Date;
+	sleep: (ms: number) => Promise<void>;
+	setupCommand: string;
+	setupTimeoutMs: number;
+	setupPollMs: number;
+}): Promise<{ readonly ok: true } | SetupStepFailure> {
+	const { input, now, sleep, setupCommand, setupTimeoutMs, setupPollMs } = args;
+	let setupSidecarId: string;
+	try {
+		const created = await input.sidecars.create({
+			burrowId: input.burrowId,
+			command: ["sh", "-c", setupCommand],
+		});
+		setupSidecarId = created.id;
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		return {
+			ok: false,
+			reason: "setup_failed",
+			message: `setup spawn failed: ${truncate(message, PREVIEW_FAILURE_TAIL_BYTES)}`,
+			failureTail: "",
+		};
+	}
+
+	const deadline = now().getTime() + setupTimeoutMs;
+	while (true) {
+		let status: { state: string; exitCode: number | null };
+		try {
+			status = await input.sidecars.get(input.burrowId, setupSidecarId);
+		} catch {
+			// Transient status-poll failure: don't fail the setup over a single
+			// dropped query. Sleep and try again until the wall clock catches up.
+			if (now().getTime() >= deadline) {
+				const failureTail = await captureFailureTail(
+					input.sidecars,
+					input.burrowId,
+					setupSidecarId,
+				);
+				await safeDeleteSidecar(input.sidecars, input.burrowId, setupSidecarId);
+				return {
+					ok: false,
+					reason: "setup_timeout",
+					message: `setup did not exit within ${setupTimeoutMs}ms`,
+					failureTail,
+				};
+			}
+			await sleep(setupPollMs);
+			continue;
+		}
+
+		if (status.state === "exited") {
+			if (status.exitCode === 0) {
+				// Best-effort cleanup of the completed setup sidecar — burrow's
+				// registry would garbage-collect it eventually, but explicit
+				// removal keeps `GET /burrows/:id/sidecars` lists short.
+				await safeDeleteSidecar(input.sidecars, input.burrowId, setupSidecarId);
+				return { ok: true };
+			}
+			const failureTail = await captureFailureTail(input.sidecars, input.burrowId, setupSidecarId);
+			await safeDeleteSidecar(input.sidecars, input.burrowId, setupSidecarId);
+			return {
+				ok: false,
+				reason: "setup_failed",
+				message: `setup exited with code ${status.exitCode}`,
+				failureTail,
+			};
+		}
+
+		if (now().getTime() >= deadline) {
+			const failureTail = await captureFailureTail(input.sidecars, input.burrowId, setupSidecarId);
+			await safeDeleteSidecar(input.sidecars, input.burrowId, setupSidecarId);
+			return {
+				ok: false,
+				reason: "setup_timeout",
+				message: `setup did not exit within ${setupTimeoutMs}ms`,
+				failureTail,
+			};
+		}
+		await sleep(setupPollMs);
 	}
 }
 

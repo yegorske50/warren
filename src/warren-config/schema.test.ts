@@ -282,6 +282,72 @@ describe("PreviewConfigSchema", () => {
 		}
 	});
 
+	// warren-d9e7: setup splits dependency-install from dev-server bind so each
+	// phase has its own timeout and failure reason. Schema accepts the field at
+	// the parser layer; launcher (src/preview/launch.ts) skips the pre-step
+	// when the field is absent so existing projects keep working unchanged.
+	test("accepts a server preview with setup + setup_timeout (warren-d9e7)", () => {
+		const parsed = PreviewConfigSchema.safeParse({
+			...VALID_SERVER_PREVIEW,
+			setup: "pnpm install",
+			setup_timeout: "5m",
+		});
+		expect(parsed.success).toBe(true);
+		if (parsed.success && parsed.data.type === "server") {
+			expect(parsed.data.setup).toBe("pnpm install");
+			expect(parsed.data.setup_timeout).toBe("5m");
+		}
+	});
+
+	test("accepts setup without setup_timeout (launcher uses default)", () => {
+		const parsed = PreviewConfigSchema.safeParse({
+			...VALID_SERVER_PREVIEW,
+			setup: "pnpm install",
+		});
+		expect(parsed.success).toBe(true);
+	});
+
+	test("rejects empty setup string", () => {
+		const parsed = PreviewConfigSchema.safeParse({
+			...VALID_SERVER_PREVIEW,
+			setup: "",
+		});
+		expect(parsed.success).toBe(false);
+	});
+
+	test("accepts setup_timeout within 1s..1h", () => {
+		for (const d of ["1s", "30s", "5m", "1h", "59m59s"]) {
+			const parsed = PreviewConfigSchema.safeParse({
+				...VALID_SERVER_PREVIEW,
+				setup: "pnpm install",
+				setup_timeout: d,
+			});
+			expect(parsed.success).toBe(true);
+		}
+	});
+
+	test("rejects setup_timeout outside 1s..1h", () => {
+		for (const d of ["500ms", "999ms", "2h", "1h1s", "1d"]) {
+			const parsed = PreviewConfigSchema.safeParse({
+				...VALID_SERVER_PREVIEW,
+				setup: "pnpm install",
+				setup_timeout: d,
+			});
+			expect(parsed.success).toBe(false);
+		}
+	});
+
+	test("rejects garbage setup_timeout duration strings", () => {
+		for (const d of ["five minutes", "30", "m30", "30y", ""]) {
+			const parsed = PreviewConfigSchema.safeParse({
+				...VALID_SERVER_PREVIEW,
+				setup: "pnpm install",
+				setup_timeout: d,
+			});
+			expect(parsed.success).toBe(false);
+		}
+	});
+
 	test("rejects strict-extra fields on server preview so typos surface loudly", () => {
 		const parsed = PreviewConfigSchema.safeParse({
 			...VALID_SERVER_PREVIEW,

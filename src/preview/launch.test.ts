@@ -31,6 +31,13 @@ interface FakeSidecar {
 	readonly deletes: Array<{ burrowId: string; sidecarId: string }>;
 	logs: { stdout: string; stderr: string };
 	createImpl?: () => Promise<{ id: string; state: string }>;
+	/**
+	 * Per-sidecar-id status queue (warren-d9e7). Each successive `get()` call
+	 * pops the next status; once exhausted, the last value is returned forever.
+	 * Defaults to `{state: 'exited', exitCode: 0}` when no entries are seeded,
+	 * which keeps the dev-server-sidecar path (no status polling) unchanged.
+	 */
+	readonly statusQueue: Map<string, Array<{ state: string; exitCode: number | null }>>;
 }
 
 type CreateInput = Parameters<PreviewSidecarsClient["create"]>[0];
@@ -40,12 +47,15 @@ function fakeSidecars(
 ): FakeSidecar {
 	const creates: FakeSidecar["creates"] = [];
 	const deletes: FakeSidecar["deletes"] = [];
+	const statusQueue = new Map<string, Array<{ state: string; exitCode: number | null }>>();
 	const state: FakeSidecar = {
 		client: {} as PreviewSidecarsClient,
 		creates,
 		deletes,
 		logs: { ...initialLogs },
+		statusQueue,
 	};
+	let nextSidecarSeq = 0;
 	const client: PreviewSidecarsClient = {
 		async create(input: CreateInput) {
 			creates.push({
@@ -58,13 +68,23 @@ function fakeSidecars(
 				...(input.readinessPath !== undefined ? { readinessPath: input.readinessPath } : {}),
 			});
 			if (state.createImpl !== undefined) return state.createImpl();
-			return { id: "sc_test_1", state: "live" };
+			nextSidecarSeq++;
+			return { id: `sc_test_${nextSidecarSeq}`, state: "live" };
 		},
 		async logs() {
 			return { stdout: state.logs.stdout, stderr: state.logs.stderr };
 		},
 		async delete(burrowId: string, sidecarId: string) {
 			deletes.push({ burrowId, sidecarId });
+		},
+		async get(_burrowId: string, sidecarId: string) {
+			const queue = statusQueue.get(sidecarId);
+			if (queue === undefined || queue.length === 0) {
+				return { state: "exited", exitCode: 0 };
+			}
+			return queue.length === 1
+				? (queue[0] as { state: string; exitCode: number | null })
+				: (queue.shift() as { state: string; exitCode: number | null });
 		},
 	};
 	state.client = client;
@@ -438,6 +458,130 @@ describe("launchPreview", () => {
 			readinessPollMs: 100,
 		});
 		expect((result as { failureTail: string }).failureTail).toContain("stdout output");
+	});
+
+	// warren-d9e7: setup pre-step splits dependency install from dev-server bind
+	// so each phase has its own timeout and failure reason. The dev-server
+	// sidecar must not spawn until setup exits 0; setup non-zero exits surface
+	// as `setup_failed`; setup hangs past `setup_timeout` surface as
+	// `setup_timeout`. Projects without a `setup:` field see no behavior change.
+	describe("setup pre-step (warren-d9e7)", () => {
+		test("runs setup to completion before spawning the dev server, then probes readiness", async () => {
+			const sidecars = fakeSidecars();
+			sidecars.statusQueue.set("sc_test_1", [
+				{ state: "running", exitCode: null },
+				{ state: "exited", exitCode: 0 },
+			]);
+			const { fetch } = fakeFetch([new Response("ok", { status: 200 })]);
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: { ...PREVIEW_CONFIG, setup: "pnpm install" },
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch,
+				sleep: async () => {},
+				now: () => new Date("2026-05-14T18:00:00.000Z"),
+			});
+			expect(result.ok).toBe(true);
+			expect((result as { sidecarId: string }).sidecarId).toBe("sc_test_2");
+			// First create = setup (no inboundPortForward), second = dev server.
+			expect(sidecars.creates).toHaveLength(2);
+			expect(sidecars.creates[0]?.command).toEqual(["sh", "-c", "pnpm install"]);
+			expect(sidecars.creates[0]?.inboundPortForward).toBeUndefined();
+			expect(sidecars.creates[0]?.env).toBeUndefined();
+			expect(sidecars.creates[1]?.command).toEqual(["sh", "-c", "bun run dev"]);
+			expect(sidecars.creates[1]?.inboundPortForward).toEqual({
+				hostPort: 40000,
+				sandboxPort: 3000,
+			});
+			// Setup sidecar is cleaned up on success.
+			expect(sidecars.deletes).toContainEqual({ burrowId, sidecarId: "sc_test_1" });
+		});
+
+		test("non-zero setup exit returns setup_failed, never spawns the dev server", async () => {
+			const sidecars = fakeSidecars({ stdout: "", stderr: "ERR_PNPM_FETCH 404\n" });
+			sidecars.statusQueue.set("sc_test_1", [{ state: "exited", exitCode: 1 }]);
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: { ...PREVIEW_CONFIG, setup: "pnpm install" },
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch: (async () => new Response("never", { status: 200 })) as unknown as typeof fetch,
+				sleep: async () => {},
+				now: () => new Date("2026-05-14T18:00:00.000Z"),
+			});
+			expect(result.ok).toBe(false);
+			expect((result as { reason: string }).reason).toBe("setup_failed");
+			expect((result as { failureTail: string }).failureTail).toContain("ERR_PNPM_FETCH");
+			// Only the setup sidecar was created; the dev server never spawned.
+			expect(sidecars.creates).toHaveLength(1);
+			expect(sidecars.deletes).toEqual([{ burrowId, sidecarId: "sc_test_1" }]);
+			const row = await repos.runs.require(runId);
+			expect(row.previewState).toBe("failed");
+			expect(row.previewPort).toBeNull();
+			expect(row.previewFailureMessage).toContain("setup exited with code 1");
+			expect(row.previewFailureMessage).toContain("ERR_PNPM_FETCH");
+		});
+
+		test("setup that never exits returns setup_timeout and deletes the lingering sidecar", async () => {
+			const sidecars = fakeSidecars({ stdout: "installing…\n", stderr: "" });
+			// Status never transitions to 'exited' — every poll returns 'running'.
+			sidecars.statusQueue.set("sc_test_1", [{ state: "running", exitCode: null }]);
+			const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
+			let ticks = 0;
+			const now = (): Date => new Date(t0 + ticks);
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: { ...PREVIEW_CONFIG, setup: "sleep 9999" },
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch: (async () => new Response("never", { status: 200 })) as unknown as typeof fetch,
+				sleep: async (ms) => {
+					ticks += ms * 100; // advance fast so the loop hits the deadline in O(1)
+				},
+				now,
+				setupTimeoutMs: 200,
+				setupPollMs: 50,
+			});
+			expect(result.ok).toBe(false);
+			expect((result as { reason: string }).reason).toBe("setup_timeout");
+			// Dev server sidecar was never spawned; setup was deleted.
+			expect(sidecars.creates).toHaveLength(1);
+			expect(sidecars.deletes).toEqual([{ burrowId, sidecarId: "sc_test_1" }]);
+			const row = await repos.runs.require(runId);
+			expect(row.previewState).toBe("failed");
+			expect(row.previewPort).toBeNull();
+			expect(row.previewFailureMessage).toContain("setup did not exit within 200ms");
+		});
+
+		test("no setup field leaves the existing single-sidecar path unchanged", async () => {
+			const sidecars = fakeSidecars();
+			const { fetch } = fakeFetch([new Response("ok", { status: 200 })]);
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: PREVIEW_CONFIG,
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch,
+				sleep: async () => {},
+				now: () => new Date("2026-05-14T18:00:00.000Z"),
+			});
+			expect(result.ok).toBe(true);
+			// Only the dev-server sidecar is spawned; no setup sidecar.
+			expect(sidecars.creates).toHaveLength(1);
+			expect(sidecars.creates[0]?.inboundPortForward).toEqual({
+				hostPort: 40000,
+				sandboxPort: 3000,
+			});
+		});
 	});
 });
 
