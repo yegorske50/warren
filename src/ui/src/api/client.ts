@@ -13,6 +13,7 @@ import type {
 	ProjectRow,
 	ReadyzResponse,
 	RefreshAgentsResponse,
+	RefreshProjectAgentsResponse,
 	RefreshProjectResponse,
 	RunEvent,
 	RunRow,
@@ -108,12 +109,45 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
 /* Agents                                                                   */
 /* ----------------------------------------------------------------------- */
 
+/**
+ * Optional projectId filter for agent reads (R-03 / pl-fef5 step 6).
+ * When set, the server returns global ∪ that project's tier on `list`,
+ * and resolves project-first with global fallback on `get`. Empty string
+ * is rejected by the server, so callers must omit the filter rather than
+ * passing `""` when no project is selected.
+ */
+export interface AgentsFilter {
+	projectId?: string;
+}
+
+function agentsQuery(filter: AgentsFilter): string {
+	if (filter.projectId === undefined || filter.projectId.length === 0) return "";
+	const params = new URLSearchParams({ projectId: filter.projectId });
+	return `?${params.toString()}`;
+}
+
 export const agentsApi = {
-	list: (signal?: AbortSignal) =>
-		request<{ agents: AgentRow[] }>("/agents", { ...(signal ? { signal } : {}) }),
-	get: (name: string, signal?: AbortSignal) =>
-		request<AgentRow>(`/agents/${encodeURIComponent(name)}`, { ...(signal ? { signal } : {}) }),
+	list: (filter: AgentsFilter = {}, signal?: AbortSignal) =>
+		request<{ agents: AgentRow[] }>(`/agents${agentsQuery(filter)}`, {
+			...(signal ? { signal } : {}),
+		}),
+	get: (name: string, filter: AgentsFilter = {}, signal?: AbortSignal) =>
+		request<AgentRow>(`/agents/${encodeURIComponent(name)}${agentsQuery(filter)}`, {
+			...(signal ? { signal } : {}),
+		}),
 	refresh: () => request<RefreshAgentsResponse>("/agents/refresh", { method: "POST", body: {} }),
+	/**
+	 * Refresh just one project's `.canopy/` tier (R-03 / pl-fef5 step 6).
+	 * Distinct from `refresh`, which re-clones the library AND every
+	 * project's tier in one pass — the per-project route is the targeted
+	 * path the Agents page calls after the operator edits one project's
+	 * `.canopy/`.
+	 */
+	refreshProject: (projectId: string) =>
+		request<RefreshProjectAgentsResponse>(
+			`/projects/${encodeURIComponent(projectId)}/agents/refresh`,
+			{ method: "POST", body: {} },
+		),
 };
 
 /* ----------------------------------------------------------------------- */

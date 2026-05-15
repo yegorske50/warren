@@ -72,7 +72,7 @@ export function RunsPage() {
 	};
 	const agents = useQuery({
 		queryKey: ["agents"],
-		queryFn: ({ signal }) => agentsApi.list(signal),
+		queryFn: ({ signal }) => agentsApi.list({}, signal),
 	});
 	const projects = useQuery({
 		queryKey: ["projects"],

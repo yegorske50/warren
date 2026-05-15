@@ -191,6 +191,21 @@ export interface RefreshAgentsResponse {
 	removed: { name: string }[];
 }
 
+/**
+ * Wire envelope of `POST /projects/:id/agents/refresh` (R-03 / pl-fef5
+ * step 6). Mirrors `RefreshProjectResult` after server-side decoration:
+ * each `registered` row carries the `source: "project:<id>"` provenance
+ * stamp. Per-agent failures land in `skipped`; project-tier `removed` is
+ * `string[]` because pruning is always-on at this tier (the project's
+ * `.canopy/` is authoritative).
+ */
+export interface RefreshProjectAgentsResponse {
+	projectId: string;
+	registered: AgentRow[];
+	skipped: { name: string; reason: string; code: string }[];
+	removed: string[];
+}
+
 export interface ReadyCheckResult {
 	name: string;
 	ok: boolean;

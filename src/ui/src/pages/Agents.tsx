@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
 import { useState } from "react";
-import { agentsApi } from "@/api/client.ts";
+import { agentsApi, projectsApi } from "@/api/client.ts";
 import type { AgentRow } from "@/api/types.ts";
 import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
+import { Label } from "@/components/ui/label.tsx";
 import {
 	Table,
 	TableBody,
@@ -14,41 +15,94 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table.tsx";
+import { type AgentSourceTier, classifyAgentSource } from "@/lib/agent-source.ts";
 import { formatTimestamp } from "@/lib/utils.ts";
 
 export function AgentsPage() {
 	const qc = useQueryClient();
+	// R-03 / pl-fef5 step 8: the projectId filter scopes the list to
+	// global ∪ that project's tier. Empty string means "global only" (the
+	// server rejects `?projectId=`, so the client passes no param in that
+	// case — see agentsQuery in api/client.ts).
+	const [projectFilter, setProjectFilter] = useState("");
+	const projects = useQuery({
+		queryKey: ["projects"],
+		queryFn: ({ signal }) => projectsApi.list(signal),
+	});
 	const agents = useQuery({
-		queryKey: ["agents"],
-		queryFn: ({ signal }) => agentsApi.list(signal),
+		queryKey: ["agents", { projectId: projectFilter }],
+		queryFn: ({ signal }) =>
+			agentsApi.list(projectFilter.length > 0 ? { projectId: projectFilter } : {}, signal),
 	});
 	const refresh = useMutation({
 		mutationFn: () => agentsApi.refresh(),
+		onSuccess: () => qc.invalidateQueries({ queryKey: ["agents"] }),
+	});
+	// `POST /projects/:id/agents/refresh` — re-scans one project's `.canopy/`.
+	// Only available when a project filter is active; invalidates the
+	// project-scoped agents query so the new rows surface immediately.
+	const refreshProject = useMutation({
+		mutationFn: (projectId: string) => agentsApi.refreshProject(projectId),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["agents"] }),
 	});
 	const [openName, setOpenName] = useState<string | null>(null);
 
 	return (
 		<div className="space-y-6">
-			<header className="flex items-center justify-between">
+			<header className="flex flex-wrap items-start justify-between gap-3">
 				<div>
 					<h1 className="text-2xl font-semibold tracking-tight">Agents</h1>
 					<p className="text-sm text-(--color-muted-foreground)">
 						Agents available for dispatch. <code>claude-code</code>,{" "}
 						<code>sapling</code>, and <code>pi</code> ship inline; refresh
-						re-clones the optional canopy library for custom agents.
+						re-clones the optional canopy library for custom agents. Pick a
+						project to surface its <code>.canopy/</code> tier.
 					</p>
 				</div>
-				<Button
-					onClick={() => refresh.mutate()}
-					disabled={refresh.isPending}
-					variant="outline"
-				>
-					<RefreshCw
-						className={`h-4 w-4 ${refresh.isPending ? "animate-spin" : ""}`}
-					/>
-					Refresh registry
-				</Button>
+				<div className="flex flex-wrap items-end gap-2">
+					<div className="space-y-1.5">
+						<Label htmlFor="agent-project-filter" className="text-xs">
+							Project
+						</Label>
+						<select
+							id="agent-project-filter"
+							value={projectFilter}
+							onChange={(e) => setProjectFilter(e.target.value)}
+							className="flex h-9 min-w-[14rem] rounded-md border bg-(--color-card) px-3 py-1 text-sm shadow-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-(--color-ring)"
+						>
+							<option value="">Global only</option>
+							{projects.data?.projects.map((p) => (
+								<option key={p.id} value={p.id}>
+									{p.gitUrl} ({p.id})
+								</option>
+							))}
+						</select>
+					</div>
+					{projectFilter.length > 0 ? (
+						<Button
+							onClick={() => refreshProject.mutate(projectFilter)}
+							disabled={refreshProject.isPending}
+							variant="outline"
+						>
+							<RefreshCw
+								className={`h-4 w-4 ${
+									refreshProject.isPending ? "animate-spin" : ""
+								}`}
+							/>
+							Refresh project tier
+						</Button>
+					) : null}
+					<Button
+						onClick={() => refresh.mutate()}
+						disabled={refresh.isPending}
+						variant="outline"
+					>
+						<RefreshCw
+							className={`h-4 w-4 ${refresh.isPending ? "animate-spin" : ""}`}
+						/>
+						Refresh registry
+					</Button>
+				</div>
 			</header>
 
 			{refresh.isSuccess ? (
@@ -73,10 +127,42 @@ export function AgentsPage() {
 				</Card>
 			) : null}
 
+			{refreshProject.isSuccess ? (
+				<Card>
+					<CardContent className="flex flex-wrap items-center gap-3 p-4 text-sm">
+						<span className="font-medium">Last project refresh:</span>
+						<code className="font-mono text-xs">{refreshProject.data.projectId}</code>
+						<Badge variant="succeeded">
+							{refreshProject.data.registered.length} registered
+						</Badge>
+						{refreshProject.data.skipped.length > 0 ? (
+							<Badge variant="failed">
+								{refreshProject.data.skipped.length} skipped
+							</Badge>
+						) : null}
+						{refreshProject.data.removed.length > 0 ? (
+							<Badge variant="cancelled">
+								{refreshProject.data.removed.length} removed
+							</Badge>
+						) : null}
+					</CardContent>
+				</Card>
+			) : null}
+
 			{refresh.isError ? (
 				<Card>
 					<CardContent className="p-4 text-sm text-(--color-destructive)">
 						{refresh.error instanceof Error ? refresh.error.message : String(refresh.error)}
+					</CardContent>
+				</Card>
+			) : null}
+
+			{refreshProject.isError ? (
+				<Card>
+					<CardContent className="p-4 text-sm text-(--color-destructive)">
+						{refreshProject.error instanceof Error
+							? refreshProject.error.message
+							: String(refreshProject.error)}
 					</CardContent>
 				</Card>
 			) : null}
@@ -108,6 +194,7 @@ export function AgentsPage() {
 								<TableRow>
 									<TableHead className="w-8" />
 									<TableHead>Name</TableHead>
+									<TableHead>Source</TableHead>
 									<TableHead>Registered</TableHead>
 									<TableHead>Last refreshed</TableHead>
 								</TableRow>
@@ -115,11 +202,13 @@ export function AgentsPage() {
 							<TableBody>
 								{agents.data?.agents.map((a) => (
 									<AgentDisplayRow
-										key={a.name}
+										key={agentRowKey(a)}
 										agent={a}
-										open={openName === a.name}
+										open={openName === agentRowKey(a)}
 										onToggle={() =>
-											setOpenName(openName === a.name ? null : a.name)
+											setOpenName(
+												openName === agentRowKey(a) ? null : agentRowKey(a),
+											)
 										}
 									/>
 								))}
@@ -132,6 +221,25 @@ export function AgentsPage() {
 	);
 }
 
+/**
+ * Project-tier rows can share a `name` with a global row when the
+ * filter surfaces both; key open-state on `name + source` so toggling
+ * one doesn't expand the other.
+ */
+function agentRowKey(agent: AgentRow): string {
+	return `${agent.source ?? "unknown"}::${agent.name}`;
+}
+
+const sourceBadgeVariant: Record<
+	AgentSourceTier,
+	"default" | "secondary" | "succeeded" | "running" | "queued"
+> = {
+	builtin: "secondary",
+	library: "running",
+	project: "succeeded",
+	unknown: "default",
+};
+
 function AgentDisplayRow({
 	agent,
 	open,
@@ -141,6 +249,7 @@ function AgentDisplayRow({
 	open: boolean;
 	onToggle: () => void;
 }) {
+	const classified = classifyAgentSource(agent.source);
 	return (
 		<>
 			<TableRow className="cursor-pointer" onClick={onToggle}>
@@ -152,6 +261,19 @@ function AgentDisplayRow({
 					)}
 				</TableCell>
 				<TableCell className="font-medium">{agent.name}</TableCell>
+				<TableCell>
+					<Badge
+						variant={sourceBadgeVariant[classified.tier]}
+						className="font-mono text-xs"
+						title={
+							classified.projectId !== null
+								? `project:${classified.projectId}`
+								: undefined
+						}
+					>
+						{classified.label}
+					</Badge>
+				</TableCell>
 				<TableCell className="text-(--color-muted-foreground)">
 					{formatTimestamp(agent.registeredAt)}
 				</TableCell>
@@ -161,7 +283,7 @@ function AgentDisplayRow({
 			</TableRow>
 			{open ? (
 				<TableRow>
-					<TableCell colSpan={4} className="bg-(--color-muted)/30 max-w-0">
+					<TableCell colSpan={5} className="bg-(--color-muted)/30 max-w-0">
 						<AgentDefinitionPanel agent={agent} />
 					</TableCell>
 				</TableRow>

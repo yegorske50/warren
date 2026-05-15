@@ -2,12 +2,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { agentsApi, projectsApi, runsApi } from "@/api/client.ts";
-import type { CreateRunInput } from "@/api/types.ts";
+import type { AgentRow, CreateRunInput } from "@/api/types.ts";
+import { Badge } from "@/components/ui/badge.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import { Input } from "@/components/ui/input.tsx";
 import { Label } from "@/components/ui/label.tsx";
 import { Textarea } from "@/components/ui/textarea.tsx";
+import { classifyAgentSource } from "@/lib/agent-source.ts";
 
 function readFrontmatter(renderedJson: unknown): Record<string, unknown> {
 	if (typeof renderedJson !== "object" || renderedJson === null) return {};
@@ -19,18 +21,23 @@ function readFrontmatter(renderedJson: unknown): Record<string, unknown> {
 export function NewRunPage() {
 	const navigate = useNavigate();
 	const qc = useQueryClient();
+
+	const [agent, setAgent] = useState("");
+	const [agentTouched, setAgentTouched] = useState(false);
+	const [project, setProject] = useState("");
+	// R-03 / pl-fef5 step 8: scope the agent picker to global ∪ this
+	// project's `.canopy/` tier as soon as the operator picks a project,
+	// so project-scoped roles appear alongside built-ins/library. Without
+	// a project selected the query stays global.
 	const agents = useQuery({
-		queryKey: ["agents"],
-		queryFn: ({ signal }) => agentsApi.list(signal),
+		queryKey: ["agents", { projectId: project }],
+		queryFn: ({ signal }) =>
+			agentsApi.list(project.length > 0 ? { projectId: project } : {}, signal),
 	});
 	const projects = useQuery({
 		queryKey: ["projects"],
 		queryFn: ({ signal }) => projectsApi.list(signal),
 	});
-
-	const [agent, setAgent] = useState("");
-	const [agentTouched, setAgentTouched] = useState(false);
-	const [project, setProject] = useState("");
 	const [prompt, setPrompt] = useState("");
 	const [promptTouched, setPromptTouched] = useState(false);
 	const [ref, setRef] = useState("");
@@ -188,11 +195,15 @@ export function NewRunPage() {
 									Pick an agent…
 								</option>
 								{agents.data?.agents.map((a) => (
-									<option key={a.name} value={a.name}>
+									<option key={`${a.source ?? "unknown"}::${a.name}`} value={a.name}>
 										{a.name}
+										{classifyAgentSource(a.source).tier === "project"
+											? " (project)"
+											: ""}
 									</option>
 								))}
 							</select>
+							<AgentSourceHint agent={selectedAgent} project={project} />
 							{agentFromDefault ? (
 								<p className="text-xs text-(--color-muted-foreground)">
 									Defaulted from this project's{" "}
@@ -356,5 +367,50 @@ export function NewRunPage() {
 				</CardContent>
 			</Card>
 		</div>
+	);
+}
+
+/**
+ * Source provenance hint shown under the agent picker (R-03 / pl-fef5
+ * step 8). Surfaces a small badge classifying the selected agent as
+ * built-in / library / project so the operator can see at-a-glance
+ * which tier they're about to dispatch. Tier badges are intentionally
+ * coarse — the expanded Agents row carries the full `project:<id>`
+ * string when needed.
+ */
+function AgentSourceHint({
+	agent,
+	project,
+}: {
+	agent: AgentRow | undefined;
+	project: string;
+}) {
+	if (agent === undefined) return null;
+	const classified = classifyAgentSource(agent.source);
+	if (classified.tier === "unknown") return null;
+	const variant =
+		classified.tier === "builtin"
+			? "secondary"
+			: classified.tier === "library"
+				? "running"
+				: classified.tier === "project"
+					? "succeeded"
+					: "default";
+	return (
+		<p className="flex flex-wrap items-center gap-1.5 text-xs text-(--color-muted-foreground)">
+			<span>Source:</span>
+			<Badge
+				variant={variant}
+				className="font-mono text-xs"
+				title={classified.projectId !== null ? `project:${classified.projectId}` : undefined}
+			>
+				{classified.label}
+			</Badge>
+			{classified.tier === "project" && classified.projectId !== project ? (
+				<span className="text-(--color-destructive)">
+					— belongs to a different project ({classified.projectId})
+				</span>
+			) : null}
+		</p>
 	);
 }
