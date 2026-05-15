@@ -45,12 +45,13 @@
  * sidecar client, sleeper, db, events) is injectable for tests.
  */
 
-import { asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import { ValidationError } from "../core/errors.ts";
-import type { WarrenDb } from "../db/client.ts";
+import type { AnyWarrenDb, PostgresDrizzleDb, SqliteDrizzleDb } from "../db/client.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import type { Repos } from "../db/repos/index.ts";
-import { type PreviewState, runs } from "../db/schema.ts";
+import type { PreviewState } from "../db/schema.ts";
 import type { RunEventBroker } from "../runs/events.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import { parseDurationMs } from "./duration.ts";
@@ -221,7 +222,7 @@ export interface RunPreviewsRepo {
 }
 
 export interface PreviewEvictionTickInput {
-	readonly db: WarrenDb;
+	readonly db: AnyWarrenDb;
 	readonly repos: Repos;
 	readonly burrowClientPool: BurrowClientPool;
 	readonly warrenConfigs: WarrenConfigCache;
@@ -531,24 +532,60 @@ async function applyEviction(input: ApplyEvictionInput): Promise<void> {
 /* Drizzle-backed previews repo                                              */
 /* ----------------------------------------------------------------------- */
 
-export function createRunPreviewsRepo(db: WarrenDb): RunPreviewsRepo {
+/**
+ * Construct a dialect-polymorphic previews repo over either sqlite or pg
+ * (warren-adfb). Concurrency strategy:
+ *
+ *   - **`evict`** is a single CAS UPDATE...WHERE state IN ('starting','live')
+ *     with `.returning({id})`. Atomic at the SQL layer on both dialects, so
+ *     two concurrent evicters (or an evicter racing a manual teardown) can't
+ *     both succeed: the second sees zero RETURNING rows and reports
+ *     `claimed=false`. No transaction needed.
+ *
+ *   - **`claimTeardown`** must report the *previous* state (torn-down vs.
+ *     already-torn-down vs. already-failed vs. never-launched), so it does
+ *     SELECT-then-UPDATE inside a tx. The pg branch grabs `SELECT ... FOR
+ *     UPDATE` on the candidate row to serialize against another claimer or
+ *     the eviction worker; sqlite single-connection naturally serializes
+ *     within one process, and warren only ever opens one writer connection.
+ *     The UPDATE keeps a `state IN ('starting','live')` filter as a belt-
+ *     and-suspenders CAS so even a concurrent evict that beats us to the
+ *     row is correctly observed (the SELECT we did before still tells us
+ *     `previousState`, but the UPDATE no-ops and we still return the right
+ *     shape).
+ */
+export function createRunPreviewsRepo(db: AnyWarrenDb): RunPreviewsRepo {
+	const adapter = DrizzleAdapter.for(db);
+	const runs = adapter.schema.runs;
+	const drizzleDb = adapter.drizzle as SqliteDrizzleDb;
+
 	return {
 		async listActivePreviews(): Promise<readonly RunPreviewRow[]> {
-			const rows = db.drizzle
-				.select({
-					runId: runs.id,
-					projectId: runs.projectId,
-					burrowId: runs.burrowId,
-					workerId: runs.workerId,
-					previewState: runs.previewState,
-					previewPort: runs.previewPort,
-					previewStartedAt: runs.previewStartedAt,
-					previewLastHitAt: runs.previewLastHitAt,
-				})
-				.from(runs)
-				.where(inArray(runs.previewState, ["starting", "live"]))
-				.orderBy(asc(runs.id))
-				.all();
+			const rows = await adapter.pickAll<{
+				runId: string;
+				projectId: string | null;
+				burrowId: string | null;
+				workerId: string | null;
+				previewState: PreviewState | null;
+				previewPort: number | null;
+				previewStartedAt: string | null;
+				previewLastHitAt: string | null;
+			}>(
+				drizzleDb
+					.select({
+						runId: runs.id,
+						projectId: runs.projectId,
+						burrowId: runs.burrowId,
+						workerId: runs.workerId,
+						previewState: runs.previewState,
+						previewPort: runs.previewPort,
+						previewStartedAt: runs.previewStartedAt,
+						previewLastHitAt: runs.previewLastHitAt,
+					})
+					.from(runs)
+					.where(inArray(runs.previewState, ["starting", "live"]))
+					.orderBy(asc(runs.id)),
+			);
 			return rows.map((r) => ({
 				runId: r.runId,
 				projectId: r.projectId,
@@ -561,103 +598,107 @@ export function createRunPreviewsRepo(db: WarrenDb): RunPreviewsRepo {
 			}));
 		},
 		async countActivePreviews(): Promise<number> {
-			const row = db.drizzle
-				.select({ n: sql<number>`count(*)` })
-				.from(runs)
-				.where(inArray(runs.previewState, ["starting", "live"]))
-				.get();
+			const row = await adapter.pickOne<{ n: number | string }>(
+				drizzleDb
+					.select({ n: sql<number>`count(*)` })
+					.from(runs)
+					.where(inArray(runs.previewState, ["starting", "live"])),
+			);
 			return Number(row?.n ?? 0);
 		},
 		async evict(input): Promise<boolean> {
-			// SQLite IMMEDIATE transaction serializes with the port allocator
-			// (mx-3f18fc) so a racing manual teardown / re-allocation sees a
-			// consistent state. Read first, bail if the state moved on us,
-			// then update — keeps the worker idempotent against the manual
-			// teardown route (SPEC §11.L).
-			return db.drizzle.transaction(
-				(tx) => {
-					const current = tx
-						.select({ previewState: runs.previewState })
-						.from(runs)
-						.where(eq(runs.id, input.runId))
-						.get();
-					if (
-						current === undefined ||
-						(current.previewState !== "starting" && current.previewState !== "live")
-					) {
-						return false;
-					}
-					tx.update(runs)
-						.set({ previewState: "torn-down", previewPort: null })
-						.where(eq(runs.id, input.runId))
-						.run();
-					return true;
-				},
-				{ behavior: "immediate" },
+			const updated = await adapter.runReturningAll<{ id: string }>(
+				drizzleDb
+					.update(runs)
+					.set({ previewState: "torn-down", previewPort: null })
+					.where(and(eq(runs.id, input.runId), inArray(runs.previewState, ["starting", "live"])))
+					.returning({ id: runs.id }),
 			);
+			return updated.length > 0;
 		},
 		async claimTeardown(input): Promise<ManualTeardownClaim> {
-			return db.drizzle.transaction(
-				(tx) => {
-					const current = tx
+			return adapter.runInTransaction(async (tx) => {
+				const txRuns = tx.schema.runs;
+				const txDb = tx.drizzle as SqliteDrizzleDb;
+
+				if (tx.dialect === "postgres") {
+					// `SELECT ... FOR UPDATE` locks the candidate row for the
+					// duration of the tx so a concurrent claimer or the
+					// eviction worker blocks until we commit / rollback. Lock
+					// is released automatically on tx end. Hand-rolled SQL
+					// because `.for("update")` is pg-only and the schema
+					// reference would need a dialect-incorrect cast to type-
+					// check against the pg drizzle handle.
+					const pgDb = tx.drizzle as PostgresDrizzleDb;
+					await pgDb.execute(sql`SELECT id FROM runs WHERE id = ${input.runId} FOR UPDATE`);
+				}
+
+				const current = await tx.pickOne<{
+					previewState: PreviewState | null;
+					previewPort: number | null;
+					burrowId: string | null;
+				}>(
+					txDb
 						.select({
-							previewState: runs.previewState,
-							previewPort: runs.previewPort,
-							burrowId: runs.burrowId,
+							previewState: txRuns.previewState,
+							previewPort: txRuns.previewPort,
+							burrowId: txRuns.burrowId,
 						})
-						.from(runs)
-						.where(eq(runs.id, input.runId))
-						.get();
-					if (current === undefined) {
-						// `teardownPreview` already calls `repos.runs.require` before us,
-						// so a row vanishing between that check and this transaction is
-						// a deletion race the route surfaces as `never-launched` rather
-						// than re-raising 404 from inside a transaction.
-						return {
-							status: "never-launched",
-							previousState: null,
-							port: null,
-							burrowId: null,
-						};
-					}
-					const previousState = current.previewState;
-					if (previousState === "starting" || previousState === "live") {
-						tx.update(runs)
-							.set({ previewState: "torn-down", previewPort: null })
-							.where(eq(runs.id, input.runId))
-							.run();
-						return {
-							status: "torn-down",
-							previousState,
-							port: current.previewPort,
-							burrowId: current.burrowId,
-						};
-					}
-					if (previousState === "torn-down") {
-						return {
-							status: "already-torn-down",
-							previousState,
-							port: current.previewPort,
-							burrowId: current.burrowId,
-						};
-					}
-					if (previousState === "failed") {
-						return {
-							status: "already-failed",
-							previousState,
-							port: current.previewPort,
-							burrowId: current.burrowId,
-						};
-					}
+						.from(txRuns)
+						.where(eq(txRuns.id, input.runId)),
+				);
+				if (current === undefined) {
+					// `teardownPreview` already calls `repos.runs.require` before us,
+					// so a row vanishing between that check and this transaction is
+					// a deletion race the route surfaces as `never-launched` rather
+					// than re-raising 404 from inside a transaction.
 					return {
 						status: "never-launched",
 						previousState: null,
+						port: null,
+						burrowId: null,
+					};
+				}
+				const previousState = current.previewState;
+				if (previousState === "starting" || previousState === "live") {
+					await tx.runWrite(
+						txDb
+							.update(txRuns)
+							.set({ previewState: "torn-down", previewPort: null })
+							.where(
+								and(eq(txRuns.id, input.runId), inArray(txRuns.previewState, ["starting", "live"])),
+							),
+					);
+					return {
+						status: "torn-down",
+						previousState,
 						port: current.previewPort,
 						burrowId: current.burrowId,
 					};
-				},
-				{ behavior: "immediate" },
-			);
+				}
+				if (previousState === "torn-down") {
+					return {
+						status: "already-torn-down",
+						previousState,
+						port: current.previewPort,
+						burrowId: current.burrowId,
+					};
+				}
+				if (previousState === "failed") {
+					return {
+						status: "already-failed",
+						previousState,
+						port: current.previewPort,
+						burrowId: current.burrowId,
+					};
+				}
+				return {
+					status: "never-launched",
+					previousState: null,
+					port: current.previewPort,
+					burrowId: current.burrowId,
+				};
+			});
 		},
 	};
 }

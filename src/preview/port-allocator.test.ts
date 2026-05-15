@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { NotFoundError, ValidationError } from "../core/errors.ts";
-import { openDatabase, type WarrenDb } from "../db/client.ts";
+import { type AnyWarrenDb, openDatabase } from "../db/client.ts";
 import { AgentsRepo } from "../db/repos/agents.ts";
 import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { ProjectsRepo } from "../db/repos/projects.ts";
 import { RunsRepo } from "../db/repos/runs.ts";
+import { isPostgresTestEnabled, withDb } from "../db/testing.ts";
 import {
 	DEFAULT_PREVIEW_PORT_RANGE,
 	loadPreviewPortRangeFromEnv,
@@ -93,201 +94,260 @@ describe("constants", () => {
 	});
 });
 
-describe("PreviewPortAllocator", () => {
-	let db: WarrenDb;
-	let runsRepo: RunsRepo;
-	let agentName: string;
-	let projectId: string;
-
+/**
+ * Construction-arg validation runs against any sqlite-typed handle and
+ * doesn't touch the db, so it lives outside the dialect-polymorphic suite.
+ */
+describe("PreviewPortAllocator (construction)", () => {
+	let db: AnyWarrenDb;
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
-		const agents = new AgentsRepo(DrizzleAdapter.for(db));
-		const projects = new ProjectsRepo(DrizzleAdapter.for(db));
-		const a = await agents.upsert({ name: "preview-bot", renderedJson: { sections: {} } });
-		const p = await projects.create({
-			gitUrl: "https://github.com/x/y.git",
-			localPath: "/data/projects/x/y",
-			defaultBranch: "main",
-		});
-		agentName = a.name;
-		projectId = p.id;
-		runsRepo = new RunsRepo(DrizzleAdapter.for(db));
 	});
-
 	afterEach(async () => {
 		await db.close();
 	});
 
-	async function spawn() {
-		return runsRepo.create({
-			agentName,
-			projectId,
-			prompt: "preview please",
-			renderedAgentJson: { sections: {} },
-			trigger: "manual",
-		});
-	}
-
-	test("rejects a range outside the valid TCP space", async () => {
-		expect(() => new PreviewPortAllocator(db, { start: 0, end: 10 })).toThrow(ValidationError);
-		expect(() => new PreviewPortAllocator(db, { start: 10, end: 5 })).toThrow(ValidationError);
-	});
-
-	test("allocates the lowest free port and writes preview state", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40002 });
-		const run = await spawn();
-		const now = new Date("2026-05-14T18:00:00.000Z");
-		const outcome = await allocator.allocate(run.id, now);
-		expect(outcome).toEqual({ status: "allocated", port: 40000 });
-
-		const reread = await runsRepo.require(run.id);
-		expect(reread.previewPort).toBe(40000);
-		expect(reread.previewState).toBe("starting");
-		expect(reread.previewStartedAt).toBe(now.toISOString());
-	});
-
-	test("skips ports already in use by starting/live runs", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40005 });
-		const inUse = await spawn();
-		await runsRepo.attachPreview(inUse.id, { previewState: "starting", previewPort: 40000 });
-		const live = await spawn();
-		await runsRepo.attachPreview(live.id, { previewState: "live", previewPort: 40001 });
-
-		const candidate = await spawn();
-		const outcome = await allocator.allocate(candidate.id);
-		expect(outcome).toEqual({ status: "allocated", port: 40002 });
-	});
-
-	test("released ports (state torn-down/failed) are re-allocatable", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40000 });
-		const first = await spawn();
-		const ok1 = await allocator.allocate(first.id);
-		expect(ok1).toEqual({ status: "allocated", port: 40000 });
-
-		// Release the port via the eviction-style write: state -> torn-down,
-		// preview_port cleared. The allocator must see 40000 as free.
-		await runsRepo.attachPreview(first.id, {
-			previewState: "torn-down",
-			previewPort: null,
-		});
-
-		const second = await spawn();
-		const ok2 = await allocator.allocate(second.id);
-		expect(ok2).toEqual({ status: "allocated", port: 40000 });
-	});
-
-	test("a stale port left behind on a failed run is still considered free", async () => {
-		// The state filter is what excludes a row from the in-use set — even
-		// if preview_port was never cleared on a failed row, the next
-		// allocator must reuse the port.
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40000 });
-		const failed = await spawn();
-		await runsRepo.attachPreview(failed.id, {
-			previewState: "failed",
-			previewPort: 40000,
-			previewFailureMessage: "boot crashed",
-		});
-
-		const next = await spawn();
-		expect(await allocator.allocate(next.id)).toEqual({ status: "allocated", port: 40000 });
-	});
-
-	test("returns exhausted when every port is in use", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40001 });
-		const a = await spawn();
-		const b = await spawn();
-		await runsRepo.attachPreview(a.id, { previewState: "starting", previewPort: 40000 });
-		await runsRepo.attachPreview(b.id, { previewState: "live", previewPort: 40001 });
-
-		const candidate = await spawn();
-		expect(await allocator.allocate(candidate.id)).toEqual({ status: "exhausted" });
-
-		// The candidate row must NOT have been mutated when the range is
-		// exhausted — caller (reap) emits preview_failed and the row stays
-		// open for a future retry once a port is released.
-		const reread = await runsRepo.require(candidate.id);
-		expect(reread.previewPort).toBeNull();
-		expect(reread.previewState).toBeNull();
-	});
-
-	test("throws NotFoundError for an unknown run id", async () => {
-		const allocator = new PreviewPortAllocator(db);
-		expect(allocator.allocate("run_doesnotexist")).rejects.toThrow(NotFoundError);
-	});
-
-	test("is idempotent for a run already holding a port (starting/live)", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40010 });
-		const run = await spawn();
-		const startedAt = "2026-05-14T18:00:00.000Z";
-		await runsRepo.attachPreview(run.id, {
-			previewState: "starting",
-			previewPort: 40005,
-			previewStartedAt: startedAt,
-		});
-		const outcome = await allocator.allocate(run.id, new Date("2026-05-14T19:00:00.000Z"));
-		expect(outcome).toEqual({ status: "allocated", port: 40005 });
-
-		// preview_started_at must not be clobbered by the idempotent path —
-		// re-allocation would otherwise reset max-lifetime accounting.
-		const reread = await runsRepo.require(run.id);
-		expect(reread.previewStartedAt).toBe(startedAt);
-	});
-
-	test("restart-safety: a fresh allocator instance sees committed in-use ports", async () => {
-		const a1 = new PreviewPortAllocator(db, { start: 40000, end: 40010 });
-		const r1 = await spawn();
-		const r2 = await spawn();
-		await a1.allocate(r1.id);
-		await a1.allocate(r2.id);
-
-		// Simulating restart: the runs table survives; a brand-new allocator
-		// against the same db must avoid the already-claimed ports.
-		const a2 = new PreviewPortAllocator(db, { start: 40000, end: 40010 });
-		const r3 = await spawn();
-		const outcome = await a2.allocate(r3.id);
-		expect(outcome).toEqual({ status: "allocated", port: 40002 });
-	});
-
-	test("usage reports inUse count and total range size", async () => {
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40009 });
-		expect(await allocator.usage()).toEqual({
-			inUse: 0,
-			total: 10,
-			range: { start: 40000, end: 40009 },
-		});
-
-		for (let i = 0; i < 8; i += 1) {
-			const run = await spawn();
-			await allocator.allocate(run.id);
-		}
-		const usage = await allocator.usage();
-		expect(usage.inUse).toBe(8);
-		expect(usage.total).toBe(10);
-		expect(usage.inUse / usage.total).toBe(0.8);
-	});
-
-	test("usage de-duplicates would-be duplicate ports (defensive)", async () => {
-		// Two runs writing the same port would be a bug in the eviction /
-		// teardown path, but usage() should still report a unique count so
-		// the doctor warning isn't double-counted.
-		const allocator = new PreviewPortAllocator(db, { start: 40000, end: 40005 });
-		const a = await spawn();
-		const b = await spawn();
-		await runsRepo.attachPreview(a.id, { previewState: "starting", previewPort: 40000 });
-		await runsRepo.attachPreview(b.id, { previewState: "live", previewPort: 40000 });
-		const usage = await allocator.usage();
-		expect(usage.inUse).toBe(1);
-	});
-
-	test("concurrent allocations against the same db never double-allocate a port", async () => {
-		const range = { start: 40000, end: 40019 };
-		const allocator = new PreviewPortAllocator(db, range);
-		const candidates = await Promise.all(Array.from({ length: 20 }, () => spawn()));
-		const outcomes = await Promise.all(candidates.map((c) => allocator.allocate(c.id)));
-		const ports = outcomes
-			.map((o) => (o.status === "allocated" ? o.port : null))
-			.filter((p): p is number => p !== null);
-		expect(new Set(ports).size).toBe(20);
-		expect(ports.every((p) => p >= range.start && p <= range.end)).toBe(true);
+	test("rejects a range outside the valid TCP space", () => {
+		const adapter = DrizzleAdapter.for(db);
+		expect(() => new PreviewPortAllocator(adapter, { start: 0, end: 10 })).toThrow(ValidationError);
+		expect(() => new PreviewPortAllocator(adapter, { start: 10, end: 5 })).toThrow(ValidationError);
 	});
 });
+
+function suite(dialect: "sqlite" | "postgres"): void {
+	describe(`PreviewPortAllocator (${dialect})`, () => {
+		const open = async () => {
+			const handle = await withDb({ dialect });
+			const adapter = DrizzleAdapter.for(handle.db);
+			const agents = new AgentsRepo(adapter);
+			const projects = new ProjectsRepo(adapter);
+			const a = await agents.upsert({ name: "preview-bot", renderedJson: { sections: {} } });
+			const p = await projects.create({
+				gitUrl: "https://github.com/x/y.git",
+				localPath: "/data/projects/x/y",
+				defaultBranch: "main",
+			});
+			const runsRepo = new RunsRepo(adapter);
+			return { handle, adapter, runsRepo, agentName: a.name, projectId: p.id };
+		};
+
+		async function spawn(
+			runsRepo: RunsRepo,
+			agentName: string,
+			projectId: string,
+		): Promise<{ id: string }> {
+			return runsRepo.create({
+				agentName,
+				projectId,
+				prompt: "preview please",
+				renderedAgentJson: { sections: {} },
+				trigger: "manual",
+			});
+		}
+
+		test("allocates the lowest free port and writes preview state", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40002 });
+				const run = await spawn(runsRepo, agentName, projectId);
+				const now = new Date("2026-05-14T18:00:00.000Z");
+				const outcome = await allocator.allocate(run.id, now);
+				expect(outcome).toEqual({ status: "allocated", port: 40000 });
+
+				const reread = await runsRepo.require(run.id);
+				expect(reread.previewPort).toBe(40000);
+				expect(reread.previewState).toBe("starting");
+				expect(reread.previewStartedAt).toBe(now.toISOString());
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("skips ports already in use by starting/live runs", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40005 });
+				const inUse = await spawn(runsRepo, agentName, projectId);
+				await runsRepo.attachPreview(inUse.id, { previewState: "starting", previewPort: 40000 });
+				const live = await spawn(runsRepo, agentName, projectId);
+				await runsRepo.attachPreview(live.id, { previewState: "live", previewPort: 40001 });
+
+				const candidate = await spawn(runsRepo, agentName, projectId);
+				const outcome = await allocator.allocate(candidate.id);
+				expect(outcome).toEqual({ status: "allocated", port: 40002 });
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("released ports (state torn-down/failed) are re-allocatable", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40000 });
+				const first = await spawn(runsRepo, agentName, projectId);
+				const ok1 = await allocator.allocate(first.id);
+				expect(ok1).toEqual({ status: "allocated", port: 40000 });
+
+				await runsRepo.attachPreview(first.id, {
+					previewState: "torn-down",
+					previewPort: null,
+				});
+
+				const second = await spawn(runsRepo, agentName, projectId);
+				const ok2 = await allocator.allocate(second.id);
+				expect(ok2).toEqual({ status: "allocated", port: 40000 });
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("a stale port left behind on a failed run is still considered free", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40000 });
+				const failed = await spawn(runsRepo, agentName, projectId);
+				await runsRepo.attachPreview(failed.id, {
+					previewState: "failed",
+					previewPort: 40000,
+					previewFailureMessage: "boot crashed",
+				});
+
+				const next = await spawn(runsRepo, agentName, projectId);
+				expect(await allocator.allocate(next.id)).toEqual({ status: "allocated", port: 40000 });
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("returns exhausted when every port is in use", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40001 });
+				const a = await spawn(runsRepo, agentName, projectId);
+				const b = await spawn(runsRepo, agentName, projectId);
+				await runsRepo.attachPreview(a.id, { previewState: "starting", previewPort: 40000 });
+				await runsRepo.attachPreview(b.id, { previewState: "live", previewPort: 40001 });
+
+				const candidate = await spawn(runsRepo, agentName, projectId);
+				expect(await allocator.allocate(candidate.id)).toEqual({ status: "exhausted" });
+
+				const reread = await runsRepo.require(candidate.id);
+				expect(reread.previewPort).toBeNull();
+				expect(reread.previewState).toBeNull();
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("throws NotFoundError for an unknown run id", async () => {
+			const { handle, adapter } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter);
+				await expect(allocator.allocate("run_doesnotexist")).rejects.toThrow(NotFoundError);
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("is idempotent for a run already holding a port (starting/live)", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40010 });
+				const run = await spawn(runsRepo, agentName, projectId);
+				const startedAt = "2026-05-14T18:00:00.000Z";
+				await runsRepo.attachPreview(run.id, {
+					previewState: "starting",
+					previewPort: 40005,
+					previewStartedAt: startedAt,
+				});
+				const outcome = await allocator.allocate(run.id, new Date("2026-05-14T19:00:00.000Z"));
+				expect(outcome).toEqual({ status: "allocated", port: 40005 });
+
+				const reread = await runsRepo.require(run.id);
+				expect(reread.previewStartedAt).toBe(startedAt);
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("restart-safety: a fresh allocator instance sees committed in-use ports", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const a1 = new PreviewPortAllocator(adapter, { start: 40000, end: 40010 });
+				const r1 = await spawn(runsRepo, agentName, projectId);
+				const r2 = await spawn(runsRepo, agentName, projectId);
+				await a1.allocate(r1.id);
+				await a1.allocate(r2.id);
+
+				const a2 = new PreviewPortAllocator(adapter, { start: 40000, end: 40010 });
+				const r3 = await spawn(runsRepo, agentName, projectId);
+				const outcome = await a2.allocate(r3.id);
+				expect(outcome).toEqual({ status: "allocated", port: 40002 });
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("usage reports inUse count and total range size", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40009 });
+				expect(await allocator.usage()).toEqual({
+					inUse: 0,
+					total: 10,
+					range: { start: 40000, end: 40009 },
+				});
+
+				for (let i = 0; i < 8; i += 1) {
+					const run = await spawn(runsRepo, agentName, projectId);
+					await allocator.allocate(run.id);
+				}
+				const usage = await allocator.usage();
+				expect(usage.inUse).toBe(8);
+				expect(usage.total).toBe(10);
+				expect(usage.inUse / usage.total).toBe(0.8);
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("usage de-duplicates would-be duplicate ports (defensive)", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const allocator = new PreviewPortAllocator(adapter, { start: 40000, end: 40005 });
+				const a = await spawn(runsRepo, agentName, projectId);
+				const b = await spawn(runsRepo, agentName, projectId);
+				await runsRepo.attachPreview(a.id, { previewState: "starting", previewPort: 40000 });
+				await runsRepo.attachPreview(b.id, { previewState: "live", previewPort: 40000 });
+				const usage = await allocator.usage();
+				expect(usage.inUse).toBe(1);
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("concurrent allocations against the same db never double-allocate a port", async () => {
+			const { handle, adapter, runsRepo, agentName, projectId } = await open();
+			try {
+				const range = { start: 40000, end: 40019 };
+				const allocator = new PreviewPortAllocator(adapter, range);
+				const candidates = await Promise.all(
+					Array.from({ length: 20 }, () => spawn(runsRepo, agentName, projectId)),
+				);
+				const outcomes = await Promise.all(candidates.map((c) => allocator.allocate(c.id)));
+				const ports = outcomes
+					.map((o) => (o.status === "allocated" ? o.port : null))
+					.filter((p): p is number => p !== null);
+				expect(new Set(ports).size).toBe(20);
+				expect(ports.every((p) => p >= range.start && p <= range.end)).toBe(true);
+			} finally {
+				await handle.close();
+			}
+		});
+	});
+}
+
+suite("sqlite");
+if (isPostgresTestEnabled()) {
+	suite("postgres");
+}

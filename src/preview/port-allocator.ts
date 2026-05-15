@@ -1,5 +1,6 @@
 /**
- * SQLite-backed preview port allocator (R-19 / SPEC §11.L, warren-2277).
+ * Dialect-polymorphic preview port allocator (R-19 / SPEC §11.L, warren-2277;
+ * dialect-aware port via warren-adfb).
  *
  * Picks a free TCP port from a configurable range and claims it by writing
  * `runs.preview_port` + `runs.preview_state='starting'` + `runs.preview_started_at`
@@ -15,23 +16,32 @@
  * route already keep current. A torn-down or failed run that still carries
  * a stale `preview_port` is naturally excluded by the state filter.
  *
- * **Concurrency.** Allocation runs inside a `behavior: "immediate"` SQLite
- * transaction (`BEGIN IMMEDIATE`) so two concurrent allocators serialize
- * through SQLite's RESERVED lock — the second SELECT sees the first's
- * committed write and picks a different port. The same SQL is portable to
- * Postgres; when the repo layer becomes dialect-aware (pl-f17e follow-up)
- * the pg branch will swap the lock primitive for `SELECT ... FOR UPDATE`
- * on the candidate row.
+ * **Concurrency.** Two layers of serialization keep allocations correct:
+ *
+ *   1. **In-process Promise-chain mutex** — `allocateChain` serializes all
+ *      `allocate()` calls within a single warren process. SQLite holds one
+ *      connection per `WarrenDb`, so two parallel allocators would otherwise
+ *      hit "cannot start a transaction within a transaction" when the second
+ *      `BEGIN` lands while the first tx body is mid-`await`. The mutex also
+ *      makes the snapshot-then-pick-then-write sequence indivisible per
+ *      process so two concurrent allocate() calls can't race the same port.
+ *
+ *   2. **Postgres advisory lock** — inside the tx the pg branch grabs
+ *      `pg_advisory_xact_lock(PG_ADVISORY_LOCK_KEY)`, which serializes
+ *      allocators *across* warren processes / replicas sharing one db.
+ *      Auto-released on commit/rollback. Same semantic the SQLite branch
+ *      gets implicitly from the single-process mutex (sqlite is single-
+ *      writer per process; warren only ever opens one writer connection).
  *
  * **Exhaustion.** Returns `{ status: 'exhausted' }` instead of throwing.
  * The reap-time launch sub-step (warren-f156) translates that into a
  * `preview_failed` event with `reason='port_exhausted'` per SPEC §11.L.
  */
 
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { NotFoundError, ValidationError } from "../core/errors.ts";
-import type { WarrenDb } from "../db/client.ts";
-import { runs } from "../db/schema.ts";
+import type { PostgresDrizzleDb, SqliteDrizzleDb } from "../db/client.ts";
+import type { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 
 export const WARREN_PREVIEW_PORT_RANGE_ENV = "WARREN_PREVIEW_PORT_RANGE" as const;
 
@@ -49,6 +59,16 @@ export const PREVIEW_PORT_USAGE_WARN_RATIO = 0.8;
 
 /** Reason value the reap-time launch sub-step emits on exhaustion. */
 export const PORT_EXHAUSTED_REASON = "port_exhausted" as const;
+
+/**
+ * Constant key for `pg_advisory_xact_lock` — serializes all preview port
+ * allocations across pg processes against one database. Picked once and
+ * stable: changing it during a rolling deploy would let an old- and new-
+ * version allocator race on the same port range. Postgres advisory locks
+ * share a single namespace per db; this value is a positive int8 chosen
+ * to avoid trivial collisions with other potential warren locks.
+ */
+const PG_ADVISORY_LOCK_KEY = 5710638504754n;
 
 export type EnvLike = Readonly<Record<string, string | undefined>>;
 
@@ -117,8 +137,17 @@ function isValidPort(n: number): boolean {
  * same db agree on the in-use set by construction.
  */
 export class PreviewPortAllocator {
+	/**
+	 * Promise-chain mutex serializing concurrent `allocate()` calls within
+	 * a single process. See module header for why: sqlite single-connection
+	 * + async tx body would otherwise BEGIN-inside-BEGIN under Promise.all,
+	 * and even on pg this prevents two concurrent picks from observing the
+	 * same in-use snapshot.
+	 */
+	private allocateChain: Promise<unknown> = Promise.resolve();
+
 	constructor(
-		private readonly db: WarrenDb,
+		private readonly adapter: DrizzleAdapter,
 		private readonly range: PortRange = DEFAULT_PREVIEW_PORT_RANGE,
 	) {
 		if (!isValidPort(range.start) || !isValidPort(range.end) || range.start > range.end) {
@@ -143,46 +172,64 @@ export class PreviewPortAllocator {
 	 * structural bug — reap looks up the run row before calling here).
 	 */
 	async allocate(runId: string, now: Date = new Date()): Promise<AllocateOutcome> {
-		return this.db.drizzle.transaction(
-			(tx) => {
-				const current = tx
+		const next = this.allocateChain.then(() => this.allocateOnce(runId, now));
+		// Don't let a rejection from one allocation poison the chain for
+		// subsequent calls — the rejection still surfaces on `next`.
+		this.allocateChain = next.catch(() => undefined);
+		return next;
+	}
+
+	private async allocateOnce(runId: string, now: Date): Promise<AllocateOutcome> {
+		return this.adapter.runInTransaction(async (tx) => {
+			if (tx.dialect === "postgres") {
+				const pgDb = tx.drizzle as PostgresDrizzleDb;
+				await pgDb.execute(sql`SELECT pg_advisory_xact_lock(${PG_ADVISORY_LOCK_KEY})`);
+			}
+			const runs = tx.schema.runs;
+			const txDb = tx.drizzle as SqliteDrizzleDb;
+
+			const current = await tx.pickOne<{
+				previewPort: number | null;
+				previewState: string | null;
+			}>(
+				txDb
 					.select({
 						previewPort: runs.previewPort,
 						previewState: runs.previewState,
 					})
 					.from(runs)
-					.where(eq(runs.id, runId))
-					.get();
-				if (!current) {
-					throw new NotFoundError(`run not found: ${runId}`);
-				}
+					.where(eq(runs.id, runId)),
+			);
+			if (!current) {
+				throw new NotFoundError(`run not found: ${runId}`);
+			}
 
-				if (
-					current.previewPort !== null &&
-					(current.previewState === "starting" || current.previewState === "live")
-				) {
-					return { status: "allocated", port: current.previewPort };
-				}
+			if (
+				current.previewPort !== null &&
+				(current.previewState === "starting" || current.previewState === "live")
+			) {
+				return { status: "allocated", port: current.previewPort };
+			}
 
-				const inUse = this.snapshotInUse(tx);
-				const chosen = this.pickFreePort(inUse);
-				if (chosen === null) {
-					return { status: "exhausted" };
-				}
+			const inUse = await this.snapshotInUse(tx);
+			const chosen = this.pickFreePort(inUse);
+			if (chosen === null) {
+				return { status: "exhausted" };
+			}
 
-				tx.update(runs)
+			await tx.runWrite(
+				txDb
+					.update(runs)
 					.set({
 						previewPort: chosen,
 						previewState: "starting",
 						previewStartedAt: now.toISOString(),
 					})
-					.where(eq(runs.id, runId))
-					.run();
+					.where(eq(runs.id, runId)),
+			);
 
-				return { status: "allocated", port: chosen };
-			},
-			{ behavior: "immediate" },
-		);
+			return { status: "allocated", port: chosen };
+		});
 	}
 
 	/**
@@ -191,16 +238,19 @@ export class PreviewPortAllocator {
 	 * `starting` or `live` runs; `total` is the configured range size.
 	 */
 	async usage(): Promise<PortUsage> {
-		const inUse = this.snapshotInUse(this.db.drizzle);
+		const inUse = await this.snapshotInUse(this.adapter);
 		return { inUse: inUse.size, total: rangeSize(this.range), range: this.range };
 	}
 
-	private snapshotInUse(tx: SnapshotQueryable): Set<number> {
-		const rows = tx
-			.select({ port: runs.previewPort })
-			.from(runs)
-			.where(and(inArray(runs.previewState, ["starting", "live"]), isNotNull(runs.previewPort)))
-			.all();
+	private async snapshotInUse(scope: DrizzleAdapter): Promise<Set<number>> {
+		const runs = scope.schema.runs;
+		const txDb = scope.drizzle as SqliteDrizzleDb;
+		const rows = await scope.pickAll<{ port: number | null }>(
+			txDb
+				.select({ port: runs.previewPort })
+				.from(runs)
+				.where(and(inArray(runs.previewState, ["starting", "live"]), isNotNull(runs.previewPort))),
+		);
 		const set = new Set<number>();
 		for (const row of rows) {
 			if (row.port !== null) set.add(row.port);
@@ -215,10 +265,3 @@ export class PreviewPortAllocator {
 		return null;
 	}
 }
-
-/**
- * Narrow surface this module needs from drizzle's sqlite handle. Both the
- * top-level `db.drizzle` and a transaction handle satisfy it, so the
- * snapshot helper can run in or out of a transaction.
- */
-type SnapshotQueryable = Pick<WarrenDb["drizzle"], "select">;

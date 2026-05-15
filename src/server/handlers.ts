@@ -36,6 +36,7 @@ import type {
 import { withTransportMapping } from "../burrow-client/client.ts";
 import { fanOutAcrossWorkers } from "../burrow-client/fanout.ts";
 import { NotFoundError, ValidationError } from "../core/errors.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import type { AgentRow } from "../db/schema.ts";
 import {
 	checkBurrowPoolReachable,
@@ -1039,14 +1040,7 @@ async function previewPortAllocatorReadyzCheck(deps: ServerDeps): Promise<Diagno
 			message: `no db handle wired (range ${range.start}-${range.end})`,
 		};
 	}
-	if (deps.db.dialect !== "sqlite") {
-		return {
-			name: "preview_port_allocator",
-			ok: true,
-			message: `dialect=${deps.db.dialect} (allocator usage probe is sqlite-only today)`,
-		};
-	}
-	const allocator = new PreviewPortAllocator(deps.db, range);
+	const allocator = new PreviewPortAllocator(DrizzleAdapter.for(deps.db), range);
 	return checkPreviewPortAllocator({ probe: allocator });
 }
 
@@ -1057,13 +1051,6 @@ async function previewMaxLiveReadyzCheck(deps: ServerDeps): Promise<DiagnosticCh
 			name: "preview_max_live",
 			ok: true,
 			message: `no db handle wired (cap ${maxLive})`,
-		};
-	}
-	if (deps.db.dialect !== "sqlite") {
-		return {
-			name: "preview_max_live",
-			ok: true,
-			message: `dialect=${deps.db.dialect} (live-preview probe is sqlite-only today)`,
 		};
 	}
 	const previews = createRunPreviewsRepo(deps.db);

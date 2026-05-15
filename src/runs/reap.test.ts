@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type Burrow, NotFoundError } from "@os-eco/burrow-cli";
 import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { LaunchPreviewInput, LaunchPreviewResult } from "../preview/launch.ts";
 import { PreviewPortAllocator } from "../preview/port-allocator.ts";
@@ -1097,7 +1098,7 @@ describe("reapRun", () => {
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 		});
 		expect(result.previewState).toBe("live");
@@ -1135,7 +1136,7 @@ describe("reapRun", () => {
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 		});
 		expect(result.previewState).toBeNull();
@@ -1162,7 +1163,7 @@ describe("reapRun", () => {
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 		});
 		// The launcher (real) writes preview_state="failed" before returning;
@@ -1189,7 +1190,7 @@ describe("reapRun", () => {
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 		});
 		expect(result.state).toBe("succeeded");
@@ -1215,7 +1216,7 @@ describe("reapRun", () => {
 			fs: fakeFs().fs,
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 		});
 		expect(launch.calls).toHaveLength(0);
@@ -1242,7 +1243,7 @@ describe("reapRun", () => {
 			openPr: pr.openPr,
 			previewConfig: SERVER_PREVIEW,
 			previewLaunchConfig: { host: "warren.example.com" },
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 			annotatePrPreview: annotate.annotate,
 		});
@@ -1271,7 +1272,7 @@ describe("reapRun", () => {
 			exec: e.exec,
 			previewConfig: SERVER_PREVIEW,
 			previewLaunchConfig: { host: "warren.example.com" },
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 			annotatePrPreview: annotate.annotate,
 		});
@@ -1294,7 +1295,7 @@ describe("reapRun", () => {
 			openPr: pr.openPr,
 			previewConfig: SERVER_PREVIEW,
 			previewLaunchConfig: { host: null },
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 			annotatePrPreview: annotate.annotate,
 		});
@@ -1333,7 +1334,7 @@ describe("reapRun", () => {
 			openPr: pr.openPr,
 			previewConfig: SERVER_PREVIEW,
 			previewLaunchConfig: { host: null },
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 			annotatePrPreview: annotate.annotate,
 		});
@@ -1361,7 +1362,7 @@ describe("reapRun", () => {
 			openPr: pr.openPr,
 			previewConfig: SERVER_PREVIEW,
 			previewLaunchConfig: { host: "warren.example.com" },
-			portAllocator: new PreviewPortAllocator(ctx.db),
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
 			launchPreview: launch.launch,
 			annotatePrPreview: annotate.annotate,
 		});

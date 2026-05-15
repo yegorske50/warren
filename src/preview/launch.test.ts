@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { ServerPreviewConfig } from "../warren-config/index.ts";
 import {
@@ -108,7 +109,7 @@ describe("launchPreview", () => {
 		});
 		runId = run.id;
 		burrowId = "bur_aaaa";
-		allocator = new PreviewPortAllocator(db, { start: 40000, end: 40002 });
+		allocator = new PreviewPortAllocator(DrizzleAdapter.for(db), { start: 40000, end: 40002 });
 	});
 
 	afterEach(async () => {
@@ -177,7 +178,10 @@ describe("launchPreview", () => {
 
 	test("returns port_exhausted when the allocator has no free ports", async () => {
 		// Pre-fill both ports in the tiny 40000-40001 range.
-		const tinyAllocator = new PreviewPortAllocator(db, { start: 40000, end: 40001 });
+		const tinyAllocator = new PreviewPortAllocator(DrizzleAdapter.for(db), {
+			start: 40000,
+			end: 40001,
+		});
 		const occupant1 = await repos.runs.create({
 			agentName: "agent",
 			projectId: (await repos.projects.listAll())[0]?.id as string,

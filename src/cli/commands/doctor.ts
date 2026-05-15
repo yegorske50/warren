@@ -21,6 +21,7 @@ import { BurrowClient } from "../../burrow-client/client.ts";
 import { loadBurrowClientConfigFromEnv } from "../../burrow-client/config.ts";
 import { ValidationError } from "../../core/errors.ts";
 import type { AnyWarrenDb } from "../../db/client.ts";
+import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import {
 	checkBurrowReachable,
 	checkBwrap,
@@ -195,16 +196,8 @@ async function previewPortAllocatorCheck(
 		};
 	}
 	// Allocator construction is non-destructive — usage() is a pure read
-	// against the runs table. Sqlite-only today; the pg branch lights up
-	// when the repo layer becomes dialect-aware (pl-f17e follow-up).
-	if (db.dialect !== "sqlite") {
-		return {
-			name: "preview_port_allocator",
-			ok: true,
-			message: `dialect=${db.dialect} (allocator usage probe is sqlite-only today)`,
-		};
-	}
-	const allocator = new PreviewPortAllocator(db, range);
+	// against the runs table. Dialect-polymorphic since warren-adfb.
+	const allocator = new PreviewPortAllocator(DrizzleAdapter.for(db), range);
 	return checkPreviewPortAllocator({ probe: allocator });
 }
 

@@ -26,6 +26,7 @@
 import pino from "pino";
 import { BurrowClientPool } from "../burrow-client/index.ts";
 import { type AnyWarrenDb, openDatabase, WARREN_DB_POOL_MAX_ENV } from "../db/client.ts";
+import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos } from "../db/repos/index.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
 import { createPreviewAuth, type PreviewAuth } from "../preview/cookie.ts";
@@ -153,12 +154,10 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	const warrenConfigs = createWarrenConfigCache();
 	const runBranchPrefixDefault = loadRunBranchPrefixFromEnv(env);
 	const previewPortRange = loadPreviewPortRangeFromEnv(env);
-	// The SQLite-backed port allocator is the only dialect today (warren-2277);
-	// the postgres branch lights up when the repo layer becomes dialect-aware
-	// (pl-f17e follow-up). Until then, postgres deployments skip preview
-	// launches at the boot wiring step — same as `/readyz` (mx-b82a55).
-	const portAllocator =
-		db.dialect === "sqlite" ? new PreviewPortAllocator(db, previewPortRange) : undefined;
+	// Dialect-polymorphic allocator (warren-adfb): sqlite uses BEGIN/COMMIT
+	// + per-instance mutex; postgres adds `pg_advisory_xact_lock` for cross-
+	// process serialization. Constructed unconditionally for both dialects.
+	const portAllocator = new PreviewPortAllocator(DrizzleAdapter.for(db), previewPortRange);
 	const previewLaunchConfig = loadPreviewLaunchConfigFromEnv(env);
 	const previewEvictionConfig = loadPreviewEvictionConfigFromEnv(env);
 
@@ -169,7 +168,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		logger: bridgeLoggerFromPino(logger),
 		autoOpenPr,
 		warrenConfigs,
-		...(portAllocator !== undefined ? { portAllocator } : {}),
+		portAllocator,
 		previewLaunchConfig,
 	});
 	if (bridgesBoot.resumed.length > 0) {
@@ -248,34 +247,29 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	}
 
 	// Preview TTL + LRU eviction worker (R-19 / SPEC §11.L, warren-ea6b).
-	// Same sqlite-only gate as the port allocator: postgres deploys skip the
-	// worker until the repo layer becomes dialect-aware (pl-f17e follow-up).
-	const previewEvictionWorker =
-		db.dialect === "sqlite"
-			? startPreviewEvictionWorker({
-					db,
-					repos,
-					burrowClientPool,
-					warrenConfigs,
-					config: previewEvictionConfig,
-					logger: previewEvictionLoggerFromPino(logger),
-					...(opts.now !== undefined ? { now: opts.now } : {}),
-				})
-			: null;
-	if (previewEvictionWorker !== null) {
-		if (previewEvictionConfig.disabled) {
-			logger.info({}, "preview eviction disabled via WARREN_PREVIEW_EVICTION_DISABLED");
-		} else {
-			logger.info(
-				{
-					tickMs: previewEvictionConfig.tickMs,
-					idleTtlMs: previewEvictionConfig.idleTtlMs,
-					maxLifetimeMs: previewEvictionConfig.maxLifetimeMs,
-					maxLive: previewEvictionConfig.maxLive,
-				},
-				"preview eviction worker running",
-			);
-		}
+	// Dialect-polymorphic since warren-adfb (createRunPreviewsRepo runs on
+	// either backend).
+	const previewEvictionWorker = startPreviewEvictionWorker({
+		db,
+		repos,
+		burrowClientPool,
+		warrenConfigs,
+		config: previewEvictionConfig,
+		logger: previewEvictionLoggerFromPino(logger),
+		...(opts.now !== undefined ? { now: opts.now } : {}),
+	});
+	if (previewEvictionConfig.disabled) {
+		logger.info({}, "preview eviction disabled via WARREN_PREVIEW_EVICTION_DISABLED");
+	} else {
+		logger.info(
+			{
+				tickMs: previewEvictionConfig.tickMs,
+				idleTtlMs: previewEvictionConfig.idleTtlMs,
+				maxLifetimeMs: previewEvictionConfig.maxLifetimeMs,
+				maxLive: previewEvictionConfig.maxLive,
+			},
+			"preview eviction worker running",
+		);
 	}
 
 	// Preview signed-cookie auth (R-19 / SPEC §11.L, warren-8a10). Both
@@ -350,7 +344,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			// spawnRun before bridges/burrow/db disappear under it.
 			await handle.stop();
 			await scheduler.stop();
-			if (previewEvictionWorker !== null) await previewEvictionWorker.stop();
+			await previewEvictionWorker.stop();
 			await workerProbe.stop();
 			await bridgesBoot.registry.stopAll();
 			await burrowClientPool.close();
