@@ -1,15 +1,31 @@
-# Per-project trigger entries (SPEC §11.H).
+# .warren/triggers.yaml — scheduled runs for this project (SPEC §11.I, R-06).
 #
-# Only `kind: cron` is implemented today (R-02 ships the loader; R-06 will
-# wire croner-backed dispatch). Each entry needs: id, kind, cron, seed, role.
-# `timezone` and `prompt` are optional.
+# Each entry is a cron-style trigger. Warren ticks once a minute and
+# spawns a run when a trigger is due. Today only `kind: cron` is
+# implemented; the `kind:` discriminator leaves room for future
+# webhook-style triggers without a breaking schema rev.
 #
-# Example shape:
+# Required fields: id, kind, cron, seed, role.
+# Optional fields: timezone (default UTC), prompt.
 #
-#   - id: nightly-readyz
-#     kind: cron
-#     cron: "0 4 * * *"
-#     seed: warren-xxxx
-#     role: claude-code
-#     timezone: America/Los_Angeles
-#     prompt: "Audit /readyz output and file seeds for any failing checks."
+# Field rules (TriggersConfigSchema in src/warren-config/schema.ts):
+#   id        kebab/snake-case (lowercase, digits, dots, dashes, _). Unique.
+#   kind      'cron'
+#   cron      5 or 6 whitespace-separated fields (croner-compatible)
+#   seed      seed id the agent reads + writes (e.g. warren-xxxx)
+#   role      registered agent name (kebab/snake-case)
+#   timezone  IANA tz name, e.g. America/Los_Angeles
+#   prompt    pre-filled into the agent; multi-line ok via `|`
+#
+# Example (uncomment to enable):
+#
+# - id: nightly-housekeeping
+#   kind: cron
+#   cron: '0 3 * * *'          # 03:00 daily
+#   seed: warren-housekeep
+#   role: claude-code
+#   timezone: America/Los_Angeles
+#   prompt: |
+#     Run the housekeeping checklist and file seeds for anything off.
+
+[]

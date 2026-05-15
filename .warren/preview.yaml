@@ -1,0 +1,24 @@
+# .warren/preview.yaml — per-run preview environment (warren-5840, SPEC §11.L).
+#
+# The top-level document IS the preview block (no `preview:` wrapper key).
+# Uncomment the block below to enable per-run previews. Until you do,
+# warren skips the reap-time preview launch sub-step (this is a no-op).
+#
+# Schema lives at PreviewConfigSchema in src/warren-config/schema.ts.
+# Launcher: src/preview/launch.ts. Eviction: src/preview/eviction.ts.
+
+# type: server              # discriminator; V1 only implements 'server'.
+#                           # 'static' parses but launcher rejects with
+#                           # a not-yet-implemented error (deferred).
+# mode: path                # 'path' | 'subdomain'. Optional per-project pin
+#                           # of routing mode. WARREN_PREVIEW_MODE env wins
+#                           # on conflict. Default when neither set: path.
+# command: bun run dev      # required — shell command the sandbox runs
+# port: 3000                # required — int 1..65535. Privileged ports ok;
+#                           # the sandbox is unprivileged-by-namespace.
+# readiness_path: /healthz  # optional; must start with '/'. Launcher probes
+#                           # this to decide the server is up.
+# idle_ttl: 30m             # optional — kill after this much idle time.
+#                           # Format: one or more <number><unit> pairs,
+#                           # units ms|s|m|h|d (e.g. "30m", "1h30m").
+# max_lifetime: 8h          # optional — hard ceiling regardless of activity.

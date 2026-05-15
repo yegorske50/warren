@@ -1,0 +1,43 @@
+# .warren/config.yaml — per-project warren defaults (warren-5840 layout).
+#
+# Supersedes the legacy .warren/defaults.json. All fields are optional.
+# See SPEC §11.H for the schema and .warren/MIGRATION.md for before/after.
+# Every key here matches DefaultsConfigSchema in src/warren-config/schema.ts.
+#
+# Precedence at spawn time: operator override (per-run) > project default
+# (this file) > agent frontmatter > built-in.
+
+# ── Active defaults ─────────────────────────────────────────────────────
+# These were migrated from .warren/defaults.json. Edit freely.
+
+defaultRole: pi
+defaultBranch: main
+defaultProvider: anthropic
+defaultModel: claude-opus-4-7
+
+# ── Optional knobs (uncomment to set) ───────────────────────────────────
+
+# Pre-fills the NewRun UI prompt textarea and is used as the prompt for
+# scheduled runs that don't carry their own. Free-form multi-line ok.
+# defaultPrompt: |
+#   Read the seed, plan in <= 5 steps, execute, push a branch.
+
+# Prefix for the burrow branch warren passes to `burrows.up`. The full
+# branch is `<runBranchPrefix>/<run.id>` (e.g. warren/run_abc123).
+# Must be kebab/snake-case (lowercase, digits, dots, dashes, underscores;
+# no slashes). Precedence: this field > WARREN_RUN_BRANCH_PREFIX env >
+# built-in "burrow".
+runBranchPrefix: warren
+
+# Per-run preview environment. CANONICAL home is .warren/preview.yaml
+# (top-level document = the preview block itself). The nested form below
+# is still accepted here for smooth migration; preview.yaml wins on
+# conflict. See preview.yaml in this dir for a fully-documented stub.
+# preview:
+#   type: server          # only 'server' implemented in V1; 'static' deferred
+#   mode: path            # 'path' | 'subdomain'  (operator WARREN_PREVIEW_MODE wins)
+#   command: bun run dev
+#   port: 3000
+#   readiness_path: /healthz
+#   idle_ttl: 30m         # <number><unit> pairs, units: ms, s, m, h, d
+#   max_lifetime: 8h

@@ -1,6 +1,0 @@
-{
-	"defaultRole": "pi",
-	"defaultBranch": "main",
-	"defaultProvider": "anthropic",
-	"defaultModel": "claude-opus-4-7"
-}
