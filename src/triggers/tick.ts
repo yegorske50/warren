@@ -14,10 +14,16 @@
  *
  *   3. Shells out to `sd list --format json` for scheduled-for seeds and
  *      dispatches the past-due ones via `dispatchScheduledSeed`.
- *      Post-dispatch, calls `clearScheduledFor`; any failure here is
- *      surfaced as a `trigger.cleared_extension_failed` system event on
- *      the dispatched run so the operator sees the lingering extension
- *      without tailing logs (pl-2f15 risk #4).
+ *      Post-dispatch, fires a single `updateExtensions` merge that
+ *      combines the scheduled-fire clear (`scheduledFor:null,
+ *      lastScheduledRun`) with the warren-namespaced common keys
+ *      (`role, trigger:'scheduled', lastRunId, lastRunAt`) so the seed
+ *      lands in its post-fire state with one sd update (pl-bb70 step 5,
+ *      consolidating the prior `clearScheduledFor` specialization).
+ *      Any failure here is surfaced as a
+ *      `trigger.cleared_extension_failed` system event on the dispatched
+ *      run so the operator sees the lingering extension without tailing
+ *      logs (pl-2f15 risk #4).
  *
  * Single-flight: `startScheduler` wraps the tick callback in a guard
  * that drops overlapping ticks instead of stacking them. A slow tick
@@ -31,7 +37,7 @@
 
 import type { Repos } from "../db/repos/index.ts";
 import type { ProjectRow } from "../db/schema.ts";
-import type { ScheduledSeed } from "../seeds-cli/index.ts";
+import type { ScheduledSeed, WarrenExtensions } from "../seeds-cli/index.ts";
 import type { LoadedWarrenConfig } from "../warren-config/index.ts";
 import {
 	type DispatchCronResult,
@@ -51,10 +57,17 @@ export type ListScheduledSeedsFn = (projectPath: string) => Promise<{
 	errors: readonly { seedId: string; message: string }[];
 }>;
 
-export type ClearScheduledForFn = (
+/**
+ * Shell-out facade injected from `bootScheduler` — wraps `sd update <id>
+ * --extensions <json>` so the tick can merge the post-fire extension
+ * payload in one call. The tick composes the `WarrenExtensions` object
+ * (validated downstream by `WarrenExtensionsSchema` inside the helper)
+ * so this dep stays a thin pass-through suitable for test stubs.
+ */
+export type UpdateSeedExtensionsFn = (
 	projectPath: string,
 	seedId: string,
-	runId: string,
+	extensions: WarrenExtensions,
 ) => Promise<void>;
 
 export interface TickLogger {
@@ -67,7 +80,7 @@ export interface TickDeps {
 	readonly repos: Pick<Repos, "projects" | "triggers" | "runs" | "events">;
 	readonly loadWarrenConfig: LoadWarrenConfigFn;
 	readonly listScheduledSeeds: ListScheduledSeedsFn;
-	readonly clearScheduledFor: ClearScheduledForFn;
+	readonly updateExtensions: UpdateSeedExtensionsFn;
 	readonly spawn: DispatchSpawnFn;
 	readonly now?: () => Date;
 	readonly logger?: TickLogger;
@@ -122,6 +135,7 @@ interface RunProjectTickInput {
 
 async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 	const { deps, project, now, cron, scheduled } = input;
+	const nowIso = now.toISOString();
 	const config = await deps.loadWarrenConfig(project.id, project.localPath);
 
 	// Surface .warren/ parse errors at info-level — the GET /warren-config
@@ -181,12 +195,23 @@ async function runProjectTick(input: RunProjectTickInput): Promise<void> {
 
 		if (result.kind === "fired") {
 			// Risk #4: write-once semantics. We dispatched the seed; even if
-			// the clear fails, the run id is in seed extensions via
-			// lastScheduledRun ONLY if the clear succeeds. If it fails we
-			// stamp a system event on the run so the operator sees the
-			// lingering scheduledFor without tailing logs.
+			// the merged extension write fails, the warren-side run row is
+			// authoritative. Failure stamps a system event on the run so the
+			// operator sees the lingering scheduledFor without tailing logs.
+			// pl-bb70 step 5: collapse the prior clearScheduledFor + (no-op
+			// spawn-side write) into one sd update that carries scheduledFor
+			// clear + lastScheduledRun pointer + the warren-namespaced common
+			// keys (role, trigger, lastRunId, lastRunAt).
+			const extensions: WarrenExtensions = {
+				role: result.role,
+				trigger: "scheduled",
+				lastRunId: result.runId,
+				lastRunAt: nowIso,
+				scheduledFor: null,
+				lastScheduledRun: result.runId,
+			};
 			try {
-				await deps.clearScheduledFor(project.localPath, result.seedId, result.runId);
+				await deps.updateExtensions(project.localPath, result.seedId, extensions);
 			} catch (err) {
 				await recordClearFailure(deps, result.runId, result.seedId, formatError(err));
 			}

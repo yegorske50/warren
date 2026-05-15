@@ -26,7 +26,7 @@ import type { Repos } from "../db/repos/index.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import { spawnRun } from "../runs/index.ts";
-import { clearScheduledFor, listScheduledSeeds } from "../seeds-cli/index.ts";
+import { listScheduledSeeds, updateExtensions } from "../seeds-cli/index.ts";
 import {
 	type DispatchSpawnFn,
 	type DispatchSpawnInput,
@@ -105,8 +105,8 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 		repos: input.repos,
 		loadWarrenConfig: (projectId, projectPath) => input.warrenConfigs.get(projectId, projectPath),
 		listScheduledSeeds: (projectPath) => listScheduledSeeds(seedsDeps, projectPath),
-		clearScheduledFor: (projectPath, seedId, runId) =>
-			clearScheduledFor(seedsDeps, projectPath, seedId, runId),
+		updateExtensions: (projectPath, seedId, extensions) =>
+			updateExtensions(seedsDeps, projectPath, seedId, extensions),
 		spawn: spawnDispatch,
 		...(input.logger !== undefined ? { logger: input.logger } : {}),
 		...(input.now !== undefined ? { now: input.now } : {}),

@@ -311,7 +311,7 @@ describe("dispatchScheduledSeed", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	test("dispatches a past-due seed with trigger='scheduled'", async () => {
+	test("dispatches a past-due seed with trigger='scheduled' and surfaces the resolved role", async () => {
 		const { spawn, calls, lastRunId } = spawnRecorder(repos, projectId);
 		const result = await dispatchScheduledSeed({
 			projectId,
@@ -323,6 +323,11 @@ describe("dispatchScheduledSeed", () => {
 		expect(result.kind).toBe("fired");
 		if (result.kind !== "fired") return;
 		expect(result.runId).toBe(lastRunId() ?? "");
+		// pl-bb70 step 5: role is exposed on the fired result so the tick's
+		// post-fire updateExtensions merge can include `role` alongside
+		// `{trigger:'scheduled', lastRunId, lastRunAt, scheduledFor:null,
+		// lastScheduledRun}` in a single sd update.
+		expect(result.role).toBe("claude-code");
 		expect(calls[0]?.trigger).toBe("scheduled");
 		expect(calls[0]?.agentName).toBe("claude-code");
 		expect(calls[0]?.prompt).toBe("Sched body.");

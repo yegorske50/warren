@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
+import type { WarrenExtensions } from "../seeds-cli/index.ts";
 import type { LoadedWarrenConfig } from "../warren-config/index.ts";
 import type { DispatchSpawnFn } from "./dispatch.ts";
 import { runTick, startScheduler } from "./tick.ts";
@@ -66,7 +67,7 @@ describe("runTick", () => {
 			now: () => NOW,
 			loadWarrenConfig: async () => emptyConfig(),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "run_unused" }),
 		});
 		expect(result.cron).toEqual([]);
@@ -114,7 +115,7 @@ describe("runTick", () => {
 				warnings: [],
 			}),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn,
 		});
 
@@ -127,8 +128,8 @@ describe("runTick", () => {
 		expect(row.lastRunId).toBe(createdRunId);
 	});
 
-	test("fires past-due scheduled seeds and clears their extension", async () => {
-		const cleared: { seedId: string; runId: string; path: string }[] = [];
+	test("fires past-due scheduled seeds and merges all warren extension keys in one write", async () => {
+		const writes: { path: string; seedId: string; extensions: WarrenExtensions }[] = [];
 		const result = await runTick({
 			repos,
 			now: () => NOW,
@@ -152,18 +153,34 @@ describe("runTick", () => {
 					errors: [],
 				};
 			},
-			clearScheduledFor: async (path, seedId, runId) => {
-				cleared.push({ path, seedId, runId });
+			updateExtensions: async (path, seedId, extensions) => {
+				writes.push({ path, seedId, extensions });
 			},
 			spawn: async () => ({ runId: "run_sched" }),
 		});
 
 		expect(result.scheduled).toHaveLength(1);
 		expect(result.scheduled[0]?.kind).toBe("fired");
-		expect(cleared).toEqual([{ path: localPath, seedId: "warren-sched", runId: "run_sched" }]);
+		// pl-bb70 step 5: scheduledFor clear + lastScheduledRun + the common
+		// warren-namespaced keys (role, trigger, lastRunId, lastRunAt) land in
+		// a single sd update.
+		expect(writes).toEqual([
+			{
+				path: localPath,
+				seedId: "warren-sched",
+				extensions: {
+					role: "claude-code",
+					trigger: "scheduled",
+					lastRunId: "run_sched",
+					lastRunAt: NOW.toISOString(),
+					scheduledFor: null,
+					lastScheduledRun: "run_sched",
+				},
+			},
+		]);
 	});
 
-	test("clear-failure stamps a system event on the dispatched run (risk #4)", async () => {
+	test("extension-write failure stamps a system event on the dispatched run (risk #4)", async () => {
 		// The system event is appended against the *warren-side* run row,
 		// so we need a real run row to satisfy the FK. Spawn returns an id
 		// the runs repo created.
@@ -197,7 +214,7 @@ describe("runTick", () => {
 				],
 				errors: [],
 			}),
-			clearScheduledFor: async () => {
+			updateExtensions: async () => {
 				throw new Error("sd update exit 1");
 			},
 			spawn: async () => ({ runId: realRun.id }),
@@ -231,7 +248,7 @@ describe("runTick", () => {
 				if (path === localPath) throw new Error("sd boom");
 				return { scheduled: [], errors: [] };
 			},
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "n/a" }),
 			logger,
 		});
@@ -259,7 +276,7 @@ describe("runTick", () => {
 				return emptyConfig();
 			},
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "n/a" }),
 		});
 
@@ -282,7 +299,7 @@ describe("startScheduler", () => {
 			},
 			loadWarrenConfig: async () => emptyConfig(),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "n/a" }),
 		});
 
@@ -316,7 +333,7 @@ describe("startScheduler", () => {
 					resolveInflight = () => resolve(emptyConfig());
 				}),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "n/a" }),
 			logger,
 		});
@@ -341,7 +358,7 @@ describe("startScheduler", () => {
 			},
 			loadWarrenConfig: async () => emptyConfig(),
 			listScheduledSeeds: async () => ({ scheduled: [], errors: [] }),
-			clearScheduledFor: async () => {},
+			updateExtensions: async () => {},
 			spawn: async () => ({ runId: "n/a" }),
 		});
 

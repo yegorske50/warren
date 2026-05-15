@@ -163,7 +163,7 @@ describe("bootScheduler", () => {
 		expect(bridgeCalls[0]?.burrowRunId).toBe("rb_a");
 	});
 
-	test("listScheduledSeeds + clearScheduledFor use the configured sdBinary and projectSpawn", async () => {
+	test("listScheduledSeeds + updateExtensions use the configured sdBinary and projectSpawn", async () => {
 		const bridgeCalls: BridgeCall[] = [];
 		const warrenConfigs = createWarrenConfigCache({
 			load: async () => ({
@@ -230,7 +230,9 @@ describe("bootScheduler", () => {
 		await handle.stop();
 
 		expect(result?.scheduled).toHaveLength(1);
-		expect(result?.scheduled[0]?.kind).toBe("fired");
+		const fired = result?.scheduled[0];
+		expect(fired?.kind).toBe("fired");
+		const runId = fired?.kind === "fired" ? fired.runId : "";
 		const listCall = spawnCalls.find((c) => c.cmd[1] === "list");
 		const updateCall = spawnCalls.find((c) => c.cmd[1] === "update");
 		expect(listCall?.cmd).toEqual(["sd-test", "list", "--format", "json"]);
@@ -238,7 +240,23 @@ describe("bootScheduler", () => {
 		expect(updateCall?.cmd[0]).toBe("sd-test");
 		expect(updateCall?.cmd[1]).toBe("update");
 		expect(updateCall?.cmd[2]).toBe("warren-zzzz");
+		expect(updateCall?.cmd[3]).toBe("--extensions");
+		// pl-bb70 step 5: cron tick's post-fire write is a single sd update
+		// that merges scheduledFor clear + lastScheduledRun + the warren
+		// common keys (role/trigger/lastRunId/lastRunAt).
+		expect(JSON.parse(updateCall?.cmd[4] ?? "{}")).toEqual({
+			role: "claude-code",
+			trigger: "scheduled",
+			lastRunId: runId,
+			lastRunAt: NOW.toISOString(),
+			scheduledFor: null,
+			lastScheduledRun: runId,
+		});
 		expect(updateCall?.cwd).toBe(projectPath);
+		// Only one sd update (single merged write — not two as the old
+		// clearScheduledFor + spawn-side writeSeedExtensions pair would
+		// have produced).
+		expect(spawnCalls.filter((c) => c.cmd[1] === "update")).toHaveLength(1);
 		expect(bridgeCalls).toHaveLength(1);
 	});
 

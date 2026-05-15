@@ -169,14 +169,28 @@ export interface DispatchScheduledInput {
 }
 
 export type DispatchScheduledResult =
-	| { readonly kind: "fired"; readonly runId: string; readonly seedId: string }
+	| {
+			readonly kind: "fired";
+			readonly runId: string;
+			readonly seedId: string;
+			/**
+			 * Resolved agent the seed was dispatched against (defaults.defaultRole).
+			 * Exposed so the tick's post-fire `updateExtensions` write can merge
+			 * `role` alongside `{scheduledFor:null, lastScheduledRun, lastRunId,
+			 * lastRunAt, trigger:'scheduled'}` in a single sd update (pl-bb70
+			 * step 5 / warren-2064).
+			 */
+			readonly role: string;
+	  }
 	| { readonly kind: "skipped"; readonly seedId: string; readonly reason: string }
 	| { readonly kind: "error"; readonly seedId: string; readonly reason: string };
 
 /**
  * Decide-and-spawn for a single scheduled seed. Returns `{kind: 'fired',
- * runId}` so the caller can clear the seed's extensions and surface
- * clear-failures as a system event on the run.
+ * runId, role}` so the caller can merge the full warren-namespaced
+ * extension payload (role + trigger + lastRunId + lastRunAt + scheduledFor
+ * clear + lastScheduledRun pointer) into the seed in a single sd update,
+ * and surface extension-write failures as a system event on the run.
  */
 export async function dispatchScheduledSeed(
 	input: DispatchScheduledInput,
@@ -203,7 +217,7 @@ export async function dispatchScheduledSeed(
 			trigger: "scheduled",
 			metadata: { seedId: input.seed.id, scheduledFor: input.seed.scheduledFor.toISOString() },
 		});
-		return { kind: "fired", runId: spawned.runId, seedId: input.seed.id };
+		return { kind: "fired", runId: spawned.runId, seedId: input.seed.id, role };
 	} catch (err) {
 		return {
 			kind: "error",
