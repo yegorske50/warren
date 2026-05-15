@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+	DEFAULT_PREVIEW_MODE,
 	DefaultsConfigSchema,
 	PreviewConfigSchema,
+	PreviewModeSchema,
 	parseDefaultsConfig,
+	parsePreviewFile,
 	parseTriggersConfig,
 	TriggersConfigSchema,
 } from "./schema.ts";
@@ -266,6 +269,76 @@ describe("PreviewConfigSchema", () => {
 		if (parsed.success && parsed.data.type === "server") {
 			expect(parsed.data.idle_ttl).toBe("30m");
 			expect(parsed.data.max_lifetime).toBe("8h");
+		}
+	});
+});
+
+// warren-fcb7 / SPEC §11.L path-mode addendum (pl-f4ea): operators can pin a
+// routing mode in `.warren/preview.yaml`; env wins on conflict (asserted by
+// the launch.test.ts loader tests). The schema accepts the field on both
+// discriminated-union members so per-project pinning works regardless of
+// whether the preview ends up implemented as type:'server' or type:'static'.
+describe("PreviewConfigSchema preview mode", () => {
+	test("DEFAULT_PREVIEW_MODE is 'path' (zero-domain operators win by default)", () => {
+		expect(DEFAULT_PREVIEW_MODE).toBe("path");
+	});
+
+	test("PreviewModeSchema accepts 'path' and 'subdomain'", () => {
+		expect(PreviewModeSchema.safeParse("path").success).toBe(true);
+		expect(PreviewModeSchema.safeParse("subdomain").success).toBe(true);
+	});
+
+	test("PreviewModeSchema rejects unknown values (no silent typos)", () => {
+		expect(PreviewModeSchema.safeParse("PATH").success).toBe(false);
+		expect(PreviewModeSchema.safeParse("subDomain").success).toBe(false);
+		expect(PreviewModeSchema.safeParse("").success).toBe(false);
+		expect(PreviewModeSchema.safeParse(null).success).toBe(false);
+	});
+
+	test("accepts server preview with mode: 'path'", () => {
+		const parsed = PreviewConfigSchema.safeParse({ ...VALID_SERVER_PREVIEW, mode: "path" });
+		expect(parsed.success).toBe(true);
+		if (parsed.success && parsed.data.type === "server") {
+			expect(parsed.data.mode).toBe("path");
+		}
+	});
+
+	test("accepts server preview with mode: 'subdomain'", () => {
+		const parsed = PreviewConfigSchema.safeParse({ ...VALID_SERVER_PREVIEW, mode: "subdomain" });
+		expect(parsed.success).toBe(true);
+	});
+
+	test("accepts server preview without mode (operator env decides)", () => {
+		const parsed = PreviewConfigSchema.safeParse(VALID_SERVER_PREVIEW);
+		expect(parsed.success).toBe(true);
+		if (parsed.success && parsed.data.type === "server") {
+			expect(parsed.data.mode).toBeUndefined();
+		}
+	});
+
+	test("rejects unknown mode values on server preview", () => {
+		const parsed = PreviewConfigSchema.safeParse({ ...VALID_SERVER_PREVIEW, mode: "lambda" });
+		expect(parsed.success).toBe(false);
+	});
+
+	test("accepts static preview with mode (passthrough stays permissive)", () => {
+		const parsed = PreviewConfigSchema.safeParse({ type: "static", mode: "subdomain" });
+		expect(parsed.success).toBe(true);
+	});
+
+	test("parsePreviewFile threads mode into the parsed value", () => {
+		const result = parsePreviewFile({ ...VALID_SERVER_PREVIEW, mode: "subdomain" });
+		expect(result.ok).toBe(true);
+		if (result.ok && result.value !== null && result.value.type === "server") {
+			expect(result.value.mode).toBe("subdomain");
+		}
+	});
+
+	test("parsePreviewFile surfaces unknown mode values via the error envelope", () => {
+		const result = parsePreviewFile({ ...VALID_SERVER_PREVIEW, mode: "weird" });
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.message).toMatch(/mode/);
 		}
 	});
 });

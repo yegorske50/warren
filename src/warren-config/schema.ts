@@ -10,7 +10,11 @@
  *
  * `parseConfigFile` parses `config.yaml` / legacy `defaults.json` against
  * `DefaultsConfigSchema`. `parsePreviewFile` parses a standalone
- * `preview.yaml` whose top-level document is the preview block itself.
+ * `preview.yaml` whose top-level document is the preview block itself. The
+ * preview block accepts an optional `mode: path | subdomain` field
+ * (warren-fcb7 / SPEC §11.L path-mode addendum) so a project can pin a
+ * routing mode for its previews; `WARREN_PREVIEW_MODE` (operator-facing,
+ * env) wins on conflict — precedence is enforced at consumption time.
  *
  * Triggers carry a `kind: 'cron'` discriminator even though only cron is
  * implemented today. Per pl-5d74 risk #1, this leaves room for future
@@ -116,6 +120,19 @@ const PreviewReadinessPathSchema = z
 	.min(1, "preview.readiness_path must be non-empty if provided")
 	.regex(/^\//, "preview.readiness_path must start with '/'");
 
+// warren-fcb7 / SPEC §11.L (path-mode addendum, pl-f4ea): per-project pin of
+// the preview routing mode. Operator-facing surface is `WARREN_PREVIEW_MODE`
+// in env; this top-level field on `.warren/preview.yaml` lets a project
+// declare its own preference when the operator runs warren in a mixed
+// configuration. Env wins on conflict — merge precedence is enforced at
+// consumption time, not in this schema.
+export const PreviewModeSchema = z.enum(["path", "subdomain"]);
+
+export type PreviewMode = z.infer<typeof PreviewModeSchema>;
+
+/** Default routing mode when neither env nor per-project pin is set. */
+export const DEFAULT_PREVIEW_MODE: PreviewMode = "path";
+
 // warren-7be9 / SPEC §11.L: the schema carries a `type` discriminator from
 // day one so V2 can add `type: 'static'` (build step + dir to serve) without
 // breaking the config. V1 implements only `type: 'server'`. `type: 'static'`
@@ -124,6 +141,7 @@ const PreviewReadinessPathSchema = z
 const ServerPreviewConfigSchema = z
 	.object({
 		type: z.literal("server"),
+		mode: PreviewModeSchema.optional(),
 		command: PreviewCommandSchema,
 		port: PreviewPortSchema,
 		readiness_path: PreviewReadinessPathSchema.optional(),
@@ -139,6 +157,7 @@ const ServerPreviewConfigSchema = z
 const StaticPreviewConfigSchema = z
 	.object({
 		type: z.literal("static"),
+		mode: PreviewModeSchema.optional(),
 	})
 	.passthrough();
 

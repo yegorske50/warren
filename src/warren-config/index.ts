@@ -31,11 +31,14 @@ export {
 } from "./load.ts";
 export {
 	type CronTrigger,
+	DEFAULT_PREVIEW_MODE,
 	type DefaultsConfig,
 	DefaultsConfigSchema,
 	type ParseResult,
 	type PreviewConfig,
 	PreviewConfigSchema,
+	type PreviewMode,
+	PreviewModeSchema,
 	parseConfigFile,
 	parseDefaultsConfig,
 	parsePreviewFile,
