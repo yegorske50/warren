@@ -3,6 +3,7 @@ import {
 	COOKIE_NAME,
 	COOKIE_VERSION,
 	createPreviewAuth,
+	DEFAULT_COOKIE_PATH_PREFIX,
 	DEFAULT_COOKIE_TTL_MS,
 	extractCookieValue,
 } from "./cookie.ts";
@@ -39,8 +40,10 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		expect(auth.verifyCookie(`${COOKIE_NAME}=${cookie.value}`, "run_abc", now)).toBe(true);
 	});
 
-	test("Set-Cookie header includes scoped attributes when domain is provided", () => {
-		const auth = createPreviewAuth(TOKEN, { cookieDomain: ".preview.example.com" });
+	test("Set-Cookie header includes scoped attributes when subdomain mode pins a Domain", () => {
+		const auth = createPreviewAuth(TOKEN, {
+			scope: { mode: "subdomain", cookieDomain: ".preview.example.com" },
+		});
 		const cookie = auth.signCookie("run_abc", new Date());
 		expect(cookie.setCookieHeader).toContain(`${COOKIE_NAME}=`);
 		expect(cookie.setCookieHeader).toContain("Path=/");
@@ -49,6 +52,50 @@ describe("createPreviewAuth.signCookie / verifyCookie", () => {
 		expect(cookie.setCookieHeader).toContain("Secure");
 		expect(cookie.setCookieHeader).toContain("Domain=.preview.example.com");
 		expect(cookie.setCookieHeader).toContain("Max-Age=");
+	});
+
+	test("path mode emits Path=/p/<runId>/ with no Domain attribute", () => {
+		const auth = createPreviewAuth(TOKEN, { scope: { mode: "path" } });
+		const cookie = auth.signCookie("run_abc", new Date());
+		expect(cookie.setCookieHeader).toContain(`${COOKIE_NAME}=`);
+		expect(cookie.setCookieHeader).toContain(`Path=${DEFAULT_COOKIE_PATH_PREFIX}/run_abc/`);
+		expect(cookie.setCookieHeader).not.toContain("Domain=");
+		expect(cookie.setCookieHeader).not.toContain("Path=/;");
+		expect(cookie.setCookieHeader).toContain("HttpOnly");
+		expect(cookie.setCookieHeader).toContain("SameSite=Lax");
+		expect(cookie.setCookieHeader).toContain("Secure");
+		expect(cookie.setCookieHeader).toContain("Max-Age=");
+	});
+
+	test("path mode honors a custom pathPrefix", () => {
+		const auth = createPreviewAuth(TOKEN, {
+			scope: { mode: "path", pathPrefix: "/preview" },
+		});
+		const cookie = auth.signCookie("run_abc", new Date());
+		expect(cookie.setCookieHeader).toContain("Path=/preview/run_abc/");
+	});
+
+	test("path mode rejects an invalid pathPrefix", () => {
+		expect(() => createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "" } })).toThrow();
+		expect(() => createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "p" } })).toThrow();
+		expect(() =>
+			createPreviewAuth(TOKEN, { scope: { mode: "path", pathPrefix: "/p/" } }),
+		).toThrow();
+	});
+
+	test("two runs scoped under the same path-mode auth get disjoint Path attributes", () => {
+		const auth = createPreviewAuth(TOKEN, { scope: { mode: "path" } });
+		const a = auth.signCookie("run_abc", new Date());
+		const b = auth.signCookie("run_xyz", new Date());
+		expect(a.setCookieHeader).toContain("Path=/p/run_abc/");
+		expect(b.setCookieHeader).toContain("Path=/p/run_xyz/");
+	});
+
+	test("default scope (no options) stays host-only subdomain — no Domain attribute", () => {
+		const auth = createPreviewAuth(TOKEN);
+		const cookie = auth.signCookie("run_abc", new Date());
+		expect(cookie.setCookieHeader).toContain("Path=/");
+		expect(cookie.setCookieHeader).not.toContain("Domain=");
 	});
 
 	test("Secure attribute can be disabled for local http loopback tests", () => {

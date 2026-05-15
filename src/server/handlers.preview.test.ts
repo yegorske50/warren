@@ -32,6 +32,7 @@ async function depsFor(
 	repos: Repos,
 	previewAuth: PreviewAuth | undefined,
 	db?: WarrenDb,
+	previewMode: "subdomain" | "path" = "subdomain",
 ): Promise<{ deps: ServerDeps; bridges: BridgeRegistry }> {
 	const client = makeBurrowClient();
 	await repos.workers.upsert({ name: "local", url: "unix:///tmp/x.sock" });
@@ -44,6 +45,12 @@ async function depsFor(
 		burrowClientPool,
 		bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 	});
+	const previewExtras =
+		previewAuth === undefined
+			? {}
+			: previewMode === "path"
+				? { previewAuth, previewMode: "path" as const }
+				: { previewAuth, previewMode: "subdomain" as const, previewHost: HOST };
 	const deps: ServerDeps = {
 		repos,
 		burrowClientPool,
@@ -53,7 +60,7 @@ async function depsFor(
 		logger: silentLogger,
 		uiDistDir: null,
 		...(db !== undefined ? { db } : {}),
-		...(previewAuth !== undefined ? { previewAuth, previewHost: HOST } : {}),
+		...previewExtras,
 	};
 	return { deps, bridges };
 }
@@ -116,7 +123,10 @@ describe("GET /runs/:id/preview/login", () => {
 	});
 
 	test("issues a signed cookie and redirects to the run subdomain when token matches", async () => {
-		const previewAuth = createPreviewAuth(TOKEN, { cookieDomain: `.${HOST}`, secure: false });
+		const previewAuth = createPreviewAuth(TOKEN, {
+			scope: { mode: "subdomain", cookieDomain: `.${HOST}` },
+			secure: false,
+		});
 		const { deps } = await depsFor(repos, previewAuth);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -248,6 +258,137 @@ describe("GET /runs/:id/preview/login", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { error: { code: string } };
 		expect(body.error.code).toBe("validation_error");
+	});
+
+	describe("path mode (warren-edff)", () => {
+		test("302 with a Path=/p/<id>/ cookie and a same-origin redirect", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(TOKEN)}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(302);
+			const origin = tcpUrl(handle);
+			expect(res.headers.get("location")).toBe(`${origin}/p/${runId}/`);
+			const setCookie = res.headers.get("set-cookie");
+			expect(setCookie).toContain(`${COOKIE_NAME}=`);
+			expect(setCookie).toContain(`Path=/p/${runId}/`);
+			expect(setCookie).not.toContain("Domain=");
+		});
+
+		test("accepts a relative redirect under /p/<id>/", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(
+					TOKEN,
+				)}&redirect=${encodeURIComponent(`/p/${runId}/inner`)}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(302);
+			expect(res.headers.get("location")).toBe(`${tcpUrl(handle)}/p/${runId}/inner`);
+		});
+
+		test("400 when redirect points outside /p/<id>/", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(
+					TOKEN,
+				)}&redirect=${encodeURIComponent("/agents")}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as { error: { code: string } };
+			expect(body.error.code).toBe("preview_redirect_invalid");
+		});
+
+		test("400 when redirect targets a sibling run id", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(
+					TOKEN,
+				)}&redirect=${encodeURIComponent(`/p/run_otherrun/`)}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(400);
+		});
+
+		test("400 when redirect is cross-origin", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(
+					TOKEN,
+				)}&redirect=${encodeURIComponent(`https://evil.example.com/p/${runId}/`)}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(400);
+		});
+
+		test("path mode works without WARREN_PREVIEW_HOST", async () => {
+			// Regression for warren-edff: subdomain mode required previewHost
+			// in deps and 400'd without it. Path mode must NOT require it.
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			// Sanity: depsFor must NOT have wired previewHost.
+			expect(deps.previewHost).toBeUndefined();
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			});
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${runId}/preview/login?token=${encodeURIComponent(TOKEN)}`,
+				{ redirect: "manual" },
+			);
+			expect(res.status).toBe(302);
+		});
 	});
 });
 

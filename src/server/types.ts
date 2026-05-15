@@ -18,7 +18,7 @@ import type { ProjectsConfig } from "../projects/config.ts";
 import type { CanopyRegistryConfig } from "../registry/config.ts";
 import type { RunEventBroker } from "../runs/events.ts";
 import type { AutoOpenPrConfig } from "../runs/pr.ts";
-import type { WarrenConfigCache } from "../warren-config/index.ts";
+import type { PreviewMode, WarrenConfigCache } from "../warren-config/index.ts";
 
 /**
  * Error envelope rendered for every non-2xx response. Mirrors burrow's
@@ -174,19 +174,28 @@ export interface ServerDeps {
 	readonly previewMaxLive?: number;
 	/**
 	 * Operator's preview host suffix (R-19 / SPEC §11.L, warren-8a10).
-	 * Resolved at boot from `WARREN_PREVIEW_HOST`. When set, the request
-	 * pipeline runs the Host-match preview proxy preamble before the
-	 * normal auth + route match, and `GET /runs/:id/preview/login` issues
-	 * the signed-cookie handshake. Undefined → preview surface is off,
-	 * the login handler returns 503, and the proxy never inspects a
-	 * request.
+	 * Resolved at boot from `WARREN_PREVIEW_HOST`. In subdomain mode the
+	 * Host-match preview proxy preamble requires this; in path mode it
+	 * stays optional (previews ride on the warren host itself). Undefined
+	 * + subdomain mode → preview surface is off, the login handler returns
+	 * 400, and the proxy never inspects a request.
 	 */
 	readonly previewHost?: string;
 	/**
+	 * Preview routing mode (warren-edff / SPEC §11.L path addendum).
+	 * Drives the login handler's redirect validation: subdomain mode
+	 * targets `https://run-<id>.<host>/`; path mode targets the inbound
+	 * origin under `/p/<id>/`. Defaults to `subdomain` so legacy callers
+	 * that wire `previewAuth` without setting a mode keep their old
+	 * semantics; `bootServer` always sets this.
+	 */
+	readonly previewMode?: PreviewMode;
+	/**
 	 * Signed-cookie auth for the preview proxy (R-19 / SPEC §11.L,
 	 * warren-8a10). Bound at boot from `WARREN_API_TOKEN` (the same
-	 * bearer the rest of warren uses). Undefined when `WARREN_PREVIEW_HOST`
-	 * is unset or warren booted with `--no-auth`.
+	 * bearer the rest of warren uses). Undefined when the operator
+	 * disabled the preview surface (subdomain mode with no host) or
+	 * warren booted with `--no-auth`.
 	 */
 	readonly previewAuth?: PreviewAuth;
 }

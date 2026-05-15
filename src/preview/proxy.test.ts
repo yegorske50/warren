@@ -383,10 +383,11 @@ describe("createPreviewProxyHandler (path mode)", () => {
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		// Path mode runs against the warren origin: no Domain attribute
-		// on the cookie (warren-edff narrows scope to Path=/p/<id>/ in
-		// the next step; this step still HMAC-verifies against runId).
-		auth = createPreviewAuth(TOKEN, { secure: false, cookieDomain: null });
+		// Path mode runs against the warren origin: cookie scopes itself
+		// per-runId via Path=/p/<id>/ (warren-edff). The proxy preamble
+		// only HMAC-verifies the cookie value against runId — browser-
+		// enforced Path scope is what isolates sibling-run sessions.
+		auth = createPreviewAuth(TOKEN, { secure: false, scope: { mode: "path" } });
 		await repos.agents.upsert({ name: "agent", renderedJson: { sections: {} } });
 		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
@@ -854,7 +855,7 @@ describe("createPreviewProxyHandler (path mode) — HTML rewrites (warren-ab3a)"
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
-		auth = createPreviewAuth(TOKEN, { secure: false, cookieDomain: null });
+		auth = createPreviewAuth(TOKEN, { secure: false, scope: { mode: "path" } });
 		await repos.agents.upsert({ name: "agent", renderedJson: { sections: {} } });
 		const project = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",

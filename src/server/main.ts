@@ -272,15 +272,24 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
-	// Preview signed-cookie auth (R-19 / SPEC §11.L, warren-8a10). Both
-	// surfaces (login handshake + proxy preamble) need the same secret;
-	// derive from `WARREN_API_TOKEN` so a fresh-install operator doesn't
-	// have a second token to manage. Disabled when `WARREN_PREVIEW_HOST`
-	// is unset (no operator opt-in) or when warren booted with
-	// `--no-auth` (no token to derive from).
+	// Preview signed-cookie auth (R-19 / SPEC §11.L, warren-8a10; path-mode
+	// scope warren-edff). Both surfaces (login handshake + proxy preamble)
+	// need the same secret; derive from `WARREN_API_TOKEN` so a fresh-install
+	// operator doesn't have a second token to manage.
+	//
+	// Subdomain mode requires `WARREN_PREVIEW_HOST` (the cookie's Domain
+	// scope and the proxy's Host match both anchor to it). Path mode
+	// (default) doesn't — previews ride on the warren host itself, so the
+	// only disabler is `--no-auth` (no token to sign with).
 	const previewAuth: PreviewAuth | undefined =
-		previewLaunchConfig.host !== null && serverConfig.token !== null
-			? createPreviewAuth(serverConfig.token, { cookieDomain: `.${previewLaunchConfig.host}` })
+		serverConfig.token !== null &&
+		(previewLaunchConfig.mode === "path" || previewLaunchConfig.host !== null)
+			? createPreviewAuth(serverConfig.token, {
+					scope:
+						previewLaunchConfig.mode === "path"
+							? { mode: "path" }
+							: { mode: "subdomain", cookieDomain: `.${previewLaunchConfig.host}` },
+				})
 			: undefined;
 	const previewHostForDeps =
 		previewLaunchConfig.host !== null ? previewLaunchConfig.host : undefined;
@@ -301,6 +310,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		previewPortRange,
 		previewMaxLive: previewEvictionConfig.maxLive,
+		previewMode: previewLaunchConfig.mode,
 		...(previewHostForDeps !== undefined ? { previewHost: previewHostForDeps } : {}),
 		...(previewAuth !== undefined ? { previewAuth } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
@@ -311,19 +321,21 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 
 	// Wire the preview proxy preamble. Mode discriminator from
 	// `WARREN_PREVIEW_MODE` (warren-fcb7) picks the routing branch:
-	// subdomain mode keys off `Host: run-<id>.<host>` and so still
-	// requires `WARREN_PREVIEW_HOST`; path mode keys off the request
-	// pathname and the host gating relaxes in a follow-up step
-	// (warren-edff) that owns the cookie-scope half.
+	// subdomain mode keys off `Host: run-<id>.<host>` and requires
+	// `WARREN_PREVIEW_HOST`. Path mode (warren-edff) keys off the
+	// request pathname and works without a host — the proxy derives
+	// the preview origin from the inbound request, the cookie scopes
+	// itself per-runId via `Path=/p/<id>/`.
 	const previewProxy =
-		previewAuth !== undefined && previewLaunchConfig.host !== null
+		previewAuth !== undefined &&
+		(previewLaunchConfig.mode === "path" || previewLaunchConfig.host !== null)
 			? createPreviewProxyHandler({
 					repos,
 					previewAuth,
 					config:
 						previewLaunchConfig.mode === "path"
 							? { mode: "path", host: previewLaunchConfig.host }
-							: { mode: "subdomain", host: previewLaunchConfig.host },
+							: { mode: "subdomain", host: previewLaunchConfig.host as string },
 					...(opts.now !== undefined ? { now: opts.now } : {}),
 				})
 			: undefined;

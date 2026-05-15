@@ -715,13 +715,20 @@ function cancelRunHandler(deps: ServerDeps): RouteHandler {
 
 /**
  * `GET /runs/:id/preview/login?token=<bearer>&redirect=<absolute-url>`
- * (R-19 / SPEC §11.L, warren-8a10).
+ * (R-19 / SPEC §11.L, warren-8a10; path-mode redirect warren-edff).
  *
  * The signed-cookie handshake the preview proxy depends on. A browser
- * hitting `run-<id>.<host>` directly can't carry an Authorization
- * header, so the operator opens this URL on the warren host, the
- * handler validates the bearer in the query, sets a domain-scoped
- * `warren_preview` cookie, and redirects to the preview subdomain.
+ * hitting a preview origin directly can't carry an Authorization header,
+ * so the operator opens this URL on the warren host, the handler
+ * validates the bearer in the query, sets a scoped `warren_preview`
+ * cookie, and 302s to the preview.
+ *
+ *   - **Subdomain mode** (`deps.previewMode === "subdomain"`): cookie is
+ *     `Domain=.<host>; Path=/`; redirect must be
+ *     `https://run-<id>.<previewHost>/...`.
+ *   - **Path mode** (default; `deps.previewMode === "path"`): cookie is
+ *     `Path=/p/<id>/`; redirect must be same-origin as the inbound
+ *     request and live under `/p/<id>/`. No `previewHost` is required.
  *
  * This route is auth-exempt (`isAuthExempt` whitelists `/preview/login`)
  * because the standard bearer gate would 401 the browser before the
@@ -729,22 +736,27 @@ function cancelRunHandler(deps: ServerDeps): RouteHandler {
  * `previewAuth.verifyLoginToken` (constant-time compare against the
  * configured `WARREN_API_TOKEN`).
  *
- * `redirect` must be an absolute URL pointing at the run's preview
- * subdomain — anything else is rejected so a stolen login link can't
- * become an open redirect.
+ * `redirect` is constrained to the run's own preview surface — anything
+ * else is rejected so a stolen login link can't become an open redirect.
  *
- * 503 when `previewAuth` is null (no `WARREN_PREVIEW_HOST` configured,
- * or `WARREN_API_TOKEN` unset under `--no-auth`); the proxy is also
- * disabled in those configurations so the handshake has nothing to
- * issue against.
+ * 400 when `previewAuth` is null (subdomain mode with no host, or
+ * warren booted with `--no-auth`); the proxy is also disabled in those
+ * configurations so the handshake has nothing to issue against.
  */
 function previewLoginHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const runId = requireParam(ctx, "id");
-		if (deps.previewAuth === undefined || deps.previewHost === undefined) {
+		const mode: "subdomain" | "path" = deps.previewMode ?? "subdomain";
+		if (deps.previewAuth === undefined) {
 			throw new ValidationError("preview surface is not configured on this warren", {
 				recoveryHint:
-					"set WARREN_PREVIEW_HOST (and ensure WARREN_API_TOKEN is set) to enable per-run previews",
+					"ensure WARREN_API_TOKEN is set (and WARREN_PREVIEW_HOST when WARREN_PREVIEW_MODE=subdomain) to enable per-run previews",
+			});
+		}
+		if (mode === "subdomain" && deps.previewHost === undefined) {
+			throw new ValidationError("preview surface is not configured on this warren", {
+				recoveryHint:
+					"set WARREN_PREVIEW_HOST to enable subdomain-mode previews, or switch to WARREN_PREVIEW_MODE=path",
 			});
 		}
 		const token = ctx.url.searchParams.get("token");
@@ -761,12 +773,19 @@ function previewLoginHandler(deps: ServerDeps): RouteHandler {
 		await deps.repos.runs.require(runId);
 
 		const redirect = ctx.url.searchParams.get("redirect");
-		const redirectTarget = resolvePreviewRedirect(redirect, runId, deps.previewHost);
+		const redirectTarget =
+			mode === "path"
+				? resolvePathPreviewRedirect(redirect, runId, ctx.url.origin)
+				: resolveSubdomainPreviewRedirect(redirect, runId, deps.previewHost as string);
 		if (redirectTarget === null) {
+			const hint =
+				mode === "path"
+					? `redirect must be a same-origin URL under ${ctx.url.origin}/p/${runId}/`
+					: `redirect must be an absolute URL under https://run-${runId}.${deps.previewHost}/`;
 			return jsonResponse(400, {
 				error: {
 					code: "preview_redirect_invalid",
-					message: `redirect must be an absolute URL under https://run-${runId}.${deps.previewHost}/`,
+					message: hint,
 				},
 			});
 		}
@@ -783,7 +802,11 @@ function previewLoginHandler(deps: ServerDeps): RouteHandler {
 	};
 }
 
-function resolvePreviewRedirect(raw: string | null, runId: string, host: string): string | null {
+function resolveSubdomainPreviewRedirect(
+	raw: string | null,
+	runId: string,
+	host: string,
+): string | null {
 	const fallback = `https://run-${runId}.${host}/`;
 	if (raw === null || raw.length === 0) return fallback;
 	let parsed: URL;
@@ -794,6 +817,27 @@ function resolvePreviewRedirect(raw: string | null, runId: string, host: string)
 	}
 	if (parsed.protocol !== "https:") return null;
 	if (parsed.hostname !== `run-${runId}.${host}`) return null;
+	return parsed.toString();
+}
+
+function resolvePathPreviewRedirect(
+	raw: string | null,
+	runId: string,
+	inboundOrigin: string,
+): string | null {
+	const fallback = `${inboundOrigin}/p/${runId}/`;
+	if (raw === null || raw.length === 0) return fallback;
+	let parsed: URL;
+	try {
+		// Relative URLs (`/p/<id>/foo`) resolve against the inbound origin so
+		// callers don't have to know the scheme/host upfront. Absolute URLs are
+		// then origin-checked below.
+		parsed = new URL(raw, inboundOrigin);
+	} catch {
+		return null;
+	}
+	if (parsed.origin !== inboundOrigin) return null;
+	if (!parsed.pathname.startsWith(`/p/${runId}/`)) return null;
 	return parsed.toString();
 }
 
