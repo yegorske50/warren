@@ -5,6 +5,11 @@ name: auto-merge
 # still run CI but require a manual `gh pr merge` (or click). Squash is
 # the chosen merge method — keeps main history linear, drops the
 # burrow/run_xxx branch noise from agent-opened PRs.
+#
+# Uses AUTO_MERGE_PAT (not GITHUB_TOKEN) so that the resulting push to
+# main triggers downstream workflows (CI, Release). GITHUB_TOKEN-authored
+# pushes are deliberately suppressed by GitHub to prevent recursive loops.
+# See seed warren-a2dc.
 
 on:
   pull_request:
@@ -23,6 +28,6 @@ jobs:
     steps:
       - name: Enable auto-merge (squash)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_PAT }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr merge --auto --squash "$PR_URL"
