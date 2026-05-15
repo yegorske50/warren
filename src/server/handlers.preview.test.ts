@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
-import { openDatabase, type WarrenDb } from "../db/client.ts";
+import { type AnyWarrenDb, openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
+import { isPostgresTestEnabled, withDb } from "../db/testing.ts";
 import { COOKIE_NAME, createPreviewAuth, type PreviewAuth } from "../preview/cookie.ts";
 import { createPreviewProxyHandler } from "../preview/proxy.ts";
 import { RunEventBroker } from "../runs/index.ts";
@@ -31,7 +32,7 @@ function makeBurrowClient(): BurrowClient {
 async function depsFor(
 	repos: Repos,
 	previewAuth: PreviewAuth | undefined,
-	db?: WarrenDb,
+	db?: AnyWarrenDb,
 	previewMode: "subdomain" | "path" = "subdomain",
 ): Promise<{ deps: ServerDeps; bridges: BridgeRegistry }> {
 	const client = makeBurrowClient();
@@ -649,9 +650,12 @@ describe("POST /runs/:id/preview/teardown", () => {
 		expect(body.tornDown).toBe(false);
 	});
 
-	test("503 when no db handle is wired (preview teardown sqlite-only)", async () => {
+	test("503 when no db handle is wired", async () => {
 		// Build deps without db — the handler should refuse rather than
-		// silently no-op against a missing CAS surface.
+		// silently no-op against a missing CAS surface. The previous
+		// sqlite-only gate (warren-a743) was dropped once createRunPreviewsRepo
+		// became dialect-polymorphic; the only remaining precondition is the
+		// repo layer existing at all.
 		const { deps } = await depsFor(repos, undefined);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -666,6 +670,86 @@ describe("POST /runs/:id/preview/teardown", () => {
 		expect(res.status).toBe(503);
 		const body = (await res.json()) as { error: { code: string } };
 		expect(body.error.code).toBe("preview_teardown_unavailable");
+	});
+});
+
+describe.skipIf(!isPostgresTestEnabled())("POST /runs/:id/preview/teardown (postgres)", () => {
+	// Regression for warren-a743: handlers.ts previously hard-gated this
+	// route on `dialect === "sqlite"` even though createRunPreviewsRepo
+	// (the underlying CAS) was already pg-capable. Exercise the route end-
+	// to-end against a real postgres to prove the gate is gone and the
+	// happy path lights up the same `torn-down` outcome on pg.
+	let db: AnyWarrenDb;
+	let close: () => Promise<void>;
+	let repos: Repos;
+	let handle: ServeHandle | null = null;
+	let runId: string;
+
+	beforeEach(async () => {
+		const opened = await withDb({ dialect: "postgres" });
+		db = opened.db;
+		close = opened.close;
+		repos = createRepos(db);
+		await repos.agents.upsert({ name: "agent", renderedJson: { sections: {} } });
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+		});
+		const run = await repos.runs.create({
+			agentName: "agent",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_teardown_pg",
+		});
+		runId = run.id;
+		await repos.runs.attachPreview(run.id, {
+			previewState: "live",
+			previewPort: 30201,
+			previewStartedAt: "2026-05-14T18:00:00.000Z",
+		});
+	});
+
+	afterEach(async () => {
+		if (handle) {
+			await handle.stop();
+			handle = null;
+		}
+		await close();
+	});
+
+	test("200 + flips live → torn-down on postgres dialect", async () => {
+		expect(db.dialect).toBe("postgres");
+		const { deps } = await depsFor(repos, undefined, db);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: bearerAuth(TOKEN),
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/runs/${runId}/preview/teardown`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${TOKEN}` },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			status: string;
+			tornDown: boolean;
+			previousState: string | null;
+			port: number | null;
+		};
+		expect(body).toEqual({
+			status: "torn-down",
+			tornDown: true,
+			previousState: "live",
+			port: 30201,
+		});
+
+		const reread = await repos.runs.require(runId);
+		expect(reread.previewState).toBe("torn-down");
+		expect(reread.previewPort).toBeNull();
 	});
 });
 

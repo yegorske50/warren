@@ -1011,9 +1011,11 @@ function resolvePathPreviewRedirect(
  *
  * Responds 200 on every CAS outcome (`torn-down`, `already-torn-down`,
  * `already-failed`, `never-launched`); 404 on unknown runId; 503 when
- * the deploy is postgres-dialect or `deps.db` is undefined (mirrors
- * the port allocator / eviction worker posture, mx-b82a55). The route
- * is `tornDown: true` only when the call actually flipped a
+ * `deps.db` is undefined (no repo layer wired). Works on both sqlite
+ * and postgres dialects — `createRunPreviewsRepo` is dialect-
+ * polymorphic (warren-adfb), so the eviction-worker CAS path that
+ * teardown rides on is already exercised on pg in production. The
+ * route is `tornDown: true` only when the call actually flipped a
  * `starting`/`live` row.
  */
 function previewTeardownHandler(deps: ServerDeps): RouteHandler {
@@ -1022,14 +1024,11 @@ function previewTeardownHandler(deps: ServerDeps): RouteHandler {
 		const body = await readJsonBodyOrEmpty(ctx);
 		const actor = body !== null ? optionalString(body, "actor") : undefined;
 
-		if (deps.db === undefined || deps.db.dialect !== "sqlite") {
+		if (deps.db === undefined) {
 			return jsonResponse(503, {
 				error: {
 					code: "preview_teardown_unavailable",
-					message:
-						deps.db === undefined
-							? "preview teardown requires the sqlite repo layer; this warren has no db handle wired"
-							: `preview teardown is sqlite-only today (dialect=${deps.db.dialect}); see SPEC §11.L pl-f17e follow-up`,
+					message: "preview teardown requires the repo layer; this warren has no db handle wired",
 				},
 			});
 		}
