@@ -1259,6 +1259,35 @@ describe("reapRun", () => {
 		expect(events.find((ev) => ev.kind === "preview_annotated")).toBeDefined();
 	});
 
+	test("annotates the PR body with the path-mode preview URL when mode=path (warren-c3c4)", async () => {
+		const e = fakeExec({ revListCount: "2" });
+		const pr = fakeOpenPr([{ ok: true, url: "https://github.com/x/y/pull/77", mode: "created" }]);
+		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);
+		const annotate = fakeAnnotate([{ ok: true, mode: "patched" }]);
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
+			openPr: pr.openPr,
+			previewConfig: SERVER_PREVIEW,
+			previewLaunchConfig: { host: "warren.example.com", mode: "path" },
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
+			launchPreview: launch.launch,
+			annotatePrPreview: annotate.annotate,
+		});
+		expect(annotate.calls).toHaveLength(1);
+		expect(annotate.calls[0]?.preview).toEqual({
+			state: "live",
+			url: `https://warren.example.com/p/${ctx.runId}/`,
+		});
+		expect(result.previewUrl).toBe(`https://warren.example.com/p/${ctx.runId}/`);
+	});
+
 	test("pr_annotate_preview is skipped when no PR was opened", async () => {
 		const e = fakeExec({ revListCount: "2" });
 		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);

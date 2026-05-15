@@ -350,9 +350,15 @@ describe("loadPreviewLaunchConfigFromEnv", () => {
 });
 
 describe("formatPreviewUrl", () => {
-	test("renders https URL with run id sub-host", () => {
-		expect(formatPreviewUrl("run_abc123", "warren.example.com")).toBe(
+	test("subdomain mode renders https URL with run id sub-host (no trailing slash)", () => {
+		expect(formatPreviewUrl("run_abc123", "warren.example.com", "subdomain")).toBe(
 			"https://run-run_abc123.warren.example.com",
+		);
+	});
+
+	test("path mode renders https URL under /p/<id>/ with trailing slash (warren-c3c4)", () => {
+		expect(formatPreviewUrl("run_abc123", "warren.example.com", "path")).toBe(
+			"https://warren.example.com/p/run_abc123/",
 		);
 	});
 });

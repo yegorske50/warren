@@ -92,7 +92,7 @@ import {
 } from "../preview/launch.ts";
 import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import { parseGitHubUrl } from "../projects/url.ts";
-import type { ServerPreviewConfig } from "../warren-config/index.ts";
+import { DEFAULT_PREVIEW_MODE, type ServerPreviewConfig } from "../warren-config/index.ts";
 import type { RunEventBroker } from "./events.ts";
 import {
 	type AutoOpenPrConfig,
@@ -585,6 +585,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// hasn't wired `WARREN_PREVIEW_HOST` yet — the launch still ran so
 		// state stays observable in the UI, but no URL exists to publish).
 		const previewHost = input.previewLaunchConfig?.host ?? null;
+		const previewMode = input.previewLaunchConfig?.mode ?? DEFAULT_PREVIEW_MODE;
 		if (
 			prUrl !== null &&
 			previewLaunchState !== null &&
@@ -611,13 +612,13 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 							previewLaunchState === "live"
 								? {
 										state: "live",
-										url: formatPreviewUrl(run.id, previewHost as string),
+										url: formatPreviewUrl(run.id, previewHost as string, previewMode),
 									}
 								: { state: "failed", failureTail },
 					});
 					if (result.ok) {
 						if (previewLaunchState === "live") {
-							previewUrl = formatPreviewUrl(run.id, previewHost as string);
+							previewUrl = formatPreviewUrl(run.id, previewHost as string, previewMode);
 						}
 						await emit("preview_annotated", {
 							prUrl,

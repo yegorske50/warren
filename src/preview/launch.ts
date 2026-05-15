@@ -323,9 +323,19 @@ export function loadPreviewLaunchConfigFromEnv(
 /**
  * Format the preview URL for a `live` preview. The host suffix is the
  * operator's `WARREN_PREVIEW_HOST`; URLs are always `https` per SPEC §11.D
- * (TLS terminates on the operator's reverse proxy). Subdomain mode only —
- * path-mode URL composition (warren-c3c4) lives with the PR annotator.
+ * (TLS terminates on the operator's reverse proxy).
+ *
+ * - **Subdomain mode** (`https://run-<id>.<host>`): the reviewer-facing
+ *   shape from the original §11.L. No trailing slash so the URL stays
+ *   stable across modes and existing PR annotations.
+ * - **Path mode** (`https://<host>/p/<id>/`, warren-c3c4 / SPEC §11.L
+ *   addendum): trailing slash is load-bearing — without it the browser
+ *   resolves the upstream's root-relative HTML (`href="/assets/foo"`)
+ *   against `/p/` instead of `/p/<id>/`, defeating the proxy preamble.
  */
-export function formatPreviewUrl(runId: string, host: string): string {
+export function formatPreviewUrl(runId: string, host: string, mode: PreviewMode): string {
+	if (mode === "path") {
+		return `https://${host}/p/${runId}/`;
+	}
 	return `https://run-${runId}.${host}`;
 }
