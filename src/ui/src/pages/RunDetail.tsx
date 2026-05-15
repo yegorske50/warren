@@ -186,6 +186,16 @@ export function RunDetailPage() {
 					<span className="font-mono text-xs">{r.burrowRunId ?? "—"}</span>
 				</MetaCard>
 				<MetaCard label="Updated">{relativeTime(r.endedAt ?? r.startedAt)}</MetaCard>
+				{r.seedId !== null ? (
+					<MetaCard label="Seed">
+						<span
+							className="font-mono text-xs"
+							title="Seeds issue this run was dispatched against (pl-bb70 / warren-c845)"
+						>
+							{r.seedId}
+						</span>
+					</MetaCard>
+				) : null}
 				{r.prUrl !== null ? (
 					<MetaCard label="Pull Request">
 						<a

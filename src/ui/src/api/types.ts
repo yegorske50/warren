@@ -60,6 +60,16 @@ export interface RunRow {
 	projectId: string | null;
 	burrowId: string | null;
 	burrowRunId: string | null;
+	/**
+	 * Back-link to the seeds issue this run was dispatched against
+	 * (pl-bb70 step 3 / warren-805a). Null encodes "no seed" — manual
+	 * prompts from POST /runs without `seedId`, or legacy rows written
+	 * before the column existed. Surfaced as a MetaCard on RunDetail so
+	 * operators can navigate from a run back to its issue (pl-bb70 step
+	 * 6 / warren-c845). R-04 will turn this into a proper hyperlink
+	 * when the issues page lands.
+	 */
+	seedId: string | null;
 	renderedAgentJson: unknown;
 	state: RunState;
 	failureReason: RunFailureReason | null;
@@ -144,6 +154,14 @@ export interface CreateRunInput {
 	ref?: string;
 	providerOverride?: string;
 	modelOverride?: string;
+	/**
+	 * Optional back-link to the seeds issue this run was dispatched
+	 * against (pl-bb70 step 3 / warren-805a). When set, the server
+	 * persists it onto `runs.seed_id` and (when a seeds CLI is
+	 * configured) writes warren-namespaced extension keys on the seed
+	 * after dispatch (pl-bb70 step 4 / warren-46cd).
+	 */
+	seedId?: string;
 }
 
 export interface SpawnRunResponse {
