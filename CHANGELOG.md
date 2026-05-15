@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.14] — 2026-05-15
+
+Fix the preview proxy's blank-page failure mode (`run_7jjpt2jn9ej5`
+preview rendered as `ERR_CONTENT_DECODING_FAILED` in the browser even
+though `preview_state='live'` and the upstream HTML reached the
+forwarder).
+
+Root cause: Bun's `fetch` auto-decompresses gzip/br/deflate bodies
+transparently but does **not** strip the `Content-Encoding` header
+from `upstream.headers` (oven-sh/bun#4528). The proxy was forwarding
+those headers verbatim alongside the already-decompressed body, so
+the browser tried to gunzip plaintext and bailed. The announced
+`Content-Length` had the same problem — it described the encoded body
+length, not the plaintext we were streaming.
+
+### Fixed
+
+- **`fix(preview/proxy)`** — strip `Content-Encoding` and
+  `Content-Length` once at the upstream boundary in `forwardToUpstream`
+  so every downstream branch (subdomain passthrough, path-mode HTML
+  rewrite, path-mode non-HTML passthrough) emits clean headers. The
+  `applyPathModeRewrites` signature now takes the pre-stripped headers
+  from the caller rather than cloning `upstream.headers` itself, which
+  also removes the previous "skip rewrite when Content-Encoding is
+  set" special case — under the new boundary contract that branch was
+  dead code (the header is gone by the time it ran).
+
 ## [0.3.13] — 2026-05-15
 
 Bake `netcat-openbsd` into the runtime image. Burrow's inbound

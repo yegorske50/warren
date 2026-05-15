@@ -975,10 +975,15 @@ describe("createPreviewProxyHandler (path mode) — HTML rewrites (warren-ab3a)"
 		expect(await res?.text()).toBe(html);
 	});
 
-	test("skips rewriting when the upstream sets Content-Encoding", async () => {
-		// Best-effort posture: with a Content-Encoding header in play we
-		// cannot safely splice into the byte stream, so we pass through
-		// rather than smuggle plaintext under a gzip label.
+	test("strips Content-Encoding at the boundary and still rewrites", async () => {
+		// Bun's fetch auto-decompresses transparently, so by the time the
+		// proxy sees `upstream.body` it is already plaintext. The upstream
+		// `Content-Encoding` header survives the decompression (Bun bug
+		// oven-sh/bun#4528), so the proxy must strip it — otherwise the
+		// browser tries to gunzip plaintext and fails with
+		// `ERR_CONTENT_DECODING_FAILED` (diagnosed against run_7jjpt2jn9ej5).
+		// Once the header is stripped, the path-mode rewrite proceeds
+		// normally; the `Content-Length` strip is the same safety belt.
 		const html = "<html><head></head><body>raw</body></html>";
 		const handler = pathHandler(
 			fetchStub(
@@ -988,13 +993,18 @@ describe("createPreviewProxyHandler (path mode) — HTML rewrites (warren-ab3a)"
 						headers: {
 							"content-type": "text/html",
 							"content-encoding": "gzip",
+							"content-length": String(html.length),
 						},
 					}),
 			),
 		);
 		const { request, url } = buildPathRequest(`/p/${runId}/`);
 		const res = await handler(request, url);
-		expect(await res?.text()).toBe(html);
+		expect(res?.headers.get("content-encoding")).toBeNull();
+		expect(res?.headers.get("content-length")).toBeNull();
+		const body = await res?.text();
+		expect(body).toContain(`<base href="/p/${runId}/">`);
+		expect(body).toContain("<body>raw</body>");
 	});
 
 	test("rewrites a same-origin Location: header on 302", async () => {

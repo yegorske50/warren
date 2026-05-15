@@ -352,14 +352,27 @@ async function forwardToUpstream(
 		);
 	}
 
+	// Bun's fetch auto-decompresses gzip/br/deflate transparently, but it
+	// does NOT strip the `Content-Encoding` header from `upstream.headers`
+	// (oven-sh/bun#4528). If we forward those headers verbatim the browser
+	// receives plaintext labeled as gzip → `ERR_CONTENT_DECODING_FAILED`
+	// (diagnosed against run_7jjpt2jn9ej5's blank preview page). The
+	// announced `Content-Length` is also for the *encoded* body, so it
+	// disagrees with the decompressed length we'd be streaming. Strip both
+	// once at the boundary so every downstream branch (subdomain mode,
+	// path-mode HTML rewrite, path-mode passthrough) sees clean headers.
+	const passHeaders = new Headers(upstream.headers);
+	passHeaders.delete("content-encoding");
+	passHeaders.delete("content-length");
+
 	if (pathPrefix === null) {
 		return new Response(upstream.body, {
 			status: upstream.status,
 			statusText: upstream.statusText,
-			headers: upstream.headers,
+			headers: passHeaders,
 		});
 	}
-	return applyPathModeRewrites(upstream, pathPrefix);
+	return applyPathModeRewrites(upstream, passHeaders, pathPrefix);
 }
 
 /**
@@ -369,8 +382,11 @@ async function forwardToUpstream(
  * on `text/html` bodies. All other content types and statuses stream
  * through unchanged.
  */
-async function applyPathModeRewrites(upstream: Response, pathPrefix: string): Promise<Response> {
-	const headers = new Headers(upstream.headers);
+async function applyPathModeRewrites(
+	upstream: Response,
+	headers: Headers,
+	pathPrefix: string,
+): Promise<Response> {
 	if (upstream.status >= 300 && upstream.status < 400) {
 		const loc = headers.get("location");
 		if (loc !== null) {
@@ -387,21 +403,9 @@ async function applyPathModeRewrites(upstream: Response, pathPrefix: string): Pr
 		});
 	}
 
-	// Re-encoding the head may change byte length; strip content-length so
-	// the consumer doesn't see a stale value. Content-Encoding (gzip/br) is
-	// passed through unchanged — Bun's fetch auto-decompresses, so the body
-	// we read is already plaintext; preserving the header would mislead the
-	// browser. Skip injection (and clear the header) when an encoding was
-	// applied so we don't smuggle plaintext under a gzip label.
-	headers.delete("content-length");
-	const encoding = headers.get("content-encoding");
-	if (encoding !== null && encoding.toLowerCase() !== "identity") {
-		return new Response(upstream.body, {
-			status: upstream.status,
-			statusText: upstream.statusText,
-			headers,
-		});
-	}
+	// `headers` was already stripped of content-encoding and content-length
+	// by the caller (forwardToUpstream) so the browser doesn't try to
+	// gunzip plaintext or trust a length from the encoded upstream body.
 
 	const reader = upstream.body.getReader();
 	const chunks: Uint8Array[] = [];
