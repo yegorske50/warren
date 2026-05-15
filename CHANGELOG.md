@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-05-14
+
+Claude-code joins pi on the cost/token tracking surface, the UI gets a
+visible version badge plus an autoscroll fix, this repo's own `.warren/`
+config moves off the legacy JSON layout, and CI stops re-running the
+full lint/test trinity on every doc/seed-sync commit.
+
+### Added
+
+- **`feat(runs)`** — claude-code cost tracking (#11, `warren-a7dc` /
+  `warren-87f9`). `src/runs/stream.ts` gains `extractClaudeUsage`, which
+  shape-sniffs the terminal `result` envelope's `total_cost_usd` +
+  `usage.*_tokens` (single-shot — claude-code emits cumulative totals
+  once at end). `persistInStreamPiUsage` is renamed
+  `persistInStreamUsage` with a runtime tag; on terminal, pi wins if
+  observed, else fall back to claude. 4 new tests cover single-shot
+  extraction, malformed-result null parity, `is_error=true` still
+  recording cost, and pi-winning when both shapes appear. SPEC §11.K
+  broadened past pi-only with shape-sniff dispatch and pi-wins fallback
+  documented.
+
+- **`feat(ui)`** — warren version badge in sidebar (#10, `warren-6ea5`).
+  New auth-exempt `GET /version` route returns `{version: VERSION}`;
+  `src/ui/src/components/Layout.tsx` renders it as a muted monospace
+  `vX.Y.Z` tag next to the "warren" title. The UI fetches once via
+  React Query (`staleTime: Infinity`) since the value is stable for the
+  process lifetime. Tests cover the route, auth exemption, and
+  UI-vs-API fallback.
+
+- **`test(acceptance)`** — scenario 21 claude-code cost smoke
+  (`warren-87f9`). New `scripts/acceptance/scenarios/21-claude-code-cost-smoke.ts`
+  stubs the claude-code runtime in burrow (`burrow-with-stub.ts` Map.set
+  override on `AgentRegistry`), emits a stream-json result envelope, and
+  asserts all five cost/token columns are non-null after the run
+  terminates.
+
+- **`branding`** — warren logo (burrow network) + README banner
+  (`062aaf1`). Grayscale mark matching the UI palette: a 6-node hex
+  burrow network around a central control-plane node, with one bright
+  node + spoke indicating an active run. Includes the generator script
+  (`branding/generate-logo.py`), 1x/2x banners, and a square icon.
+
+### Changed
+
+- **`config`** — this repo's own `.warren/` migrated off the legacy
+  `defaults.json` layout to `config.yaml` + `preview.yaml`
+  (`60318d0`, `warren-5840`). Stops the deprecation warning from firing
+  in `doctor`/`readyz`. Every `DefaultsConfig` / `PreviewConfig` /
+  `TriggersConfig` knob is scaffolded as a commented example in-file so
+  customizing further is just an uncomment. Activates
+  `runBranchPrefix=warren` so burrow branches land under
+  `warren/<run-id>` instead of the built-in `burrow/<run-id>`.
+
+- **`ui`** — autoscroll no longer turns off during event bursts
+  (`339ff96`). Programmatic scrolls fire `scroll` async; during bursts
+  the handler ran after more content appended and read a stale
+  (non-bottom) position, silently disabling autoscroll. Re-enable only
+  from `scroll`; disable via wheel-up / touch-move user intent.
+
+- **`ci`** — scope release + postgres workflows so they don't run on
+  every commit (`a27c114`). `release.yml` gains a paths filter on
+  `package.json` / `CHANGELOG.md` so only version-bump commits trigger
+  it (`workflow_dispatch` unchanged). `ci-postgres` split into its own
+  workflow file, PRs only, with a paths filter for `src/db/**`,
+  `src/preview/**`, `package.json`, `bun.lock`, and the workflow itself.
+
+### Removed
+
+- **`docs`** — `.warren/MIGRATION.md` and its inbound references
+  (`db52729`). The guide was only useful for the one-time
+  `defaults.json` → YAML transition; `warren config migrate` (in-tree)
+  does the actual conversion and is enough for stragglers. README,
+  SPEC, and the `init`/`config-migrate` `config.yaml` headers no
+  longer point at the deleted file.
+
 ## [0.3.6] — 2026-05-14
 
 Path-based preview mode (SPEC §11.L addendum, `warren-f4d7` / `pl-f4ea`).
