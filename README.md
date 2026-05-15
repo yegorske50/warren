@@ -71,6 +71,34 @@ fly secrets set \
 fly deploy
 ```
 
+### Continuous deployment from GitHub Actions
+
+Once warren is live on Fly, wiring tag-driven auto-deploy is two commands:
+
+```bash
+fly tokens create deploy -a <your-warren-app> --name "github-actions" --expiry 8760h \
+  | gh secret set FLY_API_TOKEN -R <your-org>/<your-fork>
+```
+
+Then add a `deploy` job to your release workflow that runs after release/tag:
+
+```yaml
+deploy:
+  needs: release
+  if: needs.release.outputs.release == 'true'
+  runs-on: ubuntu-latest
+  concurrency:
+    group: fly-deploy-<your-warren-app>
+    cancel-in-progress: false
+  steps:
+    - uses: actions/checkout@v6
+    - uses: superfly/flyctl-actions/setup-flyctl@master
+    - env: { FLY_API_TOKEN: "${{ secrets.FLY_API_TOKEN }}" }
+      run: flyctl deploy --remote-only --app <your-warren-app>
+```
+
+The deploy-scoped token is bound to a single app and cannot list secrets, ssh, or touch other apps — safe to live in CI. See `.github/workflows/release.yml` for the reference shape used by `warren-deployed.fly.dev`.
+
 ## Power features (opt-in)
 
 Warren bundles a small set of [os-eco](https://github.com/jayminwest/os-eco) tools as built-in features. None of them are required to dispatch a run — they light up when you use them, stay silent when you don't.
