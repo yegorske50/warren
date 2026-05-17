@@ -276,6 +276,43 @@ describe("spawnRun", () => {
 		expect(reread.plotId).toBe("pl-2047");
 	});
 
+	test("injects PLOT_ID + PLOT_ACTOR onto the burrow up call when plotId is set (warren-e26f)", async () => {
+		db.raw.exec("UPDATE projects SET has_plot = 1 WHERE id = 'prj_xxxxxxxxxxxx'");
+
+		const { client, calls } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClientPool: await makePool(repos, client),
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "fix it",
+			plotId: "pl-2047",
+		});
+
+		const up = calls.find((c) => c.method === "POST" && c.path === "/burrows");
+		expect(up).toBeDefined();
+		const env = (up?.body as { env?: Record<string, string> }).env;
+		expect(env).toEqual({
+			PLOT_ID: "pl-2047",
+			PLOT_ACTOR: `agent:refactor-bot:${result.run.id}`,
+		});
+	});
+
+	test("omits env from the burrow up call when no plotId is set (warren-e26f)", async () => {
+		const { client, calls } = makeBurrowClient();
+		await spawnRun({
+			repos,
+			burrowClientPool: await makePool(repos, client),
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "fix it",
+		});
+
+		const up = calls.find((c) => c.method === "POST" && c.path === "/burrows");
+		expect(up).toBeDefined();
+		expect((up?.body as { env?: unknown }).env).toBeUndefined();
+	});
+
 	test("prefers the project-tier agent when one exists for the spawn's project (R-03 / warren-0a7e)", async () => {
 		await repos.agents.upsert({
 			name: "refactor-bot",

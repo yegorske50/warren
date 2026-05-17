@@ -33,9 +33,11 @@
  */
 
 import {
+	type Burrow,
 	NotFoundError as BurrowNotFoundError,
 	ValidationError as BurrowValidationError,
 	CredentialError,
+	type HttpBurrowUpInput,
 	HttpClient,
 	HttpClientError,
 	type HttpClientOptions,
@@ -122,6 +124,58 @@ export class BurrowClient {
 	 * burrow without `/admin/drain` returning 404 `not_found`) pass through
 	 * as the rehydrated `BurrowError` subclass.
 	 */
+	/**
+	 * Provision a burrow with optional per-run env injection (warren-e26f).
+	 *
+	 * Delegates to `http.burrows.up` when no env is supplied — that path is
+	 * the source of truth for field allowlisting and error rehydration.
+	 * When `env` is set, build the body manually and POST directly: burrow's
+	 * `HttpBurrowsClient.up` allowlists known fields and silently drops the
+	 * rest, so it can't carry per-run env vars forward. Plot integration
+	 * (warren-000b / pl-2047 step 4) uses this path to forward
+	 * `PLOT_ID` / `PLOT_ACTOR` to the sandbox.
+	 *
+	 * Error rehydration mirrors burrow's own `rehydrateError` table for the
+	 * codes burrow's `up` route actually emits (validation_error,
+	 * not_found, credential_error, …); everything else falls through to
+	 * `HttpClientError` so warren's `renderError` still tags it correctly.
+	 */
+	async burrowsUp(input: HttpBurrowUpInput & { env?: Record<string, string> }): Promise<Burrow> {
+		if (input.env === undefined) {
+			return this.http.burrows.up(input);
+		}
+		return withTransportMapping(this.config, async () => {
+			const body: Record<string, unknown> = { projectRoot: input.projectRoot };
+			if (input.name !== undefined) body.name = input.name;
+			if (input.branch !== undefined) body.branch = input.branch;
+			if (input.baseBranch !== undefined) body.baseBranch = input.baseBranch;
+			if (input.originUrl !== undefined) body.originUrl = input.originUrl;
+			if (input.network !== undefined) body.network = input.network;
+			if (input.provider !== undefined) body.provider = input.provider;
+			if (input.agents !== undefined) body.agents = [...input.agents];
+			if (input.seed !== undefined) {
+				body.seed = { files: input.seed.files.map((f) => ({ ...f })) };
+			}
+			body.env = { ...input.env };
+
+			const url = buildBurrowsUrl(this.config);
+			const headers: Record<string, string> = { "content-type": "application/json" };
+			if (this.config.token !== undefined) headers.authorization = `Bearer ${this.config.token}`;
+			const init: RequestInit & { unix?: string } = {
+				method: "POST",
+				headers,
+				body: JSON.stringify(body),
+			};
+			if (this.config.transport.kind === "unix") init.unix = this.config.transport.path;
+			const res = await this.fetchImpl(url, init);
+			if (!res.ok) {
+				throw await rehydrateBurrowsUpError(res);
+			}
+			const raw = (await res.json()) as Record<string, unknown>;
+			return reviveBurrow(raw);
+		});
+	}
+
 	async setDrain(drain: boolean): Promise<{ drain: boolean }> {
 		return withTransportMapping(this.config, async () => {
 			const url = buildAdminUrl(this.config);
@@ -140,6 +194,72 @@ export class BurrowClient {
 			return (await res.json()) as { drain: boolean };
 		});
 	}
+}
+
+function buildBurrowsUrl(config: BurrowClientConfig): string {
+	const base =
+		config.transport.kind === "unix"
+			? "http://localhost"
+			: `http://${config.transport.hostname}:${config.transport.port}`;
+	return `${base}/burrows`;
+}
+
+/**
+ * Rehydrate a non-2xx response from `POST /burrows` into the same error
+ * shapes `HttpClient.burrows.up` would throw. Codes not in the table fall
+ * through to `HttpClientError` so warren's `renderError` still maps them.
+ */
+async function rehydrateBurrowsUpError(res: Response): Promise<Error> {
+	let envelope: AdminErrorEnvelope | null = null;
+	try {
+		envelope = (await res.json()) as AdminErrorEnvelope;
+	} catch {
+		// Non-JSON body — fall through to a generic HttpClientError below.
+	}
+	const code = envelope?.error?.code ?? "internal_error";
+	const message = envelope?.error?.message ?? `burrow POST /burrows returned HTTP ${res.status}`;
+	const hint = envelope?.error?.hint;
+	const opts = hint !== undefined ? { recoveryHint: hint } : undefined;
+	switch (code) {
+		case "not_found":
+			return new BurrowNotFoundError(message, opts);
+		case "validation_error":
+			return new BurrowValidationError(message, opts);
+		case "credential_error":
+			return new CredentialError(message, opts);
+		default:
+			return new HttpClientError(res.status, code, message, hint);
+	}
+}
+
+interface BurrowRowDates {
+	createdAt: unknown;
+	updatedAt: unknown;
+	destroyedAt: unknown;
+}
+
+/**
+ * Mirror of burrow-cli's internal `reviveBurrow`: turn ISO date strings
+ * coming over the wire back into `Date` instances. Kept local to the
+ * `burrowsUp` direct-fetch path so we don't depend on a non-exported
+ * helper from `@os-eco/burrow-cli`.
+ */
+function reviveBurrow(raw: Record<string, unknown>): Burrow {
+	const row = raw as Record<string, unknown> & BurrowRowDates;
+	return {
+		...row,
+		createdAt: toDate(row.createdAt),
+		updatedAt: toDate(row.updatedAt),
+		destroyedAt:
+			row.destroyedAt === null || row.destroyedAt === undefined ? null : toDate(row.destroyedAt),
+	} as Burrow;
+}
+
+function toDate(value: unknown): Date {
+	if (value instanceof Date) return value;
+	if (typeof value === "string") return new Date(value);
+	if (typeof value === "number") return new Date(value);
+	throw new Error(`burrowsUp: expected date-like value, got ${typeof value}`);
 }
 
 function buildAdminUrl(config: BurrowClientConfig): string {
