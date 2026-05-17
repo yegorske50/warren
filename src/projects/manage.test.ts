@@ -106,6 +106,35 @@ describe("addProject", () => {
 		expect(row.defaultBranch).toBe("trunk");
 	});
 
+	test("probes for .plot/ after clone and persists hasPlot on the row (warren-4e20)", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: (localPath) => {
+				expect(localPath).toBe("/data/projects/x/y");
+				return { hasPlot: true };
+			},
+		});
+		expect(row.hasPlot).toBe(true);
+		const persisted = await repo.require(row.id);
+		expect(persisted.hasPlot).toBe(true);
+	});
+
+	test("defaults hasPlot=false when the probe returns false", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: false }),
+		});
+		expect(row.hasPlot).toBe(false);
+	});
+
 	test("rejects an invalid GitHub URL with ValidationError before touching the cloner", async () => {
 		let cloneCalled = false;
 		await expect(
@@ -431,7 +460,11 @@ describe("refreshProject", () => {
 			refresh: async (input) => {
 				receivedRef = input.ref;
 				receivedPath = input.localPath;
-				return { headSha: "abcd1234abcd1234abcd1234abcd1234abcd1234", ref: input.ref };
+				return {
+					headSha: "abcd1234abcd1234abcd1234abcd1234abcd1234",
+					ref: input.ref,
+					features: { hasPlot: false },
+				};
 			},
 			now: () => new Date("2026-05-09T19:00:00.000Z"),
 		});
@@ -465,7 +498,7 @@ describe("refreshProject", () => {
 			spawn: NOOP_SPAWN,
 			refresh: async (input) => {
 				receivedRef = input.ref;
-				return { headSha: "deadbeef".repeat(5), ref: input.ref };
+				return { headSha: "deadbeef".repeat(5), ref: input.ref, features: { hasPlot: false } };
 			},
 		});
 
@@ -514,7 +547,7 @@ describe("refreshProject", () => {
 				id: row.id,
 				ref: "",
 				spawn: NOOP_SPAWN,
-				refresh: async () => ({ headSha: "x", ref: "" }),
+				refresh: async () => ({ headSha: "x", ref: "", features: { hasPlot: false } }),
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
 	});
@@ -526,9 +559,63 @@ describe("refreshProject", () => {
 				config: CFG,
 				id: "prj_nope",
 				spawn: NOOP_SPAWN,
-				refresh: async () => ({ headSha: "x", ref: "main" }),
+				refresh: async () => ({ headSha: "x", ref: "main", features: { hasPlot: false } }),
 			}),
 		).rejects.toMatchObject({ code: "not_found" });
+	});
+
+	test("persists the .plot/ probe outcome onto the project row (warren-4e20)", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: false }),
+		});
+		expect(row.hasPlot).toBe(false);
+
+		const result = await refreshProject({
+			repo,
+			config: CFG,
+			id: row.id,
+			spawn: NOOP_SPAWN,
+			refresh: async (input) => ({
+				headSha: "1234".repeat(10),
+				ref: input.ref,
+				features: { hasPlot: true },
+			}),
+		});
+
+		expect(result.project.hasPlot).toBe(true);
+		const persisted = await repo.require(row.id);
+		expect(persisted.hasPlot).toBe(true);
+	});
+
+	test("flips hasPlot back to false when .plot/ is removed upstream", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: true }),
+		});
+		expect(row.hasPlot).toBe(true);
+
+		const result = await refreshProject({
+			repo,
+			config: CFG,
+			id: row.id,
+			spawn: NOOP_SPAWN,
+			refresh: async (input) => ({
+				headSha: "5678".repeat(10),
+				ref: input.ref,
+				features: { hasPlot: false },
+			}),
+		});
+
+		expect(result.project.hasPlot).toBe(false);
 	});
 
 	test("invalidates the warren-config cache BEFORE refresh runs (pl-5d74 risk #4)", async () => {
@@ -556,7 +643,7 @@ describe("refreshProject", () => {
 			},
 			refresh: async (input) => {
 				order.push("refresh");
-				return { headSha: "deadbeef".repeat(5), ref: input.ref };
+				return { headSha: "deadbeef".repeat(5), ref: input.ref, features: { hasPlot: false } };
 			},
 		});
 

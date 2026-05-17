@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { SpawnFn, SpawnResult } from "./clone.ts";
 import type { ProjectsConfig } from "./config.ts";
 import { ProjectUnavailableError } from "./errors.ts";
-import { refreshProjectClone } from "./refresh.ts";
+import { detectProjectFeatures, refreshProjectClone } from "./refresh.ts";
 
 const CFG: ProjectsConfig = { root: "/data/projects", gitBinary: "git" };
 
@@ -42,7 +42,7 @@ describe("refreshProjectClone", () => {
 			exists: () => true,
 		});
 
-		expect(result).toEqual({ headSha: sha, ref: "main" });
+		expect(result).toEqual({ headSha: sha, ref: "main", features: { hasPlot: true } });
 		expect(calls.map((c) => c.cmd[1])).toEqual([
 			"fetch",
 			"checkout",
@@ -152,6 +152,30 @@ describe("refreshProjectClone", () => {
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
 	});
 
+	test("probes for .plot/ alongside git ops and surfaces the boolean on features (warren-4e20)", async () => {
+		const sha = "feedfacefeedfacefeedfacefeedfacefeedface";
+		const probed: string[] = [];
+		const { spawn } = recorder((cmd) => {
+			if (cmd[1] === "rev-parse") return ok(`${sha}\n`);
+			return ok();
+		});
+		const result = await refreshProjectClone({
+			config: CFG,
+			localPath: "/data/projects/x/y",
+			ref: "main",
+			spawn,
+			exists: (p) => {
+				probed.push(p);
+				if (p === "/data/projects/x/y") return true;
+				if (p === "/data/projects/x/y/.plot") return false;
+				return false;
+			},
+		});
+
+		expect(result.features).toEqual({ hasPlot: false });
+		expect(probed).toContain("/data/projects/x/y/.plot");
+	});
+
 	test("throws ProjectUnavailableError when rev-parse returns empty", async () => {
 		const { spawn } = recorder((cmd) => {
 			if (cmd[1] === "rev-parse") return ok("\n");
@@ -166,5 +190,22 @@ describe("refreshProjectClone", () => {
 				exists: () => true,
 			}),
 		).rejects.toBeInstanceOf(ProjectUnavailableError);
+	});
+});
+
+describe("detectProjectFeatures", () => {
+	test("returns hasPlot=true when .plot/ exists at the clone root", () => {
+		const probed: string[] = [];
+		const result = detectProjectFeatures("/data/projects/x/y", (p) => {
+			probed.push(p);
+			return p === "/data/projects/x/y/.plot";
+		});
+		expect(result).toEqual({ hasPlot: true });
+		expect(probed).toEqual(["/data/projects/x/y/.plot"]);
+	});
+
+	test("returns hasPlot=false when .plot/ is absent", () => {
+		const result = detectProjectFeatures("/data/projects/x/y", () => false);
+		expect(result).toEqual({ hasPlot: false });
 	});
 });

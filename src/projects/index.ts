@@ -31,6 +31,9 @@ export {
 	refreshProject,
 } from "./manage.ts";
 export {
+	detectProjectFeatures,
+	PROJECT_FEATURE_DIRS,
+	type ProjectFeatureFlags,
 	type RefreshProjectCloneInput,
 	type RefreshProjectCloneResult,
 	refreshProjectClone,

@@ -24,11 +24,52 @@
  */
 
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "./clone.ts";
 import type { ProjectsConfig } from "./config.ts";
 import { ProjectUnavailableError } from "./errors.ts";
 
 export const DEFAULT_GIT_TIMEOUT_MS = 120_000;
+
+/**
+ * Feature directories warren probes for at clone refresh time (warren-4e20).
+ * Today only `.plot/` is surfaced on the project row; the seed plan
+ * (pl-2047 step 2) leaves room for the existing opt-in integrations
+ * (`.mulch/`, `.seeds/`, `.canopy/`, `.pi/`) to start surfacing the same
+ * way without changing the probe shape.
+ */
+export const PROJECT_FEATURE_DIRS = {
+	plot: ".plot",
+} as const;
+
+/**
+ * Result of probing a project clone for opt-in feature directories. One
+ * boolean per gated integration; addProject / refreshProject persist the
+ * fields to the corresponding `projects` row columns.
+ */
+export interface ProjectFeatureFlags {
+	readonly hasPlot: boolean;
+}
+
+/**
+ * Synchronous probe of the on-disk clone for the directories that gate
+ * warren's opt-in integrations. Returns booleans; never throws. The
+ * `exists` probe is injectable so tests don't touch disk and so a future
+ * git-tree reader can swap to a non-checked-out ref.
+ *
+ * Called from `refreshProjectClone` after the post-fetch reset and from
+ * `addProject` immediately after the initial clone so the row reflects
+ * the feature shape of the freshly-checked-out tree. The detection is
+ * read-only and stateless on its own — persistence is the caller's job.
+ */
+export function detectProjectFeatures(
+	localPath: string,
+	exists: (path: string) => boolean = existsSync,
+): ProjectFeatureFlags {
+	return {
+		hasPlot: exists(join(localPath, PROJECT_FEATURE_DIRS.plot)),
+	};
+}
 
 export interface RefreshProjectCloneInput {
 	readonly config: ProjectsConfig;
@@ -44,6 +85,14 @@ export interface RefreshProjectCloneResult {
 	readonly headSha: string;
 	/** Echo of the resolved ref the caller asked for. */
 	readonly ref: string;
+	/**
+	 * Feature-directory probe taken after the hard-reset to origin/<ref>
+	 * (warren-4e20). Reflects the on-disk shape of the freshly-checked-out
+	 * tree, so a `.plot/` added (or removed) on the remote since the last
+	 * refresh flips the corresponding flag on the next call. `addProject`
+	 * runs the same probe right after the initial clone.
+	 */
+	readonly features: ProjectFeatureFlags;
 }
 
 export async function refreshProjectClone(
@@ -107,7 +156,8 @@ export async function refreshProjectClone(
 	}
 
 	const headSha = await readHead(spawn, config.gitBinary, localPath, timeoutMs);
-	return { headSha, ref };
+	const features = detectProjectFeatures(localPath, exists);
+	return { headSha, ref, features };
 }
 
 async function readHead(

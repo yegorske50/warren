@@ -18,12 +18,24 @@ export interface CreateProjectInput {
 	gitUrl: string;
 	localPath: string;
 	defaultBranch: string;
+	/**
+	 * Plot opt-in flag (warren-4e20). Defaults to false when omitted so
+	 * tests / callers that haven't probed the clone yet still get a
+	 * well-formed row; the column is NOT NULL.
+	 */
+	hasPlot?: boolean;
 	now?: Date;
 }
 
 export interface RecordRefreshInput {
 	id: string;
 	headSha: string;
+	/**
+	 * Latest probe outcome (warren-4e20). Omitted means "leave the prior
+	 * value" — refresh callers always supply it now, but historic callers
+	 * (manual triggers, tests) may not.
+	 */
+	hasPlot?: boolean;
 	now?: Date;
 }
 
@@ -47,6 +59,7 @@ export class ProjectsRepo {
 			addedAt: (input.now ?? new Date()).toISOString(),
 			lastFetchedAt: null,
 			lastHeadSha: null,
+			hasPlot: input.hasPlot ?? false,
 		};
 		await this.adapter.runWrite(this.db.insert(this.projects).values(row));
 		return row;
@@ -54,11 +67,15 @@ export class ProjectsRepo {
 
 	async recordRefresh(input: RecordRefreshInput): Promise<ProjectRow> {
 		const lastFetchedAt = (input.now ?? new Date()).toISOString();
+		const patch: { lastFetchedAt: string; lastHeadSha: string; hasPlot?: boolean } = {
+			lastFetchedAt,
+			lastHeadSha: input.headSha,
+		};
+		if (input.hasPlot !== undefined) {
+			patch.hasPlot = input.hasPlot;
+		}
 		await this.adapter.runWrite(
-			this.db
-				.update(this.projects)
-				.set({ lastFetchedAt, lastHeadSha: input.headSha })
-				.where(eq(this.projects.id, input.id)),
+			this.db.update(this.projects).set(patch).where(eq(this.projects.id, input.id)),
 		);
 		return this.require(input.id);
 	}

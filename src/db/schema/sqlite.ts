@@ -78,6 +78,13 @@ export const projects = sqliteTable(
 		addedAt: text("added_at").notNull(),
 		lastFetchedAt: text("last_fetched_at"),
 		lastHeadSha: text("last_head_sha"),
+		// Plot opt-in gating flag (warren-4e20). True iff a `.plot/` directory
+		// exists at the clone root at the time of the most recent
+		// addProject / refreshProjectClone. The dispatch path reads this to
+		// gate `plot_id` validation and PLOT_ID/PLOT_ACTOR env injection
+		// (warren-a8c3, warren-e26f). Defaults to false so legacy rows
+		// written before this column existed match the no-`.plot/` shape.
+		hasPlot: integer("has_plot", { mode: "boolean" }).notNull().default(false),
 	},
 	(t) => [index(INDEX_NAMES.projectsGitUrl).on(t.gitUrl)],
 );

@@ -23,6 +23,7 @@
 
 import { sql } from "drizzle-orm";
 import {
+	boolean,
 	doublePrecision,
 	index,
 	integer,
@@ -68,6 +69,11 @@ export const projects = pgTable(
 		addedAt: text("added_at").notNull(),
 		lastFetchedAt: text("last_fetched_at"),
 		lastHeadSha: text("last_head_sha"),
+		// Plot opt-in gating flag (warren-4e20) — mirror of sqlite. Boolean
+		// rather than integer here; the drift check only compares structure
+		// (column name + nullability + default presence), not the storage
+		// type, so the sqlite integer-as-boolean stays in lockstep.
+		hasPlot: boolean("has_plot").notNull().default(false),
 	},
 	(t) => [index(INDEX_NAMES.projectsGitUrl).on(t.gitUrl)],
 );

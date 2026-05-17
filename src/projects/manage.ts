@@ -40,7 +40,11 @@ import {
 } from "./clone.ts";
 import type { ProjectsConfig } from "./config.ts";
 import { ProjectUnavailableError } from "./errors.ts";
-import { type RefreshProjectCloneResult, refreshProjectClone } from "./refresh.ts";
+import {
+	detectProjectFeatures,
+	type RefreshProjectCloneResult,
+	refreshProjectClone,
+} from "./refresh.ts";
 import { parseGitHubUrl } from "./url.ts";
 
 export interface AddProjectInput {
@@ -53,6 +57,12 @@ export interface AddProjectInput {
 	readonly now?: () => Date;
 	/** Inject the cloner; defaults to the live `cloneProjectRepo`. */
 	readonly clone?: typeof cloneProjectRepo;
+	/**
+	 * Override the feature-directory probe (warren-4e20). Defaults to the
+	 * filesystem-backed `detectProjectFeatures`; tests inject a stub so
+	 * the on-disk clone can stay empty.
+	 */
+	readonly detectFeatures?: typeof detectProjectFeatures;
 }
 
 export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
@@ -77,10 +87,14 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 	});
 
+	const detect = input.detectFeatures ?? detectProjectFeatures;
+	const features = detect(clone.localPath);
+
 	return repo.create({
 		gitUrl,
 		localPath: clone.localPath,
 		defaultBranch: clone.defaultBranch,
+		hasPlot: features.hasPlot,
 		now: input.now?.(),
 	});
 }
@@ -141,6 +155,7 @@ export async function refreshProject(input: RefreshProjectInput): Promise<Refres
 	const updated = await repo.recordRefresh({
 		id: row.id,
 		headSha: result.headSha,
+		hasPlot: result.features.hasPlot,
 		now: input.now?.(),
 	});
 	return { project: updated, headSha: result.headSha, ref: result.ref };

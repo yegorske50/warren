@@ -85,6 +85,13 @@
 			"when": 1778861762957,
 			"tag": "0011_colorful_mole_man",
 			"breakpoints": true
+		},
+		{
+			"idx": 12,
+			"version": "6",
+			"when": 1779055153470,
+			"tag": "0012_grey_otto_octavius",
+			"breakpoints": true
 		}
 	]
 }

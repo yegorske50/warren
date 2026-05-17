@@ -1,0 +1,1 @@
+ALTER TABLE "projects" ADD COLUMN "has_plot" boolean DEFAULT false NOT NULL;

@@ -46,6 +46,16 @@ export interface ProjectRow {
 	addedAt: string;
 	lastFetchedAt: string | null;
 	lastHeadSha: string | null;
+	/**
+	 * Plot opt-in gating flag (warren-4e20). True iff a `.plot/` directory
+	 * existed at the clone root the last time addProject or
+	 * refreshProjectClone probed it. The dispatch path consumes this to
+	 * gate `plot_id` validation and PLOT_ID/PLOT_ACTOR env injection
+	 * downstream (warren-a8c3, warren-e26f). No UI surface yet — the
+	 * field exists so subsequent plan steps can read it without touching
+	 * the wire envelope again.
+	 */
+	hasPlot: boolean;
 }
 
 export interface RefreshProjectResponse {
