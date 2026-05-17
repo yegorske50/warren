@@ -63,6 +63,14 @@ export interface CreateRunInput {
 	 * back-link on RunDetail (pl-bb70 step 6).
 	 */
 	seedId?: string | null;
+	/**
+	 * Back-link to the Plot this run was dispatched against (warren-a8c3,
+	 * parent warren-000b). Null/undefined when the project hasn't opted
+	 * into Plots or the dispatch omitted plot_id. Validation that the
+	 * project actually has a `.plot/` directory happens at handler level
+	 * via `project.hasPlot` — the repo writes whatever it's handed.
+	 */
+	plotId?: string | null;
 	now?: Date;
 }
 
@@ -108,6 +116,7 @@ export class RunsRepo {
 			burrowRunId: input.burrowRunId ?? null,
 			workerId: input.workerId ?? null,
 			seedId: input.seedId ?? null,
+			plotId: input.plotId ?? null,
 			renderedAgentJson: input.renderedAgentJson,
 			state: "queued",
 			failureReason: null,

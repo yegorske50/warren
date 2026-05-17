@@ -239,6 +239,43 @@ describe("spawnRun", () => {
 		).rejects.toBeInstanceOf(NotFoundError);
 	});
 
+	test("rejects plotId when project.hasPlot is false (warren-a8c3)", async () => {
+		const { client, calls } = makeBurrowClient();
+		await expect(
+			spawnRun({
+				repos,
+				burrowClientPool: await makePool(repos, client),
+				agentName: "refactor-bot",
+				projectId: "prj_xxxxxxxxxxxx",
+				prompt: "fix it",
+				plotId: "pl-2047",
+			}),
+		).rejects.toBeInstanceOf(ValidationError);
+		expect(calls).toHaveLength(0);
+		expect(await repos.runs.listAll()).toHaveLength(0);
+	});
+
+	test("persists plotId on the runs row when project.hasPlot is true (warren-a8c3)", async () => {
+		// No public mutator on ProjectsRepo for has_plot yet — refreshProjectClone
+		// is the production write path (warren-4e20). Flip the column directly so
+		// the test isolates the spawn-side surface; the integration end-to-end
+		// is covered by warren-4e06's acceptance scenario.
+		db.raw.exec("UPDATE projects SET has_plot = 1 WHERE id = 'prj_xxxxxxxxxxxx'");
+
+		const { client } = makeBurrowClient();
+		const result = await spawnRun({
+			repos,
+			burrowClientPool: await makePool(repos, client),
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "fix it",
+			plotId: "pl-2047",
+		});
+		expect(result.run.plotId).toBe("pl-2047");
+		const reread = await repos.runs.require(result.run.id);
+		expect(reread.plotId).toBe("pl-2047");
+	});
+
 	test("prefers the project-tier agent when one exists for the spawn's project (R-03 / warren-0a7e)", async () => {
 		await repos.agents.upsert({
 			name: "refactor-bot",

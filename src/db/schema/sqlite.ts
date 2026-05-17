@@ -125,6 +125,17 @@ export const runs = sqliteTable(
 		// Plain text (no FK to seeds) — seeds live in the project workspace, not
 		// in warren's database, and the seed-id space is per-project.
 		seedId: text("seed_id"),
+		// Optional back-link to the Plot this run was dispatched against
+		// (warren-a8c3, parent warren-000b). Gated on the owning project's
+		// `hasPlot` flag at handler-level — POST /runs rejects a plot_id when
+		// the project has no `.plot/` directory. When set, the spawn flow
+		// (warren-e26f) injects PLOT_ID + PLOT_ACTOR into the sandbox env,
+		// emits a `run_dispatched` event into the Plot (warren-e848), and
+		// reap mirrors plot deltas back into warren's event stream tagged
+		// with this plot_id (warren-7e0f). Nullable: legacy rows and runs
+		// dispatched without a plot leave it null. Plain text, no FK — Plots
+		// live in the project workspace, not in warren's database.
+		plotId: text("plot_id"),
 		renderedAgentJson: text("rendered_agent_json", { mode: "json" }).notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
@@ -167,6 +178,7 @@ export const runs = sqliteTable(
 		index(INDEX_NAMES.runsProjectStarted).on(t.projectId, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsAgentStarted).on(t.agentName, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
+		index(INDEX_NAMES.runsPlotId).on(t.plotId),
 	],
 );
 

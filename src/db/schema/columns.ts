@@ -117,6 +117,7 @@ export const INDEX_NAMES = {
 	runsProjectStarted: "runs_project_started_idx",
 	runsAgentStarted: "runs_agent_started_idx",
 	runsWorkerState: "runs_worker_state_idx",
+	runsPlotId: "runs_plot_id_idx",
 	eventsRunSeq: "events_run_seq_idx",
 	eventsRunTs: "events_run_ts_idx",
 	triggersProject: "triggers_project_idx",

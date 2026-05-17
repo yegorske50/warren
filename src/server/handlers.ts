@@ -797,6 +797,7 @@ function createRunHandler(deps: ServerDeps): RouteHandler {
 		const providerOverride = optionalString(body, "providerOverride");
 		const modelOverride = optionalString(body, "modelOverride");
 		const seedId = optionalString(body, "seedId");
+		const plotId = optionalString(body, "plotId");
 		const result = await spawnRun({
 			repos: deps.repos,
 			burrowClientPool: deps.burrowClientPool,
@@ -811,6 +812,7 @@ function createRunHandler(deps: ServerDeps): RouteHandler {
 			...(providerOverride !== undefined ? { providerOverride } : {}),
 			...(modelOverride !== undefined ? { modelOverride } : {}),
 			...(seedId !== undefined ? { seedId } : {}),
+			...(plotId !== undefined ? { plotId } : {}),
 			...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
 			...(deps.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: deps.runBranchPrefixDefault }
@@ -1082,7 +1084,7 @@ function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 		const id = requireParam(ctx, "id");
 		// 404 fast if the run isn't known — without this we'd happily
 		// stream an empty NDJSON forever for a typo'd id.
-		await deps.repos.runs.require(id);
+		const run = await deps.repos.runs.require(id);
 
 		const follow = parseBoolean(ctx.url.searchParams.get("follow"), "follow") ?? false;
 		const sinceSeq = parseNonNegativeInt(ctx.url.searchParams.get("since"), "since");
@@ -1096,7 +1098,13 @@ function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 			...(sinceSeq !== undefined ? { sinceSeq } : {}),
 			signal: ctrl.signal,
 		});
-		return ndjsonResponse(asNdjsonStream(source, eventToNdjson, ctrl));
+		// warren-a8c3: tag every NDJSON envelope with the run's plot_id so
+		// Plot-aware consumers can route mirrored events (warren-7e0f) without
+		// a second GET /runs/:id call. Snapshot at stream-open time — plot_id
+		// is set at spawn and never mutates, so the closure-captured value is
+		// authoritative for the life of the stream.
+		const plotId = run.plotId;
+		return ndjsonResponse(asNdjsonStream(source, (row) => eventToNdjson(row, plotId), ctrl));
 	};
 }
 
@@ -1149,15 +1157,18 @@ function asNdjsonStream<T>(
 	});
 }
 
-function eventToNdjson(row: {
-	id: number;
-	runId: string;
-	burrowEventSeq: number;
-	ts: string;
-	kind: string;
-	stream: string | null;
-	payloadJson: unknown;
-}): string {
+function eventToNdjson(
+	row: {
+		id: number;
+		runId: string;
+		burrowEventSeq: number;
+		ts: string;
+		kind: string;
+		stream: string | null;
+		payloadJson: unknown;
+	},
+	plotId: string | null = null,
+): string {
 	return `${JSON.stringify({
 		id: row.id,
 		runId: row.runId,
@@ -1166,6 +1177,7 @@ function eventToNdjson(row: {
 		kind: row.kind,
 		stream: row.stream,
 		payload: row.payloadJson,
+		plotId,
 	})}\n`;
 }
 

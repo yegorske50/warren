@@ -91,6 +91,8 @@ export const runs = pgTable(
 		burrowRunId: text("burrow_run_id"),
 		workerId: text("worker_id"),
 		seedId: text("seed_id"),
+		// Mirror of sqlite plot_id (warren-a8c3). See sqlite.ts for shape.
+		plotId: text("plot_id"),
 		renderedAgentJson: jsonb("rendered_agent_json").notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
@@ -115,6 +117,7 @@ export const runs = pgTable(
 		index(INDEX_NAMES.runsProjectStarted).on(t.projectId, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsAgentStarted).on(t.agentName, sql`${t.startedAt} DESC`),
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
+		index(INDEX_NAMES.runsPlotId).on(t.plotId),
 	],
 );
 

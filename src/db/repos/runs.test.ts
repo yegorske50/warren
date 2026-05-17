@@ -107,6 +107,28 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			}
 		});
 
+		test("create persists plotId when provided", async () => {
+			const { handle, repo, agentName, projectId } = await open();
+			try {
+				const row = await spawn(repo, agentName, projectId, { plotId: "pl-2047" });
+				expect(row.plotId).toBe("pl-2047");
+				const reread = await repo.require(row.id);
+				expect(reread.plotId).toBe("pl-2047");
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("create leaves plotId null when omitted", async () => {
+			const { handle, repo, agentName, projectId } = await open();
+			try {
+				const row = await spawn(repo, agentName, projectId);
+				expect(row.plotId).toBeNull();
+			} finally {
+				await handle.close();
+			}
+		});
+
 		test("create leaves cost + token columns null", async () => {
 			const { handle, repo, agentName, projectId } = await open();
 			try {

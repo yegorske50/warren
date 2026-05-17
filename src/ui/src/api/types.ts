@@ -85,6 +85,13 @@ export interface RunRow {
 	 * when the issues page lands.
 	 */
 	seedId: string | null;
+	/**
+	 * Back-link to the Plot this run was dispatched against (warren-a8c3,
+	 * parent warren-000b). Null when the project hasn't opted into Plots
+	 * (`project.hasPlot` false) or the dispatch omitted plot_id. The
+	 * stream envelope mirrors the same field for live consumers.
+	 */
+	plotId: string | null;
 	renderedAgentJson: unknown;
 	state: RunState;
 	failureReason: RunFailureReason | null;
@@ -177,6 +184,13 @@ export interface CreateRunInput {
 	 * after dispatch (pl-bb70 step 4 / warren-46cd).
 	 */
 	seedId?: string;
+	/**
+	 * Optional back-link to the Plot this run is dispatched against
+	 * (warren-a8c3, parent warren-000b). The server validates that the
+	 * project has a `.plot/` directory (`project.hasPlot`); supplying
+	 * plot_id for a project without Plots returns a 400 ValidationError.
+	 */
+	plotId?: string;
 }
 
 export interface SpawnRunResponse {
@@ -235,6 +249,13 @@ export interface RunEvent {
 	kind: string;
 	stream: "stdout" | "stderr" | "system" | null;
 	payload: unknown;
+	/**
+	 * Run-scoped Plot back-link, snapshotted at stream-open time from
+	 * `runs.plot_id` (warren-a8c3). Null when the run was dispatched
+	 * without a plot_id. Stable across the lifetime of the stream — the
+	 * run row's plot_id is set at spawn and never mutates.
+	 */
+	plotId: string | null;
 }
 
 /**

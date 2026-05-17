@@ -105,6 +105,16 @@ export interface SpawnRunInput {
 	 * Manual prompts and legacy callers leave it undefined → null on disk.
 	 */
 	readonly seedId?: string;
+	/**
+	 * Optional Plot id this run is dispatched against (warren-a8c3,
+	 * parent warren-000b). Validated against `project.hasPlot` here:
+	 * passing a plot_id for a project whose clone has no `.plot/`
+	 * directory raises a typed ValidationError so the operator gets a
+	 * 400 with a clear hint instead of a silently-dropped field.
+	 * Persisted to `runs.plot_id`; downstream steps (warren-e26f,
+	 * warren-e848, warren-7e0f) read it from the runs row.
+	 */
+	readonly plotId?: string;
 	readonly metadata?: unknown;
 	/**
 	 * Optional per-run override of the agent's `frontmatter.provider`. When
@@ -188,6 +198,20 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		});
 	}
 	const project = await input.repos.projects.require(input.projectId);
+	// warren-a8c3: gate plot_id on the project's hasPlot flag. Probed at
+	// addProject / refreshProjectClone time (warren-4e20). Refusing here
+	// keeps the runs row honest — a non-Plot project never grows a
+	// dangling plot_id that downstream PLOT_ID env injection (warren-e26f)
+	// or .plot/ mirroring (warren-7e0f) would have to second-guess.
+	if (input.plotId !== undefined && input.plotId !== "" && !project.hasPlot) {
+		throw new ValidationError(
+			`project ${project.id} has no .plot/ directory; plot_id is not accepted`,
+			{
+				recoveryHint:
+					"either omit plot_id on POST /runs, or run `plot init` in the project clone and refresh the project so warren picks up the .plot/ directory",
+			},
+		);
+	}
 	const baseAgent = readCachedAgent(agentRow.renderedJson, agentRow.name);
 	const burrowConfig = parseBurrowConfig(baseAgent.sections.burrow_config);
 
@@ -254,6 +278,7 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		trigger: input.trigger ?? "manual",
 		workerId: placement.workerName,
 		...(input.seedId !== undefined ? { seedId: input.seedId } : {}),
+		...(input.plotId !== undefined && input.plotId !== "" ? { plotId: input.plotId } : {}),
 		now: input.now?.(),
 	});
 
