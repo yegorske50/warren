@@ -116,6 +116,33 @@ export class EventsRepo {
 		return raw === null ? null : Number(raw);
 	}
 
+	/**
+	 * Events carrying runtime usage telemetry (warren-ab18). Both
+	 * recognised shapes — pi `turn_end` and claude-code `result` — ride
+	 * the `kind=state_change`, `stream=system` carrier, so this is the
+	 * minimal scan the read-time cost hydrator needs to reconstruct
+	 * totals for a run whose bridge died before its next checkpoint.
+	 *
+	 * Empty `runIds` short-circuits without a DB hit. Ordered by
+	 * (runId, seq) so callers can group + aggregate in a single pass.
+	 */
+	async listUsageEvents(runIds: readonly string[]): Promise<EventRow[]> {
+		if (runIds.length === 0) return [];
+		return this.adapter.pickAll(
+			this.db
+				.select()
+				.from(this.events)
+				.where(
+					and(
+						inArray(this.events.runId, runIds as string[]),
+						eq(this.events.kind, "state_change"),
+						eq(this.events.stream, "system"),
+					),
+				)
+				.orderBy(asc(this.events.runId), asc(this.events.burrowEventSeq)),
+		);
+	}
+
 	async countByRun(runId: string): Promise<number> {
 		const row = await this.adapter.pickOne<{ n: number | string }>(
 			this.db

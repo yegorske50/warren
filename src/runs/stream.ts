@@ -52,6 +52,12 @@ import type { Repos } from "../db/repos/index.ts";
 import type { EventStream, RunTerminalState } from "../db/schema.ts";
 import { EVENT_STREAMS } from "../db/schema.ts";
 import type { RunEventBroker } from "./events.ts";
+import {
+	accumulatePiUsage,
+	extractClaudeUsage,
+	newSessionStatsAccumulator,
+	type SessionStatsAccumulator,
+} from "./usage-aggregate.ts";
 
 /**
  * Optional logger interface — pino-compatible subset, but typed loosely
@@ -559,123 +565,6 @@ async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<void> {
 			"attachStats threw; cost columns may be inconsistent",
 		);
 	}
-}
-
-/**
- * Mutable accumulator for pi `turn_end` usage observed in-stream. Pi
- * emits per-turn totals (not session-cumulative within a single run with
- * `--no-session`), so the bridge sums turns to land at the run total.
- * `seen` distinguishes "no pi usage observed yet" from "observed zero
- * cost" — the persist step skips the write entirely when seen=false so
- * non-pi runs keep parity with claude-code (columns stay null).
- */
-interface SessionStatsAccumulator {
-	seen: boolean;
-	costUsd: number;
-	tokensInput: number;
-	tokensOutput: number;
-	tokensCacheRead: number;
-	tokensCacheWrite: number;
-}
-
-function newSessionStatsAccumulator(): SessionStatsAccumulator {
-	return {
-		seen: false,
-		costUsd: 0,
-		tokensInput: 0,
-		tokensOutput: 0,
-		tokensCacheRead: 0,
-		tokensCacheWrite: 0,
-	};
-}
-
-/**
- * Extract pi's per-turn usage from a `turn_end` envelope and add it to
- * the accumulator. Pi's per-message usage (in `message_end`) double-counts
- * across the turn because each assistant message duplicates the
- * conversation totals, so we read only `turn_end`'s `message.usage.cost`
- * (see burrow `src/runtime/parsers/__golden__/pi-v0.74.0-anthropic-*.jsonl`).
- *
- * Defensive: unknown shapes leave the accumulator untouched. A future
- * pi version that grows new envelope fields can't crash the bridge —
- * the worst case is "we miss this run's cost", same as no-event.
- */
-function accumulatePiUsage(acc: SessionStatsAccumulator, event: RunEvent): void {
-	if (event.kind !== "state_change") return;
-	if (event.stream !== "system") return;
-	const payload = event.payload;
-	if (payload === null || typeof payload !== "object") return;
-	const env = payload as Record<string, unknown>;
-	if (env.type !== "turn_end") return;
-	const message = env.message;
-	if (message === null || typeof message !== "object") return;
-	const usage = (message as Record<string, unknown>).usage;
-	if (usage === null || typeof usage !== "object") return;
-	const u = usage as Record<string, unknown>;
-	const cost = u.cost;
-	const costTotal =
-		cost !== null && typeof cost === "object"
-			? toNumber((cost as Record<string, unknown>).total)
-			: null;
-	const tokensInput = toNumber(u.input);
-	const tokensOutput = toNumber(u.output);
-	const tokensCacheRead = toNumber(u.cacheRead);
-	const tokensCacheWrite = toNumber(u.cacheWrite);
-	// Require at least the cost total OR an input/output token count
-	// before we count the envelope as "real" usage — otherwise a malformed
-	// turn_end with a structurally-present but empty usage block would
-	// mark the run as pi-shaped and persist all-zeros.
-	if (costTotal === null && tokensInput === null && tokensOutput === null) return;
-	acc.seen = true;
-	if (costTotal !== null) acc.costUsd += costTotal;
-	if (tokensInput !== null) acc.tokensInput += tokensInput;
-	if (tokensOutput !== null) acc.tokensOutput += tokensOutput;
-	if (tokensCacheRead !== null) acc.tokensCacheRead += tokensCacheRead;
-	if (tokensCacheWrite !== null) acc.tokensCacheWrite += tokensCacheWrite;
-}
-
-function toNumber(value: unknown): number | null {
-	return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-/**
- * Extract claude-code's run-level usage from its single terminal `result`
- * envelope (warren-87f9). Shape (see burrow `src/runtime/parsers/jsonl-claude.ts`):
- *   {"type":"result", "subtype":"success", "total_cost_usd": N,
- *    "usage":{ "input_tokens":N, "output_tokens":N,
- *              "cache_read_input_tokens":N, "cache_creation_input_tokens":N }}
- * Single-shot: claude-code emits cumulative totals once at end, so we
- * assign (not add) to the accumulator. Pi's `turn_end` shape is
- * disjoint (different `type` + nested `message.usage.cost.total`), so
- * shape-sniffing here can't collide with `accumulatePiUsage`.
- *
- * Defensive: unknown shapes leave the accumulator untouched. A future
- * claude-code that adds fields can't crash the bridge — worst case we
- * miss this run's cost.
- */
-function extractClaudeUsage(acc: SessionStatsAccumulator, event: RunEvent): void {
-	if (event.kind !== "state_change") return;
-	if (event.stream !== "system") return;
-	const payload = event.payload;
-	if (payload === null || typeof payload !== "object") return;
-	const env = payload as Record<string, unknown>;
-	if (env.type !== "result") return;
-	const costTotal = toNumber(env.total_cost_usd);
-	const usage = env.usage;
-	const u = usage !== null && typeof usage === "object" ? (usage as Record<string, unknown>) : null;
-	const tokensInput = u !== null ? toNumber(u.input_tokens) : null;
-	const tokensOutput = u !== null ? toNumber(u.output_tokens) : null;
-	const tokensCacheRead = u !== null ? toNumber(u.cache_read_input_tokens) : null;
-	const tokensCacheWrite = u !== null ? toNumber(u.cache_creation_input_tokens) : null;
-	// Require cost OR input/output tokens before flagging the envelope as
-	// real claude-code usage — mirrors accumulatePiUsage's guard.
-	if (costTotal === null && tokensInput === null && tokensOutput === null) return;
-	acc.seen = true;
-	acc.costUsd = costTotal ?? 0;
-	acc.tokensInput = tokensInput ?? 0;
-	acc.tokensOutput = tokensOutput ?? 0;
-	acc.tokensCacheRead = tokensCacheRead ?? 0;
-	acc.tokensCacheWrite = tokensCacheWrite ?? 0;
 }
 
 interface PersistInStreamUsageInput {

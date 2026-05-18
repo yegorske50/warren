@@ -64,3 +64,17 @@ export {
 	recoverActiveRunStreams,
 	type SessionStats,
 } from "./stream.ts";
+export {
+	accumulatePiUsage,
+	aggregateUsageFromEvents,
+	eventRowToUsageInput,
+	extractClaudeUsage,
+	newSessionStatsAccumulator,
+	type SessionStatsAccumulator,
+	type UsageEventInput,
+} from "./usage-aggregate.ts";
+export {
+	hydrateRunsUsage,
+	hydrateRunUsage,
+	type UsageEventsFetcher,
+} from "./usage-hydrate.ts";

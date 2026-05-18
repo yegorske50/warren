@@ -93,6 +93,8 @@ import {
 } from "../registry/refresh.ts";
 import {
 	cancelRun,
+	hydrateRunsUsage,
+	hydrateRunUsage,
 	resolveDispatcherHandle,
 	spawnRun,
 	steerRun,
@@ -807,20 +809,27 @@ function listRunsHandler(deps: ServerDeps): RouteHandler {
 			throw new ValidationError("filter by either ?project=... or ?agent=..., not both");
 		}
 		const order = parseRunsSort(ctx);
-		if (project !== null) {
-			return jsonResponse(200, { runs: await deps.repos.runs.listByProject(project, order) });
-		}
-		if (agent !== null) {
-			return jsonResponse(200, { runs: await deps.repos.runs.listByAgent(agent, order) });
-		}
-		return jsonResponse(200, { runs: await deps.repos.runs.listAll(order) });
+		const rows =
+			project !== null
+				? await deps.repos.runs.listByProject(project, order)
+				: agent !== null
+					? await deps.repos.runs.listByAgent(agent, order)
+					: await deps.repos.runs.listAll(order);
+		// warren-ab18: surface in-events cost for terminal runs whose
+		// bridge died before the final checkpoint landed.
+		const runs = await hydrateRunsUsage(rows, deps.repos.events);
+		return jsonResponse(200, { runs });
 	};
 }
 
 function getRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
-		return jsonResponse(200, await deps.repos.runs.require(id));
+		const row = await deps.repos.runs.require(id);
+		// warren-ab18: same compute-on-read fallback as the list handler
+		// so the RunDetail page shows cost for ghost / reboot-orphaned runs.
+		const run = await hydrateRunUsage(row, deps.repos.events);
+		return jsonResponse(200, run);
 	};
 }
 
