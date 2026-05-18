@@ -20,12 +20,25 @@ export {
 } from "./extensions.ts";
 export {
 	type ParseScheduledSeedsResult,
+	type PlanShowEnvelope,
+	PlanShowEnvelopeSchema,
+	type PlanShowPlan,
+	type PlanShowStep,
 	parseScheduledSeeds,
 	type ScheduledSeed,
 	type SeedRow,
+	type SeedShowEnvelope,
+	SeedShowEnvelopeSchema,
+	type SeedShowIssue,
 	type SeedsListEnvelope,
 	SeedsListEnvelopeSchema,
 } from "./schema.ts";
+export {
+	type PlanShowResult,
+	type SeedShowResult,
+	showPlan,
+	showSeed,
+} from "./show.ts";
 export {
 	type WarrenExtensions,
 	WarrenExtensionsSchema,

@@ -1,0 +1,124 @@
+/**
+ * Shell-out readers for `sd plan show <id> --json` and `sd show <id> --json`.
+ *
+ * Two operations live here, both used by the plan-run coordinator (pl-a258
+ * steps 5 + 6):
+ *
+ *   `showPlan` — read a plan's id/status/children/step blocks-DAG at
+ *      PlanRun-create time so the coordinator can enumerate children in
+ *      order without re-shelling `sd` on every tick.
+ *
+ *   `showSeed` — re-read a single child seed's status before dispatch so
+ *      the coordinator can flip already-closed seeds to `skipped` (the
+ *      warren-fcc9 resume-semantics path).
+ *
+ * Both use the same `SeedsCliDeps` + `SpawnFn` injection as
+ * `listScheduledSeeds` / `updateExtensions` (mx-371491) so tests reuse the
+ * same stubs, and both wrap shell + parse failures in `SeedsCliError`
+ * with a copy-paste recoveryHint mirroring `listScheduledSeeds` lines
+ * 50–60 of extensions.ts.
+ */
+
+import { SeedsCliError } from "./errors.ts";
+import type { SeedsCliDeps } from "./extensions.ts";
+import {
+	PlanShowEnvelopeSchema,
+	type PlanShowPlan,
+	SeedShowEnvelopeSchema,
+	type SeedShowIssue,
+} from "./schema.ts";
+
+const DEFAULT_SD_TIMEOUT_MS = 30_000;
+
+export type PlanShowResult = PlanShowPlan;
+export type SeedShowResult = SeedShowIssue;
+
+export async function showPlan(
+	deps: SeedsCliDeps,
+	projectPath: string,
+	planId: string,
+): Promise<PlanShowResult> {
+	const result = await deps.spawn([deps.sdBinary, "plan", "show", planId, "--json"], {
+		cwd: projectPath,
+		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+	});
+	if (result.exitCode !== 0) {
+		throw new SeedsCliError(
+			`sd plan show ${planId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
+			{
+				recoveryHint: `run \`${deps.sdBinary} plan show ${planId}\` in ${projectPath} to diagnose`,
+			},
+		);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(result.stdout);
+	} catch (err) {
+		throw new SeedsCliError(
+			`sd plan show ${planId} returned non-JSON output: ${formatError(err)}`,
+			{ cause: err },
+		);
+	}
+
+	const envelope = PlanShowEnvelopeSchema.safeParse(parsed);
+	if (!envelope.success) {
+		throw new SeedsCliError(
+			`sd plan show ${planId} response did not match expected envelope: ${envelope.error.issues
+				.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+				.join("; ")}`,
+		);
+	}
+
+	return envelope.data.plan;
+}
+
+export async function showSeed(
+	deps: SeedsCliDeps,
+	projectPath: string,
+	seedId: string,
+): Promise<SeedShowResult> {
+	const result = await deps.spawn([deps.sdBinary, "show", seedId, "--json"], {
+		cwd: projectPath,
+		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
+	});
+	if (result.exitCode !== 0) {
+		throw new SeedsCliError(
+			`sd show ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
+			{
+				recoveryHint: `run \`${deps.sdBinary} show ${seedId}\` in ${projectPath} to diagnose`,
+			},
+		);
+	}
+
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(result.stdout);
+	} catch (err) {
+		throw new SeedsCliError(`sd show ${seedId} returned non-JSON output: ${formatError(err)}`, {
+			cause: err,
+		});
+	}
+
+	const envelope = SeedShowEnvelopeSchema.safeParse(parsed);
+	if (!envelope.success) {
+		throw new SeedsCliError(
+			`sd show ${seedId} response did not match expected envelope: ${envelope.error.issues
+				.map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+				.join("; ")}`,
+		);
+	}
+
+	return envelope.data.issue;
+}
+
+function truncate(raw: string, limit = 500): string {
+	const trimmed = raw.trim();
+	if (trimmed.length <= limit) return trimmed;
+	return `${trimmed.slice(0, limit)}… [truncated]`;
+}
+
+function formatError(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	return String(err);
+}

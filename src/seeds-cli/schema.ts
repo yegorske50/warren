@@ -52,6 +52,72 @@ export const SeedsListEnvelopeSchema = z
 export type SeedRow = z.infer<typeof SeedRowSchema>;
 export type SeedsListEnvelope = z.infer<typeof SeedsListEnvelopeSchema>;
 
+/**
+ * Envelope shape for `sd plan show <id> --json`. We parse only the fields
+ * warren needs (plan id/status/children + the step blocks-DAG used at create
+ * time to enumerate child seeds in order) and pass `.passthrough()`
+ * everywhere else so seeds can grow new fields without breaking the facade.
+ */
+const PlanShowStepSchema = z
+	.object({
+		title: z.string(),
+		blocks: z.array(z.number().int().nonnegative()).optional(),
+	})
+	.passthrough();
+
+const PlanShowSectionsSchema = z
+	.object({
+		steps: z.array(PlanShowStepSchema).optional(),
+	})
+	.passthrough();
+
+const PlanShowPlanSchema = z
+	.object({
+		id: z.string().min(1),
+		status: z.string().min(1),
+		children: z.array(z.string().min(1)),
+		sections: PlanShowSectionsSchema.optional(),
+	})
+	.passthrough();
+
+export const PlanShowEnvelopeSchema = z
+	.object({
+		success: z.boolean().optional(),
+		plan: PlanShowPlanSchema,
+	})
+	.passthrough();
+
+export type PlanShowEnvelope = z.infer<typeof PlanShowEnvelopeSchema>;
+export type PlanShowStep = z.infer<typeof PlanShowStepSchema>;
+export type PlanShowPlan = z.infer<typeof PlanShowPlanSchema>;
+
+/**
+ * Envelope shape for `sd show <id> --json`. The coordinator branches on
+ * `status` (only `'closed'` triggers the skip-on-resume path); other
+ * callers may read `blockedBy` to detect partially-resolved dependencies.
+ * `extensions` is left as an unknown record so it can be threaded through
+ * to typed downstream parsers (e.g. WarrenExtensionsSchema) without this
+ * envelope locking the shape.
+ */
+const SeedShowIssueSchema = z
+	.object({
+		id: z.string().min(1),
+		status: z.string().min(1),
+		blockedBy: z.array(z.string().min(1)).optional(),
+		extensions: z.record(z.string(), z.unknown()).optional(),
+	})
+	.passthrough();
+
+export const SeedShowEnvelopeSchema = z
+	.object({
+		success: z.boolean().optional(),
+		issue: SeedShowIssueSchema,
+	})
+	.passthrough();
+
+export type SeedShowEnvelope = z.infer<typeof SeedShowEnvelopeSchema>;
+export type SeedShowIssue = z.infer<typeof SeedShowIssueSchema>;
+
 export interface ScheduledSeed {
 	readonly id: string;
 	readonly status: string;
