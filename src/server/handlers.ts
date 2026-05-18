@@ -358,6 +358,7 @@ function refreshAgents(deps: ServerDeps): RouteHandler {
 					client: projectCanopyClient(deps, project.localPath),
 					agents: deps.repos.agents,
 					projectId: project.id,
+					projectPath: project.localPath,
 				});
 				projectOutcomes.push(decorateRefreshResult(result));
 			} catch (err) {
@@ -388,6 +389,7 @@ function refreshProjectAgentsHandler(deps: ServerDeps): RouteHandler {
 			client: projectCanopyClient(deps, project.localPath),
 			agents: deps.repos.agents,
 			projectId: project.id,
+			projectPath: project.localPath,
 		});
 		return jsonResponse(200, decorateRefreshResult(result));
 	};

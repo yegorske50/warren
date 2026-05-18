@@ -52,11 +52,14 @@ export {
 } from "./config.ts";
 export { AgentSchemaError, CanopyUnavailableError } from "./errors.ts";
 export {
+	defaultRenderedCacheWriter,
+	RENDERED_CACHE_SUBPATH,
 	type RefreshOptions,
 	type RefreshProjectOptions,
 	type RefreshProjectResult,
 	type RefreshResult,
 	type RefreshSkipped,
+	type RenderedCacheWriter,
 	refreshAgentRegistry,
 	refreshProjectAgents,
 } from "./refresh.ts";

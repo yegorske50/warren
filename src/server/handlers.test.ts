@@ -1263,13 +1263,21 @@ describe("POST /projects/:id/agents/refresh — per-project .canopy/ tier (R-03)
 	let repos: Repos;
 	let handle: ServeHandle | null = null;
 	let projectId = "";
+	let projectLocalPath = "";
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
 		repos = createRepos(db);
+		// localPath must be a real, writable directory because the
+		// project-tier refresh now mirrors each rendered agent into
+		// `<localPath>/.canopy/.rendered/<name>.json` (warren-44e3).
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		projectLocalPath = await mkdtemp(join(tmpdir(), "warren-44e3-proj-"));
 		const row = await repos.projects.create({
 			gitUrl: "https://github.com/x/y.git",
-			localPath: "/data/projects/x/y",
+			localPath: projectLocalPath,
 			defaultBranch: "main",
 		});
 		projectId = row.id;
@@ -1281,6 +1289,11 @@ describe("POST /projects/:id/agents/refresh — per-project .canopy/ tier (R-03)
 			handle = null;
 		}
 		await db.close();
+		if (projectLocalPath) {
+			const { rm } = await import("node:fs/promises");
+			await rm(projectLocalPath, { recursive: true, force: true });
+			projectLocalPath = "";
+		}
 	});
 
 	function canopySpawnStub(
@@ -1355,6 +1368,21 @@ describe("POST /projects/:id/agents/refresh — per-project .canopy/ tier (R-03)
 		expect(await repos.agents.get("refactor-bot")).toBeNull();
 		const projectRow = await repos.agents.require("refactor-bot", { projectId });
 		expect(projectRow.projectId).toBe(projectId);
+
+		// On-disk rendered cache (warren-44e3 follow-up to R-03): the project's
+		// `.canopy/.rendered/` is populated alongside the agents-table cache
+		// so `cn render` outside warren can see the resolved agent.
+		const { readFile, readdir } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const cacheDir = join(projectLocalPath, ".canopy", ".rendered");
+		const entries = (await readdir(cacheDir)).sort();
+		expect(entries).toEqual([".gitignore", "refactor-bot.json"]);
+		const cached = JSON.parse(await readFile(join(cacheDir, "refactor-bot.json"), "utf8")) as {
+			name: string;
+			frontmatter: { source: string };
+		};
+		expect(cached.name).toBe("refactor-bot");
+		expect(cached.frontmatter.source).toBe(`project:${projectId}`);
 	});
 
 	test("returns 404 for an unknown project id", async () => {

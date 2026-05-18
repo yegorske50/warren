@@ -22,6 +22,8 @@
  * if the registry is unreadable.
  */
 
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { AgentsRepo } from "../db/repos/agents.ts";
 import type { AgentRow } from "../db/schema.ts";
 import { makeProjectAgentSource, stampAgentSource } from "./builtins/index.ts";
@@ -111,6 +113,20 @@ export interface RefreshProjectOptions {
 	readonly agents: AgentsRepo;
 	/** Project whose `.canopy/` is being scanned. Stamped onto each row's source. */
 	readonly projectId: string;
+	/**
+	 * Project working tree. When set, each registered agent's rendered JSON
+	 * is mirrored to `<projectPath>/.canopy/.rendered/<name>.json` (warren-44e3
+	 * follow-up to R-03 / pl-fef5) so `cn render` and other non-warren
+	 * consumers can see what a project-tier agent resolves to without going
+	 * through the agents-table. Omit to skip the on-disk cache (unit tests).
+	 */
+	readonly projectPath?: string;
+	/**
+	 * Override the on-disk cache writer. Defaults to `defaultRenderedCacheWriter`,
+	 * which writes JSON via `node:fs/promises`. Only consulted when
+	 * `projectPath` is set.
+	 */
+	readonly cacheWriter?: RenderedCacheWriter;
 	readonly now?: () => Date;
 }
 
@@ -120,6 +136,61 @@ export interface RefreshProjectResult {
 	readonly skipped: RefreshSkipped[];
 	readonly removed: string[];
 }
+
+/** Path of the on-disk rendered cache inside a project working tree. */
+export const RENDERED_CACHE_SUBPATH = join(".canopy", ".rendered");
+
+/**
+ * Subset of agent-name characters safe to use as a filesystem path
+ * component for the rendered cache. Canopy itself constrains prompt names
+ * to roughly this shape, but the registry boundary re-validates so a
+ * malformed name can never escape `<projectPath>/.canopy/.rendered/`.
+ */
+const SAFE_AGENT_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+
+function isSafeAgentName(name: string): boolean {
+	return SAFE_AGENT_NAME_RE.test(name);
+}
+
+/**
+ * Filesystem-side companion to the agents-table cache. Implementations
+ * write a JSON document per project agent and prune entries when a
+ * project-scoped row is removed. The writer is invoked once per
+ * `refreshProjectAgents` call when `projectPath` is set:
+ *   - `init` is called once before iterating prompts (seeds the
+ *     `.gitignore` marker so the cache stays out of project commits).
+ *   - `write` is called per successfully-registered agent, in upsert order.
+ *   - `prune` is called per agent removed from the project tier.
+ */
+export interface RenderedCacheWriter {
+	init(projectPath: string): Promise<void>;
+	write(projectPath: string, name: string, definition: AgentDefinition): Promise<void>;
+	prune(projectPath: string, name: string): Promise<void>;
+}
+
+/**
+ * Default writer: `<projectPath>/.canopy/.rendered/<name>.json`, with a
+ * self-ignoring `.gitignore` (`*\n`) seeded at init time. The directory
+ * is created if missing. Unsafe agent names are skipped silently — the
+ * agents-table row is still the authoritative cache.
+ */
+export const defaultRenderedCacheWriter: RenderedCacheWriter = {
+	async init(projectPath) {
+		const dir = join(projectPath, RENDERED_CACHE_SUBPATH);
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, ".gitignore"), "*\n");
+	},
+	async write(projectPath, name, definition) {
+		if (!isSafeAgentName(name)) return;
+		const dir = join(projectPath, RENDERED_CACHE_SUBPATH);
+		await mkdir(dir, { recursive: true });
+		await writeFile(join(dir, `${name}.json`), `${JSON.stringify(definition, null, 2)}\n`);
+	},
+	async prune(projectPath, name) {
+		if (!isSafeAgentName(name)) return;
+		await rm(join(projectPath, RENDERED_CACHE_SUBPATH, `${name}.json`), { force: true });
+	},
+};
 
 /**
  * Project-tier counterpart to `refreshAgentRegistry`. Scans the project's
@@ -147,13 +218,19 @@ export async function refreshProjectAgents(
 	opts: RefreshProjectOptions,
 ): Promise<RefreshProjectResult> {
 	const summaries = await opts.client.listAgents();
+	const cacheWriter =
+		opts.projectPath !== undefined ? (opts.cacheWriter ?? defaultRenderedCacheWriter) : null;
+	if (cacheWriter !== null && opts.projectPath !== undefined) {
+		await cacheWriter.init(opts.projectPath);
+	}
+
 	const seen = new Set<string>();
 	const registered: AgentRow[] = [];
 	const skipped: RefreshSkipped[] = [];
 
 	for (const summary of summaries) {
 		seen.add(summary.name);
-		const outcome = await registerOneProject(opts, summary);
+		const outcome = await registerOneProject(opts, summary, cacheWriter);
 		if (outcome.kind === "registered") {
 			registered.push(outcome.row);
 		} else {
@@ -166,6 +243,9 @@ export async function refreshProjectAgents(
 		if (!seen.has(existing.name)) {
 			await opts.agents.delete(existing.name, { projectId: opts.projectId });
 			removed.push(existing.name);
+			if (cacheWriter !== null && opts.projectPath !== undefined) {
+				await cacheWriter.prune(opts.projectPath, existing.name);
+			}
 		}
 	}
 
@@ -175,6 +255,7 @@ export async function refreshProjectAgents(
 async function registerOneProject(
 	opts: RefreshProjectOptions,
 	summary: AgentSummary,
+	cacheWriter: RenderedCacheWriter | null,
 ): Promise<RegisterOutcome> {
 	const rendered = await renderAndParse(opts.client, summary);
 	if (rendered.kind === "skipped") return rendered;
@@ -185,6 +266,9 @@ async function registerOneProject(
 		renderedJson: stamped,
 		now: opts.now?.(),
 	});
+	if (cacheWriter !== null && opts.projectPath !== undefined) {
+		await cacheWriter.write(opts.projectPath, stamped.name, stamped);
+	}
 	return { kind: "registered", row };
 }
 
