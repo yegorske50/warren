@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { agentsApi, projectsApi, runsApi } from "@/api/client.ts";
 import type { AgentRow, CreateRunInput } from "@/api/types.ts";
 import { Badge } from "@/components/ui/badge.tsx";
@@ -10,6 +10,33 @@ import { Input } from "@/components/ui/input.tsx";
 import { Label } from "@/components/ui/label.tsx";
 import { Textarea } from "@/components/ui/textarea.tsx";
 import { classifyAgentSource } from "@/lib/agent-source.ts";
+
+/**
+ * Route state accepted by NewRunPage when navigated via `navigate("/runs/new",
+ * { state })` — pre-fills the form so the user can click Dispatch
+ * immediately without typing. Used by PlotDetail's RunSeedButton
+ * (warren-ff2a) to dispatch a Plot-bound run from a seeds_issue
+ * attachment with project/agent/plot_id/prompt resolved up-front. All
+ * fields are optional; absent values fall back to NewRun's defaulting
+ * flow (project-default agent/prompt, etc.).
+ */
+export interface NewRunRouteState {
+	project?: string;
+	agent?: string;
+	plotId?: string;
+	prompt?: string;
+}
+
+function readRouteState(state: unknown): NewRunRouteState {
+	if (typeof state !== "object" || state === null) return {};
+	const s = state as Record<string, unknown>;
+	const out: NewRunRouteState = {};
+	if (typeof s.project === "string") out.project = s.project;
+	if (typeof s.agent === "string") out.agent = s.agent;
+	if (typeof s.plotId === "string") out.plotId = s.plotId;
+	if (typeof s.prompt === "string") out.prompt = s.prompt;
+	return out;
+}
 
 function readFrontmatter(renderedJson: unknown): Record<string, unknown> {
 	if (typeof renderedJson !== "object" || renderedJson === null) return {};
@@ -21,10 +48,17 @@ function readFrontmatter(renderedJson: unknown): Record<string, unknown> {
 export function NewRunPage() {
 	const navigate = useNavigate();
 	const qc = useQueryClient();
+	const location = useLocation();
+	// warren-ff2a: PlotDetail's RunSeedButton (and any future callers)
+	// can pre-fill the form via location.state. Read once on mount —
+	// further navigation away and back resets to the defaulting flow.
+	const [initialState] = useState(() => readRouteState(location.state));
 
-	const [agent, setAgent] = useState("");
-	const [agentTouched, setAgentTouched] = useState(false);
-	const [project, setProject] = useState("");
+	const [agent, setAgent] = useState(initialState.agent ?? "");
+	const [agentTouched, setAgentTouched] = useState(
+		initialState.agent !== undefined && initialState.agent.length > 0,
+	);
+	const [project, setProject] = useState(initialState.project ?? "");
 	// R-03 / pl-fef5 step 8: scope the agent picker to global ∪ this
 	// project's `.canopy/` tier as soon as the operator picks a project,
 	// so project-scoped roles appear alongside built-ins/library. Without
@@ -38,9 +72,11 @@ export function NewRunPage() {
 		queryKey: ["projects"],
 		queryFn: ({ signal }) => projectsApi.list(signal),
 	});
-	const [prompt, setPrompt] = useState("");
-	const [promptTouched, setPromptTouched] = useState(false);
-	const [plotId, setPlotId] = useState("");
+	const [prompt, setPrompt] = useState(initialState.prompt ?? "");
+	const [promptTouched, setPromptTouched] = useState(
+		initialState.prompt !== undefined && initialState.prompt.length > 0,
+	);
+	const [plotId, setPlotId] = useState(initialState.plotId ?? "");
 	const [ref, setRef] = useState("");
 	const [providerOverride, setProviderOverride] = useState("");
 	const [providerTouched, setProviderTouched] = useState(false);

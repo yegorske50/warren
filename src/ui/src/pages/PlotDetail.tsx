@@ -11,6 +11,7 @@ import {
 	type PlotStatus,
 } from "@/api/types.ts";
 import { PlotStatusBadge } from "@/components/PlotStatusBadge.tsx";
+import type { NewRunRouteState } from "@/pages/NewRun.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import {
@@ -527,6 +528,13 @@ function AttachmentRow({
 						planRef={attachment.ref}
 					/>
 				) : null}
+				{attachment.type === "seeds_issue" ? (
+					<RunSeedButton
+						plotId={plotId}
+						projectId={projectId}
+						seedRef={attachment.ref}
+					/>
+				) : null}
 				<Button
 					type="button"
 					variant="outline"
@@ -941,6 +949,74 @@ function ReadOnlyField({
 				<div className="text-xs text-(--color-muted-foreground)">{hint}</div>
 			) : null}
 		</div>
+	);
+}
+
+/* ----------------------------------------------------------------------- */
+/* RunSeedButton (warren-ff2a)                                              */
+/* ----------------------------------------------------------------------- */
+
+const DEFAULT_SEED_PROMPT_TEMPLATE = "work on sd {seed_id}";
+
+/**
+ * Per-attachment "Run agent" action. Visible on every `seeds_issue`
+ * attachment row in SubstratePanel. Clicking navigates to `/runs/new`
+ * with pre-filled project/agent/plot_id/prompt so the user can click
+ * Dispatch immediately without typing. Agent comes from the project's
+ * `.warren/defaults.yaml` `defaultRole`; prompt comes from the project's
+ * `defaultPrompt` (with `{seed_id}` substituted) or falls back to
+ * `DEFAULT_SEED_PROMPT_TEMPLATE`. The user can still edit any field
+ * before submitting — the pre-fill marks fields as touched so NewRun's
+ * own defaults auto-fill doesn't clobber the values we just pushed.
+ */
+function RunSeedButton({
+	plotId,
+	projectId,
+	seedRef,
+}: {
+	plotId: string;
+	projectId: string;
+	seedRef: string;
+}) {
+	const navigate = useNavigate();
+	const warrenConfig = useQuery({
+		queryKey: ["projects", projectId, "warren-config"],
+		queryFn: ({ signal }) => projectsApi.warrenConfig(projectId, signal),
+	});
+	const agents = useQuery({
+		queryKey: ["agents", { projectId }],
+		queryFn: ({ signal }) => agentsApi.list({ projectId }, signal),
+	});
+
+	const handleClick = (): void => {
+		const defaults = warrenConfig.data?.defaults ?? null;
+		const defaultRole = defaults?.defaultRole;
+		const registered = agents.data?.agents ?? [];
+		const resolvedAgent =
+			defaultRole !== undefined && registered.some((a) => a.name === defaultRole)
+				? defaultRole
+				: "";
+		const template = defaults?.defaultPrompt ?? DEFAULT_SEED_PROMPT_TEMPLATE;
+		const resolvedPrompt = template.replaceAll("{seed_id}", seedRef);
+		const state: NewRunRouteState = {
+			project: projectId,
+			agent: resolvedAgent,
+			plotId,
+			prompt: resolvedPrompt,
+		};
+		navigate("/runs/new", { state });
+	};
+
+	return (
+		<Button
+			type="button"
+			size="sm"
+			variant="outline"
+			onClick={handleClick}
+			disabled={warrenConfig.isLoading || agents.isLoading}
+		>
+			Run agent
+		</Button>
 	);
 }
 
