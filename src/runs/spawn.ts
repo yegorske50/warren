@@ -565,7 +565,14 @@ async function recordPlotAppendFailure(
 	}
 }
 
-function resolveDispatcherHandle(input: string | undefined): string {
+/**
+ * Validate a caller-supplied dispatcher handle against Plot's actor segment
+ * regex; downgrade malformed / empty input to `DEFAULT_DISPATCHER_HANDLE`
+ * so the Plot append's `user:<handle>` actor is always well-formed.
+ * Exported so the PlanRun handler (warren-b89f / pl-7937 step 4) can apply
+ * the same sanitization before emitting `plan_run_dispatched`.
+ */
+export function resolveDispatcherHandle(input: string | undefined): string {
 	const trimmed = (input ?? "").trim();
 	if (trimmed === "") return DEFAULT_DISPATCHER_HANDLE;
 	if (!ACTOR_SEGMENT_RE.test(trimmed)) return DEFAULT_DISPATCHER_HANDLE;

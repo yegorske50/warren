@@ -10,6 +10,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { BurrowClient, BurrowClientPool } from "../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
+import type {
+	AppendPlanRunDispatchedInput,
+	PlanRunPlotAppender,
+} from "../plan-runs/plot-appender.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../projects/clone.ts";
 import { RunEventBroker } from "../runs/index.ts";
 import { NO_AUTH } from "./auth.ts";
@@ -94,6 +98,8 @@ interface BuildDepsInput {
 	repos: Repos;
 	sdSpawn: SpawnFn;
 	bridges?: BridgeRegistry;
+	planRunPlotAppender?: PlanRunPlotAppender;
+	logger?: Logger;
 }
 
 async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
@@ -112,9 +118,44 @@ async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
-		logger: silentLogger,
+		logger: input.logger ?? silentLogger,
 		uiDistDir: null,
 		seedsCli: { sdBinary: "sd", spawn: input.sdSpawn },
+		...(input.planRunPlotAppender !== undefined
+			? { planRunPlotAppender: input.planRunPlotAppender }
+			: {}),
+	};
+}
+
+function makePlanRunAppender(
+	opts: { calls?: AppendPlanRunDispatchedInput[]; throws?: Error } = {},
+): PlanRunPlotAppender {
+	const calls = opts.calls ?? [];
+	return {
+		async appendPlanRunDispatched(input) {
+			calls.push(input);
+			if (opts.throws) throw opts.throws;
+		},
+	};
+}
+
+interface CapturedLog {
+	level: "info" | "warn" | "error";
+	obj: object;
+	msg: string | undefined;
+}
+
+function makeCaptureLogger(captured: CapturedLog[]): Logger {
+	return {
+		info(obj, msg) {
+			captured.push({ level: "info", obj, msg });
+		},
+		warn(obj, msg) {
+			captured.push({ level: "warn", obj, msg });
+		},
+		error(obj, msg) {
+			captured.push({ level: "error", obj, msg });
+		},
 	};
 }
 
@@ -437,6 +478,242 @@ describe("POST /plan-runs", () => {
 		expect(res.status).toBe(201);
 		const body = (await res.json()) as { planRun: { plotId: string | null } };
 		expect(body.planRun.plotId).toBeNull();
+	});
+
+	test("emits plan_run_dispatched on the bound Plot at creation time (warren-b89f)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-emit", "active", ["wa-a", "wa-b", "wa-c"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-b",
+					result: seedShowResult("wa-b", "open"),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-c",
+					result: seedShowResult("wa-c", "open"),
+				},
+			],
+		);
+		const appendCalls: AppendPlanRunDispatchedInput[] = [];
+		const deps = await depsFor({
+			repos,
+			sdSpawn,
+			planRunPlotAppender: makePlanRunAppender({ calls: appendCalls }),
+		});
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-emit",
+				agent: "claude-code",
+				plotId: "plot_emit_1",
+				dispatcherHandle: "alice",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { id: string } };
+
+		expect(appendCalls).toHaveLength(1);
+		const call = appendCalls[0];
+		if (!call) throw new Error("appender not called");
+		expect(call.plotDir).toBe("/tmp/plotted/.plot");
+		expect(call.plotId).toBe("plot_emit_1");
+		expect(call.handle).toBe("alice");
+		expect(call.planRunId).toBe(body.planRun.id);
+		expect(call.planId).toBe("pl-emit");
+		expect(call.childrenCount).toBe(3);
+	});
+
+	test("does NOT emit plan_run_dispatched when plotId is omitted (warren-b89f)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-no-emit", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const appendCalls: AppendPlanRunDispatchedInput[] = [];
+		const deps = await depsFor({
+			repos,
+			sdSpawn,
+			planRunPlotAppender: makePlanRunAppender({ calls: appendCalls }),
+		});
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-no-emit",
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(201);
+		expect(appendCalls).toHaveLength(0);
+	});
+
+	test("defaults to handle 'operator' when dispatcherHandle is omitted (warren-b89f)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-default", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const appendCalls: AppendPlanRunDispatchedInput[] = [];
+		const deps = await depsFor({
+			repos,
+			sdSpawn,
+			planRunPlotAppender: makePlanRunAppender({ calls: appendCalls }),
+		});
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-default",
+				agent: "claude-code",
+				plotId: "plot_d",
+			}),
+		});
+		expect(res.status).toBe(201);
+		expect(appendCalls[0]?.handle).toBe("operator");
+	});
+
+	test("falls back to 'operator' when dispatcherHandle is malformed (warren-b89f)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-bad", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const appendCalls: AppendPlanRunDispatchedInput[] = [];
+		const deps = await depsFor({
+			repos,
+			sdSpawn,
+			planRunPlotAppender: makePlanRunAppender({ calls: appendCalls }),
+		});
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-bad",
+				agent: "claude-code",
+				plotId: "plot_b",
+				dispatcherHandle: "@bad/handle",
+			}),
+		});
+		expect(res.status).toBe(201);
+		expect(appendCalls[0]?.handle).toBe("operator");
+	});
+
+	test("logs plan_run.plot_append_failed when the appender throws; POST still returns 201 (warren-b89f)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-fail", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const captured: CapturedLog[] = [];
+		const deps = await depsFor({
+			repos,
+			sdSpawn,
+			planRunPlotAppender: makePlanRunAppender({ throws: new Error("plot offline") }),
+			logger: makeCaptureLogger(captured),
+		});
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-fail",
+				agent: "claude-code",
+				plotId: "plot_f",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { id: string } };
+
+		const failureLog = captured.find((c) => c.msg === "plan_run.plot_append_failed");
+		expect(failureLog).toBeDefined();
+		expect(failureLog?.level).toBe("warn");
+		const obj = failureLog?.obj as {
+			planRunId?: string;
+			plotId?: string;
+			err?: string;
+		};
+		expect(obj.planRunId).toBe(body.planRun.id);
+		expect(obj.plotId).toBe("plot_f");
+		expect(obj.err).toContain("plot offline");
+
+		// Row still persists — failure was non-fatal.
+		const persisted = await repos.planRuns.require(body.planRun.id);
+		expect(persisted.plotId).toBe("plot_f");
 	});
 
 	test("404 when project doesn't exist", async () => {

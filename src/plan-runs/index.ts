@@ -33,6 +33,13 @@ export {
 	ProjectLacksSeedsError,
 } from "./errors.ts";
 export {
+	type AppendPlanRunDispatchedInput,
+	defaultPlanRunPlotAppender,
+	type EmitPlanRunDispatchedInput,
+	emitPlanRunDispatchedToPlot,
+	type PlanRunPlotAppender,
+} from "./plot-appender.ts";
+export {
 	type CreatePrMergeCheckerInput,
 	createPrMergeChecker,
 	type PrMergeChecker,

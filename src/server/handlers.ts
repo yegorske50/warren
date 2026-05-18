@@ -26,6 +26,7 @@
  * progress channel onto this route.
  */
 
+import { join } from "node:path";
 import type {
 	Burrow,
 	BurrowKind,
@@ -57,6 +58,10 @@ import {
 	ProjectLacksPlotError,
 	ProjectLacksSeedsError,
 } from "../plan-runs/errors.ts";
+import {
+	defaultPlanRunPlotAppender,
+	emitPlanRunDispatchedToPlot,
+} from "../plan-runs/plot-appender.ts";
 import { createRunPreviewsRepo, DEFAULT_MAX_LIVE } from "../preview/eviction.ts";
 import { DEFAULT_PREVIEW_PORT_RANGE, PreviewPortAllocator } from "../preview/port-allocator.ts";
 import { teardownPreview } from "../preview/teardown.ts";
@@ -69,7 +74,13 @@ import {
 	refreshAgentRegistry,
 	refreshProjectAgents,
 } from "../registry/refresh.ts";
-import { cancelRun, spawnRun, steerRun, tailRunEvents } from "../runs/index.ts";
+import {
+	cancelRun,
+	resolveDispatcherHandle,
+	spawnRun,
+	steerRun,
+	tailRunEvents,
+} from "../runs/index.ts";
 import { showPlan, showSeed } from "../seeds-cli/index.ts";
 import { buildTriggerSummaries, parseCron, resolveCronPrompt } from "../triggers/index.ts";
 import {
@@ -1339,6 +1350,25 @@ function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			...(plotId !== undefined && plotId !== "" ? { plotId } : {}),
 			...(deps.now !== undefined ? { now: deps.now() } : {}),
 		});
+
+		// (6b) warren-b89f / pl-7937 step 4: emit one `plan_run_dispatched`
+		// event onto the bound Plot — fire-and-log, mirrors the single-run
+		// `defaultPlotAppender` posture in src/runs/spawn.ts:407–425. The
+		// PlanRun row is durably persisted by this point, so a Plot-write
+		// failure logs `plan_run.plot_append_failed` and the POST still
+		// returns 201.
+		if (result.planRun.plotId !== null) {
+			await emitPlanRunDispatchedToPlot({
+				appender: deps.planRunPlotAppender ?? defaultPlanRunPlotAppender,
+				logger: deps.logger,
+				plotDir: join(project.localPath, ".plot"),
+				plotId: result.planRun.plotId,
+				handle: resolveDispatcherHandle(result.planRun.dispatcherHandle),
+				planRunId: result.planRun.id,
+				planId: result.planRun.planId,
+				childrenCount: result.children.length,
+			});
+		}
 
 		// (7) wire response — coordinator picks the row up on its next tick.
 		return jsonResponse(201, {

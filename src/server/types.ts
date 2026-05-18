@@ -12,6 +12,7 @@
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { AnyWarrenDb } from "../db/client.ts";
 import type { Repos } from "../db/repos/index.ts";
+import type { PlanRunPlotAppender } from "../plan-runs/plot-appender.ts";
 import type { PreviewAuth } from "../preview/cookie.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
@@ -207,6 +208,15 @@ export interface ServerDeps {
 	 * warren booted with `--no-auth`.
 	 */
 	readonly previewAuth?: PreviewAuth;
+	/**
+	 * Test seam for the `plan_run_dispatched` Plot append in the POST
+	 * /plan-runs handler (warren-b89f / pl-7937 step 4). Production omits
+	 * this; the handler falls back to `defaultPlanRunPlotAppender`, which
+	 * opens a `UserPlotClient` against `<project>/.plot/` and best-effort
+	 * appends one event. Tests substitute a stub to assert payload shape
+	 * without touching disk.
+	 */
+	readonly planRunPlotAppender?: PlanRunPlotAppender;
 }
 
 /**
