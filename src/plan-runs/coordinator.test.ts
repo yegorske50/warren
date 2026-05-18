@@ -1,0 +1,436 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { openDatabase, type WarrenDb } from "../db/client.ts";
+import { createRepos, type Repos } from "../db/repos/index.ts";
+import type { PlanRunRow } from "../db/schema.ts";
+import { agents } from "../db/schema.ts";
+import {
+	advancePlanRun,
+	type CoordinatorEmitFn,
+	type CoordinatorShowSeedFn,
+	type CoordinatorSpawnFn,
+} from "./coordinator.ts";
+import type { PrMergeChecker } from "./pr-merge.ts";
+
+const NOW = new Date("2026-05-17T00:00:00.000Z");
+
+interface CapturedEvent {
+	runId: string;
+	kind: string;
+	payload: Record<string, unknown>;
+}
+
+interface Harness {
+	db: WarrenDb;
+	repos: Repos;
+	projectId: string;
+	planRun: PlanRunRow;
+	events: CapturedEvent[];
+	emit: CoordinatorEmitFn;
+	showSeedStub: (status: "open" | "closed") => CoordinatorShowSeedFn;
+	spawnStub: (newRunId: () => string) => CoordinatorSpawnFn;
+	makeRun: (seedId: string) => Promise<string>;
+}
+
+async function setup(): Promise<Harness> {
+	const db = await openDatabase({ path: ":memory:" });
+	db.drizzle
+		.insert(agents)
+		.values({
+			name: "claude-code",
+			renderedJson: { sections: {} },
+			registeredAt: "2026-05-10T00:00:00.000Z",
+			lastRefreshed: "2026-05-10T00:00:00.000Z",
+		})
+		.run();
+	const repos = createRepos(db);
+	const project = await repos.projects.create({
+		gitUrl: "https://github.com/x/y.git",
+		localPath: "/data/projects/x/y",
+		defaultBranch: "main",
+	});
+	const { planRun } = await repos.planRuns.create({
+		planId: "pl-acc",
+		projectId: project.id,
+		agentName: "claude-code",
+		children: [
+			{ seq: 1, seedId: "warren-a" },
+			{ seq: 2, seedId: "warren-b" },
+		],
+		now: NOW,
+	});
+	const events: CapturedEvent[] = [];
+	const emit: CoordinatorEmitFn = async (runId, kind, payload) => {
+		events.push({ runId, kind, payload });
+	};
+	const showSeedStub = (status: "open" | "closed"): CoordinatorShowSeedFn => {
+		return async (_projectId, seedId) => ({ id: seedId, status });
+	};
+	const spawnStub = (newRunId: () => string): CoordinatorSpawnFn => {
+		return async ({ child, prompt }) => {
+			const run = await repos.runs.create({
+				agentName: "claude-code",
+				projectId: project.id,
+				prompt,
+				renderedAgentJson: { sections: {} },
+				trigger: "plan-run",
+				seedId: child.seedId,
+				now: NOW,
+			});
+			void newRunId;
+			return { runId: run.id };
+		};
+	};
+	const makeRun = async (seedId: string): Promise<string> => {
+		const run = await repos.runs.create({
+			agentName: "claude-code",
+			projectId: project.id,
+			prompt: `work on sd ${seedId}`,
+			renderedAgentJson: { sections: {} },
+			trigger: "plan-run",
+			seedId,
+			now: NOW,
+		});
+		return run.id;
+	};
+	return {
+		db,
+		repos,
+		projectId: project.id,
+		planRun,
+		events,
+		emit,
+		showSeedStub,
+		spawnStub,
+		makeRun,
+	};
+}
+
+const neverPoll: PrMergeChecker = async () => {
+	throw new Error("checkPrMerged should not be called in this branch");
+};
+
+describe("advancePlanRun — state machine", () => {
+	let h: Harness;
+
+	beforeEach(async () => {
+		h = await setup();
+	});
+
+	afterEach(async () => {
+		await h.db.close();
+	});
+
+	test("queued → running, dispatches first child", async () => {
+		const result = await advancePlanRun({
+			planRun: h.planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "run_x"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("dispatched");
+		const reloaded = await h.repos.planRuns.require(h.planRun.id);
+		expect(reloaded.state).toBe("running");
+		expect(reloaded.startedAt).toBe(NOW.toISOString());
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		const first = children.find((c) => c.seq === 1);
+		expect(first?.state).toBe("dispatched");
+		expect(first?.runId).not.toBeNull();
+		expect(h.events.map((e) => e.kind)).toContain("plan_run.dispatched");
+	});
+
+	test("non-terminal child run → waiting_for_run; running run syncs child.state", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "dispatched", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("waiting_for_run");
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("running");
+	});
+
+	test("succeeded child with prUrl → pr_open then waiting_for_merge on open poll", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "succeeded", NOW);
+		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "dispatched", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: async () => ({ kind: "open" }),
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("waiting_for_merge");
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("pr_open");
+		expect(h.events.some((e) => e.kind === "plan_run.waiting_for_merge")).toBe(true);
+	});
+
+	test("pr_open + merged poll → child merged, dispatch next, advanced result", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "succeeded", NOW);
+		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: async () => ({ kind: "merged", mergedAt: "2026-05-17T01:00:00.000Z" }),
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("advanced");
+		if (result.kind === "advanced") {
+			expect(result.mergedChildSeq).toBe(1);
+			expect(result.dispatchedChildSeq).toBe(2);
+		}
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("merged");
+		expect(children.find((c) => c.seq === 1)?.prMergedAt).toBe("2026-05-17T01:00:00.000Z");
+		expect(children.find((c) => c.seq === 2)?.state).toBe("dispatched");
+		expect(h.events.map((e) => e.kind)).toEqual(
+			expect.arrayContaining(["plan_run.merged", "plan_run.dispatched", "plan_run.advanced"]),
+		);
+	});
+
+	test("pr_open + closed_unmerged → plan_failed pr_closed_without_merge", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "succeeded", NOW);
+		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: async () => ({ kind: "closed_unmerged" }),
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_failed");
+		if (result.kind === "plan_failed") {
+			expect(result.reason).toBe("pr_closed_without_merge");
+			expect(result.failedSeq).toBe(1);
+		}
+		const reloaded = await h.repos.planRuns.require(h.planRun.id);
+		expect(reloaded.state).toBe("failed");
+		expect(reloaded.failureReason).toBe("pr_closed_without_merge");
+		expect(h.events.some((e) => e.kind === "plan_run.failed")).toBe(true);
+	});
+
+	test("pr_open + http 4xx → plan_failed pr_closed_without_merge", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "succeeded", NOW);
+		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: async () => ({ kind: "http_error", status: 404, message: "Not Found" }),
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_failed");
+	});
+
+	test("child run failed → plan_failed with child_<reason>", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "failed", NOW, "crashed");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_failed");
+		if (result.kind === "plan_failed") {
+			expect(result.reason).toBe("child_crashed");
+		}
+		const reloaded = await h.repos.planRuns.require(h.planRun.id);
+		expect(reloaded.state).toBe("failed");
+	});
+
+	test("trivial merge: succeeded run with no prUrl + reap.empty_push event", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.runs.markRunning(runId, NOW);
+		await h.repos.runs.finalize(runId, "succeeded", NOW);
+		// Insert an empty-push event so the coordinator's trivial-merge probe finds it.
+		await h.repos.events.append({
+			runId,
+			burrowEventSeq: 1,
+			ts: NOW.toISOString(),
+			kind: "reap.empty_push",
+			stream: "system",
+			payload: { branch: "burrow/run", baseBranch: "main", message: "no commits" },
+		});
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("advanced");
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("merged");
+		expect(children.find((c) => c.seq === 2)?.state).toBe("dispatched");
+		expect(h.events.some((e) => e.kind === "plan_run.merged")).toBe(true);
+	});
+
+	test("resume semantics: closed seed flips to skipped without dispatch", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		let calls = 0;
+		const showSeed: CoordinatorShowSeedFn = async (_p, seedId) => {
+			calls += 1;
+			// First call (seq=1) reports closed; second (seq=2) reports open.
+			if (seedId === "warren-a") return { id: seedId, status: "closed" };
+			return { id: seedId, status: "open" };
+		};
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed,
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("dispatched");
+		expect(calls).toBe(2);
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("skipped");
+		expect(children.find((c) => c.seq === 2)?.state).toBe("dispatched");
+	});
+
+	test("plan_succeeded: every child terminal, no pending left", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-a");
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: {
+				runId,
+				state: "merged",
+				prMergedAt: NOW.toISOString(),
+				startedAt: NOW.toISOString(),
+				endedAt: NOW.toISOString(),
+			},
+		});
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 2,
+			patch: { state: "skipped", endedAt: NOW.toISOString() },
+		});
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_succeeded");
+		const reloaded = await h.repos.planRuns.require(h.planRun.id);
+		expect(reloaded.state).toBe("succeeded");
+		expect(reloaded.endedAt).toBe(NOW.toISOString());
+		expect(h.events.some((e) => e.kind === "plan_run.succeeded")).toBe(true);
+	});
+
+	test("dispatch failure → plan_failed with dispatch_failed:<message>", async () => {
+		const failingSpawn: CoordinatorSpawnFn = async () => {
+			throw new Error("burrow unreachable");
+		};
+		const result = await advancePlanRun({
+			planRun: h.planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: failingSpawn,
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_failed");
+		if (result.kind === "plan_failed") {
+			expect(result.reason).toBe("dispatch_failed:burrow unreachable");
+			expect(result.failedSeq).toBe(1);
+		}
+		const reloaded = await h.repos.planRuns.require(h.planRun.id);
+		expect(reloaded.state).toBe("failed");
+		expect(reloaded.failureReason).toBe("dispatch_failed:burrow unreachable");
+		const children = await h.repos.planRuns.listChildren(h.planRun.id);
+		expect(children.find((c) => c.seq === 1)?.state).toBe("failed");
+	});
+});

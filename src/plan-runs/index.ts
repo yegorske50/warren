@@ -1,0 +1,45 @@
+/**
+ * Public re-exports for the PlanRun coordinator (pl-a258 step 5 /
+ * warren-2623). Internal modules import from here so the file layout under
+ * `plan-runs/` can shift without rippling out to call sites (mirrors
+ * src/triggers/ and src/runs/).
+ */
+
+export {
+	DEFAULT_PLAN_RUN_TICK_MS,
+	type EnvLike,
+	loadPlanRunCoordinatorConfigFromEnv,
+	type PlanRunCoordinatorConfig,
+} from "./config.ts";
+export {
+	type AdvancePlanRunInput,
+	type AdvanceResult,
+	advancePlanRun,
+	type CoordinatorEmitFn,
+	type CoordinatorRepos,
+	type CoordinatorShowSeedFn,
+	type CoordinatorSpawnFn,
+	type CoordinatorSpawnInput,
+	type CoordinatorSpawnResult,
+	isChildTerminal,
+	PLAN_RUN_EVENT_KINDS,
+	type PlanRunEventKind,
+} from "./coordinator.ts";
+export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts";
+export { PlanRunDispatchError } from "./errors.ts";
+export {
+	type CreatePrMergeCheckerInput,
+	createPrMergeChecker,
+	type PrMergeChecker,
+} from "./pr-merge.ts";
+export {
+	type BootPlanRunCoordinatorInput,
+	bootPlanRunCoordinator,
+	type PlanRunAdvanceLog,
+	type PlanRunCoordinatorHandle,
+	type PlanRunCoordinatorTimerHandle,
+	type PlanRunTickDeps,
+	type PlanRunTickLogger,
+	type PlanRunTickResult,
+	runPlanRunTick,
+} from "./tick.ts";
