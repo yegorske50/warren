@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Activity, Bot, FolderGit2, LogOut, Plus } from "lucide-react";
+import { Activity, Bot, FolderGit2, ListChecks, LogOut, Plus } from "lucide-react";
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { metaApi, setApiToken } from "@/api/client.ts";
 import { ThemeToggle } from "@/components/ThemeToggle.tsx";
@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils.ts";
 
 const NAV_ITEMS: { to: string; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
 	{ to: "/runs", label: "Runs", icon: Activity },
+	{ to: "/plan-runs", label: "Plans", icon: ListChecks },
 	{ to: "/agents", label: "Agents", icon: Bot },
 	{ to: "/projects", label: "Projects", icon: FolderGit2 },
 ];

@@ -6,8 +6,14 @@
 import type {
 	AgentRow,
 	ApiErrorEnvelope,
+	CancelPlanRunResponse,
 	CancelRunResponse,
+	CreatePlanRunInput,
+	CreatePlanRunResponse,
 	CreateRunInput,
+	PlanRunDetailResponse,
+	PlanRunRow,
+	PlanRunState,
 	PreviewConfigResponse,
 	PreviewTeardownResponse,
 	ProjectRow,
@@ -277,6 +283,57 @@ export function formatPreviewUrl(
 }
 
 /* ----------------------------------------------------------------------- */
+/* Plan-runs (warren-f923 / warren-a87f, pl-a258).                          */
+/* ----------------------------------------------------------------------- */
+
+export interface ListPlanRunsFilter {
+	project?: string;
+	state?: PlanRunState;
+}
+
+export const planRunsApi = {
+	list: (filter: ListPlanRunsFilter = {}, signal?: AbortSignal) => {
+		const params = new URLSearchParams();
+		if (filter.project) params.set("project", filter.project);
+		if (filter.state) params.set("state", filter.state);
+		const qs = params.toString();
+		return request<{ planRuns: PlanRunRow[] }>(
+			`/plan-runs${qs.length > 0 ? `?${qs}` : ""}`,
+			{ ...(signal ? { signal } : {}) },
+		);
+	},
+	get: (id: string, signal?: AbortSignal) =>
+		request<PlanRunDetailResponse>(`/plan-runs/${encodeURIComponent(id)}`, {
+			...(signal ? { signal } : {}),
+		}),
+	create: (input: CreatePlanRunInput) =>
+		request<CreatePlanRunResponse>("/plan-runs", { method: "POST", body: input }),
+	cancel: (id: string) =>
+		request<CancelPlanRunResponse>(`/plan-runs/${encodeURIComponent(id)}/cancel`, {
+			method: "POST",
+			body: {},
+		}),
+	events: (id: string, opts: StreamRunEventsOptions = {}) =>
+		streamPlanRunEvents(id, opts),
+};
+
+/**
+ * NDJSON tail of every child run's events for a plan-run
+ * (`GET /plan-runs/:id/events`). Each yielded envelope shares the
+ * `RunEvent` shape — the server uses the same `eventToNdjson` serializer
+ * as `/runs/:id/events`, with `runId` discriminating between children.
+ */
+export async function* streamPlanRunEvents(
+	planRunId: string,
+	opts: StreamRunEventsOptions = {},
+): AsyncGenerator<RunEvent, void, void> {
+	yield* streamNdjsonEvents(
+		`/plan-runs/${encodeURIComponent(planRunId)}/events`,
+		opts,
+	);
+}
+
+/* ----------------------------------------------------------------------- */
 /* NDJSON event stream — `GET /runs/:id/events?follow=1` (SPEC §8.1).      */
 /* ----------------------------------------------------------------------- */
 
@@ -295,11 +352,24 @@ export async function* streamRunEvents(
 	runId: string,
 	opts: StreamRunEventsOptions = {},
 ): AsyncGenerator<RunEvent, void, void> {
+	yield* streamNdjsonEvents(`/runs/${encodeURIComponent(runId)}/events`, opts);
+}
+
+/**
+ * Shared NDJSON consumer for run + plan-run event streams. The server
+ * uses the same `eventToNdjson` serializer for both, so the wire shape
+ * matches and the only thing that varies is the URL prefix + `runId`
+ * discriminator in each envelope.
+ */
+async function* streamNdjsonEvents(
+	basePath: string,
+	opts: StreamRunEventsOptions,
+): AsyncGenerator<RunEvent, void, void> {
 	const params = new URLSearchParams();
 	if (opts.follow) params.set("follow", "1");
 	if (opts.sinceSeq !== undefined) params.set("since", String(opts.sinceSeq));
 	const qs = params.toString();
-	const url = `/runs/${encodeURIComponent(runId)}/events${qs.length > 0 ? `?${qs}` : ""}`;
+	const url = `${basePath}${qs.length > 0 ? `?${qs}` : ""}`;
 
 	const headers: Record<string, string> = { accept: "application/x-ndjson" };
 	const token = getApiToken();

@@ -420,3 +420,99 @@ export interface RunTriggerResponse {
 	run: RunRow;
 	burrow: BurrowSummary;
 }
+
+/* ----------------------------------------------------------------------- */
+/* Plan-runs (warren-f923 / warren-a87f, pl-a258).                          */
+/*                                                                         */
+/* Mirrors the server payload shapes from src/server/handlers.ts and the   */
+/* drizzle row types in src/db/schema/sqlite.ts. Kept manually in sync     */
+/* with the wire — src/ui/ is excluded from the root tsconfig and the      */
+/* boundary is the HTTP wire, not a TS import (mx-1bd551).                 */
+/* ----------------------------------------------------------------------- */
+
+export type PlanRunState = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export const PLAN_RUN_TERMINAL_STATES: readonly PlanRunState[] = [
+	"succeeded",
+	"failed",
+	"cancelled",
+];
+
+export const PLAN_RUN_ACTIVE_STATES: readonly PlanRunState[] = ["queued", "running"];
+
+export type PlanRunChildState =
+	| "pending"
+	| "dispatched"
+	| "running"
+	| "pr_open"
+	| "merged"
+	| "failed"
+	| "skipped";
+
+export interface PlanRunRow {
+	id: string;
+	planId: string;
+	projectId: string;
+	agentName: string;
+	promptTemplate: string;
+	ref: string | null;
+	providerOverride: string | null;
+	modelOverride: string | null;
+	dispatcherHandle: string;
+	trigger: string;
+	state: PlanRunState;
+	failureReason: string | null;
+	createdAt: string;
+	startedAt: string | null;
+	endedAt: string | null;
+}
+
+export interface PlanRunChildRow {
+	planRunId: string;
+	seq: number;
+	seedId: string;
+	runId: string | null;
+	state: PlanRunChildState;
+	createdAt: string;
+	updatedAt: string;
+	startedAt: string | null;
+	endedAt: string | null;
+	prMergedAt: string | null;
+	failureReason: string | null;
+}
+
+/** `POST /plan-runs` request body (warren-f923). */
+export interface CreatePlanRunInput {
+	project: string;
+	planId: string;
+	agent: string;
+	promptTemplate?: string;
+	ref?: string;
+	providerOverride?: string;
+	modelOverride?: string;
+	dispatcherHandle?: string;
+}
+
+/** `POST /plan-runs` 201 response envelope. */
+export interface CreatePlanRunResponse {
+	planRun: PlanRunRow;
+	children: PlanRunChildRow[];
+}
+
+/**
+ * `GET /plan-runs/:id` envelope — row + children + fanned-out `runs[]`
+ * via repos.runs.listByIds so the detail page renders in one round-trip
+ * (warren-f923). `runs` excludes children whose `runId` is still null.
+ */
+export interface PlanRunDetailResponse {
+	planRun: PlanRunRow;
+	children: PlanRunChildRow[];
+	runs: RunRow[];
+}
+
+/** `POST /plan-runs/:id/cancel` envelope. */
+export interface CancelPlanRunResponse {
+	planRun: PlanRunRow;
+	cancelledChild: { childSeq: number; runId: string } | null;
+	alreadyTerminal: boolean;
+}
