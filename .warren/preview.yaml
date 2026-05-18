@@ -60,8 +60,19 @@
 #                           # moderately large app commonly takes 5-8 min);
 #                           # install lives under `setup_timeout` instead.
 #                           # The probe returns on first 2xx so a larger
-#                           # ceiling only delays failure reporting. Deadline
-#                           # starts at sidecar create, not first probe-connect.
+#                           # ceiling only delays failure reporting. As of
+#                           # warren-9b15 the deadline starts at first successful
+#                           # TCP connect (phase 2), not sidecar create — sidecar
+#                           # startup + port bind live under `connect_timeout`.
+# connect_timeout: 5m       # optional — phase-1 "did anything bind on the
+#                           # port?" budget (warren-9b15). Covers shell pre-exec,
+#                           # dev-server CLI startup, dependency import-graph
+#                           # load, and bind — i.e. sidecar startup variance.
+#                           # Default 5m, bound 1s..1h. A hang past this surfaces
+#                           # as reason=connect_timeout (distinct from
+#                           # readiness_timeout). The first HTTP response the
+#                           # server returns — even 4xx/5xx while the bundler
+#                           # still compiles — flips the loop into phase 2.
 # idle_ttl: 30m             # optional — kill after this much idle time.
 #                           # Format: one or more <number><unit> pairs,
 #                           # units ms|s|m|h|d (e.g. "30m", "1h30m").

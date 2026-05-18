@@ -122,7 +122,8 @@ const PreviewReadinessPathSchema = z
 	.regex(/^\//, "preview.readiness_path must start with '/'");
 
 // Try-parse a duration string and return null when the shape doesn't match.
-// Used by bounded duration refines (readiness_timeout, setup_timeout) — zod
+// Used by bounded duration refines (readiness_timeout, setup_timeout,
+// connect_timeout) — zod
 // runs `.refine()` even after a sibling `.regex()` check fails, so the refine
 // must tolerate inputs the upstream regex would have rejected without
 // re-raising parseDurationMs's ValidationError as an uncaught throw.
@@ -160,6 +161,20 @@ const PreviewSetupTimeoutSchema = DurationStringSchema.refine(
 	{ message: "preview.setup_timeout must be between 1s and 1h" },
 );
 
+// warren-9b15: separates "did anything bind on the port?" from "is the bound
+// server returning 2xx?". The phase-1 deadline covers shell pre-exec, dev-
+// server CLI startup, and port bind — i.e. sidecar startup overhead that
+// varies with burrow health and image cold cache, not bundler work. Phase 2
+// (readiness_timeout) starts at first successful TCP connect. Same 1s..1h
+// bounds and "try-parse" pattern as the sibling timeouts.
+const PreviewConnectTimeoutSchema = DurationStringSchema.refine(
+	(value) => {
+		const ms = tryParseDurationMs(value);
+		return ms !== null && ms >= 1_000 && ms <= 3_600_000;
+	},
+	{ message: "preview.connect_timeout must be between 1s and 1h" },
+);
+
 const PreviewSetupSchema = z.string().min(1, "preview.setup must be non-empty");
 
 // warren-fcb7 / SPEC §11.L (path-mode addendum, pl-f4ea): per-project pin of
@@ -193,6 +208,11 @@ const ServerPreviewConfigSchema = z
 		port: PreviewPortSchema,
 		readiness_path: PreviewReadinessPathSchema.optional(),
 		readiness_timeout: PreviewReadinessTimeoutSchema.optional(),
+		// warren-9b15: phase-1 "did anything bind?" budget. Distinct from
+		// readiness_timeout (phase 2, "is the bound server returning 2xx?")
+		// so a slow burrow / cold image / shell pre-exec hang surfaces as
+		// connect_timeout instead of eating the bundler budget.
+		connect_timeout: PreviewConnectTimeoutSchema.optional(),
 		idle_ttl: DurationStringSchema.optional(),
 		max_lifetime: DurationStringSchema.optional(),
 	})

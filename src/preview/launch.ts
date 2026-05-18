@@ -96,6 +96,14 @@ export interface LaunchPreviewInput {
 	readonly sleep?: (ms: number) => Promise<void>;
 	/** Cap the readiness probe loop. Defaults to `DEFAULT_READINESS_TIMEOUT_MS`. */
 	readonly readinessTimeoutMs?: number;
+	/**
+	 * Cap on phase 1 of the probe loop — "did anything bind on the port?"
+	 * (warren-9b15). Defaults to `DEFAULT_CONNECT_TIMEOUT_MS`. Phase 2's
+	 * `readinessTimeoutMs` deadline starts only after a successful TCP
+	 * connect, so sidecar startup variance no longer steals from the
+	 * bundler budget.
+	 */
+	readonly connectTimeoutMs?: number;
 	/** Pause between probe attempts. Defaults to `DEFAULT_READINESS_POLL_MS`. */
 	readinessPollMs?: number;
 	/** Per-call AbortController timeout. Defaults to `PROBE_PER_CALL_TIMEOUT_MS`. */
@@ -128,6 +136,7 @@ export type LaunchPreviewResult =
 export type LaunchFailureReason =
 	| "port_exhausted"
 	| "create_failed"
+	| "connect_timeout"
 	| "readiness_timeout"
 	| "sidecar_exited"
 	| "setup_failed"
@@ -135,22 +144,32 @@ export type LaunchFailureReason =
 
 /**
  * Default readiness probe wall clock. Sized for the *bundler*, not for install
- * + bind: warren-d9e7 split install into its own setup sidecar, and the
- * remaining inhabitant of this budget is dev-server bind plus first-route
- * compile. Modern SPAs (Next.js, Vite, SvelteKit, Astro) routinely take
- * 3-7 minutes for a cold first-compile of a moderately large app — run
- * `run_428nktsej0yh` on jayminwest.com (Next.js 14, 1875 modules) finished
- * its first compile at ~10 min wall clock once the install was factored out
- * (warren-fdf2). 10m gives an honest budget; the probe returns on first 2xx
- * so the happy path is unaffected. Override per-project via
- * `.warren/preview.yaml`'s `readiness_timeout`.
+ * + bind: warren-d9e7 split install into its own setup sidecar, and warren-9b15
+ * further split sidecar startup + port bind into its own `connect_timeout`
+ * phase. What remains under this budget is first-route compile / SSR — modern
+ * SPAs (Next.js, Vite, SvelteKit, Astro) routinely take 3-7 minutes for a cold
+ * first-compile of a moderately large app — run `run_428nktsej0yh` on
+ * jayminwest.com (Next.js 14, 1875 modules) finished its first compile at
+ * ~10 min wall clock once the install was factored out (warren-fdf2). 10m
+ * gives an honest budget; the probe returns on first 2xx so the happy path
+ * is unaffected. Override per-project via `.warren/preview.yaml`'s
+ * `readiness_timeout`.
  *
- * Note that the deadline starts when the dev-server sidecar is *created*,
- * not when the first probe connects, so burrow startup + shell pre-exec
- * eat into this budget too. Tightening that semantic is a follow-up
- * (warren-fdf2 approach B); the default bump is approach A.
+ * Post-warren-9b15 the deadline starts at the first successful TCP connect
+ * (phase transition), not at sidecar create. Sidecar startup overhead lives
+ * under `connect_timeout` instead.
  */
 export const DEFAULT_READINESS_TIMEOUT_MS = 600_000;
+/**
+ * Default phase-1 ("did anything bind on the port?") deadline (warren-9b15).
+ * Covers shell pre-exec, dev-server CLI startup, dependency import graph,
+ * and port bind — i.e. sidecar startup variance, not bundler work. Sized at
+ * 5m so a slow burrow / cold image / large dev-server import graph fails
+ * fast with a distinct `connect_timeout` reason instead of degrading into
+ * `readiness_timeout`. Override per-project via `.warren/preview.yaml`'s
+ * `connect_timeout`.
+ */
+export const DEFAULT_CONNECT_TIMEOUT_MS = 300_000;
 /** Default pause between probe attempts. */
 export const DEFAULT_READINESS_POLL_MS = 500;
 /**
@@ -211,6 +230,7 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 	const fetchImpl = input.fetch ?? globalThis.fetch;
 	const sleep = input.sleep ?? defaultSleep;
 	const timeoutMs = input.readinessTimeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS;
+	const connectTimeoutMs = input.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
 	const pollMs = input.readinessPollMs ?? DEFAULT_READINESS_POLL_MS;
 	const perCallTimeoutMs = input.probePerCallTimeoutMs ?? PROBE_PER_CALL_TIMEOUT_MS;
 	const setupTimeoutMs = input.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS;
@@ -280,11 +300,17 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 
 	const readinessPath = input.previewConfig.readiness_path ?? "/";
 	const probeUrl = `http://127.0.0.1:${port}${readinessPath}`;
-	const deadline = now().getTime() + timeoutMs;
 
+	// warren-9b15: two-phase probe loop. Phase 1 ("connect") waits for the
+	// sidecar's listener to accept TCP — any HTTP response, even 4xx/5xx,
+	// proves the port bound. Phase 2 ("readiness") then waits for 2xx/3xx
+	// with its own wall clock, starting at the phase transition. Splitting
+	// the budget means a slow burrow / cold image / shell pre-exec hang
+	// surfaces as `connect_timeout` and stops eating the bundler budget.
+	const connectDeadline = now().getTime() + connectTimeoutMs;
 	while (true) {
-		const ready = await probeOnce(fetchImpl, probeUrl, perCallTimeoutMs);
-		if (ready) {
+		const probe = await probeOnce(fetchImpl, probeUrl, perCallTimeoutMs);
+		if (probe === "ready") {
 			await input.repos.runs.attachPreview(input.runId, {
 				previewState: "live",
 				previewLastHitAt: now().toISOString(),
@@ -292,10 +318,50 @@ export async function launchPreview(input: LaunchPreviewInput): Promise<LaunchPr
 			});
 			return { ok: true, port, sidecarId };
 		}
-		if (now().getTime() >= deadline) {
+		if (probe === "http_response") {
+			// Phase 1 → phase 2: port bound but didn't yet return 2xx/3xx.
+			break;
+		}
+		// probe === "not_connected" → keep waiting under the connect budget.
+		if (now().getTime() >= connectDeadline) {
 			const failureTail = await captureFailureTail(input.sidecars, input.burrowId, sidecarId);
 			await safeDeleteSidecar(input.sidecars, input.burrowId, sidecarId);
-			const message = `readiness probe did not return 2xx within ${timeoutMs}ms (probed ${probeUrl})`;
+			const message = `phase=connect: preview port did not accept a TCP connection within ${connectTimeoutMs}ms (probed ${probeUrl})`;
+			await input.repos.runs.attachPreview(input.runId, {
+				previewState: "failed",
+				previewPort: null,
+				previewFailureMessage: composeFailureMessage(message, failureTail),
+			});
+			return {
+				ok: false,
+				reason: "connect_timeout",
+				message,
+				failureTail,
+				port,
+			};
+		}
+		await sleep(pollMs);
+	}
+
+	const readinessDeadline = now().getTime() + timeoutMs;
+	while (true) {
+		const probe = await probeOnce(fetchImpl, probeUrl, perCallTimeoutMs);
+		if (probe === "ready") {
+			await input.repos.runs.attachPreview(input.runId, {
+				previewState: "live",
+				previewLastHitAt: now().toISOString(),
+				previewFailureMessage: null,
+			});
+			return { ok: true, port, sidecarId };
+		}
+		// In phase 2 both "http_response" and "not_connected" mean "not ready
+		// yet" — the latter can legitimately happen if the dev server briefly
+		// disconnects mid-restart (e.g. HMR rebuilds). We keep probing under
+		// the readiness budget either way.
+		if (now().getTime() >= readinessDeadline) {
+			const failureTail = await captureFailureTail(input.sidecars, input.burrowId, sidecarId);
+			await safeDeleteSidecar(input.sidecars, input.burrowId, sidecarId);
+			const message = `phase=readiness: readiness probe did not return 2xx within ${timeoutMs}ms (probed ${probeUrl})`;
 			await input.repos.runs.attachPreview(input.runId, {
 				previewState: "failed",
 				previewPort: null,
@@ -404,11 +470,33 @@ async function runSetupStep(args: {
 	}
 }
 
+/**
+ * Tri-state probe outcome (warren-9b15):
+ *
+ * - `ready`          → 2xx/3xx response. Launch succeeds.
+ * - `http_response`  → connected and got a non-2xx/3xx HTTP response
+ *                      (e.g. 4xx/5xx while bundler still compiles). Used
+ *                      as the phase-1 → phase-2 discriminator.
+ * - `not_connected`  → no HTTP response at all (ECONNREFUSED, EHOSTUNREACH,
+ *                      AbortController fired before connect completed).
+ *                      Keeps the loop in phase 1 under the connect budget.
+ *
+ * Bun's `fetch()` throws on transport-level failures (refused TCP, DNS,
+ * abort) and resolves with a `Response` once headers are in — so the
+ * presence of a `Response` object is a reliable "TCP connected + at
+ * least some HTTP bytes flowed" signal. We can't perfectly distinguish
+ * "bound but hung mid-headers + abort" from "never connected + abort"
+ * inside the catch arm; treating that case as `not_connected` is the
+ * conservative choice (it keeps the loop in phase 1, which has the
+ * larger combined budget for slow-binding servers).
+ */
+type ProbeOutcome = "ready" | "http_response" | "not_connected";
+
 async function probeOnce(
 	fetchImpl: typeof fetch,
 	url: string,
 	perCallTimeoutMs: number,
-): Promise<boolean> {
+): Promise<ProbeOutcome> {
 	const ac = new AbortController();
 	const tid = setTimeout(() => ac.abort(), perCallTimeoutMs);
 	try {
@@ -421,12 +509,12 @@ async function probeOnce(
 		// "/" → "/index" is ready; the proxy will follow on real traffic.
 		if (res.ok || (res.status >= 300 && res.status < 400)) {
 			await drainBody(res);
-			return true;
+			return "ready";
 		}
 		await drainBody(res);
-		return false;
+		return "http_response";
 	} catch {
-		return false;
+		return "not_connected";
 	} finally {
 		clearTimeout(tid);
 	}

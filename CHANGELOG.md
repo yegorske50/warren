@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(preview)`** — Two-phase readiness probe with a distinct
+  `connect_timeout` (warren-9b15 / warren-fdf2 approach B). `preview`
+  blocks now accept an optional `connect_timeout` (default 5m, bound
+  1s..1h) that caps phase 1 ("did anything bind on the port?"). The
+  existing `readiness_timeout` keeps its 10m default but now caps phase 2
+  ("did the bound server return 2xx?"), with the deadline starting at
+  first successful TCP connect — sidecar startup variance (shell pre-exec,
+  dev-server CLI startup, dependency import-graph load, port bind) lives
+  under `connect_timeout` instead of stealing from the bundler budget. Any
+  HTTP response (even 4xx/5xx) flips the loop into phase 2; ECONNREFUSED /
+  hung connect-aborts keep the loop in phase 1. New
+  `LaunchFailureReason: 'connect_timeout'` and `preview_failure_message`
+  now records the failing phase (`phase=connect:` / `phase=readiness:`).
+  **Migration note:** existing per-project `readiness_timeout` values stay
+  valid but now cover less — only the post-connect bundler phase. Operators
+  whose dev server binds in well under 5m can shrink `readiness_timeout`
+  to match the bundler's actual cold-compile cost. Closes `warren-9b15`.
+
 ### Fixed
 
 - **`fix(bridge)`** — Detect & reconcile "ghost" runs (warren state

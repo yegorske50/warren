@@ -603,6 +603,15 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 						input.previewConfig.setup_timeout !== undefined
 							? parseDurationMs(input.previewConfig.setup_timeout)
 							: undefined;
+					// warren-9b15: same plumb-through for the phase-1 connect budget.
+					// Schema validated bounds at load time so parseDurationMs is
+					// infallible here; omitting the key when the field is absent
+					// preserves the existing single-phase budget for projects that
+					// haven't opted in.
+					const connectTimeoutMs =
+						input.previewConfig.connect_timeout !== undefined
+							? parseDurationMs(input.previewConfig.connect_timeout)
+							: undefined;
 					const result = await (input.launchPreview ?? launchPreview)({
 						runId: run.id,
 						burrowId: run.burrowId,
@@ -613,6 +622,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 						now,
 						...(readinessTimeoutMs !== undefined ? { readinessTimeoutMs } : {}),
 						...(setupTimeoutMs !== undefined ? { setupTimeoutMs } : {}),
+						...(connectTimeoutMs !== undefined ? { connectTimeoutMs } : {}),
 					});
 					if (result.ok) {
 						previewLaunchState = "live";

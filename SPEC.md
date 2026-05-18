@@ -1228,6 +1228,29 @@ annotation patch is its own idempotent step. All three sub-steps emit
 `reap_failed` events with `step` ∈ {`pr_open`, `preview_launch`,
 `pr_annotate_preview`} on error and never mark the run failed.
 
+**Two-phase readiness probe (warren-9b15).** The launcher splits its
+wall clock into two named phases so sidecar startup overhead doesn't
+eat the bundler budget:
+
+1. **`connect` phase.** Cap: `connect_timeout` (default 5m). Covers
+   shell pre-exec, dev-server CLI startup, dependency import-graph load,
+   and port bind. Any HTTP response the server returns — even 4xx/5xx
+   while the bundler still compiles — flips the loop into phase 2.
+   Exhaustion surfaces as `LaunchFailureReason: 'connect_timeout'` —
+   operator action is "check the sidecar's command (binding wrong host?
+   port mismatch?), check burrow forwarder."
+2. **`readiness` phase.** Cap: `readiness_timeout` (default 10m). Starts
+   at first successful TCP connect, not sidecar create. Waits for 2xx/3xx
+   from `readiness_path` (or `GET /`). Exhaustion surfaces as
+   `LaunchFailureReason: 'readiness_timeout'` — operator action is
+   "check the dev server's first-compile cost, possibly raise
+   `readiness_timeout`."
+
+`preview_failure_message` records the failing phase (`phase=connect:` /
+`phase=readiness:`) so operators can tell which cap was actually hit.
+Both timeouts accept the standard duration grammar (`1s..1h`) and are
+overridable per-project under the `preview` block.
+
 **Same sandbox, not a fork.** The preview runs in the same burrow
 workspace the agent used. Forking would double burrow workload and
 complicate port binding for marginal safety; the agent's side effects

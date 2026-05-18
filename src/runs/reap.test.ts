@@ -1258,6 +1258,47 @@ describe("reapRun", () => {
 		expect(launch.calls[0]?.setupTimeoutMs).toBeUndefined();
 	});
 
+	// warren-9b15: per-project connect_timeout follows the same plumb-through
+	// pattern. Phase-1 budget covers sidecar startup + port bind; phase-2
+	// budget (readiness_timeout) covers bundler first-compile. Both default
+	// when unset so existing projects see no behavior change.
+	test("forwards previewConfig.connect_timeout as launcher connectTimeoutMs", async () => {
+		const e = fakeExec({ revListCount: "2" });
+		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);
+		await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			previewConfig: { ...SERVER_PREVIEW, connect_timeout: "2m" },
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
+			launchPreview: launch.launch,
+		});
+		expect(launch.calls).toHaveLength(1);
+		expect(launch.calls[0]?.connectTimeoutMs).toBe(120_000);
+	});
+
+	test("omits launcher connectTimeoutMs when previewConfig.connect_timeout absent", async () => {
+		const e = fakeExec({ revListCount: "2" });
+		const launch = fakeLaunch([{ ok: true, port: 40000, sidecarId: "sc_1" }]);
+		await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			previewConfig: SERVER_PREVIEW,
+			portAllocator: new PreviewPortAllocator(DrizzleAdapter.for(ctx.db)),
+			launchPreview: launch.launch,
+		});
+		expect(launch.calls[0]?.connectTimeoutMs).toBeUndefined();
+	});
+
 	test("skips preview launch when project did not opt in (no previewConfig)", async () => {
 		const e = fakeExec({ revListCount: "2" });
 		const launch = fakeLaunch([]);

@@ -4,6 +4,7 @@ import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import type { ServerPreviewConfig } from "../warren-config/index.ts";
 import {
+	DEFAULT_CONNECT_TIMEOUT_MS,
 	DEFAULT_READINESS_TIMEOUT_MS,
 	formatPreviewUrl,
 	launchPreview,
@@ -377,10 +378,13 @@ describe("launchPreview", () => {
 		expect(calls.length).toBeLessThan(5);
 	});
 
-	// warren-33eb: a fetch that never resolves on its own must not block the
-	// readiness deadline. The per-call AbortController fires before each probe
-	// returns, the loop ticks past the wall-clock deadline, and we end in
-	// `readiness_timeout` rather than hanging until the upstream fetch unblocks.
+	// warren-33eb / warren-9b15: a fetch that never resolves on its own must
+	// not block the loop's wall clock. The per-call AbortController fires
+	// before each probe returns, the loop ticks past the connect deadline,
+	// and we end in `connect_timeout` (the new phase-1 reason — a hung fetch
+	// that never produces a Response is indistinguishable from "port never
+	// bound" once the AbortController fires) rather than hanging on the
+	// upstream fetch.
 	test("aborts hung fetches via per-call timeout and still hits the wall-clock deadline", async () => {
 		const sidecars = fakeSidecars({ stdout: "", stderr: "compiling…\n" });
 		const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
@@ -420,23 +424,187 @@ describe("launchPreview", () => {
 				ticks += 1_000;
 			},
 			now,
-			readinessTimeoutMs: 200,
+			connectTimeoutMs: 200,
+			readinessTimeoutMs: 5_000,
 			readinessPollMs: 50,
 			probePerCallTimeoutMs: 10,
 		});
 
 		expect(result.ok).toBe(false);
-		expect((result as { reason: string }).reason).toBe("readiness_timeout");
+		expect((result as { reason: string }).reason).toBe("connect_timeout");
 		// Loop must have iterated at least once and bounded — not a single 10s hang.
 		expect(probeCalls).toBeGreaterThanOrEqual(1);
 		expect(probeCalls).toBeLessThan(20);
 		const row = await repos.runs.require(runId);
 		expect(row.previewState).toBe("failed");
 		expect(row.previewPort).toBeNull();
+		expect(row.previewFailureMessage).toContain("phase=connect");
 	});
 
 	test("PROBE_PER_CALL_TIMEOUT_MS is 2 seconds (warren-33eb)", () => {
 		expect(PROBE_PER_CALL_TIMEOUT_MS).toBe(2_000);
+	});
+
+	// warren-9b15: DEFAULT_CONNECT_TIMEOUT_MS sizes the phase-1 "did anything
+	// bind on the port?" budget. 5m covers shell pre-exec, dev-server CLI
+	// startup, dependency import-graph load, and bind — i.e. sidecar startup
+	// overhead. The bundler first-compile budget lives under readiness_timeout.
+	test("DEFAULT_CONNECT_TIMEOUT_MS is 5 minutes (warren-9b15)", () => {
+		expect(DEFAULT_CONNECT_TIMEOUT_MS).toBe(300_000);
+	});
+
+	// warren-9b15: phase 1 ("did anything bind?") uses connect_timeout, phase
+	// 2 ("did the bound server return 2xx?") uses readiness_timeout starting
+	// at the phase transition. A port that never binds surfaces as
+	// connect_timeout — distinct from readiness_timeout, so operators can tell
+	// "sidecar didn't even open the socket" from "server bound but bundler is
+	// slow" without staring at logs.
+	describe("two-phase probe loop (warren-9b15)", () => {
+		test("returns connect_timeout when the port never accepts a connection", async () => {
+			const sidecars = fakeSidecars({ stdout: "", stderr: "spawn refused\n" });
+			const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
+			let ticks = 0;
+			const now = (): Date => new Date(t0 + ticks);
+			// Fetch throws synchronously like ECONNREFUSED — every probe is
+			// "not_connected", phase 1 never transitions, connect_timeout fires.
+			const refusingFetch = (async () => {
+				throw new TypeError("fetch failed: ECONNREFUSED");
+			}) as unknown as typeof fetch;
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: PREVIEW_CONFIG,
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch: refusingFetch,
+				sleep: async () => {
+					ticks += 1_000;
+				},
+				now,
+				connectTimeoutMs: 200,
+				readinessTimeoutMs: 5_000,
+				readinessPollMs: 50,
+			});
+			expect(result.ok).toBe(false);
+			expect((result as { reason: string }).reason).toBe("connect_timeout");
+			expect((result as { failureTail: string }).failureTail).toContain("spawn refused");
+			expect(sidecars.deletes).toHaveLength(1);
+			const row = await repos.runs.require(runId);
+			expect(row.previewState).toBe("failed");
+			expect(row.previewPort).toBeNull();
+			expect(row.previewFailureMessage).toContain("phase=connect");
+			expect(row.previewFailureMessage).toContain("did not accept");
+		});
+
+		test("transitions phase 1 → phase 2 on first HTTP response (4xx/5xx), then waits the full readiness budget", async () => {
+			const sidecars = fakeSidecars({ stdout: "", stderr: "compiling…\n" });
+			const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
+			let ticks = 0;
+			const now = (): Date => new Date(t0 + ticks);
+			let i = 0;
+			// First probe: ECONNREFUSED (phase 1, no transition).
+			// Second probe: 502 (phase 1 → phase 2 transition).
+			// Third probe: 200 (phase 2 → ready).
+			const fetchImpl = (async (input: URL | RequestInfo): Promise<Response> => {
+				i++;
+				if (i === 1) throw new TypeError("fetch failed");
+				if (i === 2) return new Response("bad gateway", { status: 502 });
+				const url =
+					typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+				expect(url).toBe("http://127.0.0.1:40000/");
+				return new Response("ok", { status: 200 });
+			}) as unknown as typeof fetch;
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: PREVIEW_CONFIG,
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch: fetchImpl,
+				sleep: async () => {
+					ticks += 10;
+				},
+				now,
+				connectTimeoutMs: 5_000,
+				readinessTimeoutMs: 5_000,
+				readinessPollMs: 10,
+			});
+			expect(result.ok).toBe(true);
+			expect(i).toBe(3);
+			const row = await repos.runs.require(runId);
+			expect(row.previewState).toBe("live");
+			expect(row.previewFailureMessage).toBeNull();
+		});
+
+		test("connect_timeout deadline does not count against readiness_timeout (slow bind → fast compile passes)", async () => {
+			const sidecars = fakeSidecars();
+			const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
+			let ticks = 0;
+			const now = (): Date => new Date(t0 + ticks);
+			// Phase 1: ~3 ECONNREFUSED probes eat ~3000ms of wall clock
+			// (longer than readinessTimeoutMs alone would allow). Phase 2: first
+			// probe is 200. With a single-phase deadline starting at create, the
+			// 200ms readiness budget would have been exhausted by phase-1 waits;
+			// the two-phase contract keeps it intact.
+			let i = 0;
+			const fetchImpl = (async (): Promise<Response> => {
+				i++;
+				if (i <= 3) throw new TypeError("fetch failed");
+				return new Response("ok", { status: 200 });
+			}) as unknown as typeof fetch;
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: PREVIEW_CONFIG,
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch: fetchImpl,
+				sleep: async () => {
+					ticks += 1_000;
+				},
+				now,
+				connectTimeoutMs: 10_000,
+				readinessTimeoutMs: 200,
+				readinessPollMs: 50,
+			});
+			expect(result.ok).toBe(true);
+			expect(i).toBe(4);
+		});
+
+		test("readiness_timeout failure message records phase=readiness", async () => {
+			const sidecars = fakeSidecars({ stdout: "", stderr: "compile error\n" });
+			const t0 = new Date("2026-05-14T18:00:00.000Z").getTime();
+			let ticks = 0;
+			const now = (): Date => new Date(t0 + ticks);
+			const { fetch } = fakeFetch([
+				new Response("502", { status: 502 }),
+				new Response("502", { status: 502 }),
+				new Response("502", { status: 502 }),
+			]);
+			const result = await launchPreview({
+				runId,
+				burrowId,
+				previewConfig: PREVIEW_CONFIG,
+				repos,
+				allocator,
+				sidecars: sidecars.client,
+				fetch,
+				sleep: async () => {
+					ticks += 5_000;
+				},
+				now,
+				connectTimeoutMs: 5_000,
+				readinessTimeoutMs: 2_000,
+				readinessPollMs: 100,
+			});
+			expect(result.ok).toBe(false);
+			expect((result as { reason: string }).reason).toBe("readiness_timeout");
+			const row = await repos.runs.require(runId);
+			expect(row.previewFailureMessage).toContain("phase=readiness");
+		});
 	});
 
 	test("falls back to stdout tail when stderr is empty", async () => {

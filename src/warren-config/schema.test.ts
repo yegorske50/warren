@@ -337,6 +337,32 @@ describe("PreviewConfigSchema", () => {
 		}
 	});
 
+	// warren-9b15: connect_timeout splits "did anything bind?" from
+	// readiness_timeout's "did the bound server return 2xx?". Same 1s..1h
+	// bounds and shape-validation pattern as the sibling timeouts.
+	test("accepts connect_timeout within 1s..1h (warren-9b15)", () => {
+		for (const d of ["1s", "30s", "5m", "1h", "59m59s"]) {
+			const parsed = PreviewConfigSchema.safeParse({
+				...VALID_SERVER_PREVIEW,
+				connect_timeout: d,
+			});
+			expect(parsed.success).toBe(true);
+			if (parsed.success && parsed.data.type === "server") {
+				expect(parsed.data.connect_timeout).toBe(d);
+			}
+		}
+	});
+
+	test("rejects connect_timeout outside 1s..1h", () => {
+		for (const d of ["500ms", "999ms", "2h", "1h1s", "1d"]) {
+			const parsed = PreviewConfigSchema.safeParse({
+				...VALID_SERVER_PREVIEW,
+				connect_timeout: d,
+			});
+			expect(parsed.success).toBe(false);
+		}
+	});
+
 	test("rejects garbage setup_timeout duration strings", () => {
 		for (const d of ["five minutes", "30", "m30", "30y", ""]) {
 			const parsed = PreviewConfigSchema.safeParse({
