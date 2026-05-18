@@ -24,6 +24,11 @@ export interface CreateProjectInput {
 	 * well-formed row; the column is NOT NULL.
 	 */
 	hasPlot?: boolean;
+	/**
+	 * Seeds opt-in flag (warren-9990 / pl-a258 step 1). Defaults to false
+	 * when omitted; mirrors hasPlot's nullability shape.
+	 */
+	hasSeeds?: boolean;
 	now?: Date;
 }
 
@@ -36,6 +41,11 @@ export interface RecordRefreshInput {
 	 * (manual triggers, tests) may not.
 	 */
 	hasPlot?: boolean;
+	/**
+	 * Latest probe outcome (warren-9990). Omitted means "leave the prior
+	 * value" — refresh callers always supply it.
+	 */
+	hasSeeds?: boolean;
 	now?: Date;
 }
 
@@ -60,6 +70,7 @@ export class ProjectsRepo {
 			lastFetchedAt: null,
 			lastHeadSha: null,
 			hasPlot: input.hasPlot ?? false,
+			hasSeeds: input.hasSeeds ?? false,
 		};
 		await this.adapter.runWrite(this.db.insert(this.projects).values(row));
 		return row;
@@ -67,12 +78,20 @@ export class ProjectsRepo {
 
 	async recordRefresh(input: RecordRefreshInput): Promise<ProjectRow> {
 		const lastFetchedAt = (input.now ?? new Date()).toISOString();
-		const patch: { lastFetchedAt: string; lastHeadSha: string; hasPlot?: boolean } = {
+		const patch: {
+			lastFetchedAt: string;
+			lastHeadSha: string;
+			hasPlot?: boolean;
+			hasSeeds?: boolean;
+		} = {
 			lastFetchedAt,
 			lastHeadSha: input.headSha,
 		};
 		if (input.hasPlot !== undefined) {
 			patch.hasPlot = input.hasPlot;
+		}
+		if (input.hasSeeds !== undefined) {
+			patch.hasSeeds = input.hasSeeds;
 		}
 		await this.adapter.runWrite(
 			this.db.update(this.projects).set(patch).where(eq(this.projects.id, input.id)),

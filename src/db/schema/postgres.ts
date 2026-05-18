@@ -74,6 +74,9 @@ export const projects = pgTable(
 		// (column name + nullability + default presence), not the storage
 		// type, so the sqlite integer-as-boolean stays in lockstep.
 		hasPlot: boolean("has_plot").notNull().default(false),
+		// Seeds opt-in gating flag (warren-9990 / pl-a258 step 1) — mirror of
+		// sqlite. See sqlite.ts for shape.
+		hasSeeds: boolean("has_seeds").notNull().default(false),
 	},
 	(t) => [index(INDEX_NAMES.projectsGitUrl).on(t.gitUrl)],
 );

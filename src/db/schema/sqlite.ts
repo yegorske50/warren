@@ -85,6 +85,13 @@ export const projects = sqliteTable(
 		// (warren-a8c3, warren-e26f). Defaults to false so legacy rows
 		// written before this column existed match the no-`.plot/` shape.
 		hasPlot: integer("has_plot", { mode: "boolean" }).notNull().default(false),
+		// Seeds opt-in gating flag (warren-9990 / pl-a258 step 1). True iff a
+		// `.seeds/` directory exists at the clone root at the time of the
+		// most recent addProject / refreshProjectClone. The PlanRun API
+		// (warren-f923) reads this to reject plan-run dispatch against
+		// projects without the issue queue. Defaults to false so legacy rows
+		// written before this column existed match the no-`.seeds/` shape.
+		hasSeeds: integer("has_seeds", { mode: "boolean" }).notNull().default(false),
 	},
 	(t) => [index(INDEX_NAMES.projectsGitUrl).on(t.gitUrl)],
 );

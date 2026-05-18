@@ -56,6 +56,15 @@ export interface ProjectRow {
 	 * the wire envelope again.
 	 */
 	hasPlot: boolean;
+	/**
+	 * Seeds opt-in gating flag (warren-9990 / pl-a258 step 1). True iff a
+	 * `.seeds/` directory existed at the clone root the last time
+	 * addProject or refreshProjectClone probed it. The PlanRun API
+	 * (warren-f923) reads this server-side to reject plan-run dispatch
+	 * against projects without the issue queue; the NewPlanRun form
+	 * disables submission when this is false.
+	 */
+	hasSeeds: boolean;
 }
 
 export interface RefreshProjectResponse {

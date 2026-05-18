@@ -33,13 +33,14 @@ export const DEFAULT_GIT_TIMEOUT_MS = 120_000;
 
 /**
  * Feature directories warren probes for at clone refresh time (warren-4e20).
- * Today only `.plot/` is surfaced on the project row; the seed plan
- * (pl-2047 step 2) leaves room for the existing opt-in integrations
- * (`.mulch/`, `.seeds/`, `.canopy/`, `.pi/`) to start surfacing the same
- * way without changing the probe shape.
+ * The seed plan (pl-2047 step 2) leaves room for the existing opt-in
+ * integrations (`.mulch/`, `.canopy/`, `.pi/`) to start surfacing the same
+ * way without changing the probe shape. `.seeds/` joined in warren-9990
+ * to gate plan-run dispatch.
  */
 export const PROJECT_FEATURE_DIRS = {
 	plot: ".plot",
+	seeds: ".seeds",
 } as const;
 
 /**
@@ -49,6 +50,7 @@ export const PROJECT_FEATURE_DIRS = {
  */
 export interface ProjectFeatureFlags {
 	readonly hasPlot: boolean;
+	readonly hasSeeds: boolean;
 }
 
 /**
@@ -68,6 +70,7 @@ export function detectProjectFeatures(
 ): ProjectFeatureFlags {
 	return {
 		hasPlot: exists(join(localPath, PROJECT_FEATURE_DIRS.plot)),
+		hasSeeds: exists(join(localPath, PROJECT_FEATURE_DIRS.seeds)),
 	};
 }
 
@@ -87,10 +90,11 @@ export interface RefreshProjectCloneResult {
 	readonly ref: string;
 	/**
 	 * Feature-directory probe taken after the hard-reset to origin/<ref>
-	 * (warren-4e20). Reflects the on-disk shape of the freshly-checked-out
-	 * tree, so a `.plot/` added (or removed) on the remote since the last
-	 * refresh flips the corresponding flag on the next call. `addProject`
-	 * runs the same probe right after the initial clone.
+	 * (warren-4e20, warren-9990). Reflects the on-disk shape of the
+	 * freshly-checked-out tree, so a `.plot/` or `.seeds/` added (or
+	 * removed) on the remote since the last refresh flips the
+	 * corresponding flag on the next call. `addProject` runs the same
+	 * probe right after the initial clone.
 	 */
 	readonly features: ProjectFeatureFlags;
 }

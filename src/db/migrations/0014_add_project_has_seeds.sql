@@ -1,0 +1,1 @@
+ALTER TABLE `projects` ADD `has_seeds` integer DEFAULT false NOT NULL;

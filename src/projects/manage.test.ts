@@ -115,7 +115,7 @@ describe("addProject", () => {
 			clone: fakeClone(),
 			detectFeatures: (localPath) => {
 				expect(localPath).toBe("/data/projects/x/y");
-				return { hasPlot: true };
+				return { hasPlot: true, hasSeeds: false };
 			},
 		});
 		expect(row.hasPlot).toBe(true);
@@ -130,9 +130,23 @@ describe("addProject", () => {
 			gitUrl: "https://github.com/x/y.git",
 			spawn: NOOP_SPAWN,
 			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: false }),
+			detectFeatures: () => ({ hasPlot: false, hasSeeds: false }),
 		});
 		expect(row.hasPlot).toBe(false);
+	});
+
+	test("persists hasSeeds=true after probe (warren-9990)", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: false, hasSeeds: true }),
+		});
+		expect(row.hasSeeds).toBe(true);
+		const persisted = await repo.require(row.id);
+		expect(persisted.hasSeeds).toBe(true);
 	});
 
 	test("rejects an invalid GitHub URL with ValidationError before touching the cloner", async () => {
@@ -463,7 +477,7 @@ describe("refreshProject", () => {
 				return {
 					headSha: "abcd1234abcd1234abcd1234abcd1234abcd1234",
 					ref: input.ref,
-					features: { hasPlot: false },
+					features: { hasPlot: false, hasSeeds: false },
 				};
 			},
 			now: () => new Date("2026-05-09T19:00:00.000Z"),
@@ -498,7 +512,11 @@ describe("refreshProject", () => {
 			spawn: NOOP_SPAWN,
 			refresh: async (input) => {
 				receivedRef = input.ref;
-				return { headSha: "deadbeef".repeat(5), ref: input.ref, features: { hasPlot: false } };
+				return {
+					headSha: "deadbeef".repeat(5),
+					ref: input.ref,
+					features: { hasPlot: false, hasSeeds: false },
+				};
 			},
 		});
 
@@ -547,7 +565,11 @@ describe("refreshProject", () => {
 				id: row.id,
 				ref: "",
 				spawn: NOOP_SPAWN,
-				refresh: async () => ({ headSha: "x", ref: "", features: { hasPlot: false } }),
+				refresh: async () => ({
+					headSha: "x",
+					ref: "",
+					features: { hasPlot: false, hasSeeds: false },
+				}),
 			}),
 		).rejects.toBeInstanceOf(ValidationError);
 	});
@@ -559,7 +581,11 @@ describe("refreshProject", () => {
 				config: CFG,
 				id: "prj_nope",
 				spawn: NOOP_SPAWN,
-				refresh: async () => ({ headSha: "x", ref: "main", features: { hasPlot: false } }),
+				refresh: async () => ({
+					headSha: "x",
+					ref: "main",
+					features: { hasPlot: false, hasSeeds: false },
+				}),
 			}),
 		).rejects.toMatchObject({ code: "not_found" });
 	});
@@ -571,7 +597,7 @@ describe("refreshProject", () => {
 			gitUrl: "https://github.com/x/y.git",
 			spawn: NOOP_SPAWN,
 			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: false }),
+			detectFeatures: () => ({ hasPlot: false, hasSeeds: false }),
 		});
 		expect(row.hasPlot).toBe(false);
 
@@ -583,7 +609,7 @@ describe("refreshProject", () => {
 			refresh: async (input) => ({
 				headSha: "1234".repeat(10),
 				ref: input.ref,
-				features: { hasPlot: true },
+				features: { hasPlot: true, hasSeeds: false },
 			}),
 		});
 
@@ -599,7 +625,7 @@ describe("refreshProject", () => {
 			gitUrl: "https://github.com/x/y.git",
 			spawn: NOOP_SPAWN,
 			clone: fakeClone(),
-			detectFeatures: () => ({ hasPlot: true }),
+			detectFeatures: () => ({ hasPlot: true, hasSeeds: false }),
 		});
 		expect(row.hasPlot).toBe(true);
 
@@ -611,11 +637,65 @@ describe("refreshProject", () => {
 			refresh: async (input) => ({
 				headSha: "5678".repeat(10),
 				ref: input.ref,
-				features: { hasPlot: false },
+				features: { hasPlot: false, hasSeeds: false },
 			}),
 		});
 
 		expect(result.project.hasPlot).toBe(false);
+	});
+
+	test("persists hasSeeds=true after probe (warren-9990)", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: false, hasSeeds: false }),
+		});
+		expect(row.hasSeeds).toBe(false);
+
+		const result = await refreshProject({
+			repo,
+			config: CFG,
+			id: row.id,
+			spawn: NOOP_SPAWN,
+			refresh: async (input) => ({
+				headSha: "1234".repeat(10),
+				ref: input.ref,
+				features: { hasPlot: false, hasSeeds: true },
+			}),
+		});
+
+		expect(result.project.hasSeeds).toBe(true);
+		const persisted = await repo.require(row.id);
+		expect(persisted.hasSeeds).toBe(true);
+	});
+
+	test("flips hasSeeds back to false when .seeds/ is removed upstream (warren-9990)", async () => {
+		const row = await addProject({
+			repo,
+			config: CFG,
+			gitUrl: "https://github.com/x/y.git",
+			spawn: NOOP_SPAWN,
+			clone: fakeClone(),
+			detectFeatures: () => ({ hasPlot: false, hasSeeds: true }),
+		});
+		expect(row.hasSeeds).toBe(true);
+
+		const result = await refreshProject({
+			repo,
+			config: CFG,
+			id: row.id,
+			spawn: NOOP_SPAWN,
+			refresh: async (input) => ({
+				headSha: "5678".repeat(10),
+				ref: input.ref,
+				features: { hasPlot: false, hasSeeds: false },
+			}),
+		});
+
+		expect(result.project.hasSeeds).toBe(false);
 	});
 
 	test("invalidates the warren-config cache BEFORE refresh runs (pl-5d74 risk #4)", async () => {
@@ -643,7 +723,11 @@ describe("refreshProject", () => {
 			},
 			refresh: async (input) => {
 				order.push("refresh");
-				return { headSha: "deadbeef".repeat(5), ref: input.ref, features: { hasPlot: false } };
+				return {
+					headSha: "deadbeef".repeat(5),
+					ref: input.ref,
+					features: { hasPlot: false, hasSeeds: false },
+				};
 			},
 		});
 

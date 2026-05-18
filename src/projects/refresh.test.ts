@@ -42,7 +42,11 @@ describe("refreshProjectClone", () => {
 			exists: () => true,
 		});
 
-		expect(result).toEqual({ headSha: sha, ref: "main", features: { hasPlot: true } });
+		expect(result).toEqual({
+			headSha: sha,
+			ref: "main",
+			features: { hasPlot: true, hasSeeds: true },
+		});
 		expect(calls.map((c) => c.cmd[1])).toEqual([
 			"fetch",
 			"checkout",
@@ -172,8 +176,32 @@ describe("refreshProjectClone", () => {
 			},
 		});
 
-		expect(result.features).toEqual({ hasPlot: false });
+		expect(result.features).toEqual({ hasPlot: false, hasSeeds: false });
 		expect(probed).toContain("/data/projects/x/y/.plot");
+	});
+
+	test("probes for .seeds/ alongside git ops and surfaces the boolean on features (warren-9990)", async () => {
+		const sha = "abadcafeabadcafeabadcafeabadcafeabadcafe";
+		const probed: string[] = [];
+		const { spawn } = recorder((cmd) => {
+			if (cmd[1] === "rev-parse") return ok(`${sha}\n`);
+			return ok();
+		});
+		const result = await refreshProjectClone({
+			config: CFG,
+			localPath: "/data/projects/x/y",
+			ref: "main",
+			spawn,
+			exists: (p) => {
+				probed.push(p);
+				if (p === "/data/projects/x/y") return true;
+				if (p === "/data/projects/x/y/.seeds") return true;
+				return false;
+			},
+		});
+
+		expect(result.features).toEqual({ hasPlot: false, hasSeeds: true });
+		expect(probed).toContain("/data/projects/x/y/.seeds");
 	});
 
 	test("throws ProjectUnavailableError when rev-parse returns empty", async () => {
@@ -200,12 +228,22 @@ describe("detectProjectFeatures", () => {
 			probed.push(p);
 			return p === "/data/projects/x/y/.plot";
 		});
-		expect(result).toEqual({ hasPlot: true });
-		expect(probed).toEqual(["/data/projects/x/y/.plot"]);
+		expect(result).toEqual({ hasPlot: true, hasSeeds: false });
+		expect(probed).toContain("/data/projects/x/y/.plot");
 	});
 
 	test("returns hasPlot=false when .plot/ is absent", () => {
 		const result = detectProjectFeatures("/data/projects/x/y", () => false);
-		expect(result).toEqual({ hasPlot: false });
+		expect(result).toEqual({ hasPlot: false, hasSeeds: false });
+	});
+
+	test("returns hasSeeds=true when .seeds/ exists at the clone root (warren-9990)", () => {
+		const probed: string[] = [];
+		const result = detectProjectFeatures("/data/projects/x/y", (p) => {
+			probed.push(p);
+			return p === "/data/projects/x/y/.seeds";
+		});
+		expect(result).toEqual({ hasPlot: false, hasSeeds: true });
+		expect(probed).toContain("/data/projects/x/y/.seeds");
 	});
 });

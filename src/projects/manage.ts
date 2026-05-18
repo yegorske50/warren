@@ -95,6 +95,7 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 		localPath: clone.localPath,
 		defaultBranch: clone.defaultBranch,
 		hasPlot: features.hasPlot,
+		hasSeeds: features.hasSeeds,
 		now: input.now?.(),
 	});
 }
@@ -156,6 +157,7 @@ export async function refreshProject(input: RefreshProjectInput): Promise<Refres
 		id: row.id,
 		headSha: result.headSha,
 		hasPlot: result.features.hasPlot,
+		hasSeeds: result.features.hasSeeds,
 		now: input.now?.(),
 	});
 	return { project: updated, headSha: result.headSha, ref: result.ref };
