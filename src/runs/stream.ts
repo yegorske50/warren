@@ -38,6 +38,19 @@
  * (server/bridges.ts) reads `terminalDetected` and calls `reapRun` —
  * the bridge does not transition warren state itself (mx-fadaa2).
  *
+ * Run-state fallback (warren-6596). In-stream terminal detection only
+ * fires for runtimes that emit a recognised terminal envelope
+ * (claude-code, pi). Declarative agents with `outputFormat=raw-text`
+ * (the acceptance stub-shell, many user-authored shell agents) emit
+ * only `text` events, so the bridge has no in-stream signal to break on.
+ * To cover that gap, the bridge runs a parallel low-frequency poller
+ * that calls burrow's `runs.get(burrowRunId)`. When burrow reports a
+ * terminal state, the poller waits a short drain window (so the next
+ * tail poll picks up final events), then aborts the stream. The bridge
+ * synthesises a `terminalDetected` from the burrow state so reap runs
+ * exactly as it would have via in-stream detection. Disabled in tests
+ * that override `source` without supplying `runStateProbe`.
+ *
  * Restart recovery. `recoverActiveRunStreams` walks the runs table for
  * rows in {queued, running} that already have a `burrow_run_id`, and
  * starts a bridge for each. It returns the in-flight bridges so the
@@ -109,6 +122,32 @@ export interface PiStatsClient {
 	fetch(burrowRunId: string, signal: AbortSignal): Promise<SessionStats | null>;
 }
 
+/**
+ * Run-state probe shape (warren-6596). The bridge calls this on a low
+ * cadence in parallel with the event stream so raw-text / declarative
+ * agents (no in-stream terminal envelope) still reach terminal in warren.
+ * Returns the current burrow run state, or `null` if the row was lost
+ * (handled by the BurrowNotFoundError path).
+ *
+ * Production default: `client.http.runs.get(burrowRunId)` projected to
+ * `{state, exitCode}`. Tests override with a synthetic probe.
+ */
+export type RunStateProbe = (
+	burrowRunId: string,
+	signal: AbortSignal,
+) => Promise<{
+	state: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+	exitCode: number | null;
+} | null>;
+
+/** Burrow run-state poll cadence (ms) — light load: 1 RPC/run/2s. */
+export const DEFAULT_RUN_STATE_POLL_MS = 2_000;
+/**
+ * After observing terminal, wait this long before aborting the stream so
+ * tailBurrow's next 200ms poll picks up the final events. Tunable for tests.
+ */
+export const DEFAULT_RUN_STATE_DRAIN_MS = 1_000;
+
 export interface BridgeRunStreamInput {
 	readonly runId: string;
 	/** Burrow's run id (column `runs.burrow_run_id`). */
@@ -140,6 +179,18 @@ export interface BridgeRunStreamInput {
 	 * pre-warren-a7dc behaviour for claude-code/sapling runs.
 	 */
 	readonly piStats?: PiStatsClient;
+	/**
+	 * Run-state probe override (warren-6596). When unset, the bridge
+	 * defaults to `client.http.runs.get` via the resolved sourceClient. Tests
+	 * that pass `source` (no real client) can pass an explicit probe to
+	 * exercise the run-state fallback; tests that don't pass either leave
+	 * the poller dormant.
+	 */
+	readonly runStateProbe?: RunStateProbe;
+	/** Override the run-state poll cadence (ms). Default 2000. */
+	readonly runStatePollMs?: number;
+	/** Override the post-terminal drain window (ms). Default 1000. */
+	readonly runStateDrainMs?: number;
 }
 
 export interface BridgeRunStreamResult {
@@ -195,6 +246,28 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 			? null
 			: (await input.burrowClientPool.clientFor({ burrowId: input.burrowId })).client;
 	const source = input.source ?? defaultSource(sourceClient as BurrowClient, burrowRunId);
+
+	// warren-6596: run-state poller. Covers runtimes that don't emit a
+	// recognised in-stream terminal envelope (raw-text declarative agents).
+	// Skipped when neither a probe override nor a real burrow client exists
+	// (tests that pass `source` but no `runStateProbe`).
+	const runStateProbe: RunStateProbe | null =
+		input.runStateProbe ??
+		(sourceClient !== null ? defaultRunStateProbe(sourceClient as BurrowClient) : null);
+	const probedTerminal: { value: BurrowTerminalSnapshot | null } = { value: null };
+	const pollerTask =
+		runStateProbe !== null
+			? runStatePoller({
+					probe: runStateProbe,
+					burrowRunId,
+					ctrl,
+					pollIntervalMs: input.runStatePollMs ?? DEFAULT_RUN_STATE_POLL_MS,
+					drainMs: input.runStateDrainMs ?? DEFAULT_RUN_STATE_DRAIN_MS,
+					observed: probedTerminal,
+					runId,
+					...(input.logger !== undefined ? { logger: input.logger } : {}),
+				})
+			: null;
 
 	let written = 0;
 	let skipped = 0;
@@ -339,6 +412,20 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 				{ runId, burrowRunId, written, skipped, err: err.message },
 				"run stream bridge: burrow returned 404 for burrow_run_id (ghost run)",
 			);
+		} else if (probedTerminal.value !== null) {
+			// warren-6596: the run-state poller observed burrow terminal and
+			// aborted the source. An AbortError surfacing here is intentional —
+			// don't flag `errored` (which would trip the registry's reconnect
+			// loop). The synthesized `terminalDetected` is set below.
+			input.logger?.info?.(
+				{
+					runId,
+					burrowRunId,
+					burrowState: probedTerminal.value.state,
+					err: err instanceof Error ? err.message : String(err),
+				},
+				"run stream bridge: stream aborted by run-state poller after terminal observation",
+			);
 		} else {
 			errored = true;
 			input.logger?.error?.(
@@ -355,7 +442,22 @@ export async function bridgeRunStream(input: BridgeRunStreamInput): Promise<Brid
 	} finally {
 		if (input.signal !== undefined) input.signal.removeEventListener("abort", onAbort);
 		ctrl.abort();
+		if (pollerTask !== null) await pollerTask;
 		broker.close(runId);
+	}
+
+	// warren-6596: if the in-stream terminal-detect path didn't fire but the
+	// run-state poller saw burrow terminal, synthesise `terminalDetected` so
+	// the registry's inline reap still runs. Outcome maps 1:1 from burrow
+	// state (succeeded/failed/cancelled). Skipped when terminal was already
+	// detected in-stream — the in-stream path is authoritative because it
+	// carries exit_code semantics from the runtime parser.
+	if (terminalDetected === undefined && !burrowRunMissing && probedTerminal.value !== null) {
+		terminalDetected = { outcome: probedTerminal.value.state };
+		input.logger?.info?.(
+			{ runId, burrowRunId, outcome: probedTerminal.value.state },
+			"bridge synthesized terminalDetected from burrow run-state probe",
+		);
 	}
 
 	input.logger?.info?.(
@@ -452,6 +554,103 @@ function defaultSource(
 			},
 		};
 	};
+}
+
+interface BurrowTerminalSnapshot {
+	readonly state: RunTerminalState;
+	readonly exitCode: number | null;
+}
+
+interface RunStatePollerInput {
+	readonly probe: RunStateProbe;
+	readonly burrowRunId: string;
+	readonly ctrl: AbortController;
+	readonly pollIntervalMs: number;
+	readonly drainMs: number;
+	readonly observed: { value: BurrowTerminalSnapshot | null };
+	readonly runId: string;
+	readonly logger?: BridgeLogger;
+}
+
+const BURROW_TERMINAL_STATES = new Set<RunTerminalState>(["succeeded", "failed", "cancelled"]);
+
+/**
+ * Default run-state probe: project burrow's `runs.get` to the
+ * {state, exitCode} pair the poller needs. `BurrowNotFoundError` bubbles
+ * up so the bridge's main catch block records `burrowRunMissing` exactly
+ * once instead of fighting with the stream's own 404. Other transport
+ * errors return null and the poller retries on the next tick.
+ */
+function defaultRunStateProbe(client: BurrowClient): RunStateProbe {
+	return async (burrowRunId, _signal) => {
+		const run = await withTransportMapping(client.config, () => client.http.runs.get(burrowRunId));
+		return { state: run.state, exitCode: run.exitCode };
+	};
+}
+
+/**
+ * Poll burrow's run state in parallel with the event stream. On first
+ * terminal observation: record the snapshot, sleep the drain window so
+ * tailBurrow's next 200ms cycle picks up final events, then abort the
+ * stream. Errors are swallowed — the stream's own error handling is
+ * authoritative for transport failures.
+ */
+async function runStatePoller(input: RunStatePollerInput): Promise<void> {
+	const { probe, burrowRunId, ctrl, pollIntervalMs, drainMs, observed, runId, logger } = input;
+	while (!ctrl.signal.aborted) {
+		try {
+			const row = await probe(burrowRunId, ctrl.signal);
+			if (row !== null && isBurrowTerminal(row.state)) {
+				observed.value = { state: row.state, exitCode: row.exitCode };
+				logger?.info?.(
+					{ runId, burrowRunId, burrowState: row.state, exitCode: row.exitCode },
+					"run-state poller observed burrow terminal; draining stream before abort",
+				);
+				await sleepMs(drainMs, ctrl.signal);
+				ctrl.abort();
+				return;
+			}
+		} catch (err) {
+			// BurrowNotFoundError or transport failure — let the main stream
+			// loop classify (404 → burrowRunMissing, others → errored). The
+			// poller doesn't make those calls itself; it just keeps trying
+			// until the stream aborts.
+			logger?.warn?.(
+				{
+					runId,
+					burrowRunId,
+					err: err instanceof Error ? err.message : String(err),
+				},
+				"run-state poller probe failed; retrying",
+			);
+		}
+		if (await sleepMs(pollIntervalMs, ctrl.signal)) return;
+	}
+}
+
+function isBurrowTerminal(state: string): state is RunTerminalState {
+	return BURROW_TERMINAL_STATES.has(state as RunTerminalState);
+}
+
+/** Resolve after `ms` or return true when the signal fires first. */
+function sleepMs(ms: number, signal: AbortSignal): Promise<boolean> {
+	if (ms <= 0) return Promise.resolve(signal.aborted);
+	return new Promise<boolean>((resolve) => {
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", onAbort);
+			resolve(false);
+		}, ms);
+		const onAbort = (): void => {
+			clearTimeout(timer);
+			resolve(true);
+		};
+		if (signal.aborted) {
+			clearTimeout(timer);
+			resolve(true);
+			return;
+		}
+		signal.addEventListener("abort", onAbort, { once: true });
+	});
 }
 
 /**
