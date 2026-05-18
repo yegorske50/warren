@@ -26,7 +26,11 @@ export {
 	type PlanRunEventKind,
 } from "./coordinator.ts";
 export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts";
-export { PlanRunDispatchError } from "./errors.ts";
+export {
+	PlanHasNoOpenChildrenError,
+	PlanRunDispatchError,
+	ProjectLacksSeedsError,
+} from "./errors.ts";
 export {
 	type CreatePrMergeCheckerInput,
 	createPrMergeChecker,

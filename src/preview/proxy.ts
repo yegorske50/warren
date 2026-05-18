@@ -154,6 +154,7 @@ const WARREN_API_PATH_PREFIXES: readonly string[] = [
 	"/readyz",
 	"/version",
 	"/preview",
+	"/plan-runs",
 ];
 
 /**

@@ -7,7 +7,7 @@
  * replays events in the same order burrow emitted them.
  */
 
-import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type { EventRow, EventStream } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
@@ -45,6 +45,24 @@ export class EventsRepo {
 					payloadJson: input.payload,
 				})
 				.returning(),
+		);
+	}
+
+	/**
+	 * Replay rows across many runs in ascending wall-clock order. Used by
+	 * `GET /plan-runs/:id/events` (warren-f923) to snapshot the union of
+	 * every child run's persisted history before the live broker
+	 * subscriptions stream new ones. Empty `runIds` returns an empty
+	 * array without a DB hit.
+	 */
+	async listByRunIds(runIds: readonly string[]): Promise<EventRow[]> {
+		if (runIds.length === 0) return [];
+		return this.adapter.pickAll(
+			this.db
+				.select()
+				.from(this.events)
+				.where(inArray(this.events.runId, runIds as string[]))
+				.orderBy(asc(this.events.ts), asc(this.events.id)),
 		);
 	}
 

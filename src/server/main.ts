@@ -29,6 +29,12 @@ import { type AnyWarrenDb, openDatabase, WARREN_DB_POOL_MAX_ENV } from "../db/cl
 import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos } from "../db/repos/index.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
+import {
+	bootPlanRunCoordinator,
+	createPlanRunSpawn,
+	createPrMergeChecker,
+	loadPlanRunCoordinatorConfigFromEnv,
+} from "../plan-runs/index.ts";
 import { createPreviewAuth, type PreviewAuth } from "../preview/cookie.ts";
 import {
 	loadPreviewEvictionConfigFromEnv,
@@ -46,6 +52,7 @@ import {
 	loadRunBranchPrefixFromEnv,
 	RunEventBroker,
 } from "../runs/index.ts";
+import { showSeed } from "../seeds-cli/index.ts";
 import {
 	loadWarrenServerConfigFromFile,
 	requireSharedBurrowToken,
@@ -246,6 +253,41 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
+	// Plan-run coordinator (pl-a258 / warren-2623). Polls active plan_runs
+	// rows on a 10s tick by default; same single-flight + disabled-via-env
+	// shape as bootScheduler so operators reading logs see identical
+	// lifecycle semantics.
+	const planRunCoordinatorConfig = loadPlanRunCoordinatorConfigFromEnv(env);
+	const planRunSeedsCli = { sdBinary: schedulerConfig.sdBinary, spawn: defaultSpawn };
+	const planRunCoordinator = bootPlanRunCoordinator({
+		repos,
+		showSeed: async (projectId, seedId) => {
+			const project = await repos.projects.require(projectId);
+			return showSeed(planRunSeedsCli, project.localPath, seedId);
+		},
+		checkPrMerged: createPrMergeChecker({ token: autoOpenPr.token }),
+		spawn: createPlanRunSpawn({
+			repos,
+			burrowClientPool,
+			bridges: bridgesBoot.registry,
+			warrenConfigs,
+			projectsConfig,
+			projectSpawn: defaultSpawn,
+			seedsCli: planRunSeedsCli,
+			...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
+			...(opts.now !== undefined ? { now: opts.now } : {}),
+		}),
+		tickMs: planRunCoordinatorConfig.tickMs,
+		disabled: planRunCoordinatorConfig.disabled,
+		logger: planRunLoggerFromPino(logger),
+		...(opts.now !== undefined ? { now: opts.now } : {}),
+	});
+	if (planRunCoordinatorConfig.disabled) {
+		logger.info({}, "plan-run coordinator disabled via WARREN_PLAN_RUN_DISABLED");
+	} else {
+		logger.info({ tickMs: planRunCoordinatorConfig.tickMs }, "plan-run coordinator running");
+	}
+
 	// Preview TTL + LRU eviction worker (R-19 / SPEC §11.L, warren-ea6b).
 	// Dialect-polymorphic since warren-adfb (createRunPreviewsRepo runs on
 	// either backend).
@@ -365,6 +407,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			// then drain the scheduler so any in-flight tick finishes calling
 			// spawnRun before bridges/burrow/db disappear under it.
 			await handle.stop();
+			await planRunCoordinator.stop();
 			await scheduler.stop();
 			await previewEvictionWorker.stop();
 			await workerProbe.stop();
@@ -479,6 +522,18 @@ function bridgeLoggerFromPino(logger: Logger): {
 }
 
 function schedulerLoggerFromPino(logger: Logger): {
+	info(obj: Record<string, unknown>, msg?: string): void;
+	warn(obj: Record<string, unknown>, msg?: string): void;
+	error(obj: Record<string, unknown>, msg?: string): void;
+} {
+	return {
+		info: (obj, msg) => logger.info(obj, msg),
+		warn: (obj, msg) => logger.warn(obj, msg),
+		error: (obj, msg) => logger.error(obj, msg),
+	};
+}
+
+function planRunLoggerFromPino(logger: Logger): {
 	info(obj: Record<string, unknown>, msg?: string): void;
 	warn(obj: Record<string, unknown>, msg?: string): void;
 	error(obj: Record<string, unknown>, msg?: string): void;

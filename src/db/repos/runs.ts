@@ -215,6 +215,22 @@ export class RunsRepo {
 		);
 	}
 
+	/**
+	 * Fetch the rows matching `ids` in a single query. Missing ids are
+	 * silently omitted — the caller decides whether a partial result is
+	 * an error. Used by `GET /plan-runs/:id` (warren-f923) to fan child
+	 * runIds out into the detail payload without an N+1 round-trip.
+	 */
+	async listByIds(ids: readonly string[]): Promise<RunRow[]> {
+		if (ids.length === 0) return [];
+		return this.adapter.pickAll(
+			this.db
+				.select()
+				.from(this.runs)
+				.where(inArray(this.runs.id, ids as string[])),
+		);
+	}
+
 	async listByState(state: RunState | RunState[]): Promise<RunRow[]> {
 		const where = Array.isArray(state)
 			? inArray(this.runs.state, state)

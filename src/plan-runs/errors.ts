@@ -13,3 +13,24 @@ import { WarrenError } from "../core/errors.ts";
 export class PlanRunDispatchError extends WarrenError {
 	readonly code = "plan_run_dispatch_error";
 }
+
+/**
+ * `POST /plan-runs` (warren-f923) rejection when the target project doesn't
+ * carry a `.seeds/` directory (`project.hasSeeds === false`). Mirrors the
+ * plot reject shape at warren-a8c3: 400 status, stable code so HTTP
+ * consumers branch on it without parsing the message. Mapped to 400 in
+ * src/server/errors.ts alongside ValidationError.
+ */
+export class ProjectLacksSeedsError extends WarrenError {
+	readonly code = "project_lacks_seeds";
+}
+
+/**
+ * `POST /plan-runs` (warren-f923) rejection when the target plan has no
+ * open child seeds — every child is already closed, so the coordinator
+ * would immediately succeed without dispatching anything. Same 400-status
+ * posture as ProjectLacksSeedsError.
+ */
+export class PlanHasNoOpenChildrenError extends WarrenError {
+	readonly code = "plan_has_no_open_children";
+}

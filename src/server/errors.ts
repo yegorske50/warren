@@ -39,6 +39,7 @@ import {
 	ValidationError,
 	WarrenError,
 } from "../core/errors.ts";
+import { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "../plan-runs/errors.ts";
 import { ProjectUnavailableError } from "../projects/errors.ts";
 import { AgentSchemaError, CanopyUnavailableError } from "../registry/errors.ts";
 import { RunSpawnError } from "../runs/errors.ts";
@@ -105,6 +106,8 @@ function buildEnvelope(code: string, message: string, hint?: string): ErrorEnvel
 function warrenStatusFor(err: WarrenError): number {
 	if (err instanceof NotFoundError) return 404;
 	if (err instanceof ValidationError) return 400;
+	if (err instanceof ProjectLacksSeedsError) return 400;
+	if (err instanceof PlanHasNoOpenChildrenError) return 400;
 	if (err instanceof StateTransitionError) return 409;
 	if (err instanceof BurrowUnreachableError) return 503;
 	if (err instanceof CanopyUnavailableError) return 503;
