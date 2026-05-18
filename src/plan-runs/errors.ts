@@ -34,3 +34,18 @@ export class ProjectLacksSeedsError extends WarrenError {
 export class PlanHasNoOpenChildrenError extends WarrenError {
 	readonly code = "plan_has_no_open_children";
 }
+
+/**
+ * `POST /plan-runs` (warren-c900 / pl-7937 Phase 2) rejection when the
+ * caller supplies `plot_id` but the target project has no `.plot/`
+ * directory (`project.hasPlot === false`). Mirrors ProjectLacksSeedsError's
+ * shape so HTTP consumers branch on `code === "project_lacks_plot"`
+ * without parsing the message. Mapped to 400 in src/server/errors.ts.
+ *
+ * Symmetric to the single-run gate in src/runs/spawn.ts (warren-a8c3),
+ * just routed through a typed error here so the plan-runs error surface
+ * is uniform.
+ */
+export class ProjectLacksPlotError extends WarrenError {
+	readonly code = "project_lacks_plot";
+}

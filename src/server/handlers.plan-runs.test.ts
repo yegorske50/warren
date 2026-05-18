@@ -129,6 +129,7 @@ describe("POST /plan-runs", () => {
 	let handle: ServeHandle | null = null;
 	let projectId = "";
 	let seedyProjectId = "";
+	let plottedProjectId = "";
 
 	beforeEach(async () => {
 		db = await openDatabase({ path: ":memory:" });
@@ -160,6 +161,15 @@ describe("POST /plan-runs", () => {
 			hasSeeds: false,
 		});
 		projectId = bare.id;
+
+		const plotted = await repos.projects.create({
+			gitUrl: "https://github.com/x/plotted.git",
+			localPath: "/tmp/plotted",
+			defaultBranch: "main",
+			hasSeeds: true,
+			hasPlot: true,
+		});
+		plottedProjectId = plotted.id;
 	});
 
 	afterEach(async () => {
@@ -285,6 +295,148 @@ describe("POST /plan-runs", () => {
 		expect(res.status).toBe(400);
 		const body = (await res.json()) as { error: { code: string } };
 		expect(body.error.code).toBe("plan_has_no_open_children");
+	});
+
+	test("persists plot_id when supplied against a plotted project", async () => {
+		const calls: SdCall[] = [];
+		const sdSpawn = makeSdSpawn(calls, [
+			{
+				match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+				result: planShowResult("pl-plot", "active", ["wa-a"]),
+			},
+			{
+				match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+				result: seedShowResult("wa-a", "open"),
+			},
+		]);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-plot",
+				agent: "claude-code",
+				plotId: "plot_abc",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { id: string; plotId: string | null } };
+		expect(body.planRun.plotId).toBe("plot_abc");
+
+		// Round-trips on GET /plan-runs/:id as well.
+		const detail = await fetch(`${tcpUrl(handle)}/plan-runs/${body.planRun.id}`);
+		const detailBody = (await detail.json()) as { planRun: { plotId: string | null } };
+		expect(detailBody.planRun.plotId).toBe("plot_abc");
+
+		const persisted = await repos.planRuns.require(body.planRun.id);
+		expect(persisted.plotId).toBe("plot_abc");
+	});
+
+	test("rejects plot_id on a project without .plot/: 400 + code=project_lacks_plot", async () => {
+		const sdSpawn = makeSdSpawn([], []);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-x",
+				agent: "claude-code",
+				plotId: "plot_abc",
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as {
+			error: { code: string; hint?: string };
+		};
+		expect(body.error.code).toBe("project_lacks_plot");
+		expect(body.error.hint).toContain("plot init");
+
+		// No row inserted — listActive should be empty for the seedy project.
+		const rows = await repos.planRuns.listByProjectAndState(seedyProjectId);
+		expect(rows).toHaveLength(0);
+	});
+
+	test("omitting plot_id on a plotted project leaves plotId null", async () => {
+		const calls: SdCall[] = [];
+		const sdSpawn = makeSdSpawn(calls, [
+			{
+				match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+				result: planShowResult("pl-noplot", "active", ["wa-a"]),
+			},
+			{
+				match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+				result: seedShowResult("wa-a", "open"),
+			},
+		]);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: plottedProjectId,
+				planId: "pl-noplot",
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { plotId: string | null } };
+		expect(body.planRun.plotId).toBeNull();
+	});
+
+	test("empty-string plot_id is treated as not supplied (no rejection on non-plotted project)", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-empty", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-empty",
+				agent: "claude-code",
+				plotId: "",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { plotId: string | null } };
+		expect(body.planRun.plotId).toBeNull();
 	});
 
 	test("404 when project doesn't exist", async () => {

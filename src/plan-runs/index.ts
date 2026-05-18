@@ -29,6 +29,7 @@ export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts"
 export {
 	PlanHasNoOpenChildrenError,
 	PlanRunDispatchError,
+	ProjectLacksPlotError,
 	ProjectLacksSeedsError,
 } from "./errors.ts";
 export {

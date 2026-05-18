@@ -52,7 +52,11 @@ import {
 	type DiagnosticCheck,
 } from "../diagnostics/checks.ts";
 import { VERSION } from "../index.ts";
-import { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "../plan-runs/errors.ts";
+import {
+	PlanHasNoOpenChildrenError,
+	ProjectLacksPlotError,
+	ProjectLacksSeedsError,
+} from "../plan-runs/errors.ts";
 import { createRunPreviewsRepo, DEFAULT_MAX_LIVE } from "../preview/eviction.ts";
 import { DEFAULT_PREVIEW_PORT_RANGE, PreviewPortAllocator } from "../preview/port-allocator.ts";
 import { teardownPreview } from "../preview/teardown.ts";
@@ -1217,13 +1221,18 @@ function parsePlanRunStateFilter(raw: string | null): PlanRunStateFilter | undef
  *   (2) reject when project.hasSeeds is false (ProjectLacksSeedsError mirrors
  *       the plot reject shape at warren-a8c3 — same ValidationError → 400
  *       envelope, stable code so HTTP consumers can branch on it).
+ *   (2b) reject when plot_id is set but project.hasPlot is false
+ *       (ProjectLacksPlotError, warren-c900 / pl-7937 Phase 2). Same 400
+ *       envelope; raised before the seeds-CLI fan-out so a non-Plot project
+ *       never grows a half-validated plan-run.
  *   (3) call showPlan; assert plan.status is in (approved, active, done) and
  *       at least one open child exists (PlanHasNoOpenChildrenError).
  *   (4) resolve agent via repos.agents.resolve with the project-tier fallback
  *       (mx-644fb5 — same posture as spawnRun).
  *   (5/6) build + persist plan_runs + plan_run_children rows in a single
  *       repo.create call (the repo runs them in a transaction so a half-
- *       inserted PlanRun never appears to listActive).
+ *       inserted PlanRun never appears to listActive). plot_id rides through
+ *       the same call (default null when omitted).
  *   (7) return 201 with {planRun, children}.
  */
 function createPlanRunHandler(deps: ServerDeps): RouteHandler {
@@ -1237,6 +1246,7 @@ function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const providerOverride = optionalString(body, "providerOverride");
 		const modelOverride = optionalString(body, "modelOverride");
 		const dispatcherHandle = optionalString(body, "dispatcherHandle");
+		const plotId = optionalString(body, "plotId");
 
 		// (1) project lookup — NotFoundError → 404.
 		const project = await deps.repos.projects.require(projectId);
@@ -1247,6 +1257,19 @@ function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 				`project ${project.id} has no .seeds/ directory; plan-runs are not accepted`,
 				{
 					recoveryHint: "add a .seeds/ directory to the project clone and refresh",
+				},
+			);
+		}
+
+		// (2b) hasPlot gate — symmetric to single-run's spawn-time check
+		// (src/runs/spawn.ts, warren-a8c3). Empty-string plot_id is treated
+		// as "not provided" to match the single-run handler's posture.
+		if (plotId !== undefined && plotId !== "" && !project.hasPlot) {
+			throw new ProjectLacksPlotError(
+				`project ${project.id} has no .plot/ directory; plot_id is not accepted`,
+				{
+					recoveryHint:
+						"either omit plot_id on POST /plan-runs, or run `plot init` in the project clone and refresh the project so warren picks up the .plot/ directory",
 				},
 			);
 		}
@@ -1313,6 +1336,7 @@ function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			...(providerOverride !== undefined ? { providerOverride } : {}),
 			...(modelOverride !== undefined ? { modelOverride } : {}),
 			...(dispatcherHandle !== undefined ? { dispatcherHandle } : {}),
+			...(plotId !== undefined && plotId !== "" ? { plotId } : {}),
 			...(deps.now !== undefined ? { now: deps.now() } : {}),
 		});
 
