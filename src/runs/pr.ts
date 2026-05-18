@@ -59,10 +59,34 @@ export interface PrFetcher {
 const GITHUB_API_BASE = "https://api.github.com";
 const USER_AGENT = "warren-reap-pr-open";
 
+/**
+ * Acceptance test seam (warren-ae00 / scenario 26). When
+ * `WARREN_GH_FETCH_OVERRIDE` is set, every GitHub REST call short-circuits
+ * to a canned positive response — `openPullRequest` returns a synthetic
+ * `pull/1` URL and `checkPullRequestMerged` returns `merged` immediately.
+ * Lets the in-proc plan-run roundtrip exercise reap's PR open + the
+ * coordinator's pr_open → merged transition without standing up a real
+ * GitHub fixture. Unset in production deployments.
+ */
+const GH_FETCH_OVERRIDE_ENV = "WARREN_GH_FETCH_OVERRIDE";
+
+function readGhFetchOverride(): "merged" | null {
+	const v = process.env[GH_FETCH_OVERRIDE_ENV];
+	if (typeof v !== "string") return null;
+	return v.trim() === "merged" ? "merged" : null;
+}
+
 export async function openPullRequest(
 	input: OpenPullRequestInput,
 	deps: PrFetcher = { fetch: globalThis.fetch },
 ): Promise<OpenPullRequestResult> {
+	if (readGhFetchOverride() === "merged") {
+		return {
+			ok: true,
+			url: `https://github.com/${input.owner}/${input.repo}/pull/1`,
+			mode: "created",
+		};
+	}
 	if (input.token === "") {
 		return {
 			ok: false,
@@ -344,9 +368,16 @@ export type AutoOpenEnvLike = Readonly<Record<string, string | undefined>>;
 export function loadAutoOpenPrConfigFromEnv(env: AutoOpenEnvLike = process.env): AutoOpenPrConfig {
 	const raw = env.WARREN_AUTO_OPEN_PR;
 	const enabled = raw === undefined ? true : !isFalsy(raw);
+	const fetchOverride = env[GH_FETCH_OVERRIDE_ENV];
+	const overrideActive = typeof fetchOverride === "string" && fetchOverride.trim() === "merged";
+	// Acceptance seam (warren-ae00): WARREN_GH_FETCH_OVERRIDE=merged synthesizes
+	// a stub token so reap's empty-token gate + tryOpenPr's empty-token gate
+	// don't skip pr_open. The actual HTTP call short-circuits inside
+	// openPullRequest before the token is read.
+	const token = env.GITHUB_TOKEN ?? (overrideActive ? "stub-token" : "");
 	return {
 		enabled,
-		token: env.GITHUB_TOKEN ?? "",
+		token,
 		warrenBaseUrl: env.WARREN_BASE_URL ?? null,
 	};
 }
@@ -387,6 +418,9 @@ export type CheckPrMergedResult =
 export async function checkPullRequestMerged(
 	input: CheckPullRequestMergedInput,
 ): Promise<CheckPrMergedResult> {
+	if (readGhFetchOverride() === "merged") {
+		return { kind: "merged", mergedAt: new Date().toISOString() };
+	}
 	if (input.token === "") {
 		return {
 			kind: "missing_token",

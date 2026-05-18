@@ -57,35 +57,70 @@ if [[ "${1:-}" =~ \[seed_ts=([0-9T:.Z+-]+)\] ]]; then
   seed_ts="${BASH_REMATCH[1]}"
 fi
 
+# Plan-run mode (warren-ae00 / scenario 26): the coordinator dispatches
+# children with a uniform prompt template like `closeseed {seed_id}`. The
+# agent picks the seed id out of the prompt arg and treats this run as
+# "close the named seed" — same disk side effects as the [seed_id=...]
+# knob above. When the named seed appears in the comma-separated
+# WARREN_STUB_NO_COMMIT_SEEDS env list, skip every workspace mutation
+# (no mulch row, no seed row) so reap reports commitsAhead=0 and the
+# coordinator drives the trivial-merge branch.
+closeseed_mode=0
+no_commit=0
+if [[ "${1:-}" =~ closeseed[[:space:]]+([A-Za-z0-9_.-]+) ]]; then
+  closeseed_mode=1
+  seed_id="${BASH_REMATCH[1]}"
+  no_commit_list=",${WARREN_STUB_NO_COMMIT_SEEDS:-},"
+  if [[ "${no_commit_list}" == *",${seed_id},"* ]]; then
+    no_commit=1
+  fi
+fi
+
 # Ensure target directories exist (warren may not have seeded them if
 # expertise_seed/workflow were empty).
 mkdir -p .mulch/expertise .seeds
 
-# 1. Mulch record — canonical mulch JSONL shape (recorded_at is the
-#    field warren's reap LWW compares on per mx-32631d).
-mulch_path=".mulch/expertise/${domain}.jsonl"
-record="$(cat <<JSON
+if [ "${no_commit}" = "1" ]; then
+  echo "stub-agent: started run with prompt=\"${1:-<no-prompt>}\""
+  echo "stub-agent: closeseed ${seed_id} no-commit (trivial-merge path)"
+else
+  # 1. Mulch record — canonical mulch JSONL shape (recorded_at is the
+  #    field warren's reap LWW compares on per mx-32631d).
+  mulch_path=".mulch/expertise/${domain}.jsonl"
+  record="$(cat <<JSON
 {"id":"${record_id}","domain":"${domain}","type":"convention","content":"stub agent ran successfully","recorded_at":"${mulch_ts}","confidence":1.0}
 JSON
 )"
-printf '%s\n' "${record}" >> "${mulch_path}"
+  printf '%s\n' "${record}" >> "${mulch_path}"
 
-# 2. Seeds close — append a closed row keyed by seed_id. We append a
-#    full row each run; if the project already has a row with this id,
-#    reap's seeds-close mirror runs LWW on updatedAt and either
-#    overwrites or skips. Either way a deterministic outcome.
-seeds_path=".seeds/issues.jsonl"
-seed_row="$(cat <<JSON
+  # 2. Seeds close — append a closed row keyed by seed_id. We append a
+  #    full row each run; if the project already has a row with this id,
+  #    reap's seeds-close mirror runs LWW on updatedAt and either
+  #    overwrites or skips. Either way a deterministic outcome.
+  seeds_path=".seeds/issues.jsonl"
+  seed_row="$(cat <<JSON
 {"id":"${seed_id}","title":"stub seed closed by acceptance harness","status":"closed","type":"task","priority":3,"createdAt":"${seed_ts}","updatedAt":"${seed_ts}"}
 JSON
 )"
-printf '%s\n' "${seed_row}" >> "${seeds_path}"
+  printf '%s\n' "${seed_row}" >> "${seeds_path}"
 
-# 3. Agent-visible output — burrow turns this into events on the
-#    /runs/:id/stream feed, which warren mirrors into events table.
-echo "stub-agent: started run with prompt=\"${1:-<no-prompt>}\""
-echo "stub-agent: wrote mulch record id=${record_id} to ${mulch_path}"
-echo "stub-agent: wrote seed close id=${seed_id} to ${seeds_path}"
+  # Closeseed mode (warren-ae00 / scenario 26): commit so reap's
+  # branch_push has something to push and `commitsAhead > 0` opens the
+  # auto-PR sub-step. Other scenarios (mulch/seeds reap roundtrips,
+  # restart-recovery, …) keep the historical "append, never commit"
+  # posture so their event-stream assertions stay unchanged.
+  if [ "${closeseed_mode}" = "1" ]; then
+    git add .mulch .seeds >/dev/null 2>&1 || true
+    git -c user.name="stub-agent" -c user.email="stub@warren.invalid" \
+      commit -m "stub-agent: close ${seed_id}" >/dev/null 2>&1 || true
+  fi
+
+  # 3. Agent-visible output — burrow turns this into events on the
+  #    /runs/:id/stream feed, which warren mirrors into events table.
+  echo "stub-agent: started run with prompt=\"${1:-<no-prompt>}\""
+  echo "stub-agent: wrote mulch record id=${record_id} to ${mulch_path}"
+  echo "stub-agent: wrote seed close id=${seed_id} to ${seeds_path}"
+fi
 
 # Plot integration (warren-4e06 / pl-2047 step 8). When the burrow forwards
 # PLOT_ID + PLOT_ACTOR into the sandbox (warren-e26f), echo both for the

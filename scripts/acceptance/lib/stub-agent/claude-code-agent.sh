@@ -34,6 +34,27 @@ emit '{"type":"system","subtype":"init","session_id":"sess_stub","model":"claude
 # event" signal scenario 17 polls on.
 emit '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ack"}]}}'
 
+# Plan-run mode (warren-ae00 / scenario 26): when the prompt embeds
+# `closeseed <id>`, close the named seed in the burrow workspace so
+# reap's seeds-close-mirror + branch_push have something to mirror.
+# `WARREN_STUB_NO_COMMIT_SEEDS` (comma list) names seeds whose dispatch
+# should produce no commits so reap reports `commitsAhead=0` and the
+# plan-run coordinator drives the trivial-merge branch.
+if [[ "${_prompt}" =~ closeseed[[:space:]]+([A-Za-z0-9_.-]+) ]]; then
+  _seed_id="${BASH_REMATCH[1]}"
+  _no_commit_list=",${WARREN_STUB_NO_COMMIT_SEEDS:-},"
+  if [[ "${_no_commit_list}" != *",${_seed_id},"* ]]; then
+    _ts="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+    mkdir -p .seeds
+    cat <<JSON >> .seeds/issues.jsonl
+{"id":"${_seed_id}","title":"scenario-26 ${_seed_id}","status":"closed","type":"task","priority":3,"createdAt":"${_ts}","updatedAt":"${_ts}"}
+JSON
+    git add .seeds >/dev/null 2>&1 || true
+    git -c user.name="claude-stub-agent" -c user.email="stub@warren.invalid" \
+      commit -m "claude-stub: close ${_seed_id}" >/dev/null 2>&1 || true
+  fi
+fi
+
 # terminal result — this is what warren-87f9 extracts. Numbers chosen
 # small but non-zero so the assertion `> 0` is unambiguous.
 emit '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.000421,"usage":{"input_tokens":1200,"output_tokens":400,"cache_read_input_tokens":5000,"cache_creation_input_tokens":200}}'

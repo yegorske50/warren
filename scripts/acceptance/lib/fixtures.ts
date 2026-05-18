@@ -170,7 +170,7 @@ async function buildSampleProject(repoPath: string): Promise<void> {
 		// rely on WARREN_STUB_SLEEP_MS to keep the agent alive across the
 		// kill window.
 		"[env]",
-		`optional = ["WARREN_STUB_SLEEP_MS", "WARREN_STUB_MULCH_DOMAIN", "WARREN_STUB_MULCH_ID", "WARREN_STUB_SEED_ID"]`,
+		`optional = ["WARREN_STUB_SLEEP_MS", "WARREN_STUB_MULCH_DOMAIN", "WARREN_STUB_MULCH_ID", "WARREN_STUB_SEED_ID", "WARREN_STUB_NO_COMMIT_SEEDS"]`,
 		"",
 		"[[agents]]",
 		`id = "${STUB_AGENT_NAME}"`,
