@@ -13,3 +13,4 @@
 {"type":"attachment_added","actor":"user:jayminwest","at":"2026-05-18T16:29:40.569Z","data":{"id":"att-008","type":"seeds_issue","ref":"warren-44e3","role":"tracks"}}
 {"type":"attachment_added","actor":"user:jayminwest","at":"2026-05-18T16:29:40.601Z","data":{"id":"att-009","type":"seeds_issue","ref":"warren-44a3","role":"tracks"}}
 {"type":"status_changed","actor":"user:jayminwest","at":"2026-05-18T16:30:37.089Z","data":{"from":"drafting","to":"ready"}}
+{"type":"attachment_added","actor":"user:jayminwest","at":"2026-05-18T16:34:27.671Z","data":{"id":"att-010","type":"seeds_issue","ref":"warren-bb22","role":"informs"}}

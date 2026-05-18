@@ -71,6 +71,14 @@
       "ref": "warren-44a3",
       "role": "tracks",
       "type": "seeds_issue"
+    },
+    {
+      "added_at": "2026-05-18T16:34:27.671Z",
+      "added_by": "user:jayminwest",
+      "id": "att-010",
+      "ref": "warren-bb22",
+      "role": "informs",
+      "type": "seeds_issue"
     }
   ],
   "created_at": "2026-05-18T16:29:24.188Z",
@@ -99,5 +107,5 @@
   "name": "Housekeeping pass — burn down ambient bugs + polish before next epic",
   "schema_version": 1,
   "status": "ready",
-  "updated_at": "2026-05-18T16:30:37.089Z"
+  "updated_at": "2026-05-18T16:34:27.671Z"
 }
