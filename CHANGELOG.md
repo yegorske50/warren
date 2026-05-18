@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] — 2026-05-18
+
+Patch release closing `warren-ede7`: the Plot aggregator's
+`queryWithRebuildRetry` (`src/plots/aggregate.ts`) only rebuilt the
+index on a thrown error from `client.query()`, but `.plot/.index.db`
+is gitignored (commit `2d7a75f`). A freshly-refreshed project clone
+therefore has the `*.json` + `*.events.jsonl` files but no index DB,
+and `SQLitePlotIndex` creates an empty index on first construction
+without throwing — so `query()` returned `rows: []`, the rebuild path
+was never hit, and `GET /plots` / `GET /plots/:id` came back empty /
+404 even though Plots existed on disk. Discovered dogfooding
+`plot-3e72876d` (the housekeeping Plot) in deployed warren.
+
+### Fixed
+
+- **`fix(plots)`** — `queryWithRebuildRetry` now also triggers a
+  rebuild when the first query returns zero rows and the project's
+  `.plot/` directory contains at least one non-dot `*.json` file
+  (probed via `fs.readdir`). The disk probe distinguishes "index is
+  stale, rebuild" from "project legitimately has no plots" so the
+  rebuild cost only lands when there's something to recover. Both
+  `GET /plots` (aggregator) and `GET /plots/:id` (resolver, which
+  shares the aggregator's cache path) recover from a missing index DB
+  without operator intervention. New tests at
+  `src/plots/aggregate.test.ts` pin the empty-rows-rebuild path and
+  the empty-rows-no-rebuild path; the existing throw-path retry test
+  is unchanged.
+
 ## [0.4.3] — 2026-05-18
 
 Patch release closing `warren-c106`, the cascade gap left by `0.4.1`:

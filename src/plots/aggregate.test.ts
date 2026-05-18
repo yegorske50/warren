@@ -76,12 +76,26 @@ interface StubBehaviour {
 	readonly plots: ReadonlyArray<StubPlot>;
 	readonly failFirstQuery?: boolean;
 	readonly failAllQueries?: boolean;
+	/**
+	 * Plots that exist on disk as `*.json` files but are missing from
+	 * the index DB. When set, `query()` returns rows derived from
+	 * `plots` (typically empty until `rebuildIndex` runs), and
+	 * `rebuildIndex` migrates these into `plots` so the retry sees
+	 * them. Models the warren-ede7 cold-cache empty-rows path.
+	 */
+	readonly plotsOnDiskOnly?: ReadonlyArray<StubPlot>;
+	/**
+	 * Override the disk probe result. When `plotsOnDiskOnly` is set
+	 * this defaults to `true`; otherwise to `plots.length > 0`.
+	 */
+	readonly hasFilesOnDisk?: boolean;
 }
 
 interface StubMetrics {
 	queryCalls: number;
 	rebuildCalls: number;
 	closeCalls: number;
+	hasFilesOnDiskCalls: number;
 }
 
 function makeFactory(perProject: Record<string, StubBehaviour>): {
@@ -96,9 +110,13 @@ function makeFactory(perProject: Record<string, StubBehaviour>): {
 		}
 		let m = metrics[p.id];
 		if (m === undefined) {
-			m = { queryCalls: 0, rebuildCalls: 0, closeCalls: 0 };
+			m = { queryCalls: 0, rebuildCalls: 0, closeCalls: 0, hasFilesOnDiskCalls: 0 };
 			metrics[p.id] = m;
 		}
+		// Live view of indexed plots — rebuildIndex absorbs the
+		// `plotsOnDiskOnly` set so the retry query sees them.
+		const indexed: StubPlot[] = [...behaviour.plots];
+		const onDiskOnly: StubPlot[] = behaviour.plotsOnDiskOnly ? [...behaviour.plotsOnDiskOnly] : [];
 		const client: AggregatorPlotClient = {
 			async query() {
 				m.queryCalls += 1;
@@ -106,13 +124,23 @@ function makeFactory(perProject: Record<string, StubBehaviour>): {
 				if (behaviour.failFirstQuery && m.queryCalls === 1) {
 					throw new Error("first-query-broken");
 				}
-				return { rows: behaviour.plots.map((pl) => ({ id: pl.id })) };
+				return { rows: indexed.map((pl) => ({ id: pl.id })) };
 			},
 			async rebuildIndex() {
 				m.rebuildCalls += 1;
+				while (onDiskOnly.length > 0) {
+					const next = onDiskOnly.shift();
+					if (next !== undefined) indexed.push(next);
+				}
+			},
+			async hasPlotFilesOnDisk() {
+				m.hasFilesOnDiskCalls += 1;
+				if (behaviour.hasFilesOnDisk !== undefined) return behaviour.hasFilesOnDisk;
+				if (onDiskOnly.length > 0 || indexed.length > 0) return true;
+				return false;
 			},
 			async readPlot(plotId) {
-				const pl = behaviour.plots.find((x) => x.id === plotId);
+				const pl = indexed.find((x) => x.id === plotId);
 				if (pl === undefined) throw new Error(`unknown plot ${plotId}`);
 				return {
 					name: pl.name,
@@ -123,7 +151,7 @@ function makeFactory(perProject: Record<string, StubBehaviour>): {
 				};
 			},
 			async readEvents(plotId) {
-				const pl = behaviour.plots.find((x) => x.id === plotId);
+				const pl = indexed.find((x) => x.id === plotId);
 				if (pl === undefined) throw new Error(`unknown plot ${plotId}`);
 				return pl.events;
 			},
@@ -294,6 +322,56 @@ describe("createPlotAggregator", () => {
 		expect(metrics.prj_a?.queryCalls).toBe(2);
 		expect(metrics.prj_a?.rebuildCalls).toBe(1);
 		expect(metrics.prj_a?.closeCalls).toBe(1);
+	});
+
+	test("rebuilds the index when the first query returns empty rows but .plot/ has *.json files on disk (warren-ede7)", async () => {
+		const projects = [project("prj_a")];
+		const { factory, metrics } = makeFactory({
+			prj_a: {
+				plots: [],
+				plotsOnDiskOnly: [
+					{
+						id: "plot-3e72876d",
+						name: "housekeeping",
+						status: "active",
+						updated_at: "2026-05-18T00:00:00Z",
+						goal: "housekeeping pass",
+						attachments: 0,
+						events: [noteEvent("2026-05-18T00:00:00Z", "user:operator")],
+					},
+				],
+			},
+		});
+		const agg = createPlotAggregator({
+			projectsRepo: { listAll: async () => projects },
+			logger: silentLogger(),
+			clientFactory: factory,
+		});
+		const rows = await agg.listSummaries();
+		expect(rows.map((r) => r.id)).toEqual(["plot-3e72876d"]);
+		expect(metrics.prj_a?.queryCalls).toBe(2);
+		expect(metrics.prj_a?.rebuildCalls).toBe(1);
+		expect(metrics.prj_a?.hasFilesOnDiskCalls).toBe(1);
+	});
+
+	test("does NOT rebuild when the first query returns empty rows and .plot/ has zero *.json files (warren-ede7)", async () => {
+		const projects = [project("prj_a")];
+		const { factory, metrics } = makeFactory({
+			prj_a: {
+				plots: [],
+				hasFilesOnDisk: false,
+			},
+		});
+		const agg = createPlotAggregator({
+			projectsRepo: { listAll: async () => projects },
+			logger: silentLogger(),
+			clientFactory: factory,
+		});
+		const rows = await agg.listSummaries();
+		expect(rows).toEqual([]);
+		expect(metrics.prj_a?.queryCalls).toBe(1);
+		expect(metrics.prj_a?.rebuildCalls).toBe(0);
+		expect(metrics.prj_a?.hasFilesOnDiskCalls).toBe(1);
 	});
 
 	test("isolates per-project failures: a broken .plot/ does not 500 the deployment", async () => {

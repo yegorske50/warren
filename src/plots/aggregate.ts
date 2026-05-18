@@ -13,9 +13,16 @@
  * Posture mirrors `src/runs/spawn.ts`'s `defaultPlotAppender` and
  * `src/plan-runs/plot-appender.ts` (mx-239786 / mx-92e6b3): on a
  * first-attempt query failure the index is rebuilt best-effort and the
- * query is retried once. The retry covers the documented case where a
- * project has a `.plot/` directory but no `.index.db` yet (the index
- * is reconstructible from the JSON files at any time — Plot SPEC §4.1).
+ * query is retried once. The retry also fires when the first query
+ * returns zero rows *and* `.plot/` has at least one `*.json` file on
+ * disk (warren-ede7): `.plot/.index.db` is gitignored, so a freshly
+ * refreshed clone has the JSON files but no index DB, and
+ * `SQLitePlotIndex` creates an empty index on first construction
+ * without throwing. The disk probe distinguishes "index is stale,
+ * rebuild" from "project legitimately has no plots" so the rebuild
+ * cost only lands when there's actually something to recover (the
+ * index is reconstructible from the JSON files at any time — Plot
+ * SPEC §4.1).
  *
  * Per-project queries fan out in parallel via `Promise.all`. A failure
  * inside any single project's branch is logged and DROPPED from the
@@ -39,6 +46,7 @@
  * without waiting for the TTL.
  */
 
+import { readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { PlotEvent, PlotStatus } from "@os-eco/plot-cli";
 import type { ProjectRow } from "../db/schema.ts";
@@ -55,6 +63,15 @@ import { buildIntentGoalPreview, type PlotSummary } from "./types.ts";
 export interface AggregatorPlotClient {
 	query(): Promise<{ rows: ReadonlyArray<{ id: string }> }>;
 	rebuildIndex(): Promise<void>;
+	/**
+	 * Probe whether the project's `.plot/` directory contains at least
+	 * one non-dot `*.json` Plot file on disk. Used by
+	 * `queryWithRebuildRetry` to distinguish "index is stale, rebuild"
+	 * from "project legitimately has no plots" when the first query
+	 * returns empty rows without throwing — the case a freshly-refreshed
+	 * clone hits because `.index.db` is gitignored (warren-ede7).
+	 */
+	hasPlotFilesOnDisk(): Promise<boolean>;
 	readPlot(plotId: string): Promise<{
 		name: string;
 		status: PlotStatus;
@@ -74,8 +91,9 @@ export interface AggregatorPlotClient {
 export type AggregatorClientFactory = (project: ProjectRow) => AggregatorPlotClient;
 
 export const defaultAggregatorClientFactory: AggregatorClientFactory = (project) => {
+	const dir = join(project.localPath, ".plot");
 	const client = new UserPlotClient({
-		dir: join(project.localPath, ".plot"),
+		dir,
 		actor: { kind: "user", handle: "operator", raw: "user:operator" },
 	});
 	return {
@@ -84,6 +102,14 @@ export const defaultAggregatorClientFactory: AggregatorClientFactory = (project)
 		},
 		async rebuildIndex() {
 			await client.rebuildIndex();
+		},
+		async hasPlotFilesOnDisk() {
+			try {
+				const entries = await readdir(dir);
+				return entries.some((name) => !name.startsWith(".") && name.endsWith(".json"));
+			} catch {
+				return false;
+			}
 		},
 		async readPlot(plotId) {
 			const plot = await client.get(plotId).read();
@@ -250,6 +276,24 @@ async function queryWithRebuildRetry(
 ): Promise<ReadonlyArray<{ id: string }>> {
 	try {
 		const r = await client.query();
+		if (r.rows.length === 0) {
+			// Cold-cache empty-rows path (warren-ede7): `.plot/.index.db`
+			// is gitignored, so a freshly-refreshed clone has the *.json
+			// files but no index DB. SQLitePlotIndex creates an empty
+			// index on first construction without throwing, so query()
+			// returns empty rather than failing. Probe disk to tell that
+			// case apart from a project that legitimately has no plots
+			// — only the former should pay a rebuild cost.
+			const hasFiles = await client.hasPlotFilesOnDisk();
+			if (!hasFiles) return r.rows;
+			try {
+				await client.rebuildIndex();
+			} catch {
+				return r.rows;
+			}
+			const retry = await client.query();
+			return retry.rows;
+		}
 		return r.rows;
 	} catch (err) {
 		try {
