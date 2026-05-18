@@ -21,6 +21,7 @@ export {
 	type CoordinatorSpawnFn,
 	type CoordinatorSpawnInput,
 	type CoordinatorSpawnResult,
+	type CoordinatorTransitionPlotFn,
 	isChildTerminal,
 	PLAN_RUN_EVENT_KINDS,
 	type PlanRunEventKind,
@@ -39,6 +40,14 @@ export {
 	emitPlanRunDispatchedToPlot,
 	type PlanRunPlotAppender,
 } from "./plot-appender.ts";
+export {
+	type AutoTransitionPlotToDoneInput,
+	type AutoTransitionResult,
+	autoTransitionPlotToDone,
+	defaultPlotStatusSetter,
+	type PlotStatusSetter,
+	type SetPlotStatusToDoneInput,
+} from "./plot-transition.ts";
 export {
 	type CreatePrMergeCheckerInput,
 	createPrMergeChecker,

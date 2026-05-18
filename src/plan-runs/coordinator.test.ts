@@ -8,7 +8,9 @@ import {
 	type CoordinatorEmitFn,
 	type CoordinatorShowSeedFn,
 	type CoordinatorSpawnFn,
+	type CoordinatorTransitionPlotFn,
 } from "./coordinator.ts";
+import type { AutoTransitionResult } from "./plot-transition.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
 
 const NOW = new Date("2026-05-17T00:00:00.000Z");
@@ -407,6 +409,214 @@ describe("advancePlanRun — state machine", () => {
 		expect(reloaded.state).toBe("succeeded");
 		expect(reloaded.endedAt).toBe(NOW.toISOString());
 		expect(h.events.some((e) => e.kind === "plan_run.succeeded")).toBe(true);
+	});
+
+	test("spawn receives the PlanRun.plotId so per-child PLOT_ID injection lights up", async () => {
+		// Seed a Plot-bound PlanRun directly so the coordinator's spawn
+		// closure sees a non-null plotId on the row passed through.
+		const { planRun: plotBound } = await h.repos.planRuns.create({
+			planId: "pl-plot",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			plotId: "plot_acc",
+			children: [{ seq: 1, seedId: "warren-p" }],
+			now: NOW,
+		});
+		const captured: { plotId: string | null }[] = [];
+		const spawn: CoordinatorSpawnFn = async ({ planRun, child, prompt }) => {
+			captured.push({ plotId: planRun.plotId });
+			const run = await h.repos.runs.create({
+				agentName: "claude-code",
+				projectId: h.projectId,
+				prompt,
+				renderedAgentJson: { sections: {} },
+				trigger: "plan-run",
+				seedId: child.seedId,
+				now: NOW,
+			});
+			return { runId: run.id };
+		};
+		const result = await advancePlanRun({
+			planRun: plotBound,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn,
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("dispatched");
+		expect(captured).toEqual([{ plotId: "plot_acc" }]);
+	});
+
+	test("plan_succeeded with plotId + transitionPlot → emits plan_run.plot_auto_done", async () => {
+		const { planRun } = await h.repos.planRuns.create({
+			planId: "pl-plot-done",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			plotId: "plot_done",
+			children: [{ seq: 1, seedId: "warren-p" }],
+			now: NOW,
+		});
+		await h.repos.planRuns.transitionTo(planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-p");
+		await h.repos.planRuns.updateChild({
+			planRunId: planRun.id,
+			seq: 1,
+			patch: {
+				runId,
+				state: "merged",
+				prMergedAt: NOW.toISOString(),
+				startedAt: NOW.toISOString(),
+				endedAt: NOW.toISOString(),
+			},
+		});
+		const calls: string[] = [];
+		const transitionPlot: CoordinatorTransitionPlotFn = async (pr) => {
+			calls.push(pr.id);
+			return { kind: "transitioned", previousStatus: "active" } satisfies AutoTransitionResult;
+		};
+		const reloaded = await h.repos.planRuns.require(planRun.id);
+		const result = await advancePlanRun({
+			planRun: reloaded,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			transitionPlot,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_succeeded");
+		expect(calls).toEqual([planRun.id]);
+		const ev = h.events.find((e) => e.kind === "plan_run.plot_auto_done");
+		expect(ev).toBeDefined();
+		expect(ev?.payload).toEqual({ planRunId: planRun.id, plotId: "plot_done" });
+	});
+
+	test("plan_succeeded with plotId + skipped transition → emits plan_run.plot_status_skipped", async () => {
+		const { planRun } = await h.repos.planRuns.create({
+			planId: "pl-plot-skip",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			plotId: "plot_skip",
+			children: [{ seq: 1, seedId: "warren-p" }],
+			now: NOW,
+		});
+		await h.repos.planRuns.transitionTo(planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-p");
+		await h.repos.planRuns.updateChild({
+			planRunId: planRun.id,
+			seq: 1,
+			patch: {
+				runId,
+				state: "merged",
+				prMergedAt: NOW.toISOString(),
+				startedAt: NOW.toISOString(),
+				endedAt: NOW.toISOString(),
+			},
+		});
+		const transitionPlot: CoordinatorTransitionPlotFn = async () =>
+			({ kind: "skipped", currentStatus: "drafting" }) satisfies AutoTransitionResult;
+		const reloaded = await h.repos.planRuns.require(planRun.id);
+		const result = await advancePlanRun({
+			planRun: reloaded,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			transitionPlot,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_succeeded");
+		const ev = h.events.find((e) => e.kind === "plan_run.plot_status_skipped");
+		expect(ev).toBeDefined();
+		expect(ev?.payload).toEqual({
+			planRunId: planRun.id,
+			plotId: "plot_skip",
+			currentStatus: "drafting",
+		});
+	});
+
+	test("plan_succeeded with plotId + failed transition → emits plan_run.plot_auto_done_failed", async () => {
+		const { planRun } = await h.repos.planRuns.create({
+			planId: "pl-plot-fail",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			plotId: "plot_fail",
+			children: [{ seq: 1, seedId: "warren-p" }],
+			now: NOW,
+		});
+		await h.repos.planRuns.transitionTo(planRun.id, "running", { startedAt: NOW.toISOString() });
+		const runId = await h.makeRun("warren-p");
+		await h.repos.planRuns.updateChild({
+			planRunId: planRun.id,
+			seq: 1,
+			patch: {
+				runId,
+				state: "merged",
+				prMergedAt: NOW.toISOString(),
+				startedAt: NOW.toISOString(),
+				endedAt: NOW.toISOString(),
+			},
+		});
+		const transitionPlot: CoordinatorTransitionPlotFn = async () =>
+			({ kind: "failed", reason: "fs error" }) satisfies AutoTransitionResult;
+		const reloaded = await h.repos.planRuns.require(planRun.id);
+		const result = await advancePlanRun({
+			planRun: reloaded,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			transitionPlot,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_succeeded");
+		// PlanRun terminal state is unaffected.
+		const reloadedAfter = await h.repos.planRuns.require(planRun.id);
+		expect(reloadedAfter.state).toBe("succeeded");
+		const ev = h.events.find((e) => e.kind === "plan_run.plot_auto_done_failed");
+		expect(ev).toBeDefined();
+		expect(ev?.payload).toEqual({
+			planRunId: planRun.id,
+			plotId: "plot_fail",
+			reason: "fs error",
+		});
+	});
+
+	test("plan_succeeded without plotId does not call transitionPlot", async () => {
+		await h.repos.planRuns.transitionTo(h.planRun.id, "running", { startedAt: NOW.toISOString() });
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 1,
+			patch: { state: "skipped", endedAt: NOW.toISOString() },
+		});
+		await h.repos.planRuns.updateChild({
+			planRunId: h.planRun.id,
+			seq: 2,
+			patch: { state: "skipped", endedAt: NOW.toISOString() },
+		});
+		let called = false;
+		const transitionPlot: CoordinatorTransitionPlotFn = async () => {
+			called = true;
+			return { kind: "transitioned", previousStatus: "active" };
+		};
+		const planRun = await h.repos.planRuns.require(h.planRun.id);
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			showSeed: h.showSeedStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: h.spawnStub(() => "unused"),
+			emit: h.emit,
+			transitionPlot,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("plan_succeeded");
+		expect(called).toBe(false);
 	});
 
 	test("dispatch failure → plan_failed with dispatch_failed:<message>", async () => {

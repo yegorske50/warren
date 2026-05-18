@@ -61,6 +61,7 @@ export function createPlanRunSpawn(input: CreatePlanRunSpawnInput): CoordinatorS
 			...(planRun.providerOverride !== null ? { providerOverride: planRun.providerOverride } : {}),
 			...(planRun.modelOverride !== null ? { modelOverride: planRun.modelOverride } : {}),
 			ref,
+			...(planRun.plotId !== null ? { plotId: planRun.plotId } : {}),
 			metadata: {
 				planRunId: planRun.id,
 				planId: planRun.planId,

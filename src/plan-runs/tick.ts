@@ -31,6 +31,7 @@ import {
 	type CoordinatorRepos,
 	type CoordinatorShowSeedFn,
 	type CoordinatorSpawnFn,
+	type CoordinatorTransitionPlotFn,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
 import type { PrMergeChecker } from "./pr-merge.ts";
@@ -50,6 +51,13 @@ export interface PlanRunTickDeps {
 	readonly logger?: PlanRunTickLogger;
 	/** Test seam — defaults to {@link defaultEmit} writing to events table. */
 	readonly emit?: CoordinatorEmitFn;
+	/**
+	 * Optional Plot auto-done hook (warren-b290 / pl-7937 step 5). When
+	 * wired, the coordinator calls it on the plan_succeeded transition
+	 * for any PlanRun that carries a non-null `plot_id`. Omit to skip
+	 * — tests and deployments without `.plot/` projects leave it unwired.
+	 */
+	readonly transitionPlot?: CoordinatorTransitionPlotFn;
 }
 
 export interface PlanRunAdvanceLog {
@@ -77,6 +85,7 @@ export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTick
 				checkPrMerged: deps.checkPrMerged,
 				spawn: deps.spawn,
 				emit,
+				...(deps.transitionPlot !== undefined ? { transitionPlot: deps.transitionPlot } : {}),
 				...(deps.now !== undefined ? { now: deps.now } : {}),
 			});
 			advances.push({ planRunId: planRun.id, result });

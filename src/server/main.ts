@@ -23,6 +23,7 @@
  * can report it — but logged.
  */
 
+import { join } from "node:path";
 import pino from "pino";
 import { BurrowClientPool } from "../burrow-client/index.ts";
 import { type AnyWarrenDb, openDatabase, WARREN_DB_POOL_MAX_ENV } from "../db/client.ts";
@@ -30,9 +31,11 @@ import { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import { createRepos } from "../db/repos/index.ts";
 import { parseDatabaseUrl } from "../db/url.ts";
 import {
+	autoTransitionPlotToDone,
 	bootPlanRunCoordinator,
 	createPlanRunSpawn,
 	createPrMergeChecker,
+	defaultPlotStatusSetter,
 	loadPlanRunCoordinatorConfigFromEnv,
 } from "../plan-runs/index.ts";
 import { createPreviewAuth, type PreviewAuth } from "../preview/cookie.ts";
@@ -51,6 +54,7 @@ import {
 	loadAutoOpenPrConfigFromEnv,
 	loadRunBranchPrefixFromEnv,
 	RunEventBroker,
+	resolveDispatcherHandle,
 } from "../runs/index.ts";
 import { showSeed } from "../seeds-cli/index.ts";
 import {
@@ -277,6 +281,27 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 			...(opts.now !== undefined ? { now: opts.now } : {}),
 		}),
+		// warren-b290 / pl-7937 step 5: auto-transition the bound Plot from
+		// `active` → `done` when every child of a Plot-bound PlanRun reaches
+		// a terminal state. Best-effort — the wrapper logs every outcome
+		// (transitioned / skipped / failed) and the coordinator emits a
+		// `plan_run.plot_*` system event on the anchor child run.
+		transitionPlot: async (planRun) => {
+			if (planRun.plotId === null) {
+				// Coordinator already guards on plotId, but narrow defensively
+				// so an unexpected null still produces a benign skip.
+				return { kind: "skipped", currentStatus: "unknown" };
+			}
+			const project = await repos.projects.require(planRun.projectId);
+			return autoTransitionPlotToDone({
+				setter: defaultPlotStatusSetter,
+				logger,
+				plotDir: join(project.localPath, ".plot"),
+				plotId: planRun.plotId,
+				handle: resolveDispatcherHandle(planRun.dispatcherHandle),
+				planRunId: planRun.id,
+			});
+		},
 		tickMs: planRunCoordinatorConfig.tickMs,
 		disabled: planRunCoordinatorConfig.disabled,
 		logger: planRunLoggerFromPino(logger),
