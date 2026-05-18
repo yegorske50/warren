@@ -33,7 +33,12 @@ infrastructure:
   single-run primitive (not a sixth bundled feature): `POST /plan-runs`
   walks a seeds plan's children one at a time, gating each on the
   previous PR merging before the next dispatches. Re-dispatching the
-  same plan resumes from the next open child. See SPEC §11.P.
+  same plan resumes from the next open child. When the project also
+  ships `.plot/` and the dispatch carries `plot_id`, plan-runs compose
+  onto Plot: one `plan_run_dispatched` event at start, per-child
+  `PLOT_ID` injection + `run_dispatched` for free, and an auto-`done`
+  Plot transition when the final child merges. See SPEC §11.P and
+  §11.P.Plot.
 
 Same code, same depth — only the user-facing framing surfaces them as
 opt-in. When you change cross-cutting docs (README, SPEC §1/§2, package

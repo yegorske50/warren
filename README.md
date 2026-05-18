@@ -21,7 +21,7 @@ Engineering teams self-hosting their own agent infrastructure. The deployment un
 
 ## Status
 
-Stable (`0.3.12`), running on Fly.io in continuous use against real GitHub repos. The end-to-end path is covered by 26 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/): manual runs, cron triggers, multi-worker placement, Postgres backend, per-run preview environments, restart recovery, cost tracking, seeds-extensions roundtrip, serial plan-run dispatch. The active frontier is the org-readiness cluster: SSO, remote workers, MCP, audit, budgets, GitHub App auth. See [ROADMAP.md](ROADMAP.md).
+Stable (`0.3.12`), running on Fly.io in continuous use against real GitHub repos. The end-to-end path is covered by 27 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/): manual runs, cron triggers, multi-worker placement, Postgres backend, per-run preview environments, restart recovery, cost tracking, seeds-extensions roundtrip, serial plan-run dispatch, plan-run + Plot composition. The active frontier is the org-readiness cluster: SSO, remote workers, MCP, audit, budgets, GitHub App auth. See [ROADMAP.md](ROADMAP.md).
 
 ## What you get
 
@@ -135,6 +135,8 @@ The built-in `sapling` agent is a headless coding harness with proactive context
 ### Shared coordination: plot as a peer-network substrate
 
 If a project has a `.plot/` directory, runs dispatched with a `plot_id` get `PLOT_ID` + `PLOT_ACTOR=agent:<name>:<run-id>` injected into the sandbox. The agent inside reads context with `plot get` and appends `decision_made` / `question_posed` / `artifact_produced` events with `plot append`. Warren appends a `run_dispatched` event to the originating Plot on spawn and merges the workspace `.plot/` back at reap, mirroring agent events into the run's event stream tagged with `plot_id`. Projects without `.plot/` are byte-identical to the pre-change behavior. See [plot](https://github.com/jayminwest/plot) and [SPEC §11.O](SPEC.md#11o-plot-integration-pl-2047-2026-05-17).
+
+When a project ships **both** `.plot/` and `.seeds/`, plan-runs compose onto Plot. A `POST /plan-runs { plot_id }` emits one `plan_run_dispatched` event on the bound Plot at start, threads `plot_id` through every child so each gets `PLOT_ID` + `PLOT_ACTOR` in its sandbox and emits its own `run_dispatched` event, and auto-transitions the Plot from `active` → `done` when the final child merges. Plan-runs dispatched without `plot_id`, or against a project without `.plot/`, are byte-identical to the standalone plan-run baseline. See [SPEC §11.P.Plot](SPEC.md#11pplot-planrun--plot-composition-pl-7937-2026-05-18).
 
 ### PR-body template: per-project overrides for the PR warren opens
 
@@ -294,7 +296,7 @@ bun run ui:install
 bun run ui:dev
 ```
 
-The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 26 scenarios against a live container. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
+The acceptance harness in [`scripts/acceptance/`](scripts/acceptance/) drives 27 scenarios against a live container. See [ACCEPTANCE.md](ACCEPTANCE.md) for the runbook.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, testing conventions, and PR expectations.
 

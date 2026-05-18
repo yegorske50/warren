@@ -2022,14 +2022,213 @@ one child out-of-band, asserting the close advances to `skipped`
 without a new run; stubbed `WARREN_GH_FETCH_OVERRIDE` for the PR-merge
 poll so the harness stays deterministic.
 
-**Disjoint from Plot.** PlanRun and Plot (§11.O) are orthogonal in V1.
-A PlanRun child run does not carry a `plot_id` and the PlanRun row has
-no `plot_id` column. The composition — a PlanRun whose children all
-target the same Plot, with `plan_run.merged` / `plan_run.advanced`
-mirrored into the Plot event log — is Phase 2 of `warren-fcc9` and
-tracked separately on `warren-06dc`. Phase 1 ships PlanRun standalone
-so the dispatch contract can stabilize before Plot composition layers
-on.
+**Plot composition.** A PlanRun dispatched against a project shipping
+both `.seeds/` AND `.plot/` can carry an optional `plot_id` that
+threads through every child run and reports lifecycle back to the
+originating Plot. The wiring is purely additive — a PlanRun dispatched
+without `plot_id`, or against a project without `.plot/`, is
+byte-identical to the §11.P baseline. See §11.P.Plot below.
+
+### 11.P.Plot PlanRun + Plot composition (pl-7937, 2026-05-18)
+
+Phase 2 of `warren-000b` — composing PlanRun (§11.P) onto Plot (§11.O).
+Phase 1 wired Plot into single-run dispatch; this phase mirrors that
+shape on the PlanRun surface so a plan-run launched from a Plot
+threads `plot_id` through every child and reports parent + child
+lifecycle back into the Plot's event log. Composition is purely
+additive: a PlanRun dispatched without `plot_id` (or against a project
+without `.plot/`) is byte-identical to the §11.P baseline, and the
+single-run path is unchanged.
+
+**Gating stack (.plot/ on .seeds/).** PlanRun's existing `.seeds/`
+gate is the base; Plot is an optional layer on top. The handler edge
+rejects in a fixed order — a project missing `.seeds/` returns
+`ProjectLacksSeedsError` (typed 400) even when `plot_id` is supplied;
+a project shipping `.seeds/` but not `.plot/` returns
+`ProjectLacksPlotError` (typed 400, same envelope shape) when
+`plot_id` is supplied; a project shipping both lights up the full
+composition. `plot_id` never short-circuits the `.seeds/` requirement,
+and PlanRun-with-Plot only appears when **both** directories are
+present. Side-effect-free until every gate passes — no half-row state,
+no Plot writes, no spawn.
+
+**Data model addendum.** One nullable indexed column on the existing
+`plan_runs` table, mirroring the shape of `runs.plot_id` from §11.O:
+
+- `plan_runs.plot_id` — nullable text. Index `plan_runs_plot_id_idx`
+  registered in `src/db/schema/columns.ts` so the drift test
+  (`src/db/schema/drift.test.ts`) asserts sqlite + postgres parity.
+  No new tables; the column lives alongside `dispatcher_handle` /
+  `trigger` on the parent row. PlanRun children inherit the parent's
+  `plot_id` at spawn time — there is no per-child column.
+
+**Data flow.**
+
+```
+POST /plan-runs { plot_id }
+   │
+   ▼  validate project.hasSeeds → project.hasPlot (stacked gates)
+   ▼  validate plan, enumerate children
+   ▼  repos.planRuns.create  (one tx, parent + child rows)
+   │
+   ├─►  emitPlanRunDispatchedToPlot       (fire-and-log; failure ≠ POST failure)
+   │    └─►  appends `plan_run_dispatched` to the bound Plot
+   │         actor=user:<dispatcherHandle>, payload={plan_run_id, plan_id, children_count}
+   │
+   ▼
+[ coordinator ticks ]
+   │
+   ▼  for each child: dispatch.ts forwards planRun.plotId into spawnRun
+   ▼  composePlotEnv injects PLOT_ID + PLOT_ACTOR=agent:<name>:<run-id>
+   ▼  defaultPlotAppender emits per-child `run_dispatched` on the Plot (§11.O)
+   │
+   ▼  child runs → PR opens → reap → checkPullRequestMerged
+   ▼  trivial-merge children advance without ever opening a PR (§11.P)
+   │
+   ▼  every child terminal → coordinator → AdvanceResult { kind: 'plan_succeeded' }
+   ▼  autoTransitionPlotToDone   (fire-and-log; failure ≠ PlanRun rollback)
+   ▼  guard plot.status === 'active' → setStatus('done') as user:<dispatcherHandle>
+```
+
+Every transition in the data flow is **best-effort** at the Plot edge:
+a Plot-write failure (missing `.index.db` on first dispatch, disk
+full, malformed Plot, ACL drift) emits a system event and logs but
+never rolls back persisted warren state. The PlanRun's authoritative
+state machine (§11.P) is unaffected by Plot-side outcomes.
+
+**`plan_run_dispatched` event.** A new Plot event type, added in
+`@os-eco/plot-cli@0.3.0` via plot's `plot-3e3d`. Warren consumes it
+via the existing `src/plot-client/` facade. Emission happens **once
+per PlanRun**, immediately after `repos.planRuns.create` returns
+(handler edge, not coordinator tick), via the
+`defaultPlanRunPlotAppender` helper in `src/plan-runs/plot-appender.ts`
+— same rebuild-index + retry-once shape as `defaultPlotAppender`
+(`src/runs/spawn.ts`). Payload:
+
+```json
+{
+  "type": "plan_run_dispatched",
+  "actor": "user:<dispatcherHandle>",
+  "data": {
+    "plan_run_id": "<plan-run-id>",
+    "plan_id": "<seeds-plan-id>",
+    "children_count": <int>
+  }
+}
+```
+
+The parent event is one-shot; per-child `run_dispatched` events still
+land via the unchanged Phase 1 path as the coordinator dispatches each
+child. PlanRun composition is additive — `plan_run_dispatched` is the
+parent lifecycle anchor, NOT a replacement for the per-child events
+(rejected alternative #5 on `pl-7937`). A `plan_run.plot_append_failed`
+warren log entry surfaces append failures; unlike the single-run
+`plot_run_dispatched_failed` system event, there is no `events` row at
+PlanRun creation because `events` is keyed by `run_id` and no child
+run exists yet — logger-level surfacing mirrors the
+`plan_run.cancel_child_failed` posture in `src/server/handlers.ts`.
+
+**Auto-done transition contract.** When the coordinator reaches
+`plan_succeeded` on a PlanRun with a non-null `plot_id`, the
+post-transition hook fires `autoTransitionPlotToDone`
+(`src/plan-runs/plot-transition.ts`):
+
+1. Open a `UserPlotClient` against `<project>/.plot/` with actor
+   `user:<dispatcherHandle>` — satisfies plot's `status_changed: ['user']`
+   ACL (plot SPEC §6) without needing a synthetic `system:warren`
+   actor (rejected alternative #2 on `pl-7937`).
+2. Read the Plot's current status. **Guard:**
+   `plot.status === 'active'`. Any other status — `drafting`, `ready`,
+   `done`, `archived` — yields `kind: 'skipped'` and a
+   `plan_run.plot_status_skipped` warren event with `{planRunId,
+   plotId, currentStatus}` so warren never tramples an operator-driven
+   transition mid-PlanRun (`pl-7937` risk #4).
+3. Call `setStatus('done')`. A throw is caught and surfaced as
+   `kind: 'failed'` with a `plan_run.plot_auto_done_failed` warren
+   event; the PlanRun's `succeeded` state is unaffected (acceptance
+   criterion #10 on `pl-7937`).
+4. Success emits `plan_run.plot_auto_done` for observability.
+
+The `dispatcherHandle` defaults to `operator` (per `pl-a258` /
+`mx-77f5ac`). Operators who want auto-done attributions to reflect a
+real human handle should pass a `dispatcherHandle` on dispatch — future
+work, gated on warren growing an auth surface, will pre-populate this
+from the logged-in user.
+
+**Concurrency.** Concurrent PlanRuns bound to the same Plot interleave
+per-child `run_dispatched` events in wall-clock-insert order; Plot's
+append-only event log is event-id-keyed and idempotent on replay (per
+`../plot/SPEC.md` §5) so events themselves are correct but ordering
+reflects insertion, not logical grouping. V1 accepts this — operators
+rarely dispatch two concurrent PlanRuns against the same Plot. The
+auto-done guard (`plot.status === 'active'`) also handles the
+double-completion case: the second PlanRun to finish observes
+`status: 'done'` and emits `plan_run.plot_status_skipped`, no
+clobber.
+
+**UI.** `NewPlanRun.tsx` surfaces an optional free-form `plot_id`
+input after the `planId` input, gated on the selected project having
+both `hasPlot` and `hasSeeds`; `PlanRunDetail.tsx` renders the
+`plot_id` as a placeholder `/plots/:id` link. Phase 3 (`warren-d362`)
+owns the live Plot detail page, so the link is a dead href in V1 — a
+deliberate sequencing decision per `pl-7937` step 7. Pre-population
+from a Plot detail page → "Dispatch PlanRun" action is also Phase 3.
+
+**Cross-repo dependency (plot-3e3d).** The `plan_run_dispatched` event
+type is defined in plot's `PLOT_EVENT_TYPES` (closed enum) and ACL
+(`status_changed`-style allow-user-actor entry). Warren cannot
+construct events outside the enum at compile time — the
+`src/plot-client/` facade narrows `append()` to
+`AgentAllowedEventType`, and the user-actor write surface is typed
+against `PlotEventType` from `@os-eco/plot-cli`. The dependency on
+the new event type is therefore a hard pin: `@os-eco/plot-cli` is
+double-pinned at `^0.3.0` (package.json + bun.lock) AND `0.3.0`
+(Dockerfile global install) per the burrow-cli rule documented in
+`CLAUDE.md` "Relationship to burrow". A future plot SPEC rename of
+`plan_run_dispatched` fails warren's typecheck instead of silently
+drifting.
+
+**Disjoint flows preserved.**
+
+- **Single-run path unchanged.** `POST /runs` does not see `plot_id`
+  from PlanRun; child runs spawned by the coordinator inherit
+  `planRun.plotId` via the spawn input, but the single-run handler
+  itself is untouched. Existing `POST /runs` tests pass without
+  modification (acceptance criterion #13 on `pl-7937`).
+- **PlanRun-without-plot path unchanged.** A PlanRun dispatched
+  without `plot_id`, or against a project where `hasPlot=false`,
+  is byte-identical to the §11.P baseline — no Plot writes, no
+  Plot-side env injection, no auto-done hook (acceptance criterion #4).
+
+**Acceptance.** Scenario 27
+(`scripts/acceptance/scenarios/27-plan-run-plot-roundtrip.ts`)
+composes scenarios 25 + 26 against a real warren+burrow stack:
+
+1. Init a project with both `.plot/` (one Plot, `status: 'active'`)
+   and `.seeds/` (one plan with three children, one docs-only).
+2. `POST /plan-runs` with `plot_id`. Assert one `plan_run_dispatched`
+   event lands on the Plot at creation with the right payload shape.
+3. Coordinator walks the children. For each child sandbox, assert
+   `PLOT_ID=<plot id>` and `PLOT_ACTOR=agent:<name>:<run-id>` via an
+   in-sandbox `printenv` snapshot.
+4. Assert one `run_dispatched` event per child on the Plot (including
+   the trivial-merge child where `commitsAhead === 0`).
+5. After the final child merges, assert the Plot's status flipped to
+   `'done'` AND a `status_changed` event landed in its event log with
+   actor `user:<dispatcherHandle>`.
+6. Re-dispatch the same plan id against a project without `.plot/`
+   and snapshot-compare the resulting events — byte-identical to the
+   pl-a258 §11.P baseline (zero Plot leakage).
+
+**Deferred to Phase 3 (`warren-d362`).**
+
+- Live Plot detail page; the `PlanRunDetail` `/plots/:id` link
+  becomes active.
+- Auto-populating `plot_id` on the NewPlanRun form when dispatch
+  originates from a Plot detail page → "Dispatch PlanRun" button.
+- Unified activity feed grouping runs + PlanRuns under their Plot,
+  live-streaming events from sandbox `plot append` calls (replacing
+  JSONL-tail-at-reap for live updates).
 
 ---
 
@@ -2041,7 +2240,7 @@ on.
 | **canopy** | Hard dependency. Source of agent definitions. Cloned at startup, refreshed on demand. |
 | **mulch** | Used per-project. Warren reads the project's `.mulch/expertise/` on the host to source `expertise_seed` lines and merges per-run mulch records back during reap (host-side disk write, last-write-wins-by-ts). The per-run `.mulch/` inside the burrow workspace is seeded via the `seed.files` payload on `POST /burrows` (R-07; see §11.A) — warren never shells out to `ml record` inside the sandbox. |
 | **seeds** | Used per-project. Warren reads `sd ready` to surface the project's worklist in the UI; agents file/close seeds during runs. |
-| **plot** | Used per-project. Gated on the project shipping a `.plot/` directory and the dispatch request carrying a `plot_id`. Warren imports `@os-eco/plot-cli` as a typed facade (`src/plot-client/`), injects `PLOT_ID` + `PLOT_ACTOR` env into the sandbox at spawn, appends `run_dispatched` to the originating Plot, and mirrors agent-emitted events back into warren's event stream at reap (§11.O). |
+| **plot** | Used per-project. Gated on the project shipping a `.plot/` directory and the dispatch request carrying a `plot_id`. Warren imports `@os-eco/plot-cli` as a typed facade (`src/plot-client/`), injects `PLOT_ID` + `PLOT_ACTOR` env into the sandbox at spawn, appends `run_dispatched` to the originating Plot, and mirrors agent-emitted events back into warren's event stream at reap (§11.O). Plan-runs compose onto Plot when both `.seeds/` and `.plot/` are present and `plot_id` is on the dispatch: one `plan_run_dispatched` lands at PlanRun start, every child inherits the parent's `plot_id` for free, and the Plot auto-transitions to `done` when the final child merges (§11.P.Plot). |
 | **sapling** | One of three built-in harnesses (alongside `claude-code` and `pi`). Shipped as a pre-installed CLI in the container; selected per agent via `burrow_config`. |
 | **pi** (`@earendil-works/pi-coding-agent`) | Third built-in harness, multi-provider with first-class per-run cost reporting. Shipped as a pre-installed CLI in the container; runtime contract lives in burrow's `AgentRegistry` (see §11.K). |
 | **overstory** | Sibling, not subordinate. Multi-agent orchestration is overstory's domain; warren is single-agent-per-run. Overstory could be invoked as a "harness" in a future agent definition. |

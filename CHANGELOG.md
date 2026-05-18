@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18] — 2026-05-18
+
+PlanRun composes onto Plot: a plan-run dispatched against a `.plot/`
+project threads `plot_id` through every child run, emits a single
+`plan_run_dispatched` event on the bound Plot at start, and
+auto-transitions the Plot from `active` → `done` when the final child
+merges. Phase 2 of `warren-000b`, plan `pl-7937`.
+
+### Added
+
+- **`feat(plan-runs)`** — Plot wiring for PlanRun (`warren-06dc`,
+  plan `pl-7937`). Mirrors Phase 1's single-run wiring (§11.O) on the
+  PlanRun surface, never forking the single-run code path. A new
+  nullable `plan_runs.plot_id` column (sqlite + postgres, indexed) is
+  accepted on `POST /plan-runs`; passing `plot_id` against a project
+  with `hasPlot=false` rejects with `ProjectLacksPlotError` (typed 400)
+  before any side effect, stacked on top of the existing
+  `ProjectLacksSeedsError` gate so a project missing `.seeds/` is
+  rejected first even when `plot_id` is supplied. At PlanRun creation,
+  the handler best-effort appends one `plan_run_dispatched` event on
+  the bound Plot via `defaultPlanRunPlotAppender`
+  (`src/plan-runs/plot-appender.ts`) — actor `user:<dispatcherHandle>`,
+  payload `{plan_run_id, plan_id, children_count}` — with the same
+  rebuild-index + retry-once recovery as the single-run appender; a
+  Plot-write failure logs `plan_run.plot_append_failed` and leaves the
+  PlanRun row durable. The coordinator forwards `planRun.plotId` into
+  the dispatch wrapper so every child spawns with `plotId` set; the
+  unchanged Phase 1 path (`composePlotEnv` / `defaultPlotAppender` in
+  `src/runs/spawn.ts`) injects `PLOT_ID` + `PLOT_ACTOR` and emits one
+  per-child `run_dispatched` for free. When the coordinator transitions
+  a PlanRun to `succeeded`, `autoTransitionPlotToDone`
+  (`src/plan-runs/plot-transition.ts`) opens a `UserPlotClient` as
+  `user:<dispatcherHandle>` and — guarded on `plot.status === 'active'`
+  — calls `setStatus('done')`; non-active Plots (drafting / ready /
+  done / archived) emit `plan_run.plot_status_skipped` without
+  trampling operator-driven status; setStatus throws emit
+  `plan_run.plot_auto_done_failed` without affecting the PlanRun's
+  terminal state. The NewPlanRun form surfaces an optional `plot_id`
+  input only when the selected project ships both `.plot/` and
+  `.seeds/`; PlanRunDetail renders `plot_id` with a placeholder
+  `/plots/:id` link (Phase 3 owns the live Plot detail page).
+  `@os-eco/plot-cli` is double-pinned at `^0.3.0` /
+  `0.3.0` in `package.json` + `Dockerfile` per the burrow-cli rule, to
+  consume the `plan_run_dispatched` event type added in plot's
+  `plot-3e3d` (`PLOT_EVENT_TYPES` + ACL). Acceptance scenario 27
+  (`scripts/acceptance/scenarios/27-plan-run-plot-roundtrip.ts`)
+  composes scenarios 25 + 26 against a live warren+burrow stack: three
+  children including one trivial-merge case, assertions on `PLOT_ID`
+  in every child sandbox, one `plan_run_dispatched` at start, per-child
+  `run_dispatched` events, Plot auto-transition to `done` after the
+  final merge, and a zero-leakage snapshot for plan-runs dispatched
+  without `plot_id` against the same project. See SPEC §11.P.Plot.
+  (`warren-06dc`, `pl-7937`)
+
 ## [0.3.17] — 2026-05-18
 
 PlanRun ships as a serial dispatch mode on top of the existing single-run
