@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.3] — 2026-05-18
+
+Patch release closing `warren-c106`, the cascade gap left by `0.4.1`:
+that release shipped the warren-side of `pl-95dd` BEFORE
+`@os-eco/burrow-cli@0.3.2` (containing `burrow-59cd`, `body.env`
+parsing on `POST /burrows`) was published to npm, so the two bump-step
+seeds (`warren-0a6b`, `warren-73ee`) correctly detected the
+cascade-block at execution time and recorded notes rather than
+bumping to a non-existent version (commits `9a12e6b`, `983d77a`). With
+`burrow@0.3.2` now on npm, this release lands the deferred consumer
+bump unchanged in shape from the original `pl-95dd` plan.
+
+### Changed
+
+- **`chore(burrow-cli)`** — bump `@os-eco/burrow-cli` double-pin from
+  `^0.3.1` → `^0.3.2` across `package.json`, `bun.lock` (via `bun
+  install`), and the `Dockerfile` global install (`warren-c106`).
+  Picks up `burrow-59cd` so the env-reaches-sandbox contract is now
+  satisfied by the published runtime, not just by source. Per the
+  CLAUDE.md "Relationship to burrow" convention all three pin
+  locations stay in sync; a mismatch is a no-op since `Bun.spawn`
+  resolves `./node_modules/.bin/burrow` before `PATH`.
+
 ## [0.4.2] — 2026-05-18
 
 Patch release closing `warren-6f25` / plan `pl-d4d6`: warren's host-side
