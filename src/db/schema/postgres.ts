@@ -197,6 +197,9 @@ export const planRuns = pgTable(
 		modelOverride: text("model_override"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
+		// Mirror of sqlite plan_runs.plot_id (warren-06dc / pl-7937 Phase 2).
+		// See sqlite.ts for shape + gating intent.
+		plotId: text("plot_id"),
 		state: text("state", { enum: PLAN_RUN_STATES }).notNull(),
 		failureReason: text("failure_reason"),
 		createdAt: text("created_at").notNull(),
@@ -206,6 +209,7 @@ export const planRuns = pgTable(
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
 		index(INDEX_NAMES.planRunsState).on(t.state),
+		index(INDEX_NAMES.planRunsPlotId).on(t.plotId),
 	],
 );
 

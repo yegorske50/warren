@@ -341,6 +341,19 @@ export const planRuns = sqliteTable(
 		modelOverride: text("model_override"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
+		// Optional back-link to the Plot this plan-run was dispatched against
+		// (warren-06dc / pl-7937 Phase 2; mirrors `runs.plot_id` from
+		// warren-a8c3). Gated on the owning project's `hasPlot` flag at
+		// handler level — POST /plan-runs rejects a plot_id when the project
+		// has no `.plot/` directory. When set, the coordinator forwards it to
+		// every child run's spawn input so PLOT_ID/PLOT_ACTOR injection and
+		// per-child `run_dispatched` emission light up via the unchanged
+		// Phase 1 path, and the coordinator auto-transitions the bound Plot
+		// to `done` when every child reaches a terminal state. Nullable: legacy
+		// rows and plan-runs dispatched without a Plot leave it null. Plain
+		// text, no FK — Plots live in the project workspace, not in warren's
+		// database.
+		plotId: text("plot_id"),
 		state: text("state", { enum: PLAN_RUN_STATES }).notNull(),
 		failureReason: text("failure_reason"),
 		createdAt: text("created_at").notNull(),
@@ -350,6 +363,7 @@ export const planRuns = sqliteTable(
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
 		index(INDEX_NAMES.planRunsState).on(t.state),
+		index(INDEX_NAMES.planRunsPlotId).on(t.plotId),
 	],
 );
 

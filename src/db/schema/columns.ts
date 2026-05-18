@@ -203,6 +203,7 @@ export const INDEX_NAMES = {
 	// reverses the run_id → child lookup the reap path uses.
 	planRunsProjectState: "plan_runs_project_state_idx",
 	planRunsState: "plan_runs_state_idx",
+	planRunsPlotId: "plan_runs_plot_id_idx",
 	planRunChildrenRun: "plan_run_children_run_idx",
 	planRunChildrenState: "plan_run_children_state_idx",
 } as const;
