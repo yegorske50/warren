@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`feat(ui)`** — PlotDetail "Dispatch as plan-run (N)" button on the
+  SubstratePanel (warren-bce0 / pl-f404 step 4 / SPEC §11.Q). Same
+  `isBatchDispatchTarget` filter as the parallel "Dispatch all" batch
+  button, but synthesizes a seeds plan from the Plot's open
+  `seeds_issue` attachments and dispatches it as a single tracked
+  PlanRun via `POST /plot-plan-runs` (warren-99b2). Children run
+  serially with PR-merge gating, and the Plot auto-transitions to
+  `done` when the final child merges (§11.P.Plot wiring inherited
+  unchanged). Confirm dialog renders the synthesized plan title preview
+  + candidate seed list + filter rationale; on success the user is
+  routed to `/plan-runs/:id`. The batch-dispatch dialog (warren-7c3f)
+  description now points operators at the plan-run path as the
+  recommended action for PR-merge-serial gating, with the batch button
+  reframed as the parallel-fan-out escape hatch. New API client method
+  `plotsApi.dispatchSynthesizedPlanRun` + types `CreatePlotPlanRunInput`
+  / `CreatePlotPlanRunResponse` in `src/ui/src/api/types.ts`.
+
 ## [0.4.7] — 2026-05-18
 
 Patch release bundling the next two shipped steps of the Plot UX vision

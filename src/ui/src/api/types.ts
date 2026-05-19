@@ -535,6 +535,35 @@ export interface CancelPlanRunResponse {
 	alreadyTerminal: boolean;
 }
 
+/**
+ * `POST /plot-plan-runs` request body (warren-99b2 / pl-f404 step 3 /
+ * SPEC §11.Q). Wire envelope is snake_case; UI camelCase is mapped at
+ * the `plotsApi.dispatchSynthesizedPlanRun` boundary.
+ */
+export interface CreatePlotPlanRunInput {
+	plotId: string;
+	projectId: string;
+	agent: string;
+	promptTemplate?: string;
+	ref?: string;
+	providerOverride?: string;
+	modelOverride?: string;
+	dispatcherHandle?: string;
+}
+
+/**
+ * `POST /plot-plan-runs` 201 response envelope. Same `{planRun,
+ * children}` shape as `POST /plan-runs` so the navigation target is
+ * identical, plus synthesis-specific `synthesizedPlanId` and
+ * `parentSeedId` fields the UI can surface for debugging.
+ */
+export interface CreatePlotPlanRunResponse {
+	planRun: PlanRunRow;
+	children: PlanRunChildRow[];
+	synthesizedPlanId: string;
+	parentSeedId: string;
+}
+
 /* ----------------------------------------------------------------------- */
 /* Plots (warren-4879 / pl-9d6a step 4).                                    */
 /*                                                                          */

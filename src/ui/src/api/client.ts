@@ -10,6 +10,8 @@ import type {
 	CancelRunResponse,
 	CreatePlanRunInput,
 	CreatePlanRunResponse,
+	CreatePlotPlanRunInput,
+	CreatePlotPlanRunResponse,
 	AnswerPlotQuestionInput,
 	AnswerPlotQuestionResponse,
 	AttachPlotInput,
@@ -470,6 +472,37 @@ export const plotsApi = {
 	 */
 	dispatchPlanRun: (input: CreatePlanRunInput) =>
 		request<CreatePlanRunResponse>("/plan-runs", { method: "POST", body: input }),
+	/**
+	 * `POST /plot-plan-runs` — synthesize a seeds plan from the Plot's
+	 * open `seeds_issue` attachments and dispatch it through the same
+	 * §11.P coordinator as `dispatchPlanRun` (warren-99b2, SPEC §11.Q).
+	 * Server-side filters: `pl-*`-shaped refs (sd_plan attachments) and
+	 * closed seeds drop out before synthesis; zero candidates returns
+	 * 400 `no_dispatchable_seeds`. Wire body is snake_case per the
+	 * handler contract.
+	 */
+	dispatchSynthesizedPlanRun: (input: CreatePlotPlanRunInput) =>
+		request<CreatePlotPlanRunResponse>("/plot-plan-runs", {
+			method: "POST",
+			body: {
+				plot_id: input.plotId,
+				project_id: input.projectId,
+				agent_name: input.agent,
+				...(input.promptTemplate !== undefined
+					? { prompt_template: input.promptTemplate }
+					: {}),
+				...(input.ref !== undefined ? { ref: input.ref } : {}),
+				...(input.providerOverride !== undefined
+					? { provider_override: input.providerOverride }
+					: {}),
+				...(input.modelOverride !== undefined
+					? { model_override: input.modelOverride }
+					: {}),
+				...(input.dispatcherHandle !== undefined
+					? { dispatcher_handle: input.dispatcherHandle }
+					: {}),
+			},
+		}),
 	/**
 	 * `POST /plots/:id/questions/:event_id/answer` — answer a
 	 * question_posed event. `eventId` is the targeted event's `at` ISO

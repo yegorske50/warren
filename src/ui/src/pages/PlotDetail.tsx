@@ -440,6 +440,13 @@ function SubstratePanel({ plot }: { plot: PlotEnvelope }) {
 				<CardTitle>Substrate</CardTitle>
 				<div className="flex items-center gap-2">
 					{batchTargets.length > 0 ? (
+						<DispatchAsPlanRunButton
+							plotId={plot.id}
+							projectId={plot.project_id}
+							targets={batchTargets}
+						/>
+					) : null}
+					{batchTargets.length > 0 ? (
 						<BatchDispatchAllButton
 							plotId={plot.id}
 							projectId={plot.project_id}
@@ -981,6 +988,249 @@ function ReadOnlyField({
 }
 
 /* ----------------------------------------------------------------------- */
+/* DispatchAsPlanRunButton (warren-bce0 / pl-f404 step 4 / SPEC §11.Q)      */
+/* ----------------------------------------------------------------------- */
+
+/**
+ * Synthesized plan-title preview shown in the confirm dialog. Mirrors
+ * the server-side synthesizer's title (see src/plot-plan-runs/
+ * synthesizer.ts) so the operator sees the exact name that will land in
+ * `.seeds/plans.jsonl`.
+ */
+function synthesizedPlanTitle(plotId: string): string {
+	return `Plot ${plotId} synthesized plan-run`;
+}
+
+/**
+ * Per-Plot "Dispatch as plan-run" header action (warren-bce0 /
+ * pl-f404 step 4). Recommended path over `BatchDispatchAllButton`
+ * (warren-7c3f) once SPEC §11.Q ships: instead of N parallel `POST
+ * /runs`, this synthesizes a seeds plan from the Plot's open
+ * `seeds_issue` attachments and dispatches it through the §11.P
+ * coordinator — one tracked PlanRun row, PR-merge-serial gating, and
+ * the auto-`done` Plot transition inherited for free. Eligibility is
+ * the same `isBatchDispatchTarget` filter the batch button uses; the
+ * confirm dialog lists the candidates (server-side will further drop
+ * any closed seeds at synthesis time).
+ */
+function DispatchAsPlanRunButton({
+	plotId,
+	projectId,
+	targets,
+}: {
+	plotId: string;
+	projectId: string;
+	targets: readonly PlotAttachment[];
+}) {
+	const [open, setOpen] = useState(false);
+	return (
+		<>
+			<Button type="button" size="sm" onClick={() => setOpen(true)}>
+				Dispatch as plan-run ({targets.length})
+			</Button>
+			{open ? (
+				<DispatchAsPlanRunDialog
+					plotId={plotId}
+					projectId={projectId}
+					targets={targets}
+					onOpenChange={setOpen}
+				/>
+			) : null}
+		</>
+	);
+}
+
+function DispatchAsPlanRunDialog({
+	plotId,
+	projectId,
+	targets,
+	onOpenChange,
+}: {
+	plotId: string;
+	projectId: string;
+	targets: readonly PlotAttachment[];
+	onOpenChange: (open: boolean) => void;
+}) {
+	const navigate = useNavigate();
+	const qc = useQueryClient();
+
+	// Same defaults/agent resolution as RunPlanDialog (mx-4c064b /
+	// mx-be04a6) so dispatching from a Plot uses the project's
+	// configured agent + provider/model overrides without bouncing
+	// through /plan-runs/new.
+	const projects = useQuery({
+		queryKey: ["projects"],
+		queryFn: ({ signal }) => projectsApi.list(signal),
+	});
+	const warrenConfig = useQuery({
+		queryKey: ["projects", projectId, "warren-config"],
+		queryFn: ({ signal }) => projectsApi.warrenConfig(projectId, signal),
+	});
+	const agents = useQuery({
+		queryKey: ["agents", { projectId }],
+		queryFn: ({ signal }) => agentsApi.list({ projectId }, signal),
+	});
+
+	const project = projects.data?.projects.find((p) => p.id === projectId);
+	const defaults = warrenConfig.data?.defaults ?? null;
+	const defaultRole = defaults?.defaultRole;
+	const registered = agents.data?.agents ?? [];
+	const resolvedAgent =
+		defaultRole !== undefined && registered.some((a) => a.name === defaultRole)
+			? (defaultRole as string)
+			: null;
+	const template = defaults?.defaultPrompt ?? DEFAULT_PROMPT_TEMPLATE;
+
+	const dispatch = useMutation({
+		mutationFn: () => {
+			if (resolvedAgent === null) {
+				throw new Error(
+					"No default agent resolved — set `defaults.defaultRole` in `.warren/defaults.yaml` and register the agent.",
+				);
+			}
+			const provider = defaults?.defaultProvider;
+			const model = defaults?.defaultModel;
+			return plotsApi.dispatchSynthesizedPlanRun({
+				plotId,
+				projectId,
+				agent: resolvedAgent,
+				promptTemplate: template,
+				...(provider !== undefined && provider.length > 0
+					? { providerOverride: provider }
+					: {}),
+				...(model !== undefined && model.length > 0
+					? { modelOverride: model }
+					: {}),
+			});
+		},
+		onSuccess: (data) => {
+			qc.invalidateQueries({ queryKey: ["plan-runs"] });
+			qc.invalidateQueries({ queryKey: ["plot", plotId] });
+			navigate(`/plan-runs/${encodeURIComponent(data.planRun.id)}`);
+		},
+	});
+
+	const loading = projects.isLoading || warrenConfig.isLoading || agents.isLoading;
+	const hasSeeds = project?.hasSeeds ?? false;
+	const readyToDispatch =
+		!loading && hasSeeds && resolvedAgent !== null && !dispatch.isPending;
+
+	const errorMessage = ((): string | null => {
+		if (dispatch.error === null || dispatch.error === undefined) return null;
+		if (dispatch.error instanceof ApiError) {
+			return `${dispatch.error.message} (${dispatch.error.code})`;
+		}
+		return dispatch.error instanceof Error
+			? dispatch.error.message
+			: String(dispatch.error);
+	})();
+
+	return (
+		<Dialog
+			open={true}
+			onOpenChange={(next) => {
+				if (!next) dispatch.reset();
+				onOpenChange(next);
+			}}
+		>
+			<DialogContent>
+				<DialogHeader>
+					<DialogTitle>Dispatch as plan-run</DialogTitle>
+					<DialogDescription>
+						Synthesize a seeds plan from this Plot's open{" "}
+						<code className="font-mono">seeds_issue</code> attachments and
+						dispatch it as a single plan-run. Children run serially, gated on
+						each previous PR merging; the Plot auto-transitions to{" "}
+						<code className="font-mono">done</code> when the final child
+						merges.
+					</DialogDescription>
+				</DialogHeader>
+
+				<div className="space-y-3 text-sm">
+					<ReadOnlyField label="Project" value={project?.gitUrl ?? projectId} hint={project?.gitUrl !== undefined ? projectId : undefined} />
+					<ReadOnlyField label="Plot" value={plotId} />
+					<ReadOnlyField
+						label="Synthesized plan title"
+						value={synthesizedPlanTitle(plotId)}
+						hint="Mints a fresh throwaway parent seed on submit."
+					/>
+					<ReadOnlyField
+						label="Agent"
+						value={
+							loading
+								? "resolving…"
+								: (resolvedAgent ?? "(no default agent set)")
+						}
+					/>
+					<ReadOnlyField
+						label="Prompt template"
+						value={template}
+						hint="{seed_id} is substituted per child."
+					/>
+					<div className="space-y-1">
+						<div className="text-xs font-medium uppercase tracking-wide text-(--color-muted-foreground)">
+							Candidates ({targets.length})
+						</div>
+						<p className="text-xs text-(--color-muted-foreground)">
+							seeds_issue attachments excluding sd_plan-shaped refs
+							(<code className="font-mono">pl-*</code>, dispatched via the
+							per-row Run plan button). Closed seeds are dropped server-side
+							at synthesis time.
+						</p>
+						<ul className="max-h-40 overflow-auto divide-y rounded-md border">
+							{targets.map((t) => (
+								<li
+									key={t.id}
+									className="px-3 py-1.5 text-xs"
+								>
+									<span className="truncate font-mono">{t.ref}</span>
+								</li>
+							))}
+						</ul>
+					</div>
+				</div>
+
+				{!loading && !hasSeeds ? (
+					<p className="text-sm text-(--color-destructive)">
+						Plan-runs require <code className="font-mono">.seeds/</code> at
+						the project root. This project has none — add one and refresh.
+					</p>
+				) : null}
+				{!loading && hasSeeds && resolvedAgent === null ? (
+					<p className="text-sm text-(--color-destructive)">
+						No default agent resolved. Set{" "}
+						<code className="font-mono">defaults.defaultRole</code> in{" "}
+						<code className="font-mono">.warren/defaults.yaml</code> and
+						register the agent before dispatching.
+					</p>
+				) : null}
+				{errorMessage !== null ? (
+					<p className="text-sm text-(--color-destructive)">{errorMessage}</p>
+				) : null}
+
+				<DialogFooter>
+					<Button
+						type="button"
+						variant="outline"
+						onClick={() => onOpenChange(false)}
+						disabled={dispatch.isPending}
+					>
+						Cancel
+					</Button>
+					<Button
+						type="button"
+						disabled={!readyToDispatch}
+						onClick={() => dispatch.mutate()}
+					>
+						{dispatch.isPending ? "Dispatching…" : "Dispatch"}
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
+	);
+}
+
+/* ----------------------------------------------------------------------- */
 /* BatchDispatchAllButton (warren-7c3f / pl-5310 step 3)                    */
 /* ----------------------------------------------------------------------- */
 
@@ -1155,7 +1405,10 @@ function BatchDispatchDialog({
 						{targets.length === 1 ? "" : "s"} bound to this Plot, one per
 						attached seeds_issue. Each run uses the project's default agent
 						and prompt template; <code className="font-mono">{"{seed_id}"}</code>
-						is substituted per target.
+						is substituted per target. For PR-merge-serial gating and a
+						single tracked PlanRun row, prefer the{" "}
+						<strong>Dispatch as plan-run</strong> button instead — this batch
+						action is the parallel-fan-out escape hatch.
 					</DialogDescription>
 				</DialogHeader>
 
