@@ -47,7 +47,7 @@
  *   1. GET /plots/:id returns the full envelope (id, name, status,
  *      intent, attachments[], event_log[], project_id) with the
  *      fixture's seeded shape (active, two attachments, plot_created
- *      + status_changed×2 + attachment_attached×2 + question_posed
+ *      + status_changed×2 + attachment_added×2 + question_posed
  *      events present, ordered ascending by `at`).
  *   2. POST /plots/:id/intent {goal:"…"} returns the refreshed
  *      envelope; the next GET shows `intent.goal` updated AND a new
@@ -315,7 +315,7 @@ export const scenario: Scenario = {
 			for (const required of [
 				"plot_created",
 				"status_changed",
-				"attachment_attached",
+				"attachment_added",
 				"question_posed",
 			]) {
 				assertTrue(
