@@ -7,8 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] — 2026-05-19
+
+Patch release closing out the SPEC §11.Q "Plot → synthesized plan-run
+pipeline" (pl-f404) that landed as a design lock in `0.4.7`: warren now
+ships both halves of the pipeline (server endpoint + PlotDetail UI
+button), the burrow-cli triple-pin bumps to 0.3.3 to pick up pi
+multi-provider env passthrough, and the Plots UX gains an inline
+"Refresh projects to discover new Plots" CTA that closes the first
+dogfood-discovered visibility gap.
+
 ### Added
 
+- **`feat(server)`** — `POST /plot-plan-runs` synthesis endpoint
+  (warren-99b2, pl-f404 step 2 / SPEC §11.Q). New `src/plot-plan-runs/`
+  module synthesizes a seeds plan from a Plot's open `seeds_issue`
+  attachments via `sd create` + `sd plan submit` with `existing_seed`
+  children (seeds-cli 0.4.7 contract), then dispatches it through the
+  existing §11.P plan-run coordinator unmodified. Filters out closed
+  seeds and `sd_plan`-shaped refs server-side; re-reads the synthesized
+  plan via `showPlan` and inlines the same persistence + Plot append
+  flow as `POST /plan-runs`. Typed 4xx errors:
+  `NoDispatchableSeedsError` (400), `SdPlanSynthesisError` (500), plus
+  the inherited `plot_id_invalid` / `plot_id_not_found` /
+  `project_lacks_plot` / `project_lacks_seeds` gates. Preview proxy
+  invariant (warren-63e1) updated to include `/plot-plan-runs`.
 - **`feat(ui)`** — PlotDetail "Dispatch as plan-run (N)" button on the
   SubstratePanel (warren-bce0 / pl-f404 step 4 / SPEC §11.Q). Same
   `isBatchDispatchTarget` filter as the parallel "Dispatch all" batch
@@ -25,6 +48,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reframed as the parallel-fan-out escape hatch. New API client method
   `plotsApi.dispatchSynthesizedPlanRun` + types `CreatePlotPlanRunInput`
   / `CreatePlotPlanRunResponse` in `src/ui/src/api/types.ts`.
+- **`feat(server)`** — `GET /projects/:id/seeds/:seedId` read endpoint
+  (warren-4015). Returns the narrow `{id, status, blockedBy}` shape the
+  UI needs so PlotDetail's BatchDispatchDialog can probe each target's
+  status in parallel on open and drop closed seeds at confirm time,
+  satisfying warren-ea66 acceptance (d). Gate order mirrors
+  `POST /plan-runs` (project 404 → hasSeeds gate → seedsCli gate);
+  dialog now marks closed seeds as `skipped`, dispatches only the open
+  subset, and surfaces the skipped count inline.
+- **`feat(ui)`** — Inline "Refresh projects to discover new Plots" CTA
+  (warren-bb22, first dogfood-discovered Plot UX gap). Plots committed
+  via the `plot` CLI in a project repo were silently invisible in the
+  warren UI until something else triggered `refreshProjectClone`
+  (`detectProjectFeatures` only flips `hasPlot` during refresh). New
+  `src/ui/src/components/RefreshProjectsCTA.tsx` fans out
+  `projectsApi.refresh` across every registered project and invalidates
+  `[projects]`, `[plots]`, `[plot]`. Wired into the Plots page
+  EmptyState (both "no `hasPlot` projects" and "no plots yet" branches)
+  and the PlotDetail 404/isError branch as the inline recovery path.
+  Scopes (2) periodic background refresh and (3) GitHub-webhook
+  auto-refresh remain open for follow-ups.
+- **`feat(acceptance)`** — Scenario 31 plot-plan-run synthesis roundtrip
+  (warren-af97). Composes scenarios 25 + 27 + 29 against a live
+  warren+burrow stack: `POST /plot-plan-runs` synthesizes a seeds plan
+  from a Plot's open `seeds_issue` attachments via `existing_seed`
+  adoption (seeds-cli 0.4.7), walks three children to merged through
+  the GH-fetch-merge shim, auto-transitions the Plot `active → done`,
+  and verifies re-dispatch mints a fresh `synthesizedPlanId`. Negative
+  arms cover `plot_id_invalid`, `plot_id_not_found`,
+  `project_lacks_plot`, and `no_dispatchable_seeds` typed 4xx.
+
+### Changed
+
+- **`deps`** — bump `@os-eco/burrow-cli` 0.3.2 → 0.3.3 (warren-fe96).
+  Picks up burrow-6f3f's conditional `AgentRuntime.envPassthrough` so a
+  pi run dispatched with `providerOverride='openai'` (or `gemini` /
+  `google` / `groq` / `mistral` / `deepseek`) actually sees the
+  matching `*_API_KEY` inside the sandbox. Triple-pin bump per
+  CLAUDE.md "Relationship to burrow" (`package.json` + `bun.lock` +
+  `Dockerfile`). New acceptance scenario 30 exercises the end-to-end
+  warren↔burrow handoff (operator override →
+  `renderedAgentJson.frontmatter` → burrow run metadata → dispatcher
+  `readFrontmatter` → `piEnvPassthrough` → spawn env) and asserts the
+  picked-up key is visible inside the sandbox.
+
+### Fixed
+
+- **`fix(projects)`** — `src/projects/refresh.ts` `preservePlot` wrapper
+  now spans `git checkout --force <ref>` in addition to
+  `git reset --hard origin/<ref>` (folded into warren-af97). Checkout
+  was discarding uncommitted modifications to tracked files, so the
+  host-side Plot appender writes (`plan_run_dispatched` at POST time,
+  per-child `run_dispatched` from `spawnRun`, the `active → done`
+  `status_changed` from auto-done) were getting wiped before the
+  snapshot could capture them — only the last child's writes survived.
+- **`fix(seeds-cli)`** — `PlanShowStepSchema.title` relaxed to optional
+  and now accepts `existing_seed`, matching what `sd plan show --json`
+  emits for adoption-only steps (folded into warren-af97). The
+  plot-plan-run synthesizer's payload (`steps[].existing_seed`) was
+  being rejected on the `showPlan` readback with a 500
+  `sd_plan_synthesis_error`, even though warren only consumes
+  `plan.children` for dispatch.
+- **`fix(acceptance)`** — Scenario 27 now expects a PR on the
+  no-agent-commit child (warren-9e2c). After warren-343a (commit
+  `.plot/` through reap), reap's `stagePlotForCommit` lands a
+  `chore(warren): plot state` commit on every plot-bound run carrying
+  host-side `.plot/` appender writes back to origin, so `commitsAhead`
+  is ≥ 1 even when the agent itself commits nothing — the
+  "trivial-merge no-PR" contract only holds for plot-less projects
+  (scenario 26). Variables renamed `trivialChild`/`trivialRun` →
+  `noAgentCommitChild`/`noAgentCommitRun` to match what the test
+  actually exercises.
+- **`fix(acceptance)`** — Scenario 29 now expects `attachment_added`
+  (warren-911c); plot-cli 0.3.0 renamed the event from
+  `attachment_attached`.
 
 ## [0.4.7] — 2026-05-18
 
