@@ -39,6 +39,7 @@ import type {
 	RunEvent,
 	RunRow,
 	RunTriggerResponse,
+	SeedStatusResponse,
 	SpawnRunResponse,
 	SteerRunResponse,
 	TriggersResponse,
@@ -199,6 +200,16 @@ export const projectsApi = {
 		request<RunTriggerResponse>(
 			`/projects/${encodeURIComponent(id)}/triggers/${encodeURIComponent(triggerId)}/run`,
 			{ method: "POST", body: {} },
+		),
+	/**
+	 * `GET /projects/:id/seeds/:seedId` — read a seed's current status
+	 * (warren-4015). Used by PlotDetail BatchDispatch to skip closed
+	 * seeds before firing N parallel POST /runs.
+	 */
+	seedStatus: (id: string, seedId: string, signal?: AbortSignal) =>
+		request<SeedStatusResponse>(
+			`/projects/${encodeURIComponent(id)}/seeds/${encodeURIComponent(seedId)}`,
+			{ ...(signal ? { signal } : {}) },
 		),
 };
 

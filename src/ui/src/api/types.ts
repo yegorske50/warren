@@ -414,6 +414,18 @@ export interface TriggersResponse {
 }
 
 /**
+ * `GET /projects/:id/seeds/:seedId` — single-seed status read (warren-4015).
+ * Mirrors the narrow `{id, status, blockedBy}` envelope warren returns;
+ * the wire shape is intentionally minimal because the only consumer
+ * (PlotDetail BatchDispatch) just needs `status` to drop closed seeds.
+ */
+export interface SeedStatusResponse {
+	id: string;
+	status: string;
+	blockedBy: string[];
+}
+
+/**
  * `POST /projects/:id/triggers/:triggerId/run` returns the spawned run row
  * plus the burrow summary — same envelope as `POST /runs` (mx-f3b48d).
  */

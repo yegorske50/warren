@@ -1242,10 +1242,14 @@ const DEFAULT_SEED_PROMPT_TEMPLATE = "work on sd {seed_id}";
  * their own per-row `Run plan` button (warren-5d94) and shouldn't be
  * dispatched as individual seed runs.
  *
- * Skipping *closed* seeds (per the original seed contract — warren-ea66
- * acceptance (d)) requires a seed-status read path that warren doesn't
- * surface to the UI yet; deferred. The confirm dialog lists every
- * target ref by hand so the operator can spot-check before firing.
+ * Closed-seed filtering (warren-ea66 acceptance (d)) lives inside the
+ * confirm dialog: each target's status is fetched via
+ * `projectsApi.seedStatus` (warren-4015) at dialog-open time, and
+ * closed seeds are marked `skipped` so they show up in the list but
+ * are not dispatched. The button label still counts every eligible
+ * attachment — the closed-seed count is small enough that two extra
+ * shell-outs per dispatch (parallel) beat a status probe on every
+ * Plot render.
  */
 function isBatchDispatchTarget(a: PlotAttachment): boolean {
 	return a.type === "seeds_issue" && !isSdPlanAttachment(a);
@@ -1253,9 +1257,10 @@ function isBatchDispatchTarget(a: PlotAttachment): boolean {
 
 interface BatchDispatchOutcome {
 	ref: string;
-	status: "pending" | "dispatched" | "failed";
+	status: "pending" | "dispatched" | "failed" | "skipped";
 	runId?: string;
 	error?: string;
+	seedStatus?: string;
 }
 
 /**
@@ -1324,6 +1329,28 @@ function BatchDispatchDialog({
 		queryKey: ["agents", { projectId }],
 		queryFn: ({ signal }) => agentsApi.list({ projectId }, signal),
 	});
+	// Probe each target's current seed status so closed seeds get filtered
+	// out before dispatch (warren-4015 / warren-ea66 acceptance (d)). The
+	// `GET /projects/:id/seeds/:seedId` round-trip is cheap (cached `sd
+	// show` + filesystem read) and fans out in parallel across targets.
+	// Surfacing failures as "unknown" rather than blocking keeps the
+	// dialog usable when sd misbehaves on one ref.
+	const seedStatuses = useQuery({
+		queryKey: ["projects", projectId, "seed-statuses", targets.map((t) => t.ref)],
+		queryFn: async ({ signal }) => {
+			const entries = await Promise.all(
+				targets.map(async (t) => {
+					try {
+						const resp = await projectsApi.seedStatus(projectId, t.ref, signal);
+						return [t.ref, resp.status] as const;
+					} catch {
+						return [t.ref, "unknown"] as const;
+					}
+				}),
+			);
+			return Object.fromEntries(entries);
+		},
+	});
 
 	const defaults = warrenConfig.data?.defaults ?? null;
 	const defaultRole = defaults?.defaultRole;
@@ -1333,11 +1360,32 @@ function BatchDispatchDialog({
 			? (defaultRole as string)
 			: null;
 	const template = defaults?.defaultPrompt ?? DEFAULT_SEED_PROMPT_TEMPLATE;
-	const loading = warrenConfig.isLoading || agents.isLoading;
+	const loading = warrenConfig.isLoading || agents.isLoading || seedStatuses.isLoading;
+
+	const statusMap = seedStatuses.data ?? {};
+	const closedRefs = useMemo(
+		() => new Set(targets.filter((t) => statusMap[t.ref] === "closed").map((t) => t.ref)),
+		[targets, statusMap],
+	);
+	const dispatchableCount = targets.length - closedRefs.size;
 
 	const [outcomes, setOutcomes] = useState<BatchDispatchOutcome[]>(() =>
 		targets.map((t) => ({ ref: t.ref, status: "pending" })),
 	);
+	// Re-seed outcomes with `skipped` for closed seeds once the probe
+	// resolves. The user only sees the dialog finalize its state once
+	// `loading` flips false, so flipping outcomes here doesn't race the
+	// initial render.
+	useEffect(() => {
+		if (seedStatuses.data === undefined) return;
+		setOutcomes((prev) =>
+			prev.map((o) =>
+				o.status === "pending" && closedRefs.has(o.ref)
+					? { ref: o.ref, status: "skipped", seedStatus: "closed" }
+					: o,
+			),
+		);
+	}, [seedStatuses.data, closedRefs]);
 	const [dispatching, setDispatching] = useState(false);
 	const [done, setDone] = useState(false);
 
@@ -1356,6 +1404,10 @@ function BatchDispatchDialog({
 		const agent = resolvedAgent;
 		await Promise.all(
 			targets.map(async (t, idx) => {
+				// warren-4015: closed seeds are dropped at confirm time.
+				// `outcomes[idx]` is already `skipped` from the effect above;
+				// no POST /runs fires for them.
+				if (closedRefs.has(t.ref)) return;
 				const prompt = template.replaceAll("{seed_id}", t.ref);
 				try {
 					const resp = await runsApi.create({
@@ -1401,14 +1453,21 @@ function BatchDispatchDialog({
 				<DialogHeader>
 					<DialogTitle>Dispatch all attached seeds</DialogTitle>
 					<DialogDescription>
-						Dispatch <strong>{targets.length}</strong> parallel run
-						{targets.length === 1 ? "" : "s"} bound to this Plot, one per
-						attached seeds_issue. Each run uses the project's default agent
+						Dispatch <strong>{dispatchableCount}</strong> parallel run
+						{dispatchableCount === 1 ? "" : "s"} bound to this Plot, one per
+						open seeds_issue. Each run uses the project's default agent
 						and prompt template; <code className="font-mono">{"{seed_id}"}</code>
-						is substituted per target. For PR-merge-serial gating and a
-						single tracked PlanRun row, prefer the{" "}
-						<strong>Dispatch as plan-run</strong> button instead — this batch
-						action is the parallel-fan-out escape hatch.
+						is substituted per target.
+						{closedRefs.size > 0 ? (
+							<>
+								{" "}
+								<strong>{closedRefs.size}</strong> closed
+								{closedRefs.size === 1 ? " seed is" : " seeds are"} skipped.
+							</>
+						) : null}{" "}
+						For PR-merge-serial gating and a single tracked PlanRun row,
+						prefer the <strong>Dispatch as plan-run</strong> button instead —
+						this batch action is the parallel-fan-out escape hatch.
 					</DialogDescription>
 				</DialogHeader>
 
@@ -1467,14 +1526,14 @@ function BatchDispatchDialog({
 					{!done ? (
 						<Button
 							type="button"
-							disabled={!readyToDispatch}
+							disabled={!readyToDispatch || dispatchableCount === 0}
 							onClick={() => {
 								void dispatchAll();
 							}}
 						>
 							{dispatching
-								? `Dispatching ${targets.length}…`
-								: `Dispatch ${targets.length}`}
+								? `Dispatching ${dispatchableCount}…`
+								: `Dispatch ${dispatchableCount}`}
 						</Button>
 					) : null}
 				</DialogFooter>
@@ -1488,6 +1547,16 @@ function BatchOutcomeBadge({ outcome }: { outcome: BatchDispatchOutcome }) {
 		return (
 			<span className="shrink-0 rounded border px-1.5 py-0.5 font-mono text-(--color-muted-foreground)">
 				pending
+			</span>
+		);
+	}
+	if (outcome.status === "skipped") {
+		return (
+			<span
+				className="shrink-0 rounded border px-1.5 py-0.5 font-mono text-(--color-muted-foreground)"
+				title={`seed status: ${outcome.seedStatus ?? "closed"}`}
+			>
+				skipped ({outcome.seedStatus ?? "closed"})
 			</span>
 		);
 	}

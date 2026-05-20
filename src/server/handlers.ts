@@ -507,6 +507,55 @@ function getProjectWarrenConfigHandler(deps: ServerDeps): RouteHandler {
 	};
 }
 
+/**
+ * `GET /projects/:id/seeds/:seedId` — single-seed status read
+ * (warren-4015 / warren-ea66 acceptance (d) follow-up).
+ *
+ * Surfaces the same `sd show <id> --json` payload the plan-run coordinator
+ * already shells out for (via `showSeed`) so the PlotDetail BatchDispatch
+ * dialog can drop closed seeds at confirm time instead of round-tripping
+ * a doomed `POST /runs` per attachment. Read-only; no state changes.
+ *
+ * Gates mirror the plan-run handlers so the wire contract stays uniform:
+ *   - project 404 via `projects.require`,
+ *   - `hasSeeds` gate (ProjectLacksSeedsError → 400),
+ *   - `seedsCli` configured (ValidationError → 400),
+ *   - SeedsCliError from `showSeed` bubbles up as 500 — a missing seed
+ *     surfaces as the underlying `sd show` failure rather than a special
+ *     404, matching the plan-runs / plot-plan-runs status probe posture.
+ *
+ * Response shape is intentionally narrow (`{id, status, blockedBy}`):
+ * the UI only needs `status` for the closed-seed filter and `blockedBy`
+ * is cheap to surface for future dependency-aware decisions.
+ */
+function getProjectSeedHandler(deps: ServerDeps): RouteHandler {
+	return async (ctx) => {
+		const id = requireParam(ctx, "id");
+		const seedId = requireParam(ctx, "seedId");
+		const project = await deps.repos.projects.require(id);
+		if (!project.hasSeeds) {
+			throw new ProjectLacksSeedsError(
+				`project ${project.id} has no .seeds/ directory; seed status read is not available`,
+				{
+					recoveryHint: "add a .seeds/ directory to the project clone and refresh",
+				},
+			);
+		}
+		if (deps.seedsCli === undefined) {
+			throw new ValidationError(
+				"seeds CLI is not configured on this warren; seed status read requires sd",
+				{ recoveryHint: "set WARREN_SD_BINARY (or install sd on PATH) and restart" },
+			);
+		}
+		const issue = await showSeed(deps.seedsCli, project.localPath, seedId);
+		return jsonResponse(200, {
+			id: issue.id,
+			status: issue.status,
+			blockedBy: issue.blockedBy ?? [],
+		});
+	};
+}
+
 function getProjectTriggersHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
@@ -3006,6 +3055,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "POST", pattern: "/projects", build: createProjectHandler },
 	{ method: "GET", pattern: "/projects/:id/warren-config", build: getProjectWarrenConfigHandler },
 	{ method: "GET", pattern: "/projects/:id/triggers", build: getProjectTriggersHandler },
+	{ method: "GET", pattern: "/projects/:id/seeds/:seedId", build: getProjectSeedHandler },
 	{
 		method: "POST",
 		pattern: "/projects/:id/triggers/:triggerId/run",
