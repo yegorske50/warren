@@ -12,8 +12,8 @@
 
 defaultRole: pi
 defaultBranch: main
-defaultProvider: anthropic
-defaultModel: claude-opus-4-7
+defaultProvider: google
+defaultModel: gemini-3.5-flash
 
 # ── Optional knobs (uncomment to set) ───────────────────────────────────
 
