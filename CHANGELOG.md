@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-05-22
+
+Patch release. Fixes canopy-defined interactive agents (brainstorm,
+planner) failing ~17s into a run with `execvp claude: No such file or
+directory` when the agent's name didn't match a burrow runtime id
+(warren-53e6).
+
+### Fixed
+
+- `spawnRun` now forwards `readRuntimeId(agent)` (not `agent.name`) to
+  `provisionBurrow`, so burrow's `POST /burrows` resolves the correct
+  runtime and mounts the claude toolchain. Previously, canopy agents
+  with `frontmatter.runtime` (e.g. brainstorm/planner) caused
+  `registry.get` to return undefined, `collectToolchainPaths` to skip
+  the agent, and bwrap to fail on exec. Test guard added for the
+  warren-ebca brainstorm case (warren-53e6).
+
 ## [0.5.1] — 2026-05-23
 
 Patch release. Fixes interactive agents (brainstorm/planner) failing
