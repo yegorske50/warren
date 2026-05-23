@@ -7,17 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-05-23
+
+Patch release shipping cost analytics, a responsive mobile UI, and
+several reap/refresh fixes. The cost analytics view
+(`GET /analytics/cost` + `/cost-analytics` page) breaks down
+`runs.cost_usd` across eight dimensions (date, project, plan, plot,
+run, agent, model, provider) with filterable date range and project
+selector. The UI gains a mobile navigation shell, responsive table
+layouts across all pages, and a paginated/sortable Runs table. On the
+backend, reap now commits `.seeds/` deltas on the agent's behalf
+(closing the planner-default-prompt bug where `sd plan submit` writes
+were lost on push), and project refresh merges `.plot/` snapshots
+instead of blindly overwriting them.
+
 ### Added
 
-- `POST /plots/:id/rename` — update a Plot's display name from the UI
-  (warren-bed0 / pl-b0c0 step 3). PlotDetail's header gains an inline
-  rename affordance ("rename" button next to the name, Save/Cancel +
-  Enter/Escape keybinds). Renames are allowed in every status — the
-  SPEC §6 frozen-at-done rule applies only to the intent body. The
-  rename mutates `plot.json#/name` under the lib's per-Plot file lock
-  via a new `UserPlotClient.rename` method and appends a `note` event
-  recording the from→to transition (plot-cli v0.3 has no
-  `plot_renamed` event type).
+- **`feat(analytics)`** — `GET /analytics/cost` endpoint + cost
+  analytics aggregator (warren-cf63 / pl-b0c0 step 6). Pure
+  `buildCostAnalytics` function takes flat analytics rows and emits
+  eight grouped breakdowns (date, project, plan, plot, run, agent,
+  model, provider), each with `costUsd`, `runs`, `priced` per bucket.
+  Date dimension sorted chronologically; all others by cost descending.
+  Null group keys fold into a `__none__` bucket rendered as em-dash.
+  New `CostAnalyticsPage` at `/cost-analytics` with date-range and
+  project filters persisted in URL search params. Server endpoint
+  accepts optional `projectId`, `from`, `to` query params; defaults to
+  last 30 days. Full test coverage in `cost-analytics.test.ts`.
+- **`feat(plan-runs)`** — show cost per plan on the plan-runs list page
+  (warren-2235 / pl-b0c0 step 5). `PlanRunsRepo` gains a
+  `listWithCost` query joining `plan_run_children → runs` to sum
+  `cost_usd` per plan-run; the plan-runs table renders the aggregate
+  cost inline.
+- **`feat(plots)`** — `POST /plots/:id/rename` endpoint + PlotDetail
+  inline rename affordance (warren-bed0 / pl-b0c0 step 3). Renames
+  allowed in every status (name is metadata, not frozen at done).
+  `UserPlotClient.rename` mutates `plot.json#/name` under the per-Plot
+  file lock and appends a `note` event recording the from→to
+  transition. New `src/plots/renamer.ts` seam + test coverage in
+  `renamer.test.ts`.
+- **`feat(ui)`** — mobile navigation shell and responsive layout
+  wrapper (#73). Collapsible sidebar with hamburger toggle on small
+  screens; layout wrapper applies consistent padding and max-width
+  breakpoints.
+- **`feat(ui)`** — Cost Analytics entry in sidebar navigation with
+  route at `/cost-analytics`.
+
+### Changed
+
+- **`refactor(ui)`** — Runs page: replace truncated list with
+  paginated, sortable table (#76). Server-side pagination via
+  `offset`/`limit` query params on `GET /runs`; sortable columns
+  (started, cost, state); URL-persisted page state.
+- **`refactor(ui)`** — Plot status: replace forward-only buttons with
+  a dropdown selector (warren-470e, #80). The status transition control
+  now renders a `<select>` dropdown showing all legally-reachable
+  statuses per SPEC §6.5, replacing the previous forward-only button
+  group.
+- **`refactor(ui)`** — Enhance Runs, Plan-Runs, and Projects table
+  pages responsiveness (#74). Tables use horizontal scroll on small
+  viewports; cell content truncates gracefully.
+- **`refactor(ui)`** — Ensure Plots list and Plot details pages wrap
+  and display correctly on narrow viewports (#75).
+- **`refactor(ui)`** — Optimize form pages (New Run, New Plan Run) and
+  touch targets for mobile (#77).
+- **`chore(deps)`** — bump claude-code 2.1.138→2.1.150 and pi
+  0.74.0→0.75.4 in Dockerfile.
+
+### Fixed
+
+- **`fix(reap)`** — commit `.seeds/` deltas on the agent's behalf
+  (warren-7ecc). Mirrors the `.plot/` commit-through-reap pattern
+  (warren-343a): agents with narrowly-scoped write contracts (the
+  planner) are forbidden from running `git commit`, so `sd plan submit`
+  writes to `.seeds/issues.jsonl` + `.seeds/plans.jsonl` but the push
+  landed empty (`reap.empty_push`). Reap now copies committable seeds
+  files from the project clone into the workspace, stages `.seeds/`,
+  and authors a `chore(warren): seeds state` commit under the warren
+  bot identity when there's a real delta. Skipped when the project has
+  no `.seeds/`. Best-effort: failures emit `reap_failed`
+  step=`seeds_commit`. New `seedsCommitted` field on `ReapRunResult`.
+  Test coverage for round-trip, no-op, skip-config, and planner-prompt
+  scenarios.
+- **`fix(projects)`** — merge `.plot/` snapshot on refresh instead of
+  blind overwrite (warren-af9e). `preservePlot`'s restore phase now
+  merges snapshot files with any changes that arrived via
+  `git reset --hard`, instead of unconditionally overwriting. Prevents
+  data loss when origin carries newer `.plot/` state than the snapshot.
+  Test coverage in `refresh.test.ts`.
+- **`fix(ui)`** — fix or remove broken plot interactive chat (#78).
+  Interactive chat component cleaned up to prevent runtime errors on
+  plots without an active interactive run.
 
 ## [0.5.2] — 2026-05-22
 
