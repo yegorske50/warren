@@ -43,7 +43,7 @@
 		"build:ui": "cd src/ui && bun install && bun run build",
 		"acceptance": "bun run scripts/acceptance/run.ts",
 		"acceptance:container": "bun run scripts/acceptance/run.ts --mode container",
-		"prepare": "cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit"
+		"prepare": "[ -d .git ] && [ -f scripts/hooks/pre-commit ] && cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit || true"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.10",
