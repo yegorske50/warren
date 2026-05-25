@@ -97,6 +97,7 @@ interface StubMetrics {
 	rebuildCalls: number;
 	closeCalls: number;
 	hasFilesOnDiskCalls: number;
+	countFilesOnDiskCalls: number;
 }
 
 function makeFactory(perProject: Record<string, StubBehaviour>): {
@@ -111,7 +112,13 @@ function makeFactory(perProject: Record<string, StubBehaviour>): {
 		}
 		let m = metrics[p.id];
 		if (m === undefined) {
-			m = { queryCalls: 0, rebuildCalls: 0, closeCalls: 0, hasFilesOnDiskCalls: 0 };
+			m = {
+				queryCalls: 0,
+				rebuildCalls: 0,
+				closeCalls: 0,
+				hasFilesOnDiskCalls: 0,
+				countFilesOnDiskCalls: 0,
+			};
 			metrics[p.id] = m;
 		}
 		// Live view of indexed plots — rebuildIndex absorbs the
@@ -139,6 +146,10 @@ function makeFactory(perProject: Record<string, StubBehaviour>): {
 				if (behaviour.hasFilesOnDisk !== undefined) return behaviour.hasFilesOnDisk;
 				if (onDiskOnly.length > 0 || indexed.length > 0) return true;
 				return false;
+			},
+			async countPlotFilesOnDisk() {
+				m.countFilesOnDiskCalls += 1;
+				return indexed.length + onDiskOnly.length;
 			},
 			async readPlot(plotId) {
 				const pl = indexed.find((x) => x.id === plotId);
@@ -353,6 +364,75 @@ describe("createPlotAggregator", () => {
 		expect(metrics.prj_a?.queryCalls).toBe(2);
 		expect(metrics.prj_a?.rebuildCalls).toBe(1);
 		expect(metrics.prj_a?.hasFilesOnDiskCalls).toBe(1);
+	});
+
+	test("rebuilds the index when query returns fewer rows than *.json files on disk (warren-d590)", async () => {
+		const projects = [project("prj_a")];
+		const { factory, metrics } = makeFactory({
+			prj_a: {
+				plots: [
+					{
+						id: "plot-existing",
+						name: "existing",
+						status: "active",
+						updated_at: "2026-05-10T00:00:00Z",
+						goal: "already indexed",
+						attachments: 0,
+						events: [noteEvent("2026-05-10T00:00:00Z", "user:operator")],
+					},
+				],
+				plotsOnDiskOnly: [
+					{
+						id: "plot-new-from-git",
+						name: "new from git",
+						status: "drafting",
+						updated_at: "2026-05-20T00:00:00Z",
+						goal: "just fetched",
+						attachments: 0,
+						events: [noteEvent("2026-05-20T00:00:00Z", "user:operator")],
+					},
+				],
+			},
+		});
+		const agg = createPlotAggregator({
+			projectsRepo: { listAll: async () => projects },
+			logger: silentLogger(),
+			clientFactory: factory,
+		});
+		const rows = await agg.listSummaries();
+		expect(rows.map((r) => r.id).sort()).toEqual(["plot-existing", "plot-new-from-git"]);
+		expect(metrics.prj_a?.queryCalls).toBe(2);
+		expect(metrics.prj_a?.rebuildCalls).toBe(1);
+		expect(metrics.prj_a?.countFilesOnDiskCalls).toBe(1);
+	});
+
+	test("does NOT rebuild when index row count matches disk file count (warren-d590)", async () => {
+		const projects = [project("prj_a")];
+		const { factory, metrics } = makeFactory({
+			prj_a: {
+				plots: [
+					{
+						id: "plot-synced",
+						name: "synced",
+						status: "active",
+						updated_at: "2026-05-10T00:00:00Z",
+						goal: "fully indexed",
+						attachments: 0,
+						events: [noteEvent("2026-05-10T00:00:00Z", "user:operator")],
+					},
+				],
+			},
+		});
+		const agg = createPlotAggregator({
+			projectsRepo: { listAll: async () => projects },
+			logger: silentLogger(),
+			clientFactory: factory,
+		});
+		const rows = await agg.listSummaries();
+		expect(rows.map((r) => r.id)).toEqual(["plot-synced"]);
+		expect(metrics.prj_a?.queryCalls).toBe(1);
+		expect(metrics.prj_a?.rebuildCalls).toBe(0);
+		expect(metrics.prj_a?.countFilesOnDiskCalls).toBe(1);
 	});
 
 	test("does NOT rebuild when the first query returns empty rows and .plot/ has zero *.json files (warren-ede7)", async () => {

@@ -77,6 +77,13 @@ export interface AggregatorPlotClient {
 	 * clone hits because `.index.db` is gitignored (warren-ede7).
 	 */
 	hasPlotFilesOnDisk(): Promise<boolean>;
+	/**
+	 * Count non-dot `*.json` Plot files on disk. Used by
+	 * `queryWithRebuildRetry` to detect an incremental stale index: the
+	 * query returned rows, but disk has *more* files than the index knows
+	 * about (warren-d590).
+	 */
+	countPlotFilesOnDisk(): Promise<number>;
 	readPlot(plotId: string): Promise<{
 		name: string;
 		status: PlotStatus;
@@ -114,6 +121,14 @@ export const defaultAggregatorClientFactory: AggregatorClientFactory = (project)
 				return entries.some((name) => !name.startsWith(".") && name.endsWith(".json"));
 			} catch {
 				return false;
+			}
+		},
+		async countPlotFilesOnDisk() {
+			try {
+				const entries = await readdir(dir);
+				return entries.filter((name) => !name.startsWith(".") && name.endsWith(".json")).length;
+			} catch {
+				return 0;
 			}
 		},
 		async readPlot(plotId) {
@@ -451,6 +466,20 @@ async function queryWithRebuildRetry(
 			// — only the former should pay a rebuild cost.
 			const hasFiles = await client.hasPlotFilesOnDisk();
 			if (!hasFiles) return r.rows;
+			try {
+				await client.rebuildIndex();
+			} catch {
+				return r.rows;
+			}
+			const retry = await client.query();
+			return retry.rows;
+		}
+		// Incremental stale-index path (warren-d590): index returned
+		// rows, but disk may have *more* files than the index knows
+		// about (e.g. new plots fetched via git after the index was
+		// built). Compare counts — only rebuild when disk wins.
+		const diskCount = await client.countPlotFilesOnDisk();
+		if (diskCount > r.rows.length) {
 			try {
 				await client.rebuildIndex();
 			} catch {
