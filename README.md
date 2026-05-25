@@ -21,7 +21,7 @@ Engineering teams self-hosting their own agent infrastructure. The deployment un
 
 ## Status
 
-Stable (`0.5.6`), running on Fly.io in continuous use against real GitHub repos. The end-to-end path is covered by 33 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/): manual runs, cron triggers, multi-worker placement, Postgres backend, per-run preview environments, restart recovery, cost tracking, cost analytics, seeds-extensions roundtrip, serial plan-run dispatch, plan-run + Plot composition, Plot-workbench loop. The active frontier is the org-readiness cluster: SSO, remote workers, MCP, audit, budgets, GitHub App auth. See [ROADMAP.md](ROADMAP.md).
+Stable (`0.6.0`), running on Fly.io in continuous use against real GitHub repos. The end-to-end path is covered by 33 scenario-based acceptance tests in [`scripts/acceptance/`](scripts/acceptance/): manual runs, cron triggers, multi-worker placement, Postgres backend, per-run preview environments, restart recovery, cost tracking, cost analytics, seeds-extensions roundtrip, serial plan-run dispatch, plan-run + Plot composition, Plot-workbench loop. The active frontier is the org-readiness cluster: SSO, remote workers, MCP, audit, budgets, GitHub App auth. See [ROADMAP.md](ROADMAP.md).
 
 ## What you get
 
@@ -312,6 +312,7 @@ src/
 ├── runs/               spawn / stream / reap composition flow (SPEC §4.3)
 ├── triggers/           cron + scheduled-for dispatcher (SPEC §11.I)
 ├── warren-config/      .warren/ per-project config loader + cache (SPEC §11.H)
+├── client/             typed SDK for driving warren's HTTP API programmatically
 ├── burrow-client/      facade over the sandbox runtime's HttpClient
 ├── supervisor/         container entrypoint (spawns warren + runtime)
 ├── server/             Bun.serve HTTP API + static UI serving
@@ -319,6 +320,92 @@ src/
 ├── cli/                warren admin commands
 └── ui/                 React + Vite + shadcn SPA
 ```
+
+## Client SDK
+
+`src/client/` exports a typed TypeScript client for driving warren programmatically — dispatching runs, streaming events, managing projects and plots — without reimplementing the wire format. Zero server-side imports; intended for scripts, CLIs, acceptance harnesses, and external agents.
+
+### Setup
+
+```bash
+export WARREN_BASE_URL=https://warren.example.com   # default: http://localhost:8080
+export WARREN_API_TOKEN=<your-token>
+```
+
+### Dispatch a run and wait for it
+
+```ts
+import { WarrenClient } from "./src/client/index.ts";
+
+const warren = WarrenClient.fromEnv();
+await warren.probe();  // throws WarrenUnreachableError if warren is down
+
+const { run } = await warren.dispatch({
+  agent: "claude-code",
+  project: "my-project",
+  prompt: "Add input validation to the signup form",
+  branch: "main",          // optional: git ref to clone from
+  model: "claude-sonnet-4-6", // optional: override the default model
+});
+
+const final = await warren.waitForRun(run.id, {
+  onTick: (r) => console.log(`${r.id}: ${r.state}`),
+});
+console.log(`Run ${final.state}, PR: ${final.prUrl}`);
+```
+
+### Stream events
+
+```ts
+for await (const event of warren.streamRunEvents(run.id, { follow: true })) {
+  if (event.stream === "stdout") process.stdout.write(String(event.payload));
+}
+```
+
+### Steer a running agent
+
+```ts
+await warren.steer(run.id, {
+  body: "Focus on the email field first, skip phone for now",
+  priority: "high",
+});
+```
+
+### Plots and plan-runs
+
+```ts
+// List active plots
+const { plots } = await warren.listPlots({ status: "active" });
+
+// Get full plot detail (intent + attachments + event log)
+const plot = await warren.getPlot(plots[0].id);
+
+// Dispatch a serial plan-run against a seeds plan
+const { planRun } = await warren.createPlanRun({
+  project: "my-project",
+  planId: "pl-abc123",
+  agent: "claude-code",
+  plotId: plot.id,  // optional: compose onto the plot
+});
+```
+
+### Error handling
+
+```ts
+import { WarrenClientError, WarrenUnreachableError } from "./src/client/index.ts";
+
+try {
+  await warren.dispatch({ agent: "claude-code", project: "bad-id", prompt: "..." });
+} catch (err) {
+  if (err instanceof WarrenUnreachableError) {
+    // warren is down or unreachable
+  } else if (err instanceof WarrenClientError) {
+    // warren returned an error: err.status, err.code, err.message, err.hint
+  }
+}
+```
+
+The full type surface (all inputs, outputs, row shapes, enums) is in `src/client/types.ts`.
 
 ## Operating model
 
