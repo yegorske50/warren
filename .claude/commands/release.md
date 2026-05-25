@@ -15,4 +15,4 @@ Steps:
 5. Update `CHANGELOG.md` — move items from [Unreleased] to the new version section with today's date
 6. Update `CLAUDE.md` if command counts or structure changed
 7. Update `README.md` if CLI reference or stats changed
-8. Present a summary of all changes made — do NOT commit or push
+8. COMMIT YOUR CHANGES! Then present a summary of all changes made.
