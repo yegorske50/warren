@@ -236,6 +236,7 @@ export async function runRun(
 				appended: reaped.mulchAppended,
 			},
 			seedsClosed: reaped.seedsClosed,
+			seedsCreated: reaped.seedsCreated,
 			branchPushed: reaped.branchPushed,
 			commitsAhead: reaped.commitsAhead,
 			prUrl: reaped.prUrl,

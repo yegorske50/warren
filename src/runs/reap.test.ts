@@ -661,9 +661,65 @@ describe("reapRun", () => {
 			exec: fakeExec().exec,
 		});
 		expect(result.seedsClosed).toBe(1);
+		expect(result.seedsCreated).toBe(1);
 		const merged = f.files.get("/data/projects/x/y/.seeds/issues.jsonl") ?? "";
 		expect(merged).toContain('"status":"closed"');
-		expect(merged).not.toContain('"status":"open","updatedAt":"2026-05-08T19:00:00Z"');
+		expect(merged).toContain('"id":"sd-2"');
+	});
+
+	test("mirrors newly-created open seeds from planner runs into the project clone", async () => {
+		const f = fakeFs({
+			"/data/projects/x/y/.seeds/issues.jsonl":
+				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
+		});
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(
+				fakeBurrowClient(makeBurrow(), {
+					seedsIssuesBody:
+						'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n' +
+						'{"id":"sd-new1","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"planned-a"}\n' +
+						'{"id":"sd-new2","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"planned-b"}\n',
+				}),
+				ctx.repos,
+			),
+			fs: f.fs,
+			exec: fakeExec().exec,
+		});
+		expect(result.seedsClosed).toBe(0);
+		expect(result.seedsCreated).toBe(2);
+		const merged = f.files.get("/data/projects/x/y/.seeds/issues.jsonl") ?? "";
+		expect(merged).toContain('"id":"sd-new1"');
+		expect(merged).toContain('"id":"sd-new2"');
+		expect(merged).toContain('"id":"sd-1"');
+	});
+
+	test("does not overwrite existing open seeds with workspace copies", async () => {
+		const f = fakeFs({
+			"/data/projects/x/y/.seeds/issues.jsonl":
+				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"original"}\n',
+		});
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(
+				fakeBurrowClient(makeBurrow(), {
+					seedsIssuesBody:
+						'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T22:00:00Z","title":"modified"}\n',
+				}),
+				ctx.repos,
+			),
+			fs: f.fs,
+			exec: fakeExec().exec,
+		});
+		expect(result.seedsClosed).toBe(0);
+		expect(result.seedsCreated).toBe(0);
+		const merged = f.files.get("/data/projects/x/y/.seeds/issues.jsonl") ?? "";
+		expect(merged).toContain('"title":"original"');
+		expect(merged).not.toContain('"title":"modified"');
 	});
 
 	test("seeds_close treats NotFoundError from files.read as 'no seeds file' (no error, no mirror)", async () => {

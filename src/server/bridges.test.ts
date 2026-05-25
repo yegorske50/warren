@@ -36,6 +36,7 @@ function reapStub(outcome: RunTerminalState): ReapRunResult {
 		mulchSkipped: 0,
 		mulchAppended: 0,
 		seedsClosed: 0,
+		seedsCreated: 0,
 		plotEventsAppended: 0,
 		plotsUpdated: 0,
 		plotEventsMirrored: 0,

@@ -257,6 +257,7 @@ export interface ReapRunResult {
 	readonly mulchSkipped: number;
 	readonly mulchAppended: number;
 	readonly seedsClosed: number;
+	readonly seedsCreated: number;
 	/**
 	 * Plot event log lines appended to the project's `.plot/plot-*.events.jsonl`
 	 * files after merging the burrow workspace's deltas (warren-7e0f /
@@ -380,6 +381,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			mulchSkipped: 0,
 			mulchAppended: 0,
 			seedsClosed: 0,
+			seedsCreated: 0,
 			plotEventsAppended: 0,
 			plotsUpdated: 0,
 			plotEventsMirrored: 0,
@@ -436,6 +438,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	let mulchSkipped = 0;
 	let mulchAppended = 0;
 	let seedsClosed = 0;
+	let seedsCreated = 0;
 	let plotEventsAppended = 0;
 	let plotsUpdated = 0;
 	let plotEventsMirrored = 0;
@@ -487,13 +490,15 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		try {
 			// workerClient is set whenever workspacePath !== null (both land in
 			// the same try-block above), so the cast is sound.
-			seedsClosed = await mirrorClosedSeeds({
+			const mirrorResult = await mirrorSeeds({
 				burrowClient: workerClient as BurrowClient,
 				burrowId: run.burrowId as string,
 				projectPath: project.localPath,
 				fs,
 				emit,
 			});
+			seedsClosed = mirrorResult.closed;
+			seedsCreated = mirrorResult.created;
 		} catch (err) {
 			await fail("seeds_close", err);
 		}
@@ -807,7 +812,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		state: finalState,
 		failureReason,
 		mulch: { updated: mulchUpdated, skipped: mulchSkipped, appended: mulchAppended },
-		seeds: { closed: seedsClosed, committed: seedsCommitted },
+		seeds: { closed: seedsClosed, created: seedsCreated, committed: seedsCommitted },
 		plot: {
 			eventsAppended: plotEventsAppended,
 			plotsUpdated,
@@ -834,6 +839,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			mulchSkipped,
 			mulchAppended,
 			seedsClosed,
+			seedsCreated,
 			seedsCommitted,
 			plotEventsAppended,
 			plotsUpdated,
@@ -857,6 +863,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		mulchSkipped,
 		mulchAppended,
 		seedsClosed,
+		seedsCreated,
 		plotEventsAppended,
 		plotsUpdated,
 		plotEventsMirrored,
@@ -1223,7 +1230,12 @@ interface MirrorClosedSeedsInput {
 	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
 }
 
-async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number> {
+interface MirrorSeedsResult {
+	readonly closed: number;
+	readonly created: number;
+}
+
+async function mirrorSeeds(input: MirrorClosedSeedsInput): Promise<MirrorSeedsResult> {
 	const { burrowClient, burrowId, projectPath, fs, emit } = input;
 	const projectFile = join(projectPath, ".seeds", "issues.jsonl");
 
@@ -1234,7 +1246,7 @@ async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number>
 		);
 		burrowBody = out.contents;
 	} catch (err) {
-		if (err instanceof NotFoundError) return 0;
+		if (err instanceof NotFoundError) return { closed: 0, created: 0 };
 		throw err;
 	}
 
@@ -1247,19 +1259,25 @@ async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number>
 	}
 
 	let closed = 0;
+	let created = 0;
 	let changed = false;
 
 	for (const incoming of parseSeeds(burrowBody)) {
-		if (incoming.status !== "closed") continue;
 		const existingIdx = projectIndex.get(incoming.id);
 		if (existingIdx === undefined) {
 			projectRows.push(incoming);
 			projectIndex.set(incoming.id, projectRows.length - 1);
-			closed += 1;
 			changed = true;
-			await emit("seeds.closed", { id: incoming.id, mode: "added" });
+			if (incoming.status === "closed") {
+				closed += 1;
+				await emit("seeds.closed", { id: incoming.id, mode: "added" });
+			} else {
+				created += 1;
+				await emit("seeds.created", { id: incoming.id, status: incoming.status });
+			}
 			continue;
 		}
+		if (incoming.status !== "closed") continue;
 		const existing = projectRows[existingIdx];
 		if (existing === undefined) continue;
 		if (existing.status === "closed" && existing.updatedAt >= incoming.updatedAt) continue;
@@ -1278,7 +1296,7 @@ async function mirrorClosedSeeds(input: MirrorClosedSeedsInput): Promise<number>
 		);
 	}
 
-	return closed;
+	return { closed, created };
 }
 
 function parseSeeds(body: string): SeedRow[] {
@@ -1666,10 +1684,10 @@ interface StageSeedsForCommitInput {
  * `.seeds/issues.jsonl` + `.seeds/plans.jsonl` inside the workspace;
  * without this step the push exits zero, lands no work, and reap fires
  * `reap.empty_push`. The project clone is the union point: by this
- * step `mirrorClosedSeeds` has already merged closed-status rows from
- * the workspace back into the project's `issues.jsonl`. Copying the
- * union back into the workspace gives `git push` a single canonical
- * view to ship to origin.
+ * step `mirrorSeeds` has already merged closed-status rows and
+ * newly-created rows from the workspace back into the project's
+ * `issues.jsonl`. Copying the union back into the workspace gives
+ * `git push` a single canonical view to ship to origin.
  *
  * `git add .seeds/` honors a project-level `.gitignore` of `.seeds/`
  * — a project that gitignored the directory has opted out of
