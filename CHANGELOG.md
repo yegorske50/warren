@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-05-25
+
+Patch release shipping the **nightwatch** patrol agent pattern end-to-end:
+a built-in code-quality scanning agent, an `auto_plan_run` reap hook that
+auto-dispatches plan-runs for any plans the agent creates, a nightly cron
+trigger, and the plumbing to make `seed` optional on cron triggers so
+seedless agents (like nightwatch) can run on schedule. Also switches the
+default provider/model from Google Gemini to Anthropic Opus.
+
+### Added
+
+- **`feat(registry)`** — built-in `nightwatch` patrol agent
+  (warren-a32a). New `src/registry/builtins/nightwatch.ts` ships a
+  read-only code patrol agent that scans repos for quality issues
+  (inconsistencies, bugs, type safety gaps, dead code, test gaps,
+  security vectors, doc drift) and produces a seeds plan to fix them.
+  Does not write source files — only writes to `.seeds/` via the `sd`
+  CLI. Intended for nightly cron triggers; operators with a custom
+  canopy library override by registering a same-named agent.
+- **`feat(runs)`** — `auto_plan_run` reap hook (warren-a32a). When an
+  agent's canopy frontmatter declares `auto_plan_run: true` and the run
+  succeeds, reap diffs `.seeds/plans.jsonl` (workspace vs project
+  baseline) to detect new plans created during execution and
+  auto-dispatches a plan-run for each via `POST /plan-runs`. Enables
+  the patrol pattern: cron fires a scan agent → agent files a plan →
+  warren auto-executes it. New `ReapRunResult` fields:
+  `autoPlanRunCreated`, `autoPlanRunId`, `autoPlanRunPlanId`. Failures
+  are best-effort (`reap_failed` step=`auto_plan_run`). Test coverage
+  in `src/runs/reap.test.ts`.
+- **`feat(registry)`** — `auto_plan_run` frontmatter field documented
+  in `AgentDefinition` schema comments (`src/registry/schema.ts`).
+- **`feat(triggers)`** — nightly nightwatch cron trigger
+  (`.warren/triggers.yaml`). Fires at 2 AM PT daily against the
+  `nightwatch` role with a patrol prompt.
+
+### Changed
+
+- **`feat(triggers)`** — `seed` is now optional on cron triggers
+  (warren-60dc). Previously `seed` was a required field in
+  `TriggersConfigSchema`; seedless agents (nightwatch, future patrol
+  variants) couldn't be scheduled without a placeholder seed.
+  `resolveCronPrompt` falls back to `"Run cron trigger <id>."` when no
+  seed is present. Metadata omits `seed` when undefined instead of
+  passing `undefined`.
+- **`chore(defaults)`** — switch default provider/model from Google
+  Gemini 3.5 Flash to Anthropic Claude Opus (`0226bc5`).
+
 ## [0.6.0] — 2026-05-25
 
 Minor release introducing the **Warren Client SDK** (`src/client/`) — a
