@@ -40,7 +40,7 @@
 
 - id: bugwatch-triage
   kind: cron
-  cron: '0 4 * * 0,3'
+  cron: '0 5 * * 0,3'
   role: bugwatch
   timezone: America/Los_Angeles
   prompt: |
