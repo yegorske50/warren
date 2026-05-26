@@ -31,7 +31,6 @@
 - id: nightwatch-patrol
   kind: cron
   cron: '0 2 * * *'
-  seed: warren-7602
   role: nightwatch
   timezone: America/Los_Angeles
   prompt: |
