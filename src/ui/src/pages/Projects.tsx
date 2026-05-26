@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { projectsApi } from "@/api/client.ts";
 import type { ProjectRow } from "@/api/types.ts";
+import { RefreshProjectsCTA } from "@/components/RefreshProjectsCTA.tsx";
 import { Button } from "@/components/ui/button.tsx";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card.tsx";
 import {
@@ -67,8 +68,9 @@ export function ProjectsPage() {
 			/>
 
 			<Card>
-				<CardHeader>
+				<CardHeader className="flex flex-row items-center justify-between">
 					<CardTitle>{projects.data?.projects.length ?? 0} projects</CardTitle>
+					<RefreshProjectsCTA label="Sync all" />
 				</CardHeader>
 				<CardContent className="p-0">
 					{projects.isLoading ? (
