@@ -82,6 +82,7 @@ export const NIGHTWATCH_BUILTIN: AgentDefinition = {
 	frontmatter: {
 		source: "builtin",
 		tags: ["agent"],
+		runtime: "pi",
 		auto_plan_run: true,
 	},
 };
