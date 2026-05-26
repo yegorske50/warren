@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-05-25
+
+Patch release shipping the **bugwatch** built-in agent — a bug triage
+patrol that reads open bug seeds, investigates the codebase, and
+produces seeds plans with concrete fix steps. Complements nightwatch
+(which discovers new issues by scanning code) by planning fixes for
+existing filed bugs. Also fixes nightwatch and bugwatch dispatch by
+adding the missing `runtime: "pi"` frontmatter field.
+
+### Added
+
+- **`feat(registry)`** — built-in `bugwatch` bug triage agent. New
+  `src/registry/builtins/bugwatch.ts` ships a read-only triage agent
+  that reads open bug seeds, investigates each one in the codebase, and
+  produces a seeds plan per bug with concrete fix steps. Caps at 3 plans
+  per run; skips bugs that already have plans, are in-progress, are
+  blocked, or lack sufficient detail. Uses `auto_plan_run: true` so
+  warren auto-dispatches plan-runs for each new plan on reap. Registered
+  in `seedBuiltinAgents()`.
+- **`feat(triggers)`** — twice-weekly bugwatch cron trigger
+  (`.warren/triggers.yaml`). Fires at 4 AM PT on Wednesdays and Sundays
+  against the `bugwatch` role with a triage prompt.
+
+### Fixed
+
+- **`fix(registry)`** — add missing `runtime: "pi"` to nightwatch
+  frontmatter (`src/registry/builtins/nightwatch.ts`). Without the
+  runtime field, nightwatch (and bugwatch) dispatch failed because
+  burrow couldn't resolve the agent runtime. Both patrol agents now
+  explicitly declare `runtime: "pi"`.
+
 ## [0.6.1] — 2026-05-25
 
 Patch release shipping the **nightwatch** patrol agent pattern end-to-end:
