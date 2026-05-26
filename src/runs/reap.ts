@@ -236,6 +236,7 @@ export type ReapStep =
 	| "seeds_commit"
 	| "plot_merge"
 	| "plot_commit"
+	| "auto_plan_run"
 	| "branch_push"
 	| "pr_open"
 	| "preview_launch"
@@ -352,6 +353,15 @@ export interface ReapRunResult {
 	 * the GitHub call itself errored (errors append to `errors`).
 	 */
 	readonly previewUrl: string | null;
+	/**
+	 * True when reap auto-dispatched a plan-run for a plan the agent created
+	 * during this run (warren-a32a). Requires `auto_plan_run: true` in the
+	 * agent's canopy frontmatter, `outcome === "succeeded"`, and at least one
+	 * new plan detected in the workspace's `.seeds/plans.jsonl`.
+	 */
+	readonly autoPlanRunCreated: boolean;
+	readonly autoPlanRunId: string | null;
+	readonly autoPlanRunPlanId: string | null;
 	readonly errors: readonly ReapStepError[];
 	/** True when the row was already terminal on entry — sub-steps were skipped. */
 	readonly alreadyTerminal: boolean;
@@ -393,6 +403,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			previewState: idempotentPreviewState,
 			previewPort: run.previewPort,
 			previewUrl: null,
+			autoPlanRunCreated: false,
+			autoPlanRunId: null,
+			autoPlanRunPlanId: null,
 			errors: [],
 			alreadyTerminal: true,
 		};
@@ -450,6 +463,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	let previewLaunchState: "live" | "failed" | null = null;
 	let previewLaunchPort: number | null = null;
 	let previewUrl: string | null = null;
+	let autoPlanRunCreated = false;
+	let autoPlanRunId: string | null = null;
+	let autoPlanRunPlanId: string | null = null;
 
 	let workspacePath: string | null = null;
 	let branch: string | null = null;
@@ -544,6 +560,27 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// lands empty (reap.empty_push fires) and the spawned plan is lost.
 		// Skipped when the project has no `.seeds/`. Best-effort: failures
 		// emit `reap_failed` step=`seeds_commit` and do not fail the run.
+
+		// warren-a32a: snapshot the workspace's plans.jsonl BEFORE
+		// stageSeedsForCommit (which copies project→workspace and may
+		// overwrite the agent's version). The project baseline is read
+		// alongside so the diff can identify agent-created plans.
+		let workspacePlanIds: Set<string> | null = null;
+		let baselinePlanIds: Set<string> | null = null;
+		let workspacePlansBody: string | null = null;
+		if (project.hasSeeds && input.outcome === "succeeded" && hasAutoPlanRunFrontmatter(run)) {
+			try {
+				const baselineBody =
+					(await fs.readFile(join(project.localPath, ".seeds", "plans.jsonl"))) ?? "";
+				baselinePlanIds = parsePlanIds(baselineBody);
+				workspacePlansBody =
+					(await fs.readFile(join(workspacePath, ".seeds", "plans.jsonl"))) ?? "";
+				workspacePlanIds = parsePlanIds(workspacePlansBody);
+			} catch {
+				// Non-fatal — detection failure degrades to no auto-dispatch.
+			}
+		}
+
 		if (project.hasSeeds) {
 			try {
 				seedsCommitted = await stageSeedsForCommit({
@@ -555,6 +592,44 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 				});
 			} catch (err) {
 				await fail("seeds_commit", err, join(workspacePath, ".seeds"));
+			}
+		}
+
+		// warren-a32a: auto-dispatch plan-runs for plans the agent created.
+		if (
+			workspacePlanIds !== null &&
+			baselinePlanIds !== null &&
+			workspacePlansBody !== null &&
+			workspacePlanIds.size > baselinePlanIds.size
+		) {
+			const newPlanIds: string[] = [];
+			for (const id of workspacePlanIds) {
+				if (!baselinePlanIds.has(id)) newPlanIds.push(id);
+			}
+			for (const planId of newPlanIds) {
+				try {
+					const children = parsePlanChildren(workspacePlansBody, planId);
+					if (children.length === 0) continue;
+					const result = await input.repos.planRuns.create({
+						planId,
+						projectId: project.id,
+						agentName: run.agentName,
+						children: children.map((seedId, i) => ({ seq: i + 1, seedId })),
+						trigger: "auto_plan_run",
+						ref: project.defaultBranch,
+						...(run.plotId !== null ? { plotId: run.plotId } : {}),
+					});
+					autoPlanRunCreated = true;
+					autoPlanRunId = result.planRun.id;
+					autoPlanRunPlanId = planId;
+					await emit("auto_plan_run_created", {
+						planId,
+						planRunId: result.planRun.id,
+						childCount: children.length,
+					});
+				} catch (err) {
+					await fail("auto_plan_run", err);
+				}
 			}
 		}
 
@@ -825,6 +900,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		previewState: previewLaunchState,
 		previewPort: previewLaunchPort,
 		previewUrl,
+		autoPlanRun: { created: autoPlanRunCreated, id: autoPlanRunId, planId: autoPlanRunPlanId },
 		errors,
 	});
 
@@ -851,6 +927,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			previewState: previewLaunchState,
 			previewPort: previewLaunchPort,
 			previewUrl,
+			autoPlanRunCreated,
+			autoPlanRunId,
 			errored: errors.length > 0,
 		},
 		"reap completed",
@@ -875,6 +953,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		previewState: previewLaunchState,
 		previewPort: previewLaunchPort,
 		previewUrl,
+		autoPlanRunCreated,
+		autoPlanRunId,
+		autoPlanRunPlanId,
 		errors,
 		alreadyTerminal: false,
 	};
@@ -1744,6 +1825,50 @@ async function stageSeedsForCommit(input: StageSeedsForCommitInput): Promise<boo
 		filesStaged: copied,
 	});
 	return true;
+}
+
+/* ----------------------------------------------------------------------- */
+/* Auto plan-run detection (warren-a32a)                                    */
+/* ----------------------------------------------------------------------- */
+
+function hasAutoPlanRunFrontmatter(run: { renderedAgentJson: unknown }): boolean {
+	const json = run.renderedAgentJson;
+	if (json === null || typeof json !== "object" || Array.isArray(json)) return false;
+	const fm = (json as Record<string, unknown>).frontmatter;
+	if (fm === null || typeof fm !== "object" || Array.isArray(fm)) return false;
+	return (fm as Record<string, unknown>).auto_plan_run === true;
+}
+
+function parsePlanIds(body: string): Set<string> {
+	const ids = new Set<string>();
+	for (const line of splitLines(body)) {
+		try {
+			const raw: unknown = JSON.parse(line);
+			if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+			const id = (raw as Record<string, unknown>).id;
+			if (typeof id === "string" && id.length > 0) ids.add(id);
+		} catch {
+			// skip unparseable lines
+		}
+	}
+	return ids;
+}
+
+function parsePlanChildren(body: string, planId: string): string[] {
+	for (const line of splitLines(body)) {
+		try {
+			const raw: unknown = JSON.parse(line);
+			if (raw === null || typeof raw !== "object" || Array.isArray(raw)) continue;
+			const obj = raw as Record<string, unknown>;
+			if (obj.id !== planId) continue;
+			const children = obj.children;
+			if (!Array.isArray(children)) return [];
+			return children.filter((c): c is string => typeof c === "string" && c.length > 0);
+		} catch {
+			// skip unparseable lines
+		}
+	}
+	return [];
 }
 
 function readUpdatedAt(body: string): string {

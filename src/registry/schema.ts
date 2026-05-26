@@ -72,6 +72,12 @@ export interface AgentDefinition {
  *              `brainstorm` / `planner` (warren-ebca) set this so they
  *              compose onto a real burrow runtime instead of looking up
  *              their own name in `BUILT_IN_RUNTIMES`.
+ *   auto_plan_run — boolean (warren-a32a). When true and the agent's run
+ *              succeeds, reap diffs `.seeds/plans.jsonl` to detect new
+ *              plans created during execution and auto-dispatches a
+ *              plan-run for each. Enables the patrol agent pattern:
+ *              cron fires a scan agent, the agent files a plan, warren
+ *              auto-executes it.
  *
  * Both stay in the open `frontmatter` bag (no schema rev) so a canopy
  * author can set them inline. `POST /runs` accepts the same two fields

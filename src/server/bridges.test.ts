@@ -48,6 +48,9 @@ function reapStub(outcome: RunTerminalState): ReapRunResult {
 		previewState: null,
 		previewPort: null,
 		previewUrl: null,
+		autoPlanRunCreated: false,
+		autoPlanRunId: null,
+		autoPlanRunPlanId: null,
 		errors: [],
 		alreadyTerminal: false,
 	};
