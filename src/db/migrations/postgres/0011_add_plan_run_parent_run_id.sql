@@ -1,0 +1,1 @@
+ALTER TABLE "plan_runs" ADD COLUMN "parent_run_id" text;

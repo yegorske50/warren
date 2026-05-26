@@ -371,6 +371,14 @@ export const planRuns = sqliteTable(
 		// text, no FK — Plots live in the project workspace, not in warren's
 		// database.
 		plotId: text("plot_id"),
+		// Back-link to the parent run that created this plan-run via
+		// auto_plan_run (warren-d9a2). When set, the coordinator gates on
+		// the parent run's PR being merged before dispatching the first
+		// child — the parent's branch carries the seeds state the children
+		// need. Nullable: manual plan-runs and legacy rows have no parent.
+		// Plain text, no FK — ON DELETE behavior is handled by the
+		// coordinator (parent row missing → treat as merged and proceed).
+		parentRunId: text("parent_run_id"),
 		state: text("state", { enum: PLAN_RUN_STATES }).notNull(),
 		failureReason: text("failure_reason"),
 		createdAt: text("created_at").notNull(),

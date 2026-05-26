@@ -130,6 +130,12 @@ interface FakeBurrowClientOpts {
 	 * mirroring the no-op path. Pass a string to exercise the mirror code.
 	 */
 	seedsIssuesBody?: string;
+	/**
+	 * Body the workspace-side plans file (`.seeds/plans.jsonl`) returns
+	 * over `client.http.files.read`. `undefined` (default) makes the read
+	 * throw `NotFoundError`. Pass a string to exercise mirrorPlans.
+	 */
+	seedsPlansBody?: string;
 	/** Override `client.http.files.read` end-to-end (advanced). */
 	filesRead?: (burrowId: string, path: string) => Promise<{ contents: string }>;
 }
@@ -150,6 +156,9 @@ function fakeBurrowClient(burrow: Burrow, opts: FakeBurrowClientOpts = {}): Burr
 		(async (_burrowId: string, path: string) => {
 			if (path === ".seeds/issues.jsonl" && opts.seedsIssuesBody !== undefined) {
 				return { contents: opts.seedsIssuesBody };
+			}
+			if (path === ".seeds/plans.jsonl" && opts.seedsPlansBody !== undefined) {
+				return { contents: opts.seedsPlansBody };
 			}
 			throw new NotFoundError(`file not found: ${path}`);
 		});
@@ -2283,6 +2292,140 @@ describe("reapRun", () => {
 });
 
 /* ----------------------------------------------------------------------- */
+/* Plans mirror (warren-d9a2)                                               */
+/* ----------------------------------------------------------------------- */
+
+describe("mirrorPlans (warren-d9a2)", () => {
+	async function setupWithSeeds() {
+		const db = await openDatabase({ path: ":memory:" });
+		const repos = createRepos(db);
+		await repos.agents.upsert({
+			name: "refactor-bot",
+			renderedJson: { sections: { system: "x" } },
+		});
+		const project = await repos.projects.create({
+			gitUrl: "https://github.com/x/y.git",
+			localPath: "/data/projects/x/y",
+			defaultBranch: "main",
+			hasSeeds: true,
+		});
+		const run = await repos.runs.create({
+			agentName: "refactor-bot",
+			projectId: project.id,
+			prompt: "p",
+			renderedAgentJson: {},
+			trigger: "manual",
+			burrowId: "bur_aaaaaaaaaaaa",
+			burrowRunId: "run_zzzzzzzzzzzz",
+		});
+		await repos.burrows.create({ id: "bur_aaaaaaaaaaaa", workerId: "local" });
+		await repos.runs.markRunning(run.id);
+		return {
+			db,
+			repos,
+			broker: new RunEventBroker(),
+			runId: run.id,
+			projectPath: project.localPath,
+			workspacePath: "/data/burrow/ws",
+		};
+	}
+
+	test("mirrors new plans from workspace into project clone", async () => {
+		const ctx = await setupWithSeeds();
+		try {
+			const existingPlan = '{"id":"pl-existing","status":"approved","children":["warren-a"]}\n';
+			const newPlan = '{"id":"pl-new","status":"approved","children":["warren-b","warren-c"]}\n';
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl": "",
+				"/data/projects/x/y/.seeds/plans.jsonl": existingPlan,
+			});
+			const e = fakeExec({ stagedDelta: true });
+
+			await reapRun({
+				runId: ctx.runId,
+				outcome: "succeeded",
+				repos: ctx.repos,
+				burrowClientPool: await makePool(
+					fakeBurrowClient(makeBurrow(), {
+						seedsPlansBody: `${existingPlan}${newPlan}`,
+					}),
+					ctx.repos,
+				),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			const projectPlans = f.files.get("/data/projects/x/y/.seeds/plans.jsonl") ?? "";
+			expect(projectPlans).toContain("pl-existing");
+			expect(projectPlans).toContain("pl-new");
+			const events = await ctx.repos.events.listByRun(ctx.runId);
+			expect(events.find((ev) => ev.kind === "seeds.plan_mirrored")).toBeDefined();
+		} finally {
+			await ctx.db.close();
+		}
+	});
+
+	test("does not duplicate existing plans during mirror", async () => {
+		const ctx = await setupWithSeeds();
+		try {
+			const existingPlan = '{"id":"pl-existing","status":"approved","children":["warren-a"]}\n';
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl": "",
+				"/data/projects/x/y/.seeds/plans.jsonl": existingPlan,
+			});
+			const e = fakeExec({ stagedDelta: false });
+
+			await reapRun({
+				runId: ctx.runId,
+				outcome: "succeeded",
+				repos: ctx.repos,
+				burrowClientPool: await makePool(
+					fakeBurrowClient(makeBurrow(), { seedsPlansBody: existingPlan }),
+					ctx.repos,
+				),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			const projectPlans = f.files.get("/data/projects/x/y/.seeds/plans.jsonl") ?? "";
+			const count = projectPlans.split("pl-existing").length - 1;
+			expect(count).toBe(1);
+		} finally {
+			await ctx.db.close();
+		}
+	});
+
+	test("mirrored plans survive into workspace via stageSeedsForCommit", async () => {
+		const ctx = await setupWithSeeds();
+		try {
+			const newPlan = '{"id":"pl-agent-created","status":"approved","children":["warren-x"]}\n';
+			const f = fakeFs({
+				"/data/projects/x/y/.seeds/issues.jsonl": "",
+				"/data/projects/x/y/.seeds/plans.jsonl": "",
+			});
+			const e = fakeExec({ stagedDelta: true });
+
+			await reapRun({
+				runId: ctx.runId,
+				outcome: "succeeded",
+				repos: ctx.repos,
+				burrowClientPool: await makePool(
+					fakeBurrowClient(makeBurrow(), { seedsPlansBody: newPlan }),
+					ctx.repos,
+				),
+				fs: f.fs,
+				exec: e.exec,
+			});
+
+			const workspacePlans = f.files.get("/data/burrow/ws/.seeds/plans.jsonl") ?? "";
+			expect(workspacePlans).toContain("pl-agent-created");
+		} finally {
+			await ctx.db.close();
+		}
+	});
+});
+
+/* ----------------------------------------------------------------------- */
 /* Auto plan-run from reap (warren-a32a)                                    */
 /* ----------------------------------------------------------------------- */
 
@@ -2357,6 +2500,7 @@ describe("auto_plan_run (warren-a32a)", () => {
 			expect(planRun.planId).toBe("pl-new1");
 			expect(planRun.agentName).toBe("patrol-bot");
 			expect(planRun.trigger).toBe("auto_plan_run");
+			expect(planRun.parentRunId).toBe(ctx.runId);
 			const children = await ctx.repos.planRuns.listChildren(planRun.id);
 			expect(children).toHaveLength(2);
 			expect(children[0]?.seedId).toBe("warren-c1");

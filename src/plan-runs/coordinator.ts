@@ -97,6 +97,7 @@ export type AdvanceResult =
 	| { readonly kind: "dispatched"; readonly childRunId: string }
 	| { readonly kind: "waiting_for_run" }
 	| { readonly kind: "waiting_for_merge" }
+	| { readonly kind: "waiting_for_parent_merge" }
 	| {
 			readonly kind: "advanced";
 			readonly mergedChildSeq: number;
@@ -132,6 +133,19 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 	if (planRun.state === "queued") {
 		const startedAt = nowFn().toISOString();
 		planRun = await input.repos.planRuns.transitionTo(planRun.id, "running", { startedAt });
+	}
+
+	// warren-d9a2: gate on parent run's PR being merged before dispatching
+	// the first child. Auto-plan-runs carry parentRunId — the parent's
+	// branch has the seeds state the children need on main.
+	if (planRun.parentRunId !== null) {
+		const gateResult = await checkParentRunMerged({
+			planRun,
+			repos: input.repos,
+			checkPrMerged: input.checkPrMerged,
+			now: nowFn,
+		});
+		if (gateResult !== null) return gateResult;
 	}
 
 	let mergedChildSeq: number | undefined;
@@ -452,6 +466,54 @@ async function handleInFlight(input: HandleInFlightInput): Promise<HandleInFligh
 	// `missing_token` or transient `http_error` (status 0 or 5xx that
 	// survived pr-merge.ts retries) — keep waiting.
 	return { kind: "result", result: { kind: "waiting_for_merge" } };
+}
+
+/**
+ * Gate auto-plan-runs on the parent run's PR being merged (warren-d9a2).
+ * Returns null when the gate passes (proceed to child dispatch) or an
+ * AdvanceResult when the gate blocks or fails the plan-run.
+ */
+async function checkParentRunMerged(input: {
+	readonly planRun: PlanRunRow;
+	readonly repos: CoordinatorRepos;
+	readonly checkPrMerged: PrMergeChecker;
+	readonly now: () => Date;
+}): Promise<AdvanceResult | null> {
+	const { planRun, repos, checkPrMerged, now } = input;
+	const parentRunId = planRun.parentRunId;
+	if (parentRunId === null) return null;
+
+	const parentRun = await repos.runs.get(parentRunId);
+	if (parentRun === null) {
+		// Parent run row deleted — treat as gate-passed (best-effort).
+		return null;
+	}
+
+	if (parentRun.prUrl === null) {
+		// No PR — check for trivial (empty push) merge.
+		const trivial = await hasEmptyPushEvent(repos, parentRunId);
+		if (trivial) return null;
+		// Parent still running or hasn't pushed yet — wait.
+		if (!isTerminalRun(parentRun)) return { kind: "waiting_for_parent_merge" };
+		// Terminal with no PR and no empty-push → nothing to merge from.
+		// Fail the plan-run so it doesn't hang indefinitely.
+		const reason = "parent_pr_not_merged";
+		const endedAt = now().toISOString();
+		await repos.planRuns.transitionTo(planRun.id, "failed", { endedAt, failureReason: reason });
+		return { kind: "plan_failed", failedSeq: 0, reason };
+	}
+
+	const polled = await checkPrMerged(parentRun.prUrl);
+	if (polled.kind === "merged") return null;
+	if (polled.kind === "open") return { kind: "waiting_for_parent_merge" };
+	if (polled.kind === "closed_unmerged" || isFatalHttpError(polled)) {
+		const reason = "parent_pr_not_merged";
+		const endedAt = now().toISOString();
+		await repos.planRuns.transitionTo(planRun.id, "failed", { endedAt, failureReason: reason });
+		return { kind: "plan_failed", failedSeq: 0, reason };
+	}
+	// Transient error / missing token — keep waiting.
+	return { kind: "waiting_for_parent_merge" };
 }
 
 function isFatalHttpError(result: {

@@ -234,6 +234,7 @@ export type ReapStep =
 	| "workspace_lookup"
 	| "mulch_merge"
 	| "seeds_close"
+	| "plans_mirror"
 	| "seeds_commit"
 	| "plot_merge"
 	| "plot_commit"
@@ -520,6 +521,22 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			await fail("seeds_close", err);
 		}
 
+		// warren-d9a2: mirror plans.jsonl from workspace → project clone,
+		// same shape as mirrorSeeds above. Without this, stageSeedsForCommit
+		// copies the OLD project baseline plans.jsonl into the workspace,
+		// overwriting the agent's newly-created plans.
+		try {
+			await mirrorPlans({
+				burrowClient: workerClient as BurrowClient,
+				burrowId: run.burrowId as string,
+				projectPath: project.localPath,
+				fs,
+				emit,
+			});
+		} catch (err) {
+			await fail("plans_mirror", err);
+		}
+
 		try {
 			const result = await mergePlot(workspacePath, project.localPath, fs, emit, fail);
 			plotEventsAppended = result.eventsAppended;
@@ -563,9 +580,10 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// emit `reap_failed` step=`seeds_commit` and do not fail the run.
 
 		// warren-a32a: snapshot the workspace's plans.jsonl BEFORE
-		// stageSeedsForCommit (which copies project→workspace and may
-		// overwrite the agent's version). The project baseline is read
-		// alongside so the diff can identify agent-created plans.
+		// stageSeedsForCommit (which copies project→workspace). Since
+		// warren-d9a2 added mirrorPlans, the project clone already has
+		// the agent's plans — but the snapshot is still needed to detect
+		// NEW plan IDs for auto_plan_run dispatch.
 		let workspacePlanIds: Set<string> | null = null;
 		let baselinePlanIds: Set<string> | null = null;
 		let workspacePlansBody: string | null = null;
@@ -618,6 +636,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 						children: children.map((seedId, i) => ({ seq: i + 1, seedId })),
 						trigger: "auto_plan_run",
 						ref: project.defaultBranch,
+						parentRunId: run.id,
 						...(run.plotId !== null ? { plotId: run.plotId } : {}),
 					});
 					autoPlanRunCreated = true;
@@ -1398,6 +1417,77 @@ function parseSeeds(body: string): SeedRow[] {
 		}
 	}
 	return out;
+}
+
+/* ----------------------------------------------------------------------- */
+/* Plans mirror (warren-d9a2)                                               */
+/* ----------------------------------------------------------------------- */
+
+/**
+ * Mirror `.seeds/plans.jsonl` from the burrow workspace into the project
+ * clone. Append-only: rows whose `id` is absent from the project baseline
+ * are appended. Existing rows are never overwritten — plans are immutable
+ * once submitted.
+ */
+async function mirrorPlans(input: MirrorClosedSeedsInput): Promise<number> {
+	const { burrowClient, burrowId, projectPath, fs, emit } = input;
+	const projectFile = join(projectPath, ".seeds", "plans.jsonl");
+
+	let burrowBody: string;
+	try {
+		const out = await withTransportMapping(burrowClient.config, () =>
+			burrowClient.http.files.read(burrowId, ".seeds/plans.jsonl"),
+		);
+		burrowBody = out.contents;
+	} catch (err) {
+		if (err instanceof NotFoundError) return 0;
+		throw err;
+	}
+
+	const projectBody = (await fs.readFile(projectFile)) ?? "";
+	const projectIds = new Set<string>();
+	const projectRows: { id: string; raw: string }[] = [];
+	for (const line of splitLines(projectBody)) {
+		try {
+			const parsed: unknown = JSON.parse(line);
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+			const id = (parsed as Record<string, unknown>).id;
+			if (typeof id === "string" && id.length > 0) {
+				projectIds.add(id);
+				projectRows.push({ id, raw: line });
+			}
+		} catch {
+			// preserve unparseable lines
+			projectRows.push({ id: "", raw: line });
+		}
+	}
+
+	let added = 0;
+	for (const line of splitLines(burrowBody)) {
+		try {
+			const parsed: unknown = JSON.parse(line);
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+			const id = (parsed as Record<string, unknown>).id;
+			if (typeof id !== "string" || id.length === 0) continue;
+			if (projectIds.has(id)) continue;
+			projectRows.push({ id, raw: line });
+			projectIds.add(id);
+			added += 1;
+			await emit("seeds.plan_mirrored", { id });
+		} catch {
+			// skip unparseable lines
+		}
+	}
+
+	if (added > 0) {
+		await fs.mkdirp(dirname(projectFile));
+		await fs.writeFile(
+			projectFile,
+			projectRows.length === 0 ? "" : `${projectRows.map((r) => r.raw).join("\n")}\n`,
+		);
+	}
+
+	return added;
 }
 
 /* ----------------------------------------------------------------------- */

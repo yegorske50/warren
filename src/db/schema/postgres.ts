@@ -207,6 +207,9 @@ export const planRuns = pgTable(
 		// Mirror of sqlite plan_runs.plot_id (warren-06dc / pl-7937 Phase 2).
 		// See sqlite.ts for shape + gating intent.
 		plotId: text("plot_id"),
+		// Mirror of sqlite plan_runs.parent_run_id (warren-d9a2). See
+		// sqlite.ts for shape + gating intent.
+		parentRunId: text("parent_run_id"),
 		state: text("state", { enum: PLAN_RUN_STATES }).notNull(),
 		failureReason: text("failure_reason"),
 		createdAt: text("created_at").notNull(),

@@ -70,6 +70,12 @@ export interface CreatePlanRunInput {
 	 * level via `project.hasPlot` — the repo writes whatever it's handed.
 	 */
 	plotId?: string | null;
+	/**
+	 * Back-link to the run that created this plan-run via auto_plan_run
+	 * (warren-d9a2). When set, the coordinator gates on the parent run's
+	 * PR being merged before dispatching the first child.
+	 */
+	parentRunId?: string | null;
 	state?: PlanRunState;
 	children: CreatePlanRunChildInput[];
 	now?: Date;
@@ -151,6 +157,7 @@ export class PlanRunsRepo {
 			dispatcherHandle: input.dispatcherHandle ?? "operator",
 			trigger: input.trigger ?? "manual",
 			plotId: input.plotId ?? null,
+			parentRunId: input.parentRunId ?? null,
 			state: input.state ?? "queued",
 			failureReason: null,
 			createdAt: nowIso,
