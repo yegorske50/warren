@@ -1,4 +1,5 @@
 node_modules/
+.bun/
 dist/
 src/ui/dist/
 src/ui/node_modules/
