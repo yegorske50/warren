@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-27
+
+Major structural refactoring (pl-9088): decomposed eight monolithic files
+totalling ~14 000 lines into well-organized subdirectories, each with
+co-located tests, types, and helpers. No functional changes — the public
+API surface, route table, and all runtime behaviour are identical. The
+codebase is now significantly easier to navigate and extend.
+
+### Changed
+
+- **`refactor(server)`** — Split `src/server/handlers.ts` (4 222 lines)
+  into per-domain modules under `src/server/handlers/`: agents, brainstorm,
+  burrows, diagnostics, meta, plan-runs, plot-plan-runs, plots, projects,
+  runs, and workers. The route table re-exports from `handlers/index.ts`
+  (#170, #171, #172, warren-599c / warren-a2b4).
+
+- **`refactor(server)`** — Split `src/server/main.ts` (700 lines) into
+  `src/server/main/`: dependency wiring (`deps.ts`), middleware logging
+  (`logging.ts`), preview wiring (`preview-wiring.ts`), and utilities
+  (`utils.ts`) (#181).
+
+- **`refactor(runs)`** — Split `src/runs/reap.ts` (2 114 lines) into
+  `src/runs/reap/`: auto-plan-run, mulch, plot-merge, pr-open, preview,
+  run, seeds, stage, state, types, and util — each with co-located tests
+  (#173).
+
+- **`refactor(runs)`** — Split `src/runs/spawn.ts` (880 lines) into
+  `src/runs/spawn/`: agent-cache, dispatch, plot-append, seed-extensions,
+  types, and util (#175).
+
+- **`refactor(runs)`** — Split `src/runs/stream.ts` (911 lines) into
+  `src/runs/stream/`: bridge, recover, run-state-poller, stats,
+  terminal-detect, types (#174).
+
+- **`refactor(preview)`** — Split `src/preview/proxy.ts` (912 lines) into
+  `src/preview/proxy/`: forward, rewrite, route-match, responses, types
+  (#178).
+
+- **`refactor(preview)`** — Split `src/preview/eviction.ts` (819 lines)
+  into `src/preview/eviction/`: config, repo, sidecar, tick, worker, types
+  (#179).
+
+- **`refactor(preview)`** — Split `src/preview/launch.ts` (712 lines) into
+  `src/preview/launch/`: orchestrate, probe, setup, url, helpers, types
+  (#180).
+
+- **`refactor(tests)`** — Decomposed `src/client/client.test.ts`
+  (993 lines) into per-area sibling test files: plan-runs, plots, probe,
+  projects-agents, runs, and stream (#182).
+
+- **`refactor(tests)`** — Split `src/registry/refresh.test.ts` into
+  focused siblings: cache, cross-tier, and project test files (#183).
+
+- **`chore`** — Added `.bun/` to `.gitignore`.
+
 ## [0.6.15] — 2026-05-27
 
 Patch release landing pl-5516: pi `agent_end` envelopes that carry a
