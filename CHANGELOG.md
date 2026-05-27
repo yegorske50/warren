@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11] — 2026-05-27
+
+Patch release fixing pre-commit hooks and adding quality-gate
+enforcement for coding agents in burrow sandboxes.
+
+### Fixed
+
+- **`fix(hooks)`** — `prepare` script now sets `core.hooksPath` to the
+  tracked `scripts/hooks/` directory instead of copying files to
+  `.git/hooks/`. Hooks stay in sync with source and fire on any
+  checkout without requiring `bun install` first (warren-5797).
+
+### Added
+
+- **`feat(agents)`** — Built-in coding agent prompts (claude-code, pi,
+  sapling) now instruct agents to run the project's quality gates
+  before committing, referencing `$WARREN_QUALITY_GATE` with fallbacks
+  to CLAUDE.md and common commands (warren-5797).
+- **`feat(config)`** — New optional `qualityGate` field on
+  `.warren/config.yaml`. When set, `spawnRun` injects it as
+  `WARREN_QUALITY_GATE` into the burrow sandbox environment so agents
+  can discover the project-specific command (warren-5797).
+
 ## [0.6.10] — 2026-05-26
 
 Patch release hardening the developer experience: unified quality gates,
