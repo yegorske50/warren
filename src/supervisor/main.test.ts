@@ -125,7 +125,7 @@ function makeHarness(
 const cmd = {
 	socketPath: "/tmp/burrow.sock",
 	burrowCmd: ["burrow", "serve", "--socket", "/tmp/burrow.sock"],
-	warrenCmd: ["bun", "run", "src/server/main.ts"],
+	warrenCmd: ["bun", "run", "src/server/main/index.ts"],
 };
 
 describe("runSupervisor", () => {
@@ -362,7 +362,7 @@ describe("resolveCommandFromEnv", () => {
 		const cmd = resolveCommandFromEnv({ env: {} });
 		expect(cmd.socketPath).toBe("/var/run/burrow.sock");
 		expect(cmd.burrowCmd).toEqual(["burrow", "serve", "--socket", "/var/run/burrow.sock"]);
-		expect(cmd.warrenCmd).toEqual(["bun", "run", "src/server/main.ts"]);
+		expect(cmd.warrenCmd).toEqual(["bun", "run", "src/server/main/index.ts"]);
 	});
 
 	test("env overrides flow through to both commands", () => {

@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-27
+
+Hotfix: the v0.7.0 refactoring moved `src/server/main.ts` to
+`src/server/main/index.ts` but left the supervisor's default entry path
+pointing at the old location, causing the Fly machine to crash-loop on
+deploy with `Module not found "src/server/main.ts"`.
+
+### Fixed
+
+- **`fix(supervisor)`** — Updated the default `WARREN_SERVER_ENTRY` in
+  `resolveCommandFromEnv` from `src/server/main.ts` to
+  `src/server/main/index.ts`, matching the PR #181 file move.
+- **`fix(acceptance)`** — Updated the acceptance harness (`inproc.ts`,
+  `12-supervisor-restart-budget.ts`) to use the new server entry path.
+
 ## [0.7.0] — 2026-05-27
 
 Major structural refactoring (pl-9088): decomposed eight monolithic files

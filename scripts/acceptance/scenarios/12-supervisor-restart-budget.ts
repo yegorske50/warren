@@ -286,7 +286,7 @@ function buildSupervisorEnv(opts: SupervisorEnvOpts): Record<string, string> {
 		WARREN_BURROW_SOCKET: opts.socketPath,
 		WARREN_BURROW_BIN: opts.shimPath,
 		WARREN_BURROW_NO_AUTH: "1",
-		WARREN_SERVER_ENTRY: "src/server/main.ts",
+		WARREN_SERVER_ENTRY: "src/server/main/index.ts",
 		WARREN_SUPERVISOR_BUN: "bun",
 		WARREN_DISABLE_UI: "1",
 		WARREN_LOG_LEVEL: opts.parentEnv.WARREN_ACCEPTANCE_LOG_LEVEL ?? "warn",

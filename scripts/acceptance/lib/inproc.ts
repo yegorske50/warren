@@ -1,7 +1,7 @@
 /**
  * In-process boot for the acceptance harness.
  *
- * Boots a real `burrow serve` and a real `bun run src/server/main.ts`
+ * Boots a real `burrow serve` and a real `bun run src/server/main/index.ts`
  * as siblings on a temp dir. No docker, no compose. Used as the default
  * mode for fast/cheap acceptance runs; the `--container` flag flips to
  * compose-based booting (see `compose.ts`).
@@ -40,7 +40,7 @@ export interface InProcBootOptions {
 	readonly bind?: { host: string; port: number };
 	/** Additional env vars to pass through to warren / burrow. */
 	readonly extraEnv?: Record<string, string>;
-	/** Override the warren server entry; default `src/server/main.ts`. */
+	/** Override the warren server entry; default `src/server/main/index.ts`. */
 	readonly serverEntry?: string;
 	/**
 	 * Override the WARREN_DB_URL contract (R-13). When set, the launcher
@@ -169,7 +169,7 @@ export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 	const state: ProcState = {
 		burrow: spawnBurrow(socketPath, env, burrowDir),
 		warren: undefined,
-		warrenStartCmd: () => spawnWarren(opts.serverEntry ?? "src/server/main.ts", env),
+		warrenStartCmd: () => spawnWarren(opts.serverEntry ?? "src/server/main/index.ts", env),
 		warrenStopped: undefined,
 	};
 
@@ -370,7 +370,7 @@ export async function bootInProcMulti(opts: MultiBurrowBootOptions): Promise<Mul
 		await waitForSocket(w.socketPath, SOCKET_WAIT_TIMEOUT_MS);
 	}
 
-	const warren = spawnWarren(opts.serverEntry ?? "src/server/main.ts", warrenEnv);
+	const warren = spawnWarren(opts.serverEntry ?? "src/server/main/index.ts", warrenEnv);
 	await waitForHealthz(warrenUrl, HEALTHZ_WAIT_TIMEOUT_MS);
 
 	let warrenLive: SpawnedProc | undefined = warren;

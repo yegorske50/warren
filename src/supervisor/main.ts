@@ -360,14 +360,14 @@ export const DEFAULT_BURROW_SOCKET = "/var/run/burrow.sock";
  *   WARREN_SUPERVISOR_BUN  bun binary on PATH for spawning warren.
  *                          Default: "bun".
  *   WARREN_SERVER_ENTRY    path to warren's server entry. Default:
- *                          "src/server/main.ts".
+ *                          "src/server/main/index.ts".
  */
 export function resolveCommandFromEnv(opts: ResolveCommandOptions = {}): ResolvedCommand {
 	const env = opts.env ?? process.env;
 	const socketPath = env.WARREN_BURROW_SOCKET ?? DEFAULT_BURROW_SOCKET;
 	const burrowBin = env.WARREN_BURROW_BIN ?? "burrow";
 	const bunBin = env.WARREN_SUPERVISOR_BUN ?? "bun";
-	const serverEntry = env.WARREN_SERVER_ENTRY ?? "src/server/main.ts";
+	const serverEntry = env.WARREN_SERVER_ENTRY ?? "src/server/main/index.ts";
 	const burrowCmd: string[] = [burrowBin, "serve", "--socket", socketPath];
 	if (parseBoolEnv(env.WARREN_BURROW_NO_AUTH)) burrowCmd.push("--no-auth");
 	const extraArgs = parseArgsEnv(env.WARREN_BURROW_ARGS);
