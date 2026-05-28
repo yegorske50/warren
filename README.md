@@ -454,10 +454,6 @@ Found a vulnerability? Please follow the disclosure process in [SECURITY.md](SEC
 
 Warren is part of the [os-eco](https://github.com/jayminwest/os-eco) AI agent tooling ecosystem.
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/jayminwest/os-eco/main/branding/logo.png" alt="os-eco" width="444" />
-</p>
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
