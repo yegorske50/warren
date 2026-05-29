@@ -275,6 +275,26 @@ describe("reapRun", () => {
 		expect(e.calls).toHaveLength(0);
 		expect(await ctx.repos.events.countByRun(ctx.runId)).toBe(0);
 	});
+	test("destroys the burrow workspace and removes the burrows row after reap (warren-0d89)", async () => {
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			burrowClientPool: await makePool(fakeBurrowClient(makeBurrow()), ctx.repos),
+			fs: fakeFs().fs,
+			exec: fakeExec().exec,
+		});
+
+		expect(result.workspaceDestroyed).toBe(true);
+		expect(await ctx.repos.burrows.get("bur_aaaaaaaaaaaa")).toBeNull();
+		const events = await ctx.repos.events.listByRun(ctx.runId);
+		const destroyed = events.find((ev) => ev.kind === "reap.workspace_destroyed");
+		expect(destroyed?.payloadJson).toMatchObject({ burrowId: "bur_aaaaaaaaaaaa" });
+		// Emitted after the terminal transition, so reap.completed precedes it.
+		const order = events.map((ev) => ev.kind);
+		expect(order.indexOf("reap.completed")).toBeLessThan(order.indexOf("reap.workspace_destroyed"));
+	});
+
 	test("publishes reap-emitted events to the broker for live tailers", async () => {
 		const f = fakeFs({
 			"/data/burrow/ws/.mulch/expertise/build.jsonl":

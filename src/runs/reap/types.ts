@@ -140,7 +140,8 @@ export type ReapStep =
 	| "branch_push"
 	| "pr_open"
 	| "preview_launch"
-	| "pr_annotate_preview";
+	| "pr_annotate_preview"
+	| "workspace_destroy";
 
 export interface ReapRunResult {
 	readonly state: RunTerminalState;
@@ -262,6 +263,17 @@ export interface ReapRunResult {
 	readonly autoPlanRunCreated: boolean;
 	readonly autoPlanRunId: string | null;
 	readonly autoPlanRunPlanId: string | null;
+	/**
+	 * True when reap destroyed the burrow workspace as its final sub-step
+	 * (warren-0d89) — the `DELETE /burrows/:id` call succeeded and the
+	 * burrows row was removed. False when the destroy was skipped (no
+	 * burrow, unresolved worker, interactive run, or a still-live preview)
+	 * or when the destroy attempt failed (surfaced as a `reap_failed`
+	 * step=`workspace_destroy` event). Per-reap cleanup that keeps the
+	 * persistent volume from filling with stale workspaces; a fallback GC
+	 * still covers crash-stranded burrows.
+	 */
+	readonly workspaceDestroyed: boolean;
 	readonly errors: readonly ReapStepError[];
 	/** True when the row was already terminal on entry — sub-steps were skipped. */
 	readonly alreadyTerminal: boolean;

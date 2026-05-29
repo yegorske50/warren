@@ -8,6 +8,7 @@ import type { RunTerminalState } from "../db/schema.ts";
 import { cancelRun } from "./cancel.ts";
 import { RunEventBroker } from "./events.ts";
 import type { ReapRunResult } from "./reap/index.ts";
+import { makeReapRunResult } from "./reap/test-helpers.ts";
 
 /**
  * One-worker pool wired to a stub burrow client (warren-c0c9). Upserts a
@@ -25,31 +26,7 @@ async function makePool(
 }
 
 function reapStub(outcome: RunTerminalState): ReapRunResult {
-	return {
-		state: outcome,
-		failureReason: null,
-		mulchUpdated: 0,
-		mulchSkipped: 0,
-		mulchAppended: 0,
-		seedsClosed: 0,
-		seedsCreated: 0,
-		plotEventsAppended: 0,
-		plotsUpdated: 0,
-		plotEventsMirrored: 0,
-		plotCommitted: false,
-		seedsCommitted: false,
-		branchPushed: false,
-		commitsAhead: null,
-		prUrl: null,
-		previewState: null,
-		previewPort: null,
-		previewUrl: null,
-		autoPlanRunCreated: false,
-		autoPlanRunId: null,
-		autoPlanRunPlanId: null,
-		errors: [],
-		alreadyTerminal: false,
-	};
+	return makeReapRunResult({ state: outcome });
 }
 
 function stub(

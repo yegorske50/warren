@@ -1,9 +1,47 @@
 import { execFile } from "node:child_process";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
-import type { ReapExec, ReapFs } from "./types.ts";
+import type { RunRow, RunTerminalState } from "../../db/schema.ts";
+import type { ReapExec, ReapFs, ReapRunResult } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * The no-op `ReapRunResult` returned when `reapRun` is invoked against a
+ * row that is already terminal (idempotent re-reap). Preserves the
+ * already-persisted preview lifecycle (`live`/`failed`) and PR url; every
+ * sub-step counter reports zero because no work was done.
+ */
+export function buildAlreadyTerminalResult(run: RunRow): ReapRunResult {
+	const idempotentPreviewState =
+		run.previewState === "live" || run.previewState === "failed" ? run.previewState : null;
+	return {
+		state: run.state as RunTerminalState,
+		failureReason: run.failureReason,
+		mulchUpdated: 0,
+		mulchSkipped: 0,
+		mulchAppended: 0,
+		seedsClosed: 0,
+		seedsCreated: 0,
+		plotEventsAppended: 0,
+		plotsUpdated: 0,
+		plotEventsMirrored: 0,
+		plotCommitted: false,
+		seedsCommitted: false,
+		branchPushed: false,
+		commitsAhead: null,
+		prUrl: run.prUrl,
+		previewState: idempotentPreviewState,
+		previewPort: run.previewPort,
+		previewUrl: null,
+		autoPlanRunCreated: false,
+		autoPlanRunId: null,
+		autoPlanRunPlanId: null,
+		workspaceDestroyed: false,
+		errors: [],
+		alreadyTerminal: true,
+	};
+}
 
 export function splitLines(body: string): string[] {
 	const out: string[] = [];

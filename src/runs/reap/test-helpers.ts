@@ -2,9 +2,47 @@ import { type Burrow, NotFoundError } from "@os-eco/burrow-cli";
 import { BurrowClient, BurrowClientPool } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import type { RunTerminalState } from "../../db/schema.ts";
 import { RunEventBroker } from "../events.ts";
 import type { OpenPullRequestInput, OpenPullRequestResult } from "../pr.ts";
-import type { ReapExec, ReapFs } from "./types.ts";
+import type { ReapExec, ReapFs, ReapRunResult } from "./types.ts";
+
+/**
+ * Build a `ReapRunResult` for tests that stub the reap step (bridges,
+ * cancel). Every counter defaults to a no-op; pass `overrides` to set the
+ * terminal `state` or any field under assertion. Keeping the full shape in
+ * one place means a new `ReapRunResult` field only updates here, not in
+ * every stubbed caller.
+ */
+export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapRunResult {
+	return {
+		state: "succeeded" as RunTerminalState,
+		failureReason: null,
+		mulchUpdated: 0,
+		mulchSkipped: 0,
+		mulchAppended: 0,
+		seedsClosed: 0,
+		seedsCreated: 0,
+		plotEventsAppended: 0,
+		plotsUpdated: 0,
+		plotEventsMirrored: 0,
+		plotCommitted: false,
+		seedsCommitted: false,
+		branchPushed: false,
+		commitsAhead: null,
+		prUrl: null,
+		previewState: null,
+		previewPort: null,
+		previewUrl: null,
+		autoPlanRunCreated: false,
+		autoPlanRunId: null,
+		autoPlanRunPlanId: null,
+		workspaceDestroyed: false,
+		errors: [],
+		alreadyTerminal: false,
+		...overrides,
+	};
+}
 
 /**
  * One-worker pool wired to a stub burrow client (warren-c0c9). Upserts a

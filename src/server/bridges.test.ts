@@ -9,6 +9,7 @@ import {
 	type ReapRunResult,
 	RunEventBroker,
 } from "../runs/index.ts";
+import { makeReapRunResult } from "../runs/reap/test-helpers.ts";
 import { bootBridges, createBridgeRegistry } from "./bridges.ts";
 
 /**
@@ -29,31 +30,7 @@ async function makePool(
 }
 
 function reapStub(outcome: RunTerminalState): ReapRunResult {
-	return {
-		state: outcome,
-		failureReason: null,
-		mulchUpdated: 0,
-		mulchSkipped: 0,
-		mulchAppended: 0,
-		seedsClosed: 0,
-		seedsCreated: 0,
-		plotEventsAppended: 0,
-		plotsUpdated: 0,
-		plotEventsMirrored: 0,
-		plotCommitted: false,
-		seedsCommitted: false,
-		branchPushed: false,
-		commitsAhead: null,
-		prUrl: null,
-		previewState: null,
-		previewPort: null,
-		previewUrl: null,
-		autoPlanRunCreated: false,
-		autoPlanRunId: null,
-		autoPlanRunPlanId: null,
-		errors: [],
-		alreadyTerminal: false,
-	};
+	return makeReapRunResult({ state: outcome });
 }
 
 function stub(

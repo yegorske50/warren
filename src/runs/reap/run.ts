@@ -1,9 +1,10 @@
 import { join } from "node:path";
 import type { BurrowClient } from "../../burrow-client/client.ts";
 import { withTransportMapping } from "../../burrow-client/client.ts";
-import type { EventRow, RunFailureReason, RunTerminalState } from "../../db/schema.ts";
+import type { EventRow, RunFailureReason } from "../../db/schema.ts";
 import { openPullRequest } from "../pr.ts";
 import { dispatchAutoPlanRuns, hasAutoPlanRunFrontmatter, parsePlanIds } from "./auto-plan-run.ts";
+import { runWorkspaceDestroy } from "./destroy.ts";
 import { mergeMulch } from "./mulch.ts";
 import { mergePlot } from "./plot-merge.ts";
 import { runPrOpen } from "./pr-open.ts";
@@ -12,7 +13,7 @@ import { mirrorPlans, mirrorSeeds } from "./seeds.ts";
 import { stagePlotForCommit, stageSeedsForCommit } from "./stage.ts";
 import { inferFailureReason, isTerminal, transitionToTerminal } from "./state.ts";
 import type { ReapRunInput, ReapRunResult, ReapStep, ReapStepError } from "./types.ts";
-import { createSeqAllocator, defaultExec, defaultFs } from "./util.ts";
+import { buildAlreadyTerminalResult, createSeqAllocator, defaultExec, defaultFs } from "./util.ts";
 
 export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	const fs = input.fs ?? defaultFs;
@@ -25,33 +26,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			{ runId: run.id, state: run.state },
 			"reap skipped: run already in terminal state",
 		);
-		const idempotentPreviewState =
-			run.previewState === "live" || run.previewState === "failed" ? run.previewState : null;
-		return {
-			state: run.state as RunTerminalState,
-			failureReason: run.failureReason,
-			mulchUpdated: 0,
-			mulchSkipped: 0,
-			mulchAppended: 0,
-			seedsClosed: 0,
-			seedsCreated: 0,
-			plotEventsAppended: 0,
-			plotsUpdated: 0,
-			plotEventsMirrored: 0,
-			plotCommitted: false,
-			seedsCommitted: false,
-			branchPushed: false,
-			commitsAhead: null,
-			prUrl: run.prUrl,
-			previewState: idempotentPreviewState,
-			previewPort: run.previewPort,
-			previewUrl: null,
-			autoPlanRunCreated: false,
-			autoPlanRunId: null,
-			autoPlanRunPlanId: null,
-			errors: [],
-			alreadyTerminal: true,
-		};
+		return buildAlreadyTerminalResult(run);
 	}
 
 	// State on entry is the discriminator: still `queued` means the bridge
@@ -431,6 +406,20 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		errors,
 	});
 
+	// Final sub-step (warren-0d89): destroy the burrow workspace now that
+	// every result has been extracted and the branch pushed. Best-effort —
+	// skipped for interactive runs and still-live previews, and a failure
+	// surfaces as `reap_failed` step=`workspace_destroy` without blocking
+	// the terminal-state transition above.
+	const workspaceDestroyed = await runWorkspaceDestroy({
+		run,
+		previewLaunchState,
+		workerClient,
+		repos: input.repos,
+		emit,
+		fail: (step, err) => fail(step, err),
+	});
+
 	if (input.broker !== undefined) input.broker.close(run.id);
 
 	input.logger?.info?.(
@@ -456,6 +445,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			previewUrl,
 			autoPlanRunCreated,
 			autoPlanRunId,
+			workspaceDestroyed,
 			errored: errors.length > 0,
 		},
 		"reap completed",
@@ -483,6 +473,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		autoPlanRunCreated,
 		autoPlanRunId,
 		autoPlanRunPlanId,
+		workspaceDestroyed,
 		errors,
 		alreadyTerminal: false,
 	};
