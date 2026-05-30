@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-05-29
+
+Plan-run robustness: make a plan that references a child seed which
+doesn't resolve fail fast instead of wedging, on both the coordinator
+and auto-dispatch paths.
+
+### Fixed
+
+- **`plan-runs`** — the coordinator now fails terminally when a child
+  seed can't be resolved. A definitive `sd show`/`sd plan show` "not
+  found" exit raises a new `SeedNotFoundError` (subclass of
+  `SeedsCliError`, code `seed_not_found`), which the coordinator treats
+  as terminal: it fails the child + plan-run and emits `plan_run.failed`
+  instead of spinning on `plan_run.noop` forever. Transient `sd`
+  failures (timeout, lock) stay a retryable noop so a hung seed store
+  can't kill healthy runs (warren-0fed).
+- **`runs(reap)`** — the `auto_plan_run` reap sub-step now validates a
+  new plan's child seeds before dispatching, mirroring the manual
+  `POST /plan-runs` handler. A plan referencing a seed that doesn't
+  exist on the default branch (or whose children are all closed) is
+  skipped with an `auto_plan_run_skipped` event
+  (`missing_child_seeds` / `all_children_closed`) instead of wedging the
+  coordinator on the first unresolvable child. The `seedsCli` seam is
+  threaded through reap, the CLI `run` command, and the server bridges;
+  omitting it (unit tests) leaves behavior unchanged (warren-41d5).
+
 ## [0.7.5] — 2026-05-29
 
 Medium/low backlog batch (pl-df2f / warren-4b01): CI/release hardening,
