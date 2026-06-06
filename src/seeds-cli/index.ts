@@ -11,7 +11,7 @@
  *     (R-01 producer side, pl-bb70 step 2)
  */
 
-export { SeedsCliError } from "./errors.ts";
+export { SeedNotFoundError, SeedsCliError } from "./errors.ts";
 export {
 	clearScheduledFor,
 	listScheduledSeeds,

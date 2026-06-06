@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { SpawnFn, SpawnResult } from "../projects/clone.ts";
-import { SeedsCliError } from "./errors.ts";
+import { SeedNotFoundError, SeedsCliError } from "./errors.ts";
 import { showPlan, showSeed } from "./show.ts";
 
 function ok(stdout: string): SpawnResult {
@@ -91,6 +91,13 @@ describe("showPlan", () => {
 		expect(caught).toBeInstanceOf(SeedsCliError);
 		expect((caught as SeedsCliError).recoveryHint).toBe(
 			"run `sd plan show pl-x` in /p to diagnose",
+		);
+	});
+
+	test("throws SeedNotFoundError when sd reports the plan is not found", async () => {
+		const spawn: SpawnFn = async () => fail("Plan not found");
+		await expect(showPlan({ spawn, sdBinary: "sd" }, "/p", "pl-x")).rejects.toBeInstanceOf(
+			SeedNotFoundError,
 		);
 	});
 
@@ -191,6 +198,25 @@ describe("showSeed", () => {
 		}
 		expect(caught).toBeInstanceOf(SeedsCliError);
 		expect((caught as SeedsCliError).recoveryHint).toBe("run `sd show warren-z` in /p to diagnose");
+	});
+
+	test("throws SeedNotFoundError on the real `Issue not found` message (warren-0fed)", async () => {
+		const spawn: SpawnFn = async () => fail("Issue not found");
+		await expect(showSeed({ spawn, sdBinary: "sd" }, "/p", "warren-z")).rejects.toBeInstanceOf(
+			SeedNotFoundError,
+		);
+	});
+
+	test("a transient non-zero exit stays a plain SeedsCliError, not SeedNotFoundError", async () => {
+		const spawn: SpawnFn = async () => fail("database is locked");
+		let caught: unknown;
+		try {
+			await showSeed({ spawn, sdBinary: "sd" }, "/p", "warren-z");
+		} catch (err) {
+			caught = err;
+		}
+		expect(caught).toBeInstanceOf(SeedsCliError);
+		expect(caught).not.toBeInstanceOf(SeedNotFoundError);
 	});
 
 	test("throws SeedsCliError on non-JSON stdout", async () => {

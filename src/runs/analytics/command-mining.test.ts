@@ -51,6 +51,16 @@ describe("generalizeCommand", () => {
 		expect(generalizeCommand("bun run test src/x.test.ts")).toBe("bun test");
 	});
 
+	test("keeps bun subcommands distinct from run scripts", () => {
+		expect(generalizeCommand("bun install")).toBe("bun install");
+		expect(generalizeCommand("bun i")).toBe("bun i");
+		expect(generalizeCommand("bun add lodash")).toBe("bun add");
+		expect(generalizeCommand("bun remove lodash")).toBe("bun remove");
+		expect(generalizeCommand("bun x prettier")).toBe("bun x");
+		expect(generalizeCommand("bun pm ls")).toBe("bun pm");
+		expect(generalizeCommand("bun build ./index.ts")).toBe("bun build");
+	});
+
 	test("uses the trailing &&-joined segment", () => {
 		expect(generalizeCommand("cd /workspace && bun test")).toBe("bun test");
 		expect(generalizeCommand("cd a && cd b && git status")).toBe("git status");
@@ -94,6 +104,21 @@ describe("categorize", () => {
 		expect(categorize("grep")).toBe("filesystem");
 		expect(categorize("curl")).toBe("network");
 		expect(categorize("python")).toBe("other");
+	});
+
+	test("uses token-precise matching so script names are not misclassified", () => {
+		expect(categorize(generalizeCommand("bun run latest") ?? "")).toBe("other");
+		expect(categorize(generalizeCommand("bun run rebuild") ?? "")).toBe("other");
+	});
+
+	test("buckets colon-namespaced scripts by their matching segment", () => {
+		expect(categorize(generalizeCommand("bun run test:unit") ?? "")).toBe("test");
+		expect(categorize(generalizeCommand("bun run build:ui") ?? "")).toBe("build");
+		// Direct (already-generalized) colon scripts also bucket by segment.
+		expect(categorize("bun run lint:test")).toBe("test");
+		// Non-matching colon scripts still fall through to `other`.
+		expect(categorize(generalizeCommand("bun run latest:tag") ?? "")).toBe("other");
+		expect(categorize(generalizeCommand("bun run prebuild:assets") ?? "")).toBe("other");
 	});
 });
 

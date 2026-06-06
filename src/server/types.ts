@@ -22,6 +22,7 @@ import type { RunEventBroker } from "../runs/events.ts";
 import type { AutoOpenPrConfig } from "../runs/pr.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
 import type { PreviewMode, WarrenConfigCache } from "../warren-config/index.ts";
+import type { IdempotencyStore } from "./idempotency.ts";
 
 /**
  * Error envelope rendered for every non-2xx response. Mirrors burrow's
@@ -411,6 +412,15 @@ export interface ServerDeps {
 	 * "seeds CLI not configured" error `POST /plan-runs` uses.
 	 */
 	readonly planSynthesizer?: PlanSynthesizer;
+	/**
+	 * `POST /runs` idempotency window (warren-d525). When wired, a dispatch
+	 * carrying an `Idempotency-Key` header is deduped per `(projectId, key)`
+	 * so a duplicate delivery replays the original 201 instead of spawning
+	 * a second run. `bootServer` always wires a default; tests may omit (a
+	 * dispatch without the header is unaffected either way, and one with
+	 * the header simply isn't deduped). See `src/server/idempotency.ts`.
+	 */
+	readonly idempotencyStore?: IdempotencyStore;
 }
 
 /**

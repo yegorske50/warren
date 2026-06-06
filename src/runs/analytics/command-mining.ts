@@ -187,9 +187,29 @@ export function generalizeCommand(raw: string): string | null {
 	return sub === undefined ? base : `${base} ${sub}`;
 }
 
-/** `bun` / `bun run` normalize to the same `bun run <script>` family. */
+/**
+ * Bun's own subcommands, which must not be collapsed into the
+ * `bun run <script>` family — `bun install` is package management, not a
+ * user script named `install`. `run` and `test` are handled separately.
+ */
+const BUN_SUBCOMMANDS = new Set(
+	"install i add a remove rm update outdated link unlink pm x create init build upgrade publish patch audit why exec repl".split(
+		" ",
+	),
+);
+
+/**
+ * `bun` / `bun run` normalize to the same `bun run <script>` family, but bun's
+ * own subcommands (`bun install`, `bun add`, …) keep their `bun <sub>` shape
+ * rather than masquerading as a run script.
+ */
 function generalizeBun(rest: readonly string[]): string {
-	const args = rest[0] === "run" ? rest.slice(1) : rest;
+	const first = rest[0];
+	if (first === undefined) return "bun";
+	if (first !== "run" && first !== "test" && BUN_SUBCOMMANDS.has(first)) {
+		return `bun ${first}`;
+	}
+	const args = first === "run" ? rest.slice(1) : rest;
 	const script = args[0];
 	if (script === undefined) return "bun";
 	if (script === "test") return "bun test";
@@ -202,15 +222,24 @@ export function isOsEcoCommand(generalized: string): boolean {
 	return generalized.startsWith("bun run check:");
 }
 
+// True when any token's `:`-delimited segments exactly match `segment`, so
+// `test:unit`/`lint:test` match `test` while `latest` does not (warren-1f19).
+function hasSegment(parts: readonly string[], segment: string): boolean {
+	return parts.some((part) => part.split(":").includes(segment));
+}
+
 export function categorize(generalized: string): CommandCategory {
 	if (isOsEcoCommand(generalized)) return "os-eco";
 	const parts = generalized.split(" ");
 	const bin = parts[0] ?? "";
 	if (bin === "git") return "vcs";
 	if (PKG_MANAGERS.has(bin)) {
-		if (generalized.includes("test")) return "test";
+		// Token- and segment-precise matching: `latest`/`rebuild` must not match
+		// `test`/`build` (warren-d4d5), while colon-namespaced scripts like
+		// `test:unit`/`build:ui` bucket by their matching segment (warren-1f19).
+		if (hasSegment(parts, "test")) return "test";
 		if (PKG_SUBS.has(parts[1] ?? "")) return "package";
-		if (generalized.includes("build")) return "build";
+		if (hasSegment(parts, "build")) return "build";
 		return "other";
 	}
 	if (["tsc", "vite", "make", "cargo", "tsup", "esbuild", "webpack"].includes(bin)) return "build";
