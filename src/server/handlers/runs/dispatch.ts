@@ -9,6 +9,7 @@ import {
 	spawnInteractiveTurn,
 	spawnRun,
 } from "../../../runs/index.ts";
+import type { IdempotentDispatch } from "../../idempotency.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
 import {
@@ -235,23 +236,41 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 			seedsCli: deps.seedsCli,
 		};
 
-		const result = await spawnRun(options);
+		// warren-d525: the real dispatch — spawn, (interactive) record the
+		// user turn, and attach the bridge. Wrapped so the idempotency store
+		// can run it at most once per (projectId, key), keeping every side
+		// effect (spawn + bridge start + user-message append) deduped.
+		const dispatch = async (): Promise<IdempotentDispatch> => {
+			const result = await spawnRun(options);
 
-		if (mode === "interactive") {
-			await appendUserMessage({
-				repos: deps.repos,
-				runId: result.run.id,
-				message: prompt,
-				handle: resolveDispatcherHandle(dispatcherHandle),
-				...(deps.now !== undefined ? { now: deps.now() } : {}),
-			});
-		}
+			if (mode === "interactive") {
+				await appendUserMessage({
+					repos: deps.repos,
+					runId: result.run.id,
+					message: prompt,
+					handle: resolveDispatcherHandle(dispatcherHandle),
+					...(deps.now !== undefined ? { now: deps.now() } : {}),
+				});
+			}
 
-		deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
-		return jsonResponse(201, {
-			run: result.run,
-			burrow: { id: result.burrow.id, workspacePath: result.burrow.workspacePath },
-		});
+			deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+			return {
+				run: result.run,
+				burrow: { id: result.burrow.id, workspacePath: result.burrow.workspacePath },
+			};
+		};
+
+		// `Idempotency-Key` present + a store wired → dedupe duplicate
+		// deliveries of one logical dispatch (proxy/LB replay, scheduler
+		// double-fire, client re-retry). Absent header preserves the
+		// always-spawn behavior for backward compat.
+		const idempotencyKey = ctx.request.headers.get("Idempotency-Key") ?? "";
+		const dispatched =
+			idempotencyKey !== "" && deps.idempotencyStore !== undefined
+				? await deps.idempotencyStore.run(projectId, idempotencyKey, dispatch)
+				: await dispatch();
+
+		return jsonResponse(201, dispatched);
 	};
 }
 

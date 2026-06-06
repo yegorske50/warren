@@ -7,6 +7,130 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11] — 2026-06-04
+
+Nightwatch patrol (pl-cbb5): comment-only sweep fixing two pockets of
+documentation drift left behind by the `src/server/handlers.ts` →
+`src/server/handlers/` split and the `WarrenTriggerKind` enum work.
+
+### Documentation
+
+- **stale `handlers.ts` test references** — repointed two test-comment
+  references at their verified current homes:
+  `src/runs/spawn/seed-extensions.test.ts` now names
+  `src/server/handlers/projects.ts` (the `"manual-trigger"` writer) and
+  `src/preview/proxy/route-match.test.ts` now names
+  `src/server/handlers/index.ts` (warren-5106).
+- **`manual-trigger` writer attribution** — corrected the doc comment in
+  `src/seeds-cli/warren-extensions.ts` to attribute `"manual-trigger"` to
+  the cron-trigger manual-run handler in `src/server/handlers/projects.ts`
+  and clarify that Run Now (POST /runs) defaults to `"manual"`
+  (warren-fc50).
+
+## [0.7.10] — 2026-06-03
+
+Dedupe duplicate `POST /runs` deliveries so a single logical dispatch
+spawns at most one run.
+
+### Fixed
+
+- **`POST /runs` idempotency** — duplicate deliveries of one logical
+  dispatch (proxy/LB replay, scheduler double-fire, client re-retry of a
+  timed-out POST) no longer spawn a second run, which would silently
+  ~2x agent spend with a fresh burrow + agent. When an `Idempotency-Key`
+  header is present and a store is wired, the spawn routes through an
+  in-memory idempotency window keyed on `(projectId, key)`: the first
+  request runs the real dispatch and caches its 201 body; duplicates
+  within the TTL replay that body. Concurrent duplicates await the same
+  in-flight dispatch promise rather than racing it, and a failed dispatch
+  evicts the entry so the next retry can re-spawn. Requests with no
+  `Idempotency-Key` preserve the prior always-spawn behavior
+  (warren-d525).
+
+## [0.7.9] — 2026-06-03
+
+Nightwatch patrol (pl-d6cd): comment-only sweep repointing stale
+`src/server/handlers.ts` doc references at their real homes after the
+monolithic handler file was split into `src/server/handlers/` and
+`src/server/main/`.
+
+### Documentation
+
+- **`src/server` cross-references** — retargeted ~13 stale doc comments
+  that pointed at the long-removed monolithic `src/server/handlers.ts`
+  (including a dead `:1453` line number) to the symbols' actual current
+  modules under `src/server/handlers/` and `src/server/main/`. Covers
+  the server + runtime modules (warren-79f3), the CLI + seeds-cli
+  modules (warren-6e71), and the UI api modules (warren-a97e). No
+  behavior or signature changes.
+
+## [0.7.8] — 2026-06-02
+
+Nightwatch patrol (pl-f6e3): two small, independent fixes to the
+run-analytics command-mining and insights-docs paths.
+
+### Fixed
+
+- **`runs/analytics(command-mining)`** — `categorize()` now matches
+  package-manager `test`/`build` categories on a token's `:`-delimited
+  segments, so colon-namespaced scripts like `test:unit` and `build:ui`
+  bucket correctly while names like `latest`/`rebuild` still do not
+  (warren-1f19).
+
+### Documentation
+
+- **`runs/analytics(insights)`** — corrected the `buildInsights` /
+  `SteeringSignals` docs that advertised `steering-anomaly` /
+  `pause-anomaly` callouts as live. They are latent: no production
+  caller (notably `GET /analytics/behavior`) passes a `SteeringSignals`
+  bundle, so those kinds never fire today (warren-2e86).
+
+## [0.7.7] — 2026-06-01
+
+Nightwatch patrol (pl-c046): three small, independent fixes to the
+run-analytics command-mining and insights paths.
+
+### Fixed
+
+- **`runs/analytics(command-mining)`** — `generalizeBun` no longer
+  collapses every `bun <x>` form into `bun run <x>`, so `bun install`
+  stops surfacing as a phantom `bun run install` script. Bun's own
+  subcommands (`install`, `add`, `x`, `pm`, …) are recognized and
+  emitted as `bun <sub>`, leaving the run-script family untouched
+  (warren-235e).
+- **`runs/analytics(command-mining)`** — `categorize()` now uses
+  token-precise matching for package-manager test/build categories so
+  script names like `latest` and `rebuild` are no longer misclassified
+  as `test` via substring matching (warren-d4d5).
+- **`runs/analytics(insights)`** — the worst-success-agent denominator
+  is now aligned with the success rate it reports (warren-4cfa).
+
+## [0.7.6] — 2026-05-29
+
+Plan-run robustness: make a plan that references a child seed which
+doesn't resolve fail fast instead of wedging, on both the coordinator
+and auto-dispatch paths.
+
+### Fixed
+
+- **`plan-runs`** — the coordinator now fails terminally when a child
+  seed can't be resolved. A definitive `sd show`/`sd plan show` "not
+  found" exit raises a new `SeedNotFoundError` (subclass of
+  `SeedsCliError`, code `seed_not_found`), which the coordinator treats
+  as terminal: it fails the child + plan-run and emits `plan_run.failed`
+  instead of spinning on `plan_run.noop` forever. Transient `sd`
+  failures (timeout, lock) stay a retryable noop so a hung seed store
+  can't kill healthy runs (warren-0fed).
+- **`runs(reap)`** — the `auto_plan_run` reap sub-step now validates a
+  new plan's child seeds before dispatching, mirroring the manual
+  `POST /plan-runs` handler. A plan referencing a seed that doesn't
+  exist on the default branch (or whose children are all closed) is
+  skipped with an `auto_plan_run_skipped` event
+  (`missing_child_seeds` / `all_children_closed`) instead of wedging the
+  coordinator on the first unresolvable child. The `seedsCli` seam is
+  threaded through reap, the CLI `run` command, and the server bridges;
+  omitting it (unit tests) leaves behavior unchanged (warren-41d5).
+
 ## [0.7.5] — 2026-05-29
 
 Medium/low backlog batch (pl-df2f / warren-4b01): CI/release hardening,

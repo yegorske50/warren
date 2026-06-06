@@ -31,6 +31,7 @@ import type { ProjectsConfig } from "../../projects/config.ts";
 import type { loadCanopyRegistryConfigFromEnv } from "../../registry/config.ts";
 import type { loadAutoOpenPrConfigFromEnv, RunEventBroker } from "../../runs/index.ts";
 import type { createWarrenConfigCache } from "../../warren-config/index.ts";
+import { IdempotencyStore } from "../idempotency.ts";
 import type { BridgeRegistry, Logger, ServerDeps } from "../types.ts";
 import { defaultSpawn } from "./utils.ts";
 
@@ -142,6 +143,7 @@ export function buildServerDeps(input: BuildServerDepsInput): ServerDeps {
 		planSynthesizer: createDefaultPlanSynthesizer({
 			seedsCli: { sdBinary, spawn: defaultSpawn },
 		}),
+		idempotencyStore: new IdempotencyStore(now !== undefined ? { now: () => now().getTime() } : {}),
 		...(now !== undefined ? { now } : {}),
 	};
 }

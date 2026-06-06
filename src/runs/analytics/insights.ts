@@ -9,8 +9,8 @@
  * (step 10) renders as severity-coded cards above the dense tables.
  *
  * It takes the already-computed {@link RunMetrics} + {@link CommandMining}
- * rollups (plus an optional {@link SteeringSignals} bundle the handler counts
- * while scanning events) and derives at most one {@link Insight} per category:
+ * rollups (plus an optional {@link SteeringSignals} bundle) and derives at most
+ * one {@link Insight} per category:
  *
  *   - `highest-context-seed`: the seed burning the most context tokens
  *   - `worst-success-agent`: the agent with the lowest success rate (only when
@@ -22,6 +22,13 @@
  *     its peers' median
  *   - `steering-anomaly`: a high share of runs needing mid-run human steering
  *   - `pause-anomaly`: runs that stalled until their pause timed out
+ *
+ * NOTE: the `steering-anomaly` / `pause-anomaly` callouts are latent. They
+ * fire only when a caller passes the optional {@link SteeringSignals} bundle,
+ * and no production code currently does so — the `GET /analytics/behavior`
+ * handler calls `buildInsights` without `steering`, so these two kinds never
+ * appear in the live endpoint's response today. The machinery is retained for
+ * a future caller that tallies steering/pause counters while scanning events.
  *
  * Every callout carries a typed `kind`, a `severity`, a numeric `value` (the
  * metric that triggered it) and a `subject` (the seed / agent / command /
@@ -62,8 +69,11 @@ export interface Insight {
 }
 
 /**
- * Steering / pause counters the handler tallies while scanning events. All
+ * Steering / pause counters a caller may tally while scanning events. All
  * optional — when omitted (or zeroed) the steering/pause insights are skipped.
+ * No production caller currently supplies this bundle (the
+ * `GET /analytics/behavior` handler omits it), so the steering/pause insights
+ * are dormant until a future caller wires it up.
  */
 export interface SteeringSignals {
 	readonly totalRuns: number;
@@ -137,11 +147,22 @@ function highestContextSeed(metrics: RunMetrics): Insight | null {
 	};
 }
 
+/**
+ * Terminal-run count consistent with `RunGroupBucket.successRate`, which is
+ * `succeeded / (succeeded + failed + cancelled)`. The bucket does not expose
+ * `cancelled`, so recover the denominator from the reported rate when it is
+ * positive; fall back to `succeeded + failed` only when the rate is 0 (where
+ * `succeeded` is 0 and the rate carries no denominator information).
+ */
+function terminalRuns(g: RunGroupBucket): number {
+	if (g.successRate !== null && g.successRate > 0) return Math.round(g.succeeded / g.successRate);
+	return g.succeeded + g.failed;
+}
+
 function worstSuccessAgent(metrics: RunMetrics): Insight | null {
 	let worst: RunGroupBucket | null = null;
 	for (const g of metrics.byAgent) {
-		const terminal = g.succeeded + g.failed;
-		if (g.successRate === null || terminal < MIN_AGENT_TERMINAL_RUNS) continue;
+		if (g.successRate === null || terminalRuns(g) < MIN_AGENT_TERMINAL_RUNS) continue;
 		if (worst === null || g.successRate < (worst.successRate ?? 1)) worst = g;
 	}
 	if (worst === null || worst.successRate === null) return null;
@@ -150,9 +171,9 @@ function worstSuccessAgent(metrics: RunMetrics): Insight | null {
 		kind: "worst-success-agent",
 		severity: worst.successRate < AGENT_CRITICAL_SUCCESS_RATE ? "critical" : "warning",
 		title: "Worst-performing agent",
-		detail: `Agent "${worst.key}" succeeded in only ${pct(worst.successRate)} of ${
-			worst.succeeded + worst.failed
-		} terminal run(s).`,
+		detail: `Agent "${worst.key}" succeeded in only ${pct(worst.successRate)} of ${terminalRuns(
+			worst,
+		)} terminal run(s).`,
 		value: worst.successRate,
 		subject: worst.key,
 	};

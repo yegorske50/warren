@@ -19,7 +19,7 @@
  * 50–60 of extensions.ts.
  */
 
-import { SeedsCliError } from "./errors.ts";
+import { SeedNotFoundError, SeedsCliError } from "./errors.ts";
 import type { SeedsCliDeps } from "./extensions.ts";
 import {
 	PlanShowEnvelopeSchema,
@@ -43,12 +43,13 @@ export async function showPlan(
 		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
 	});
 	if (result.exitCode !== 0) {
-		throw new SeedsCliError(
-			`sd plan show ${planId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
-			{
-				recoveryHint: `run \`${deps.sdBinary} plan show ${planId}\` in ${projectPath} to diagnose`,
-			},
-		);
+		const detail = truncate(result.stderr || result.stdout);
+		const message = `sd plan show ${planId} exited ${result.exitCode}: ${detail}`;
+		const recoveryHint = `run \`${deps.sdBinary} plan show ${planId}\` in ${projectPath} to diagnose`;
+		if (isNotFoundMessage(detail)) {
+			throw new SeedNotFoundError(message, { recoveryHint });
+		}
+		throw new SeedsCliError(message, { recoveryHint });
 	}
 
 	let parsed: unknown;
@@ -83,12 +84,13 @@ export async function showSeed(
 		timeoutMs: deps.timeoutMs ?? DEFAULT_SD_TIMEOUT_MS,
 	});
 	if (result.exitCode !== 0) {
-		throw new SeedsCliError(
-			`sd show ${seedId} exited ${result.exitCode}: ${truncate(result.stderr || result.stdout)}`,
-			{
-				recoveryHint: `run \`${deps.sdBinary} show ${seedId}\` in ${projectPath} to diagnose`,
-			},
-		);
+		const detail = truncate(result.stderr || result.stdout);
+		const message = `sd show ${seedId} exited ${result.exitCode}: ${detail}`;
+		const recoveryHint = `run \`${deps.sdBinary} show ${seedId}\` in ${projectPath} to diagnose`;
+		if (isNotFoundMessage(detail)) {
+			throw new SeedNotFoundError(message, { recoveryHint });
+		}
+		throw new SeedsCliError(message, { recoveryHint });
 	}
 
 	let parsed: unknown;
@@ -110,6 +112,16 @@ export async function showSeed(
 	}
 
 	return envelope.data.issue;
+}
+
+/**
+ * `sd show` / `sd plan show` exit 1 with a "not found" message when the id
+ * doesn't resolve (e.g. `Issue not found`, `no such issue`). Distinguishing
+ * this from a transient shell-out failure (timeout, lock) lets the plan-run
+ * coordinator fail terminally instead of retrying forever (warren-0fed).
+ */
+function isNotFoundMessage(detail: string): boolean {
+	return /not found|no such/i.test(detail);
 }
 
 function truncate(raw: string, limit = 500): string {

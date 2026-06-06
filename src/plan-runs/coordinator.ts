@@ -40,7 +40,7 @@ import {
 	type PlanRunChildState,
 	type PlanRunRow,
 } from "../db/schema.ts";
-import type { SeedShowResult } from "../seeds-cli/index.ts";
+import { SeedNotFoundError, type SeedShowResult } from "../seeds-cli/index.ts";
 import {
 	checkParentRunMerged,
 	hasEmptyPushEvent,
@@ -229,6 +229,35 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 		try {
 			seedShow = await input.showSeed(planRun.projectId, next.seedId);
 		} catch (err) {
+			// warren-0fed: a definitive "seed not found" is terminal — the
+			// plan references an id that doesn't resolve (planned-but-never-
+			// created, or only on an unmerged branch), so retrying forever
+			// just spams plan_run.noop. Fail the child + plan-run. Any other
+			// (transient: timeout / lock / malformed) sd failure stays a
+			// retryable noop so a hung seed store can't kill healthy runs.
+			if (err instanceof SeedNotFoundError) {
+				const reason = `child_seed_not_found:${next.seedId}`;
+				const endedAt = nowFn().toISOString();
+				await input.repos.planRuns.updateChild({
+					planRunId: planRun.id,
+					seq: next.seq,
+					patch: { state: "failed", failureReason: reason, endedAt },
+					now: nowFn(),
+				});
+				await input.repos.planRuns.transitionTo(planRun.id, "failed", {
+					endedAt,
+					failureReason: reason,
+				});
+				const anchor = mostRecentDispatchedRunId(children);
+				if (anchor !== null) {
+					await input.emit(anchor, "plan_run.failed", {
+						planRunId: planRun.id,
+						failedSeq: next.seq,
+						reason,
+					});
+				}
+				return { kind: "plan_failed", failedSeq: next.seq, reason };
+			}
 			return {
 				kind: "noop",
 				reason: `show_seed_failed:${formatError(err)}`,
