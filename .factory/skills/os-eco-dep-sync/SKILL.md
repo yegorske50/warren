@@ -11,7 +11,7 @@ inputs:
 outputs:
   - updated package.json + regenerated bun.lock with caret ranges on latest
   - updated Dockerfile global-install pins on latest
-  - a focused commit on a branch and a PR (gates green)
+  - a focused commit on main (gates green)
 ---
 
 # os-eco-dep-sync
@@ -125,17 +125,21 @@ If burrow/plot shipped a breaking change, this is where typecheck or tests
 catch it. Fix forward against the new version or, if the break is real and out
 of scope, stop and report it rather than pinning back silently.
 
-### 6. Commit and open a PR
+### 6. Commit to main
+
+Commit directly to `main` — do **not** create a feature branch or open a PR
+for this sync. Stage only the touched surfaces and write one focused commit:
 
 ```bash
-git switch -c chore/os-eco-dep-sync
-git add package.json bun.lock Dockerfile src/index.ts CHANGELOG.md
+git add package.json bun.lock Dockerfile src/index.ts CHANGELOG.md docs/openapi.yaml
 git commit -m "chore: sync os-eco deps to latest published versions"
-gh pr create --fill                # only if gh is authed and the user wants a PR
 ```
 
-Do not `git push` or open the PR unless the user asked for it — otherwise leave
-the commit local and report the branch name.
+(`docs/openapi.yaml` only changes if the VERSION bump in step 4 re-baselined
+it via `bun run gen:openapi`; include it when it shows in `git status`.)
+
+Do not `git push` unless the user asked for it — leave the commit local and
+report that it's on `main`.
 
 ## Acceptance
 
@@ -145,7 +149,7 @@ the commit local and report the branch name.
   Dockerfile's `burrow-cli`/`plot-cli` pins match the lockfile (double-pin held).
 - `package.json` `"version"` equals `src/index.ts` `VERSION`.
 - `bun run check:all` exits 0.
-- One focused commit on a branch; tree otherwise clean.
+- One focused commit on `main` (no feature branch, no PR); tree otherwise clean.
 
 ## Failure modes
 
