@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.12] — 2026-06-05
+
+Sync the bundled os-eco tools onto their latest published versions.
+
+### Changed
+
+- **os-eco dependency bump** — `@os-eco/burrow-cli` 0.3.6 → 0.3.11
+  (`package.json` + `bun.lock` + the Dockerfile global pin, double-pin
+  held), and the Dockerfile CLI pins for `@os-eco/seeds-cli` 0.5.4 →
+  0.5.9 and `@os-eco/mulch-cli` 0.10.6 → 0.10.7. `plot`, `canopy`, and
+  `sapling` were already on their latest published versions.
+
 ## [0.7.11] — 2026-06-04
 
 Nightwatch patrol (pl-cbb5): comment-only sweep fixing two pockets of
