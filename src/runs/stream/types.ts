@@ -11,8 +11,9 @@
 import type { RunEvent } from "@os-eco/burrow-cli";
 import type { BurrowClientPool } from "../../burrow-client/pool.ts";
 import type { Repos } from "../../db/repos/index.ts";
-import type { RunTerminalState } from "../../db/schema.ts";
+import type { RunMode, RunTerminalState } from "../../db/schema.ts";
 import type { RunEventBroker } from "../events.ts";
+import type { ConversationTurnHandler } from "./conversation-turn.ts";
 
 /**
  * Optional logger interface — pino-compatible subset, but typed loosely
@@ -110,6 +111,21 @@ export interface BridgeRunStreamInput {
 	 */
 	readonly burrowClientPool: BurrowClientPool;
 	readonly signal?: AbortSignal;
+	/**
+	 * Run mode (warren-df71). When `'conversation'`, the bridge treats a pi
+	 * `agent_end` as a TURN boundary rather than a run terminal: it persists
+	 * the turn's usage + assistant text and applies any `propose_intent`
+	 * patch, then KEEPS the run `running` (no break, no inline reap). Omitted
+	 * / any other value behaves exactly as before — non-conversation run
+	 * lifecycles are unchanged.
+	 */
+	readonly mode?: RunMode;
+	/**
+	 * Conversation-turn side-effect seam (warren-df71). Consulted only when
+	 * `mode === 'conversation'` to persist assistant turns and apply
+	 * `propose_intent` patches. Omit for non-conversation runs.
+	 */
+	readonly conversationTurn?: ConversationTurnHandler;
 	/** Override the stream source (tests). Default: `client.http.runs.stream`. */
 	readonly source?: (signal: AbortSignal) => AsyncIterable<RunEvent>;
 	readonly logger?: BridgeLogger;

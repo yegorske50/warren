@@ -114,10 +114,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// `project.defaultBranch`, the correct ref for `rev-list --count`.
 	const baseBranch: string | null = project?.defaultBranch ?? null;
 
-	if (stateOnEntry === "queued" && workspacePath !== null && project !== null) {
-		await emit("reap.never_started_skip", {
-			message: "agent never ran; skipping workspace pipeline",
-		});
+	// warren-df71: a conversation run must NOT push a branch / commit `.plot/`
+	// / open a PR (send-off owns its plotSync PR; this pipeline made junk PRs).
+	if (run.mode === "conversation" && workspacePath !== null) {
+		await emit("reap.branch_push_skipped", { reason: "conversation_run" });
+	} else if (stateOnEntry === "queued" && workspacePath !== null && project !== null) {
+		await emit("reap.never_started_skip", { message: "agent never ran; skipping pipeline" });
 	} else if (stateOnEntry !== "queued" && workspacePath !== null && project !== null) {
 		try {
 			const result = await mergeMulch(workspacePath, project.localPath, fs, emit, fail);
@@ -290,11 +292,9 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			await fail("branch_push", err, workspacePath);
 		}
 
-		// Empty-push observability (warren-f3bb): branchPushed alone can't
-		// tell a real-work push from a no-op against an unchanged HEAD.
-		// Count commits ahead of the project's defaultBranch; surface zero
-		// as `reap.empty_push` and pin the count on `commitsAhead`. rev-list
-		// failures are non-fatal — they degrade to `commitsAhead: null`.
+		// Empty-push observability (warren-f3bb): count commits ahead of
+		// defaultBranch, surface zero as `reap.empty_push`, pin on
+		// `commitsAhead`; rev-list failure degrades to `commitsAhead: null`.
 		if (branchPushed && baseBranch !== null) {
 			try {
 				const out = await exec.run("git", ["rev-list", "--count", `${baseBranch}..HEAD`], {

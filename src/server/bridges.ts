@@ -45,6 +45,7 @@ import { NotFoundError as BurrowNotFoundError } from "@os-eco/burrow-cli";
 import { withTransportMapping } from "../burrow-client/client.ts";
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
+import type { RunMode } from "../db/schema.ts";
 import type { PreviewLaunchConfig } from "../preview/launch/index.ts";
 import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import {
@@ -58,6 +59,10 @@ import {
 	type RunEventBroker,
 	reapRun,
 } from "../runs/index.ts";
+import {
+	type ConversationTurnHandler,
+	createConversationTurnHandler,
+} from "../runs/stream/conversation-turn.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import { defaultSleep, reconcileLostBurrowRun, runWithReconnect } from "./bridge-reconnect.ts";
@@ -153,6 +158,13 @@ export interface CreateBridgeRegistryInput {
 	 * manual `POST /plan-runs` handler. Omit to skip validation (tests).
 	 */
 	readonly seedsCli?: SeedsCliDeps;
+	/**
+	 * Conversation-turn side-effect handler (warren-df71). Defaults to a
+	 * `createConversationTurnHandler` bound to `input.repos`; consulted only
+	 * for `mode:'conversation'` bridges to persist assistant turns and apply
+	 * `propose_intent` patches. Tests inject a stub.
+	 */
+	readonly conversationTurn?: ConversationTurnHandler;
 }
 
 export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRegistry {
@@ -162,8 +174,14 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 	const backoff = input.reconnectBackoffMs ?? DEFAULT_RECONNECT_BACKOFF_MS;
 	const stallThreshold = input.stallThreshold ?? BRIDGE_STALL_THRESHOLD;
 	const sleep = input.sleep ?? defaultSleep;
+	const conversationTurn =
+		input.conversationTurn ??
+		createConversationTurnHandler({
+			repos: input.repos,
+			...(input.logger !== undefined ? { logger: input.logger } : {}),
+		});
 
-	function start(runId: string, burrowRunId: string, burrowId: string): void {
+	function start(runId: string, burrowRunId: string, burrowId: string, mode?: RunMode): void {
 		if (live.has(runId)) return;
 		const abort = new AbortController();
 		const done = runWithReconnect({
@@ -179,6 +197,8 @@ export function createBridgeRegistry(input: CreateBridgeRegistryInput): BridgeRe
 			backoff,
 			stallThreshold,
 			sleep,
+			conversationTurn,
+			...(mode !== undefined ? { mode } : {}),
 			...(input.logger !== undefined ? { logger: input.logger } : {}),
 			...(input.autoOpenPr !== undefined ? { autoOpenPr: input.autoOpenPr } : {}),
 			...(input.warrenConfigs !== undefined ? { warrenConfigs: input.warrenConfigs } : {}),
@@ -354,7 +374,7 @@ export async function bootBridges(input: CreateBridgeRegistryInput): Promise<Boo
 				"bootBridges reconcile probe failed (non-404); starting bridge anyway",
 			);
 		}
-		registry.start(run.id, run.burrowRunId, run.burrowId);
+		registry.start(run.id, run.burrowRunId, run.burrowId, run.mode);
 		resumed.push({ runId: run.id, burrowRunId: run.burrowRunId });
 		input.logger?.info?.(
 			{ runId: run.id, burrowRunId: run.burrowRunId, state: run.state },

@@ -161,7 +161,7 @@ export function createConversationHandler(deps: ServerDeps): RouteHandler {
 			...(deps.now !== undefined ? { now: deps.now() } : {}),
 		});
 
-		deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+		deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id, "conversation");
 
 		return jsonResponse(201, {
 			conversation,
@@ -437,7 +437,12 @@ export function rewakeConversationHandler(deps: ServerDeps): RouteHandler {
 			...(deps.now !== undefined ? { now: deps.now } : {}),
 		});
 
-		deps.bridges.start(result.turn.run.id, result.turn.burrowRun.id, result.turn.burrow.id);
+		deps.bridges.start(
+			result.turn.run.id,
+			result.turn.burrowRun.id,
+			result.turn.burrow.id,
+			"conversation",
+		);
 
 		const conversation = await deps.repos.conversations.require(id);
 

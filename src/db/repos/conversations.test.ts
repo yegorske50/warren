@@ -118,6 +118,18 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			}
 		});
 
+		test("getByAnchoringRunId resolves the conversation that anchors a run (warren-df71)", async () => {
+			const { handle, repo, projectId } = await open();
+			try {
+				const c = await repo.create({ projectId, anchoringRunId: "run_anchor" });
+				const found = await repo.getByAnchoringRunId("run_anchor");
+				expect(found?.id).toBe(c.id);
+				expect(await repo.getByAnchoringRunId("run_missing")).toBeNull();
+			} finally {
+				await handle.close();
+			}
+		});
+
 		test("close is idempotent and one-way", async () => {
 			const { handle, repo, projectId } = await open();
 			try {

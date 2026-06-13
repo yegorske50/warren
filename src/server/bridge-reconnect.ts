@@ -10,7 +10,7 @@
 
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { Repos } from "../db/repos/index.ts";
-import type { EventRow, RunState } from "../db/schema.ts";
+import type { EventRow, RunMode, RunState } from "../db/schema.ts";
 import type { PreviewLaunchConfig } from "../preview/launch/index.ts";
 import type { PreviewPortAllocator } from "../preview/port-allocator.ts";
 import type {
@@ -23,6 +23,7 @@ import type {
 	RunEventBroker,
 } from "../runs/index.ts";
 import type { PrTemplateOverrides } from "../runs/pr-template.ts";
+import type { ConversationTurnHandler } from "../runs/stream/conversation-turn.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
 import type { ServerPreviewConfig, WarrenConfigCache } from "../warren-config/index.ts";
 
@@ -45,6 +46,14 @@ export interface RunWithReconnectInput {
 	readonly backoff: readonly number[];
 	readonly stallThreshold: number;
 	readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
+	/**
+	 * Run mode (warren-df71). Threaded into every `bridgeRunStream` pass so a
+	 * conversation run's `agent_end` is treated as a turn boundary, not a
+	 * run terminal. Omitted for non-conversation runs.
+	 */
+	readonly mode?: RunMode;
+	/** Conversation-turn side-effect seam (warren-df71); see `bridgeRunStream`. */
+	readonly conversationTurn?: ConversationTurnHandler;
 	readonly logger?: BridgeLogger;
 	readonly autoOpenPr?: AutoOpenPrConfig;
 	readonly warrenConfigs?: WarrenConfigCache;
@@ -83,6 +92,8 @@ export async function runWithReconnect(
 			broker: input.broker,
 			burrowClientPool: input.burrowClientPool,
 			signal: input.signal,
+			...(input.mode !== undefined ? { mode: input.mode } : {}),
+			...(input.conversationTurn !== undefined ? { conversationTurn: input.conversationTurn } : {}),
 			...(input.logger !== undefined ? { logger: input.logger } : {}),
 		};
 		const result = await input.bridge(bridgeInput);

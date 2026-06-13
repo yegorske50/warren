@@ -79,6 +79,20 @@ export class ConversationsRepo {
 	}
 
 	/**
+	 * The conversation whose anchoring run is `runId`, or null. Used by the
+	 * stream bridge's conversation-turn path (warren-df71) to resolve the
+	 * owning conversation from the run it is courier-ing so assistant turns
+	 * land in the right transcript. `anchoring_run_id` is unique per live
+	 * run (it rotates on re-wake), so at most one row matches.
+	 */
+	async getByAnchoringRunId(runId: string): Promise<ConversationRow | null> {
+		const row = await this.adapter.pickOne(
+			this.db.select().from(this.conversations).where(eq(this.conversations.anchoringRunId, runId)),
+		);
+		return row ?? null;
+	}
+
+	/**
 	 * Conversations for a project, most-recent-activity first. Optional
 	 * `status` narrows to `active` / `closed`. The `conversations_project`
 	 * index covers the predicate; ordering is in-memory on `lastActivityAt`.

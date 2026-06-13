@@ -12,6 +12,7 @@
 import type { BurrowClientPool } from "../burrow-client/pool.ts";
 import type { AnyWarrenDb } from "../db/client.ts";
 import type { Repos } from "../db/repos/index.ts";
+import type { RunMode } from "../db/schema.ts";
 import type { PlanRunPlotAppender } from "../plan-runs/plot-appender.ts";
 import type { PlanSynthesizer } from "../plot-plan-runs/index.ts";
 import type { PreviewAuth } from "../preview/cookie.ts";
@@ -433,9 +434,11 @@ export interface BridgeRegistry {
 	/**
 	 * Start a bridge for the given run; idempotent against a running bridge.
 	 * `burrowId` is required so the bridge can resolve the owning worker via
-	 * `BurrowClientPool.clientFor` (warren-c0c9).
+	 * `BurrowClientPool.clientFor` (warren-c0c9). `mode` (warren-df71) makes a
+	 * `'conversation'` run keep-alive across pi `agent_end` turn boundaries;
+	 * omit / `'batch'` retains the prior one-shot terminal behaviour.
 	 */
-	start(runId: string, burrowRunId: string, burrowId: string): void;
+	start(runId: string, burrowRunId: string, burrowId: string, mode?: RunMode): void;
 	/** Abort all in-flight bridges and await their drain. */
 	stopAll(): Promise<void>;
 	/** Test/diagnostic surface — number of currently-attached bridges. */

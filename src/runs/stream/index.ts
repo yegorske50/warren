@@ -68,6 +68,14 @@
 
 export { bridgeRunStream } from "./bridge.ts";
 export {
+	type ConversationTurnHandler,
+	type ConversationTurnHandlerDeps,
+	createConversationTurnHandler,
+	extractAssistantText,
+	extractIntentPatch,
+	LEVERET_PLOT_ACTOR,
+} from "./conversation-turn.ts";
+export {
 	type ActiveBridge,
 	type RecoverActiveRunStreamsInput,
 	type RecoverActiveRunStreamsResult,
