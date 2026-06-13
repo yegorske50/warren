@@ -52,6 +52,12 @@ primary_region = "sjc"
   BURROW_DATA_DIR = "/data/burrow"
   WARREN_BIND_HOST = "0.0.0.0"
   WARREN_BIND_PORT = "8080"
+  # Enable the send-off PR-merge poller (warren-b872): once a leveret
+  # conversation's plot-sync PR merges, auto-dispatch the planner run
+  # keyed on plot_id. Without this the conversation -> planner half of
+  # the happy path silently stalls and operators must hand-dispatch the
+  # planner (which then never links back to the conversation).
+  WARREN_MERGE_POLLER_ENABLED = "1"
 
 [[mounts]]
   source = "warren_data"
