@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.3] — 2026-06-16
+### Added
+
+- **`ci(pr-fixer)`** — the polling CI-fixer is wired into the scheduler
+  tick. Each tick, projects with `ciFixer.enabled` enumerate their open-PR
+  candidates (`RunsRepo.listPrCandidatesByProject`, indexed by the new
+  `runs_pr_url_idx`), classify each PR's check-runs, and dispatch a
+  `ci-fixer` run against the failing PR — gated by the per-PR retry +
+  cooldown history (`RunsRepo.fixAttemptHistoryByPrUrl`) and back-linked to
+  the PR's opener via `parentRunId`. Dispatched fixers stamp a
+  `ci_fixer.dispatched` system event on the opener run. The PR-head
+  `targetBranch` push and CI-log extraction land in warren-a993
+  (warren-0b75).
 
 The remaining pl-dfb5 papercuts land: a project-scoped seeds-plan read
 endpoint feeding a populated plan selector on the dispatch form, plus a

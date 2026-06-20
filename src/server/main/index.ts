@@ -275,6 +275,8 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		projectSpawn: defaultSpawn,
 		config: schedulerConfig,
 		logger: schedulerLoggerFromPino(logger),
+		// warren-0b75: CI-fixer poller reuses the reap pr-open GITHUB_TOKEN.
+		githubToken: autoOpenPr.token,
 		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});

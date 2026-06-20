@@ -221,10 +221,9 @@ export const runs = sqliteTable(
 		// keep the column tolerant of a since-deleted parent row.
 		parentRunId: text("parent_run_id"),
 		// Chain-kind discriminator (warren-e96f). Tells a `parent_run_id`
-		// back-link apart: `continue` (warren-4b11) seeds the workspace from
-		// the parent's pushed branch; `replicate` (warren-e96f) re-dispatches
-		// the parent's exact config against the project default base. Null for
-		// root runs (no parent). See `CLONE_KINDS` in columns.ts.
+		// back-link apart: `continue` (warren-4b11) seeds the workspace from the
+		// parent's pushed branch; `replicate` re-dispatches its exact config
+		// against the project default base. Null for root runs. See `CLONE_KINDS`.
 		cloneKind: text("clone_kind", { enum: CLONE_KINDS }),
 	},
 	(t) => [
@@ -234,6 +233,7 @@ export const runs = sqliteTable(
 		index(INDEX_NAMES.runsWorkerState).on(t.workerId, t.state),
 		index(INDEX_NAMES.runsPlotId).on(t.plotId),
 		index(INDEX_NAMES.runsMode).on(t.mode),
+		index(INDEX_NAMES.runsPrUrl).on(t.prUrl),
 	],
 );
 
