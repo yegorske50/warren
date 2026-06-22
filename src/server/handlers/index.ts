@@ -51,6 +51,7 @@ import {
 } from "./conversations.ts";
 import { readyzHandler } from "./diagnostics.ts";
 import { healthzHandler, previewConfigHandler, versionHandler } from "./meta.ts";
+import { metricsHandler } from "./metrics.ts";
 import {
 	cancelPlanRunHandler,
 	createPlanRunHandler,
@@ -254,6 +255,7 @@ const ROUTE_TABLE: readonly RouteEntry[] = [
 	{ method: "GET", pattern: "/healthz", build: () => healthzHandler() },
 	{ method: "GET", pattern: "/readyz", build: readyzHandler },
 	{ method: "GET", pattern: "/version", build: () => versionHandler() },
+	{ method: "GET", pattern: "/metrics", build: metricsHandler },
 
 	{ method: "GET", pattern: "/agents", build: listAgentsHandler },
 	{ method: "POST", pattern: "/agents/refresh", build: refreshAgentsHandler },
@@ -399,6 +401,7 @@ export const API_PREFIXES: readonly string[] = [
 	"/healthz",
 	"/readyz",
 	"/version",
+	"/metrics",
 	"/preview",
 	"/plan-runs",
 	"/plot-plan-runs",
@@ -434,6 +437,11 @@ export function isApiPath(pathname: string): boolean {
  */
 export function isAuthExempt(pathname: string): boolean {
 	if (pathname === "/healthz") return true;
+	// `/metrics` is the Prometheus scrape surface (warren observability
+	// Phase 1). Fly's managed Prometheus scrapes it over the private
+	// network without a bearer token; the body is aggregate counts +
+	// counters only (no secrets), mirroring `/healthz`.
+	if (pathname === "/metrics") return true;
 	// `/version` is non-sensitive (just the package version string) and
 	// the UI fetches it before the user logs in to render in the sidebar
 	// header. Keeping it auth-exempt avoids a chicken-and-egg on the

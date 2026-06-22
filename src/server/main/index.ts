@@ -81,13 +81,13 @@ import { buildServerDeps } from "./deps.ts";
 import { bootBackgroundDetectors } from "./detector-wiring.ts";
 import {
 	bridgeLoggerFromPino,
-	createWarrenLogger,
 	planRunLoggerFromPino,
 	previewEvictionLoggerFromPino,
 	probeLoggerFromPino,
 	schedulerLoggerFromPino,
 	workspaceGcLoggerFromPino,
 } from "./logging.ts";
+import { bootObservability, captureBootFailure } from "./observability-wiring.ts";
 import { createPreviewAuthAndProxy } from "./preview-wiring.ts";
 import { closeDatabase, defaultSpawn, redactDbUrl, resolvePgPoolMax } from "./utils.ts";
 
@@ -111,7 +111,7 @@ export interface WarrenServerHandle extends ServeHandle {
 
 export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenServerHandle> {
 	const env = opts.env ?? process.env;
-	const logger = createWarrenLogger(env);
+	const { logger, metricsRegistry } = await bootObservability(env);
 
 	const serverConfig = loadServerConfigFromEnv({
 		env,
@@ -489,6 +489,7 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		workspaceGcTtlMs: workspaceGcConfig.ttlMs,
 		previewAuth,
 		sdBinary: schedulerConfig.sdBinary,
+		metricsRegistry,
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
 
@@ -537,8 +538,9 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
  * policy kicks in.
  */
 if (import.meta.main) {
-	bootServer().catch((err) => {
+	bootServer().catch(async (err) => {
 		const message = err instanceof Error ? err.message : String(err);
+		await captureBootFailure(err);
 		// eslint-disable-next-line no-console
 		console.error(`warren: ${message}`);
 		process.exit(1);

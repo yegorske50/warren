@@ -24,7 +24,18 @@
 #   # path when an SRE team operates warren state in their own Postgres
 #   # (e.g., Fly Postgres, RDS, Supabase) rather than a docker volume.
 #   #     fly secrets set WARREN_DB_URL=postgres://user:pw@host/db
+#   # Optional — error tracking (warren observability Phase 1). Unset =
+#   # no Sentry overhead; set the DSN to capture unhandled exceptions,
+#   # 500-path errors, and error-level log lines. SENTRY_ENVIRONMENT
+#   # (default "production") + SENTRY_RELEASE are optional.
+#   #     fly secrets set SENTRY_DSN=https://...@oXXXX.ingest.sentry.io/XXXX
 #   fly deploy
+#
+# Metrics: the `[[metrics]]` block below makes Fly's managed Prometheus
+# scrape warren's auth-exempt `GET /metrics` endpoint (run/cost/token
+# gauges + warn/error log-rate counters). Machine-level metrics (CPU,
+# mem, restarts) are scraped automatically with no config. Dashboards
+# live in Fly's hosted Grafana at https://fly-metrics.net.
 #
 # BURROW_API_TOKEN (read by `burrow serve`) and WARREN_BURROW_TOKEN
 # (read by warren's burrow-client) MUST be set to the same value —
@@ -70,6 +81,13 @@ primary_region = "sjc"
 [[mounts]]
   source = "warren_data"
   destination = "/data"
+
+# Fly's managed Prometheus scrapes this over the private network. The
+# endpoint is auth-exempt (aggregate counts + counters only, no secrets),
+# mirroring /healthz. Dashboards: https://fly-metrics.net.
+[[metrics]]
+  port = 8080
+  path = "/metrics"
 
 # Warren is single-instance: one Machine, one persistent volume. Deploys
 # bounce the supervisor (which restarts both children); the volume keeps

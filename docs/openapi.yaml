@@ -19,6 +19,8 @@ tags:
     description: '`/conversations` routes.'
   - name: meta
     description: Liveness, readiness, and version.
+  - name: metrics
+    description: '`/metrics` routes.'
   - name: plan-runs
     description: '`/plan-runs` routes.'
   - name: plot-plan-runs
@@ -229,6 +231,17 @@ paths:
       tags:
         - meta
       summary: GET /healthz
+      responses:
+        '200':
+          description: Successful response.
+        default:
+          description: Error response (see `src/core/errors.ts`).
+  /metrics:
+    get:
+      operationId: metricsHandler
+      tags:
+        - metrics
+      summary: GET /metrics
       responses:
         '200':
           description: Successful response.

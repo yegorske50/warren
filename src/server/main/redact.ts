@@ -26,7 +26,7 @@
  * object. Listed bare and as a one-level wildcard so both
  * `{ token }` and `{ config: { token } }` are caught.
  */
-const SECRET_FIELDS = [
+export const SECRET_FIELDS = [
 	"token",
 	"githubToken",
 	"warrenBurrowToken",
