@@ -106,6 +106,7 @@ export interface RunRow {
 	prompt: string;
 	trigger: string;
 	prUrl: string | null;
+	targetBranch: string | null;
 	costUsd: number | null;
 	tokensInput: number | null;
 	tokensOutput: number | null;
@@ -152,6 +153,8 @@ export interface CreateRunInput {
 	project?: string;
 	prompt?: string;
 	ref?: string;
+	/** Existing branch to push the workspace back to at reap (warren-05ea / #419). */
+	targetBranch?: string;
 	providerOverride?: string;
 	modelOverride?: string;
 	seedId?: string;
@@ -171,6 +174,8 @@ export interface DispatchRunInput {
 	prompt: string;
 	/** Maps to CreateRunInput.ref — git branch / ref to clone the workspace from. */
 	branch?: string;
+	/** Maps to CreateRunInput.targetBranch — branch reap pushes back to (#419). */
+	targetBranch?: string;
 	/** Maps to CreateRunInput.modelOverride. */
 	model?: string;
 	/** Maps to CreateRunInput.providerOverride. */

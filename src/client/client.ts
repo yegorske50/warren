@@ -212,6 +212,7 @@ export class WarrenClient {
 			prompt: input.prompt,
 		};
 		if (input.branch !== undefined) body.ref = input.branch;
+		if (input.targetBranch !== undefined) body.targetBranch = input.targetBranch;
 		if (input.model !== undefined) body.modelOverride = input.model;
 		if (input.provider !== undefined) body.providerOverride = input.provider;
 		if (input.seedId !== undefined) body.seedId = input.seedId;

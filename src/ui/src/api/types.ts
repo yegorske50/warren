@@ -140,6 +140,8 @@ export interface RunRow {
 	 * branch == defaultBranch) or the GitHub call errored.
 	 */
 	prUrl: string | null;
+	/** Existing branch reap pushes the workspace back to (#419). Null when unset. */
+	targetBranch: string | null;
 	/**
 	 * Per-run cost in USD (warren-a7dc). Currently populated only for runs
 	 * dispatched against the `pi` runtime — the bridge snapshots
@@ -209,6 +211,8 @@ export interface CreateRunInput {
 	project: string;
 	prompt: string;
 	ref?: string;
+	/** Existing branch reap pushes the workspace back to (#419). */
+	targetBranch?: string;
 	providerOverride?: string;
 	modelOverride?: string;
 	/**

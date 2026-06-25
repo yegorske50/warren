@@ -18,6 +18,7 @@ describe("WarrenClient.dispatch", () => {
 			project: "p1",
 			prompt: "do thing",
 			branch: "feature/x",
+			targetBranch: "feature/x",
 			model: "claude-sonnet-4-5",
 			provider: "anthropic",
 		});
@@ -26,6 +27,7 @@ describe("WarrenClient.dispatch", () => {
 			project: "p1",
 			prompt: "do thing",
 			ref: "feature/x",
+			targetBranch: "feature/x",
 			modelOverride: "claude-sonnet-4-5",
 			providerOverride: "anthropic",
 		});
