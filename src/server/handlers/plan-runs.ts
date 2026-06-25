@@ -27,6 +27,7 @@ import { cancelRun, resolveDispatcherHandle } from "../../runs/index.ts";
 import { showPlan, showSeed } from "../../seeds-cli/index.ts";
 import { jsonResponse, ndjsonResponse } from "../response.ts";
 import type { RouteHandler, ServerDeps } from "../types.ts";
+import { refreshDispatchProject } from "./dispatch-refresh.ts";
 import {
 	assertPlotIdDispatchable,
 	optionalString,
@@ -135,6 +136,11 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 		// still wins when both apply.
 		await assertPlotIdDispatchable({ plotId, plotResolver: deps.plotResolver });
 
+		// (2d) warren-6d60: refresh the project host clone before the plan
+		// walk so a plan pushed moments earlier is read off fresh on-disk
+		// state. See `refreshDispatchProject`.
+		const dispatchProject = await refreshDispatchProject(deps, project, ref);
+
 		// (3) read the plan via seeds-cli.
 		if (deps.seedsCli === undefined) {
 			throw new ValidationError(
@@ -142,7 +148,7 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 				{ recoveryHint: "set WARREN_SD_BINARY (or install sd on PATH) and restart" },
 			);
 		}
-		const plan = await showPlan(deps.seedsCli, project.localPath, planId);
+		const plan = await showPlan(deps.seedsCli, dispatchProject.localPath, planId);
 		if (!(PLAN_RUN_ACCEPTED_PLAN_STATUSES as readonly string[]).includes(plan.status)) {
 			throw new ValidationError(
 				`plan ${planId} is in status '${plan.status}'; plan-runs require one of ${PLAN_RUN_ACCEPTED_PLAN_STATUSES.join(", ")}`,
@@ -162,7 +168,7 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const seedsCli = deps.seedsCli;
 		const childStatuses = await Promise.all(
 			plan.children.map((seedId) =>
-				showSeed(seedsCli, project.localPath, seedId).then((s) => ({
+				showSeed(seedsCli, dispatchProject.localPath, seedId).then((s) => ({
 					seedId,
 					status: s.status,
 				})),
@@ -211,7 +217,7 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			await emitPlanRunDispatchedToPlot({
 				appender: deps.planRunPlotAppender ?? defaultPlanRunPlotAppender,
 				logger: deps.logger,
-				plotDir: join(project.localPath, ".plot"),
+				plotDir: join(dispatchProject.localPath, ".plot"),
 				plotId: result.planRun.plotId,
 				handle: resolveDispatcherHandle(result.planRun.dispatcherHandle),
 				planRunId: result.planRun.id,
@@ -226,7 +232,7 @@ export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 			await promotePlotToActiveOnDispatch({
 				activator: deps.planRunPlotActivator ?? defaultPlanRunPlotActivator,
 				logger: deps.logger,
-				plotDir: join(project.localPath, ".plot"),
+				plotDir: join(dispatchProject.localPath, ".plot"),
 				plotId: result.planRun.plotId,
 				handle: resolveDispatcherHandle(result.planRun.dispatcherHandle),
 				planRunId: result.planRun.id,

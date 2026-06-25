@@ -18,6 +18,7 @@ import type { PlanSynthesizer } from "../plot-plan-runs/index.ts";
 import type { PreviewAuth } from "../preview/cookie.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
+import type { refreshProject } from "../projects/manage.ts";
 import type { CanopyRegistryConfig } from "../registry/config.ts";
 import type { RunEventBroker } from "../runs/events.ts";
 import type { AutoOpenPrConfig } from "../runs/pr.ts";
@@ -250,6 +251,15 @@ export interface ServerDeps {
 	 * guard (`status === 'active'`) is reachable via dispatch.
 	 */
 	readonly planRunPlotActivator?: PlanRunPlotActivator;
+	/**
+	 * Project host-clone refresher (warren-6d60). Used by the plan-run
+	 * dispatch handlers (`refreshDispatchProject`) so the seeds plan is
+	 * read off a freshly fetched + reset clone, mirroring the single-run
+	 * path's `spawnRun` refresh. Production omits this (falls back to the
+	 * live `refreshProject` when `spawn` is wired); tests substitute a
+	 * stub so they never shell out to git.
+	 */
+	readonly refreshProjectFn?: typeof refreshProject;
 	/**
 	 * Server-side Plot aggregator (warren-c167 / pl-9d6a step 2). Used by
 	 * `GET /plots` to fan out `UserPlotClient.query` across every

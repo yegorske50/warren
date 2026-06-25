@@ -167,6 +167,10 @@ export interface BuildDepsInput {
 	plotReader?: PlotReader;
 	plotResolver?: PlotResolver;
 	logger?: Logger;
+	/** Wire the git `spawn` seam so the handler refreshes the clone (warren-6d60). */
+	spawn?: SpawnFn;
+	/** Stub the project refresher so tests assert the refresh without shelling out (warren-6d60). */
+	refreshProjectFn?: ServerDeps["refreshProjectFn"];
 }
 
 export async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
@@ -197,6 +201,8 @@ export async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
 		...(input.planSynthesizer !== undefined ? { planSynthesizer: input.planSynthesizer } : {}),
 		...(input.plotReader !== undefined ? { plotReader: input.plotReader } : {}),
 		...(input.plotResolver !== undefined ? { plotResolver: input.plotResolver } : {}),
+		...(input.spawn !== undefined ? { spawn: input.spawn } : {}),
+		...(input.refreshProjectFn !== undefined ? { refreshProjectFn: input.refreshProjectFn } : {}),
 	};
 }
 
