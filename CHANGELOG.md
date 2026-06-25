@@ -7,7 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.6] — 2026-06-24
+## [0.9.7] — 2026-06-25
+
+### Added
+
+- **`feat(dispatch)`** — runs now persist and honor a per-run
+  `targetBranch`. A nullable `runs.target_branch` column is added via a
+  generated migration, and the dispatch + spawn path threads the value
+  through so a run's PR base can be overridden without mutating project
+  defaults (#419, #507, #508).
+- **`feat(alerts)`** — closed-loop alert healer: `POST /alerts/heal`
+  dispatches a healer agent to remediate an incoming alert
+  (warren-3db0, Phase 2).
+- **`feat(config)`** — the loaded config source file is surfaced from
+  the loader through the API (`sourceFile: string`) and rendered in the
+  UI so operators can see which dynamic config file is in effect (#486,
+  #505, #506).
+
+### Changed
+
+- **`feat(plan-run)`** — added the `ready`->`active` Plot promotion seam
+  and wired it into the plan-run dispatch path; reconciled SPEC §11.P.Plot
+  with the dispatch-time runtime behavior (#487, #503, #504).
+- **`ci`** — added the `check:ci-parity` gate to the CI workflow
+  (commit 90f60a81).
+
+### Fixed
+
+- **`fix(reap)`** — path-limit warren bookkeeping commits with
+  `git commit --only` so reap-time state commits no longer sweep in
+  unrelated working-tree changes (#420, #502).
 
 ### Fixed
 
