@@ -12,8 +12,8 @@
 
 defaultRole: pi
 defaultBranch: main
-defaultProvider: anthropic
-defaultModel: claude-opus-4-8
+defaultProvider: zai
+defaultModel: glm-5.2
 
 # ── Optional knobs (uncomment to set) ───────────────────────────────────
 
