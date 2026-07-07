@@ -40,12 +40,15 @@ export function resolveModelTiers(
 ): ModelTiers {
 	return {
 		opus: {
-			provider: pick(env.WARREN_MODEL_OPUS_PROVIDER, "anthropic"),
-			model: pick(env.WARREN_MODEL_OPUS, "claude-opus-4-8"),
+			// MiniMax is the default route in this fork — providers can
+			// still flip a single agent back to anthropic via frontmatter
+			// override or env override (WARREN_MODEL_OPUS_PROVIDER).
+			provider: pick(env.WARREN_MODEL_OPUS_PROVIDER, "minimax"),
+			model: pick(env.WARREN_MODEL_OPUS, "MiniMax-M3"),
 		},
 		sonnet: {
-			provider: pick(env.WARREN_MODEL_SONNET_PROVIDER, "anthropic"),
-			model: pick(env.WARREN_MODEL_SONNET, "claude-sonnet-4-6"),
+			provider: pick(env.WARREN_MODEL_SONNET_PROVIDER, "minimax"),
+			model: pick(env.WARREN_MODEL_SONNET, "MiniMax-M3"),
 		},
 	};
 }
