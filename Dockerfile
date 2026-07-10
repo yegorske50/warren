@@ -118,37 +118,24 @@ RUN bun install -g \
 # burrow tries to spawn it.
 RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
 
-# Pi ships dist/cli.js with a `#!/usr/bin/env node` shebang. Historically we
-# satisfied this by symlinking /usr/local/bin/node → the oven/bun-node-fallback
-# shim, but that double-purposed the global `node` for non-pi consumers (npm
-# stubs, dev-server shell-wrappers) which then loaded under Bun and crashed
-# on Bun-missing built-ins like `node:sqlite` (warren-a82b). Now that real
-# Node is installed in the apt layer above, /usr/local/bin/node IS real Node.
-#
-# The OLD shebang-sed block targeted dist/cli.js. That entrypoint has NO
-# restoreSandboxEnv() call, so when run under bun inside bwrap,
-# `process.env` comes up empty (oven-sh/bun#27802). pi then immediately
-# sets `process.env.PI_CODING_AGENT = "true"`, so the
-# `Object.keys(process.env).length === 0` guard in pi-ai's getProcEnv
-# fallback never fires — the env is non-empty by length but missing
-# provider keys — and the `/proc/self/environ` recovery is skipped. Result:
-# pi reports "No API key found for minimax" even though
-# PI_PROVIDER_ENV_KEYS → sandbox env → bwrap → bun → process.env should
-# have delivered the key.
-#
-# The fix: route pi through its dedicated bun entrypoint at dist/bun/cli.js
-# which DOES call restoreSandboxEnv() before importing the main CLI. That
-# function re-reads /proc/self/environ and re-populates process.env with
-# the keys burrow passed via env passthrough. Patch the bun entrypoint's
-# shebang to bun (so it runs under bun, matching the rest of pi's
-# node_modules layout) and symlink /usr/local/bin/pi to it.
-RUN sed -i '1s|^#!/usr/bin/env node|#!/usr/bin/env bun|' \
-        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
- && chmod +x \
-        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
- && ln -sf \
-        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
-        /usr/local/bin/pi
+RUN sed -i '1s|^#!/usr/bin/env bun|#!/usr/bin/env node|' \
+        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js \
+ && cat > /usr/local/bin/pi <<'EOF'
+#!/bin/sh
+for entry in $(tr '\0' '\n' < /proc/self/environ); do
+  case "$entry" in
+    MINIMAX_API_KEY=*|ANTHROPIC_API_KEY=*|ANTHROPIC_AUTH_TOKEN=*|\
+    ANTHROPIC_BASE_URL=*|WARREN_API_TOKEN=*|BURROW_API_TOKEN=*|\
+    WARREN_BURROW_TOKEN=*|WARREN_QUALITY_GATE=*|OPENAI_API_KEY=*|\
+    GEMINI_API_KEY=*|ZAI_API_KEY=*|MISTRAL_API_KEY=*|DEEPSEEK_API_KEY=*|\
+    GROQ_API_KEY=*|XAI_API_KEY=*)
+      export "$entry"
+      ;;
+  esac
+done
+exec bun /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js "$@"
+EOF
+RUN chmod +x /usr/local/bin/pi
 
 WORKDIR /app
 
