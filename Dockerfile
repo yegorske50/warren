@@ -144,6 +144,8 @@ RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/ins
 # node_modules layout) and symlink /usr/local/bin/pi to it.
 RUN sed -i '1s|^#!/usr/bin/env node|#!/usr/bin/env bun|' \
         /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
+ && chmod +x \
+        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
  && ln -sf \
         /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
         /usr/local/bin/pi
