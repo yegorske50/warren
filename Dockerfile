@@ -87,9 +87,22 @@ RUN apt-get update \
 # inside the sandbox, so symlinks at /usr/local/bin/{sd,ml,cn,sapling,burrow}
 # pointing into /root/.bun would dangle for the UID-1000 agent (warren-1eaa).
 # /usr/local sits under /usr so the symlink targets resolve inside the sandbox.
+
+# Pin burrow to a specific commit so a normal `docker build` re-pulls the
+# fork on every commit bump. Without the ref, the layer is cacheable across
+# forks pointing at the same head SHA — meaning a fresh `git push` to main
+# of the burrow fork won't change what's installed in the warren image
+# until Docker decides that layer is dirty. With `#<ref>` we always
+# re-fetch.
+#
+# Bump this whenever the burrow fork's HEAD moves. Find the latest commit
+# in your burrow fork with `git ls-remote github:yegorske50/burrow HEAD`
+# or via the github web UI.
+ARG BURROW_REF=43458446ce89ebd009eaf82ef0f44bf4d1ef973c
+
 ENV BUN_INSTALL=/usr/local
 RUN bun install -g \
-    github:yegorske50/burrow \
+    "github:yegorske50/burrow#${BURROW_REF}" \
     @os-eco/canopy-cli@0.2.4 \
     @os-eco/seeds-cli@0.5.13 \
     @os-eco/mulch-cli@0.10.7 \
@@ -111,11 +124,29 @@ RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/ins
 # stubs, dev-server shell-wrappers) which then loaded under Bun and crashed
 # on Bun-missing built-ins like `node:sqlite` (warren-a82b). Now that real
 # Node is installed in the apt layer above, /usr/local/bin/node IS real Node.
-# Patch pi's shebang in-place so it runs under bun directly, bypassing the
-# `node` binary entirely. Without this pi would launch under real Node — which
-# pi does not target — and break on the first bun-only API it touches.
+#
+# The OLD shebang-sed block targeted dist/cli.js. That entrypoint has NO
+# restoreSandboxEnv() call, so when run under bun inside bwrap,
+# `process.env` comes up empty (oven-sh/bun#27802). pi then immediately
+# sets `process.env.PI_CODING_AGENT = "true"`, so the
+# `Object.keys(process.env).length === 0` guard in pi-ai's getProcEnv
+# fallback never fires — the env is non-empty by length but missing
+# provider keys — and the `/proc/self/environ` recovery is skipped. Result:
+# pi reports "No API key found for minimax" even though
+# PI_PROVIDER_ENV_KEYS → sandbox env → bwrap → bun → process.env should
+# have delivered the key.
+#
+# The fix: route pi through its dedicated bun entrypoint at dist/bun/cli.js
+# which DOES call restoreSandboxEnv() before importing the main CLI. That
+# function re-reads /proc/self/environ and re-populates process.env with
+# the keys burrow passed via env passthrough. Patch the bun entrypoint's
+# shebang to bun (so it runs under bun, matching the rest of pi's
+# node_modules layout) and symlink /usr/local/bin/pi to it.
 RUN sed -i '1s|^#!/usr/bin/env node|#!/usr/bin/env bun|' \
-        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
+ && ln -sf \
+        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/bun/cli.js \
+        /usr/local/bin/pi
 
 WORKDIR /app
 
