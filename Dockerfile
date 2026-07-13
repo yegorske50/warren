@@ -6,7 +6,7 @@
 #                   plus the bundled os-eco CLIs warren shells out to.
 
 # ---------- stage 1: build the UI ----------
-FROM oven/bun:1.2 AS ui-builder
+FROM oven/bun:1.3.13 AS ui-builder
 WORKDIR /ui-build
 COPY src/ui/package.json src/ui/bun.lock src/ui/tsconfig.json ./
 COPY src/ui/tsconfig.app.json src/ui/tsconfig.node.json ./
@@ -16,7 +16,7 @@ RUN bun install --frozen-lockfile
 RUN bun run build
 
 # ---------- stage 2: runtime ----------
-FROM oven/bun:1.2
+FROM oven/bun:1.3.13
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -32,8 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin burrow to a specific commit so a normal `docker build` re-pulls the
-# fork on every commit bump. Without the ref, the layer is cacheable across
-# forks pointing at the same head SHA.
+# fork on every commit bump.
 ARG BURROW_REF=43458446ce89ebd009eaf82ef0f44bf4d1ef973c
 
 ENV BUN_INSTALL=/usr/local
@@ -45,7 +44,7 @@ RUN bun install -g \
     @os-eco/sapling-cli@0.3.2 \
     @os-eco/plot-cli@0.4.0 \
     @anthropic-ai/claude-code@2.1.150 \
-    @earendil-works/pi-coding-agent@0.77.0 \
+    @earendil-works/pi-coding-agent@0.78.1 \
     pnpm@11.1.2
 
 # bun install -g skips lifecycle scripts by default, so claude-code's
@@ -54,31 +53,11 @@ RUN bun install -g \
 # burrow tries to spawn it.
 RUN bun run /usr/local/install/global/node_modules/@anthropic-ai/claude-code/install.cjs
 
-# Pi's dist/cli.js ships with `#!/usr/bin/env node`. We replace
-# /usr/local/bin/pi with a shell wrapper that re-exports known provider
-# keys from /proc/self/environ (kernel-preserved inside bwrap) before
-# exec'ing pi under bun. This sidesteps the empty process.env bug under
-# bun inside bwrap (oven-sh/bun#27802) and pi's broken
-# restoreSandboxEnv early-return.
-#
-# The rm -f guarantees /usr/local/bin/pi is not a stale symlink from a
-# previous build; without it, the cat > redirect follows the symlink and
-# overwrites dist/cli.js with the wrapper content.
-RUN rm -f /usr/local/bin/pi \
- && sed -i '1s|^#!/usr/bin/env bun|#!/usr/bin/env node|' \
-        /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js \
- && cat > /usr/local/bin/pi <<'EOF'
-#!/bin/sh
-for entry in $(tr '\0' '\n' < /proc/self/environ); do
-case "$entry" in
-MINIMAX_API_KEY=*|ANTHROPIC_API_KEY=*|ANTHROPIC_AUTH_TOKEN=*|ANTHROPIC_BASE_URL=*|WARREN_API_TOKEN=*|BURROW_API_TOKEN=*|WARREN_BURROW_TOKEN=*|WARREN_QUALITY_GATE=*|OPENAI_API_KEY=*|GEMINI_API_KEY=*|ZAI_API_KEY=*|MISTRAL_API_KEY=*|DEEPSEEK_API_KEY=*|GROQ_API_KEY=*|XAI_API_KEY=*)
-export "$entry"
-;;
-esac
-done
-exec bun /usr/local/install/global/node_modules/@earendil-works/pi-coding-agent/dist/cli.js "$@"
-EOF
-RUN chmod +x /usr/local/bin/pi
+# pi's package bin (/usr/local/bin/pi) is created automatically by
+# `bun install -g` as a symlink to dist/cli.js, which has
+# `#!/usr/bin/env node` shebang. Real Node 22 is installed above, so pi
+# runs under Node — not Bun — and sees the env passed by burrow via
+# bwrap normally. No shebang patching, no wrapper.
 
 WORKDIR /app
 
