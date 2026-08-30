@@ -6,7 +6,6 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
@@ -67,6 +66,7 @@ describe("createPlanRunSpawn", () => {
 			projectId,
 			agentName: "claude-code",
 			children: [{ seq: 1, seedId: "warren-a" }],
+			maxCostUsd: 3,
 			now: NOW,
 		});
 		const child = (await repos.planRuns.listChildren(planRun.id))[0];
@@ -85,8 +85,8 @@ describe("createPlanRunSpawn", () => {
 			});
 			return {
 				run,
-				burrow: { id: "bur_a", workspacePath: "/ws" } as Burrow,
-				burrowRun: { id: "rb_a" } as BurrowRun,
+				sandbox: { id: "bur_a", workspacePath: "/ws" },
+				sandboxRun: { id: "rb_a" },
 				agent: { name: input.agentName, sections: {} } as never,
 			};
 		};
@@ -123,8 +123,12 @@ describe("createPlanRunSpawn", () => {
 
 		expect(captured).toHaveLength(1);
 		expect(captured[0]?.trigger).toBe("plan-run");
+		// warren-9ce3: underscore spelling distinct from the hyphenated trigger.
+		expect(captured[0]?.dispatchOrigin).toBe("plan_run");
 		expect(captured[0]?.dispatcherHandle).toBe(planRun.dispatcherHandle);
 		expect(captured[0]?.runtimeProvider).toBe(runtimeProvider);
+		// warren-a63d: the plan-run's per-child spend cap rides the override slot.
+		expect(captured[0]?.maxCostUsdOverride).toBe(3);
 	});
 
 	test("spawns a single child run for a PlanRun with no bindings", async () => {
@@ -151,8 +155,8 @@ describe("createPlanRunSpawn", () => {
 			});
 			return {
 				run,
-				burrow: { id: "bur_b", workspacePath: "/ws" } as Burrow,
-				burrowRun: { id: "rb_b" } as BurrowRun,
+				sandbox: { id: "bur_b", workspacePath: "/ws" },
+				sandboxRun: { id: "rb_b" },
 				agent: { name: input.agentName, sections: {} } as never,
 			};
 		};

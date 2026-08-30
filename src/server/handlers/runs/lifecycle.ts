@@ -1,6 +1,6 @@
 import { ValidationError } from "../../../core/errors.ts";
-import type { RunRow } from "../../../db/schema.ts";
 import { readProviderFrontmatter } from "../../../registry/index.ts";
+import type { RunRow } from "../../../runs/index.ts";
 import {
 	buildCostAnalytics,
 	type CostAnalyticsRow,
@@ -30,19 +30,55 @@ export const PUBLIC_RUN_FIELDS = [
 	"seedId",
 	"parentRunId",
 	"cloneKind",
+	// warren-4af7: the infra-lost retry back-link — a run-id back-reference of
+	// the same class as parentRunId, safe for spectators.
+	"retryOf",
 	"mode",
 	"state",
 	"failureReason",
+	// warren-0af9: the queued instant — a load-shape timestamp, public for
+	// the same reason startedAt/endedAt are.
+	"createdAt",
 	"startedAt",
 	"endedAt",
 	"prompt",
 	"trigger",
 	"prUrl",
 	"targetBranch",
+	// warren-5255: the composed workspace branch frozen at dispatch — a
+	// branch name carrying the run id, same spectator class as salvageRef.
+	"branch",
+	// warren-afeb: the dispatch-supplied clone ref — a branch/tag/SHA name of
+	// the same class as targetBranch and salvageRef, safe for spectators.
+	"ref",
+	// warren-aaf7: the base-commit pin — a SHA of the same spectator class as
+	// ref/targetBranch (a name in the public repo's history).
+	"baseCommit",
 	// warren-cd3b: the rescue ref is operator-recovery metadata (a branch name
 	// carrying the run id, which is already public) — safe for spectators.
 	"salvageRef",
+	// warren-2ede: the declared provider/model frozen at dispatch. Already
+	// spectator-visible as the byModel/byProvider analytics bucket keys, so
+	// the per-run copy carries no new information.
+	"provider",
+	"model",
+	// warren-3bc6: the merge watcher's PR facts. `prUrl` is already public
+	// and the PR lifecycle is visible to anyone who can open that URL, so
+	// the projected copy carries no new information. NULL reads as
+	// "unknown" (historical rows, or no PR), never "not merged".
+	"prState",
+	"prMergedAt",
+	// warren-ab2b: reap-time measured outcome facts (commits ahead of base +
+	// parsed diff totals). Load-shape metrics of the same class as the token
+	// counts; NULL means unknown (pre-column rows, unmeasured finalize).
+	"commitsAhead",
+	"filesChanged",
+	"insertions",
+	"deletions",
 	"costUsd",
+	// warren-f3c3: how costUsd was priced — the same spectator-safe class as
+	// costUsd itself (it qualifies the number, adds nothing new).
+	"costBasis",
 	"tokensInput",
 	"tokensOutput",
 	"tokensCacheRead",
@@ -60,7 +96,7 @@ export const PUBLIC_RUN_FIELDS = [
  *
  * - `renderedAgentJson` — the fully rendered system prompt. Prompt
  *   engineering is the IP here, and it is pure noise to a spectator.
- * - `burrowId` / `burrowRunId` / `workerId` — internal runtime handles.
+ * - `sandboxId` / `sandboxRunId` / `workerId` — internal runtime handles.
  *   They also render as empty "—" cards on the K8s instance today.
  * - `previewFailureMessage` — free text carrying a subprocess stderr tail.
  * - `salvagePath` — a host filesystem path (warren-cd3b); internal topology,
@@ -68,8 +104,8 @@ export const PUBLIC_RUN_FIELDS = [
  */
 export const REDACTED_RUN_FIELDS = [
 	"renderedAgentJson",
-	"burrowId",
-	"burrowRunId",
+	"sandboxId",
+	"sandboxRunId",
 	"workerId",
 	"previewFailureMessage",
 	"salvagePath",
@@ -121,7 +157,7 @@ function parseRunsSort(ctx: { url: URL }): { sort: "started" | "cost"; dir: "asc
  * end (no opaque cursor — the predicates here are stable + the
  * `runs.id` tiebreaker in `orderByClause` keeps the order total).
  */
-function parseRunsPagination(ctx: { url: URL }): { limit: number; offset: number } {
+export function parseRunsPagination(ctx: { url: URL }): { limit: number; offset: number } {
 	const rawLimit = ctx.url.searchParams.get("limit");
 	const rawOffset = ctx.url.searchParams.get("offset");
 	let limit = 100;
@@ -142,6 +178,29 @@ function parseRunsPagination(ctx: { url: URL }): { limit: number; offset: number
 		offset = n;
 	}
 	return { limit, offset };
+}
+
+/**
+ * Overlay the dispatch-context spend cap onto the projected list rows
+ * (warren-f8a2): `maxCostUsd` is the per-run USD cap the mobile runs card
+ * uses for its near-cap tint. A spectator gets no caps at all, so the cap
+ * never reaches the public projection — same posture as the list's
+ * `costTotalUsd`.
+ */
+async function projectRunsWithCaps(
+	deps: ServerDeps,
+	runs: readonly RunRow[],
+	actor: Actor | undefined,
+): Promise<unknown[]> {
+	const publicOnly = isPublicOnly(actor);
+	const caps = publicOnly
+		? new Map<string, number>()
+		: await deps.repos.dispatchContext.getMaxCostUsdByRunIds(runs.map((r) => r.id));
+	return runs.map((run) => {
+		const projected = projectRun(run, actor);
+		if (publicOnly) return projected;
+		return { ...projected, maxCostUsd: caps.get(run.id) ?? null };
+	});
 }
 
 export function listRunsHandler(deps: ServerDeps): RouteHandler {
@@ -175,8 +234,9 @@ export function listRunsHandler(deps: ServerDeps): RouteHandler {
 		// context, so it belongs in a deliberately framed ledger view
 		// rather than here; per-run `costUsd` survives the projection.
 		const publicOnly = isPublicOnly(ctx.actor);
+		const projectedRuns = await projectRunsWithCaps(deps, hydrated, ctx.actor);
 		return jsonResponse(200, {
-			runs: hydrated.map((run) => projectRun(run, ctx.actor)),
+			runs: projectedRuns,
 			total: agg.total,
 			...(publicOnly ? {} : { costTotalUsd: agg.costTotalUsd }),
 			costPricedCount: agg.costPricedCount,
@@ -193,7 +253,10 @@ export function getRunHandler(deps: ServerDeps): RouteHandler {
 		// warren-ab18: same compute-on-read fallback as the list handler
 		// so the RunDetail page shows cost for ghost / reboot-orphaned runs.
 		const run = await hydrateRunUsage(row, deps.repos.events);
-		return jsonResponse(200, projectRun(run, ctx.actor));
+		// warren-7d84: detail GETs wrap the resource, matching POST /runs
+		// ({run}) and the plan-runs family ({planRun, children, runs}) so
+		// consumers need no per-route envelope knowledge.
+		return jsonResponse(200, { run: projectRun(run, ctx.actor) });
 	};
 }
 
@@ -222,21 +285,24 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 		const rowsRaw = await deps.repos.runs.listForAnalytics(filter);
 		// Hydrate so terminal runs with bridge-died cost still count.
 		const rows = await hydrateRunsUsage(rowsRaw, deps.repos.events);
-		const planByRun = new Map<string, string>();
+		const planByRun = new Map<string, string | null>();
 		if (rows.length > 0) {
 			const joined = await deps.repos.planRuns.resolvePlanForRunIds(rows.map((r) => r.id));
 			for (const j of joined) planByRun.set(j.runId, j.planId);
 		}
 		const analyticsRows: CostAnalyticsRow[] = rows.map((r) => {
-			const { provider, model } = extractProviderModel(r.renderedAgentJson);
+			// warren-2ede: read the dispatch-frozen columns; the frontmatter
+			// re-parse survives only as the historical-row (NULL) fallback.
+			const fallback =
+				r.provider === null || r.model === null ? extractProviderModel(r.renderedAgentJson) : {};
 			return {
 				runId: r.id,
 				projectId: r.projectId,
 				agentName: r.agentName,
 				planId: planByRun.get(r.id) ?? null,
 				planRunId: null,
-				provider: provider ?? null,
-				model: model ?? null,
+				provider: r.provider ?? fallback.provider ?? null,
+				model: r.model ?? fallback.model ?? null,
 				costUsd: r.costUsd,
 				startedAt: r.startedAt,
 			};
@@ -253,10 +319,7 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 	};
 }
 
-export function parseAnalyticsDateBound(
-	ctx: { url: URL },
-	name: "from" | "to",
-): string | undefined {
+export function parseAnalyticsDateBound(ctx: { url: URL }, name: string): string | undefined {
 	const raw = ctx.url.searchParams.get(name);
 	if (raw === null || raw === "") return undefined;
 	const d = new Date(raw);

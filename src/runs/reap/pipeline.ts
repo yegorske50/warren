@@ -21,20 +21,16 @@
 import { join } from "node:path";
 import type { EventRow, ProjectRow, RunRow } from "../../db/schema.ts";
 import type { PreviewSidecarResolver } from "../../preview/launch/index.ts";
-import type {
-	FinalizeIntent,
-	FinalizeResult,
-	FinalizeStage,
-	RunHandle,
-	RuntimeProvider,
-} from "../../runtime/contract.ts";
-import { openPullRequest } from "../pr.ts";
+import type { FinalizeResult, FinalizeStage, RuntimeProvider } from "../../runtime/contract.ts";
+import { finalizeCommitStage, finalizeMergeStage } from "../../runtime/contract.ts";
+import { PUSH_REJECTED_EVENT } from "../../runtime/push-rejection.ts";
 import type { BoundBridgeLogger } from "../stream/index.ts";
 import { dispatchAutoPlanRuns, hasAutoPlanRunFrontmatter, parsePlanIds } from "./auto-plan-run.ts";
 import { applyK8sCloneDeltas } from "./clone-apply.ts";
-import { runPrOpen } from "./pr-open.ts";
+import { runProviderFinalize } from "./finalize-intent.ts";
+import { type DiffStats, recordOutcomeFacts } from "./outcome-facts.ts";
+import { type OpenedPr, runPrOpen } from "./pr-open.ts";
 import { runPreviewAnnotate, runPreviewLaunch } from "./preview.ts";
-import { seededArtifactResetPaths } from "./seed-reset.ts";
 import type { ReapExec, ReapFs, ReapRunInput, ReapStep } from "./types.ts";
 import { classifyEmptyPush } from "./util.ts";
 
@@ -48,6 +44,9 @@ export interface ReapPipelineState {
 	seedsCommitted: boolean;
 	branchPushed: boolean;
 	commitsAhead: number | null;
+	/** warren-ab2b: parsed `git diff --numstat` totals measured at reap;
+	 * null = unmeasurable (unknown). Persisted on the run row with commitsAhead. */
+	diffStats: DiffStats | null;
 	droppedCommit: boolean;
 	/** warren-89b0: deliberate no-op (clean/bookkeeping-only tree); stays succeeded. */
 	noChanges: boolean;
@@ -60,15 +59,21 @@ export interface ReapPipelineState {
 	 * `finalize_failed` in reap.
 	 */
 	finalizeUnposted: NonNullable<FinalizeResult["unposted"]> | null;
+	/** warren-b68d: the REMOTE refused the push on policy grounds, narrowing
+	 * `finalizeFailed` to `push_rejected_policy`. False for a non-fast-forward,
+	 * which stays `finalize_failed`; the unblock URL rides the replayed event. */
+	pushRejectedByPolicy: boolean;
 	/** warren-e9e1 (leg 2): K8s finalize's mirror deltas applied to the clone; local=false. */
 	cloneDeltasApplied: boolean;
 	/**
 	 * warren-486c: the K8s mirror commit could NOT be made durable on origin
 	 * (push failed/rejected), so auto-dispatch is suppressed — a plan-run must
-	 * never be created against host-only tracker state child pods can't clone.
+	 * never be created against host-only tracker state pods can't clone.
 	 */
 	mirrorDurabilityFailed: boolean;
 	prUrl: string | null;
+	/** The full PR handle from `pr_open` — feeds `pr_annotate_preview` (warren-45e6). */
+	openedPr: OpenedPr | null;
 	previewLaunchState: "live" | "failed" | null;
 	previewLaunchPort: number | null;
 	previewUrl: string | null;
@@ -88,13 +93,16 @@ export function createPipelineState(): ReapPipelineState {
 		seedsCommitted: false,
 		branchPushed: false,
 		commitsAhead: null,
+		diffStats: null,
 		droppedCommit: false,
 		noChanges: false,
 		finalizeFailed: false,
 		finalizeUnposted: null,
+		pushRejectedByPolicy: false,
 		cloneDeltasApplied: false,
 		mirrorDurabilityFailed: false,
 		prUrl: null,
+		openedPr: null,
 		previewLaunchState: null,
 		previewLaunchPort: null,
 		previewUrl: null,
@@ -135,17 +143,29 @@ export interface ReapPipelineContext {
 }
 
 /**
- * Map a finalize stage onto the reap step name reap's `errors[]` uses. Omitted
- * stages (`commits_ahead`) are NOT errors — reap only logs a rev-list failure.
+ * warren-357c: map a finalize stage onto reap's step vocabulary. Stage names
+ * are DERIVED from the opaque artifact keys (`${key}_merge` / `${key}_commit`),
+ * so the fold is a function, not a fixed record. Unknown derived keys and
+ * `commits_ahead` fold to nothing — a rev-list failure is log-only, not an error.
  */
-const FINALIZE_STAGE_TO_REAP_STEP: Partial<Record<FinalizeStage, ReapStep>> = {
-	mulch_merge: "mulch_merge",
-	seeds_mirror: "seeds_close",
-	plans_mirror: "plans_mirror",
-	seeds_commit: "seeds_commit",
-	seed_reset: "seed_reset",
-	branch_push: "branch_push",
-};
+function finalizeStageToReapStep(stage: FinalizeStage): ReapStep | undefined {
+	switch (stage) {
+		case "seed_reset":
+			return "seed_reset";
+		case "branch_push":
+			return "branch_push";
+		case finalizeMergeStage("mulch"):
+			return "mulch_merge";
+		case finalizeMergeStage("seeds"):
+			return "seeds_close";
+		case finalizeMergeStage("plans"):
+			return "plans_mirror";
+		case finalizeCommitStage("seeds"):
+			return "seeds_commit";
+		default:
+			return undefined;
+	}
+}
 
 /**
  * warren-a32a: snapshot the project-clone baseline plans.jsonl BEFORE finalize's
@@ -172,32 +192,6 @@ async function snapshotBaselinePlanIds(ctx: ReapPipelineContext): Promise<Set<st
 	}
 }
 
-/** Build the seam handle + neutral intent, then run the §4 finalize. */
-async function runFinalize(ctx: ReapPipelineContext): Promise<FinalizeResult> {
-	const handle: RunHandle = {
-		runId: ctx.run.id,
-		sandboxId: ctx.run.burrowId as string, // non-null in the pipeline branch (reapRun guards it)
-		providerRunId: ctx.run.burrowRunId ?? "",
-	};
-	// Merges run unconditionally; COMMITS gate on project flags (warren-1f56).
-	const commit: "seeds"[] = [];
-	if (ctx.project.hasSeeds) commit.push("seeds");
-	const intent: FinalizeIntent = {
-		branch: ctx.branch ?? "",
-		push: true,
-		// Opaque artifact keys the domain asks the provider to merge (warren-df3e);
-		// the returned `FinalizeResult.artifacts` is keyed the same way.
-		artifacts: ["mulch", "seeds", "plans"],
-		commit,
-		projectClonePathHint: ctx.project.localPath,
-		// warren-8d95: reset warren-seeded artifacts to base before push so a broad
-		// agent commit can't sweep them into the PR (Article IX protected-path guard).
-		resetSeededPaths: seededArtifactResetPaths(ctx.run.renderedAgentJson),
-		...(ctx.baseBranch !== null ? { baseBranch: ctx.baseBranch } : {}),
-	};
-	return ctx.provider.finalize(handle, intent);
-}
-
 /** Re-emit finalize's collected per-record events through reap's real emit. */
 async function replayFinalizeEvents(ctx: ReapPipelineContext, r: FinalizeResult): Promise<void> {
 	for (const ev of r.events) {
@@ -213,7 +207,7 @@ async function replayFinalizeEvents(ctx: ReapPipelineContext, r: FinalizeResult)
 function recordFinalizeErrors(ctx: ReapPipelineContext, r: FinalizeResult): void {
 	for (const st of r.stages) {
 		if (st.status !== "failed") continue;
-		const step = FINALIZE_STAGE_TO_REAP_STEP[st.stage];
+		const step = finalizeStageToReapStep(st.stage);
 		if (step === undefined) continue;
 		ctx.recordError(step, st.error ?? "");
 	}
@@ -238,12 +232,15 @@ function applyFinalizeToState(state: ReapPipelineState, r: FinalizeResult): void
 	state.finalizeFailed = r.stages.some((s) => s.stage === "branch_push" && s.status === "failed");
 	// warren-5ea1: a warren-synthesized result (pod never posted) carries its cause.
 	state.finalizeUnposted = r.unposted ?? null;
+	// warren-b68d: trust a POLICY refusal only alongside a failed push stage.
+	state.pushRejectedByPolicy =
+		state.finalizeFailed && r.events.some((e) => e.kind === PUSH_REJECTED_EVENT);
 }
 
 /**
- * warren-72b9 / warren-89b0: classify a zero-commit push via `classifyEmptyPush`
- * — clean/bookkeeping-only ⇒ `noChanges` (succeeded), else `droppedCommit`
- * (failed). Domain-owned: needs the run outcome; workspace is gone post-terminate.
+ * warren-72b9 / warren-89b0: classify zero-commit push via `classifyEmptyPush`
+ * (noChanges vs droppedCommit). Run-level flip for ref-dispatch `no_changes`
+ * is in `reapRun` (warren-ba08). Domain-owned; workspace gone post-terminate.
  */
 async function emitEmptyPushIfNeeded(
 	ctx: ReapPipelineContext,
@@ -284,8 +281,7 @@ async function autoDispatchStep(
 	state: ReapPipelineState,
 	plans: { ids: Set<string> | null; body: string | null; baseline: Set<string> | null },
 ): Promise<void> {
-	// warren-486c: never dispatch against a mirror commit that never reached
-	// origin — the child pods would clone a ref missing their seed ids.
+	// warren-486c: never dispatch against a mirror commit that never reached origin.
 	if (state.mirrorDurabilityFailed) {
 		await ctx.emit("auto_plan_run_skipped", { reason: "mirror_durability_failed" });
 		return;
@@ -299,7 +295,7 @@ async function autoDispatchStep(
 		planRuns: ctx.input.repos.planRuns,
 		emit: ctx.emit,
 		fail: (step, err) => ctx.fail(step, err),
-		...(ctx.input.seedsCli !== undefined ? { seedsCli: ctx.input.seedsCli } : {}),
+		...(ctx.input.issueTracker !== undefined ? { issueTracker: ctx.input.issueTracker } : {}),
 	});
 	state.autoPlanRunCreated = autoDispatch.created;
 	state.autoPlanRunId = autoDispatch.id;
@@ -322,8 +318,12 @@ async function prOpenStep(ctx: ReapPipelineContext, state: ReapPipelineState): P
 	) {
 		return;
 	}
-	state.prUrl = await runPrOpen({
+	// warren-45e6: a reap input without a forge (tests) skips pr_open as if disabled.
+	const forge = ctx.input.forge;
+	if (forge === undefined) return;
+	state.openedPr = await runPrOpen({
 		autoOpen: ctx.input.autoOpenPr,
+		forge,
 		project: ctx.project,
 		run: ctx.run,
 		branch,
@@ -332,25 +332,25 @@ async function prOpenStep(ctx: ReapPipelineContext, state: ReapPipelineState): P
 		previewOptedIn: ctx.input.previewConfig !== undefined,
 		exec: ctx.exec,
 		emit: ctx.emit,
+		issueTracker: ctx.input.issueTracker,
 		fail: (step, err) => ctx.fail(step, err),
 		setPrUrl: (id, url) => ctx.input.repos.runs.setPrUrl(id, url),
-		openPr: ctx.input.openPr ?? openPullRequest,
 		...(ctx.input.prTemplate !== undefined ? { prTemplate: ctx.input.prTemplate } : {}),
 		...(ctx.input.sleep !== undefined ? { sleep: ctx.input.sleep } : {}),
 	});
+	state.prUrl = state.openedPr?.url ?? null;
 }
 
 /**
- * Preview launch (warren-f156 / docs/design/preview-environments.md). Skipped on a dropped commit
- * (warren-72b9). warren-4fbe: preview is LocalProvider-only — under a provider
- * with `capabilities.previewPorts === false` (K8s) skip cleanly, surfacing
- * `reap.preview_skipped_unsupported` when a project opted in.
+ * Preview launch (warren-f156 / docs/design/preview-environments.md). Skipped on a dropped
+ * commit (warren-72b9). warren-4fbe: under a provider without `previewPorts` (K8s) skip
+ * cleanly, surfacing `reap.preview_skipped_unsupported` when a project opted in.
  */
 async function previewLaunchStep(
 	ctx: ReapPipelineContext,
 	state: ReapPipelineState,
 ): Promise<void> {
-	const { burrowId } = ctx.run;
+	const { sandboxId } = ctx.run;
 	// Surface the skip only when a successful, committed run opted in (preview
 	// WOULD have launched locally); otherwise stay silent.
 	if (!ctx.provider.capabilities.previewPorts) {
@@ -378,18 +378,18 @@ async function previewLaunchStep(
 			ctx.input.previewConfig !== undefined &&
 			ctx.input.portAllocator !== undefined &&
 			ctx.previewSidecars !== undefined &&
-			burrowId !== null
+			sandboxId !== null
 		)
 	) {
 		return;
 	}
 	// Resolve the sandbox sidecars facade through the neutral seam; a null
 	// resolution (sandbox gone) skips the launch (warren-e24d).
-	const sidecars = await ctx.previewSidecars(burrowId);
+	const sidecars = await ctx.previewSidecars(sandboxId);
 	if (sidecars === null) return;
 	const pv = await runPreviewLaunch({
 		runId: ctx.run.id,
-		burrowId,
+		sandboxId,
 		workerId: ctx.run.workerId,
 		outcome: ctx.input.outcome,
 		previewConfig: ctx.input.previewConfig,
@@ -409,29 +409,32 @@ async function previewAnnotateStep(
 	ctx: ReapPipelineContext,
 	state: ReapPipelineState,
 ): Promise<void> {
-	const { prUrl, previewLaunchState } = state;
+	const { openedPr, previewLaunchState } = state;
+	// warren-45e6: the token gate is gone — the forge reports `no_credential`
+	// as a seam result, and a forge without `pullRequestBodyEdit` reports the
+	// skip as a sub-step event (forge-contract.md §5) inside runPreviewAnnotate.
 	if (
 		!(
-			prUrl !== null &&
+			openedPr !== null &&
 			previewLaunchState !== null &&
 			ctx.input.autoOpenPr?.enabled === true &&
-			ctx.input.autoOpenPr.token !== ""
+			ctx.input.forge !== undefined
 		)
 	) {
 		return;
 	}
 	state.previewUrl = await runPreviewAnnotate({
 		runId: ctx.run.id,
-		prUrl,
+		prUrl: openedPr.url,
+		repoRef: openedPr.repoRef,
+		prRef: openedPr.prRef,
+		prBody: openedPr.body,
 		previewLaunchState,
-		autoOpenPr: ctx.input.autoOpenPr,
+		forge: ctx.input.forge,
 		previewLaunchConfig: ctx.input.previewLaunchConfig,
 		repos: ctx.input.repos,
 		emit: ctx.emit,
 		fail: ctx.fail,
-		...(ctx.input.annotatePrPreview !== undefined
-			? { annotatePrPreviewFn: ctx.input.annotatePrPreview }
-			: {}),
 	});
 }
 
@@ -467,7 +470,7 @@ export async function runReapPipeline(
 
 	let finalizeResult: FinalizeResult;
 	try {
-		finalizeResult = await runFinalize(ctx);
+		finalizeResult = await runProviderFinalize(ctx);
 	} catch (err) {
 		// The seam call should not throw on the tested paths (reapRun only runs
 		// the pipeline once the workspace resolved), but degrade to a no-op rather
@@ -485,6 +488,26 @@ export async function runReapPipeline(
 	// the clone host-side. Gated on the K8s discriminator; the local path already
 	// merged into the clone during finalize (byte-identical). See clone-apply.ts.
 	if (ctx.workspacePath === null) await applyK8sCloneDeltas(ctx, state, finalizeResult);
+
+	// warren-ab2b: persist the reap-time outcome facts (commits_ahead + parsed
+	// diff totals) while the workspace / pushed branch is still readable.
+	// Skipped when finalize never measured (commitsAhead null ⇒ all unknown).
+	// warren-ba08: diff against the SAME ref finalize counted from (repair runs: a SHA).
+	if (state.commitsAhead !== null) {
+		state.diffStats = await recordOutcomeFacts({
+			runId: ctx.run.id,
+			workspacePath: ctx.workspacePath,
+			branch: ctx.branch,
+			baseBranch: finalizeResult.commitsAheadBase ?? ctx.baseBranch,
+			project: ctx.project,
+			commitsAhead: state.commitsAhead,
+			branchPushed: state.branchPushed,
+			exec: ctx.exec,
+			...(ctx.input.forge !== undefined ? { forge: ctx.input.forge } : {}),
+			log: ctx.log,
+			setOutcomeFacts: (id, facts) => ctx.input.repos.runs.setOutcomeFacts(id, facts),
+		});
+	}
 
 	// warren-df3e: the clone-side seed-close safety net is no longer a pipeline
 	// step — it observes `post_reap` on the observation bus

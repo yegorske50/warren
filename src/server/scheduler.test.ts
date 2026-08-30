@@ -2,14 +2,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Burrow, Run as BurrowRun } from "@os-eco/burrow-cli";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
+import { FakeForge } from "../forge/fake/fake-forge.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import type { SpawnRunInput, SpawnRunResult } from "../runs/index.ts";
 import type { RuntimeProvider } from "../runtime/contract.ts";
+import { SeedsTracker } from "../tracker/seeds-tracker.ts";
 import type { TriggerSchedulerConfig } from "../triggers/index.ts";
 import { createWarrenConfigCache } from "../warren-config/index.ts";
 import { bootScheduler } from "./scheduler.ts";
@@ -17,13 +18,13 @@ import type { BridgeRegistry } from "./types.ts";
 
 interface BridgeCall {
 	readonly runId: string;
-	readonly burrowRunId: string;
+	readonly sandboxRunId: string;
 }
 
 function makeBridges(calls: BridgeCall[]): BridgeRegistry {
 	return {
-		start(runId, burrowRunId) {
-			calls.push({ runId, burrowRunId });
+		start(runId, sandboxRunId) {
+			calls.push({ runId, sandboxRunId });
 		},
 		async stopAll() {},
 		size: () => 0,
@@ -47,6 +48,10 @@ const NOW = new Date("2026-05-11T00:05:00.000Z");
 // (warren-c531 follow-up: a dropped provider silently falls back to the
 // burrow-backed LocalProvider, which cannot spawn under WARREN_RUNTIME=k8s).
 const RUNTIME_PROVIDER = { kind: "stub" } as unknown as RuntimeProvider;
+
+// FakeForge owns only `fake://` urls, so the github.com fixtures mint no
+// credential (undefined → anonymous git) — the old empty-token passthrough.
+const FORGE = new FakeForge();
 
 describe("bootScheduler", () => {
 	let db: WarrenDb;
@@ -117,14 +122,15 @@ describe("bootScheduler", () => {
 			});
 			return {
 				run,
-				burrow: { id: "bur_a", workspacePath: "/ws" } as Burrow,
-				burrowRun: { id: "rb_a" } as BurrowRun,
+				sandbox: { id: "bur_a", workspacePath: "/ws" },
+				sandboxRun: { id: "rb_a" },
 				agent: { name: input.agentName, sections: {} } as never,
 			};
 		};
 
 		const handle = bootScheduler({
 			repos,
+			forge: FORGE,
 			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
@@ -147,15 +153,18 @@ describe("bootScheduler", () => {
 		expect(spawnRunCalls[0]?.agentName).toBe("claude-code");
 		expect(spawnRunCalls[0]?.projectId).toBe(projectId);
 		expect(spawnRunCalls[0]?.trigger).toBe("cron");
+		// warren-9ce3: explicit provenance + seedId forward from the cron entry.
+		expect(spawnRunCalls[0]?.dispatchOrigin).toBe("cron");
+		expect(spawnRunCalls[0]?.seedId).toBe("warren-abc");
 		// spawnRun threaded the prod plumbing through (refresh hook + cache).
 		expect(spawnRunCalls[0]?.projectsConfig).toBe(PROJECTS_CONFIG);
 		expect(spawnRunCalls[0]?.warrenConfigs).toBe(warrenConfigs);
 		expect(spawnRunCalls[0]?.runtimeProvider).toBe(RUNTIME_PROVIDER);
 		expect(bridgeCalls).toHaveLength(1);
-		expect(bridgeCalls[0]?.burrowRunId).toBe("rb_a");
+		expect(bridgeCalls[0]?.sandboxRunId).toBe("rb_a");
 	});
 
-	test("listScheduledSeeds + updateExtensions use the configured sdBinary and projectSpawn", async () => {
+	test("scheduled pass routes through the tracker seam using the configured sdBinary and projectSpawn (warren-6234)", async () => {
 		const bridgeCalls: BridgeCall[] = [];
 		const warrenConfigs = createWarrenConfigCache({
 			load: async () => ({
@@ -191,30 +200,38 @@ describe("bootScheduler", () => {
 			return { stdout: "", stderr: "", exitCode: 0 };
 		};
 
+		const scheduledSpawnCalls: SpawnRunInput[] = [];
 		const spawnRunFn = async (input: SpawnRunInput): Promise<SpawnRunResult> => {
+			scheduledSpawnCalls.push(input);
 			const run = await repos.runs.create({
 				agentName: input.agentName,
 				projectId: input.projectId,
 				prompt: input.prompt,
 				renderedAgentJson: { sections: {} },
 				trigger: input.trigger ?? "manual",
+				...(input.seedId !== undefined ? { seedId: input.seedId } : {}),
 			});
 			return {
 				run,
-				burrow: { id: "bur_b", workspacePath: "/ws" } as Burrow,
-				burrowRun: { id: "rb_b" } as BurrowRun,
+				sandbox: { id: "bur_b", workspacePath: "/ws" },
+				sandboxRun: { id: "rb_b" },
 				agent: { name: input.agentName, sections: {} } as never,
 			};
 		};
 
 		const handle = bootScheduler({
 			repos,
+			forge: FORGE,
 			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges(bridgeCalls),
 			warrenConfigs,
 			projectsConfig: PROJECTS_CONFIG,
 			projectSpawn,
 			config: { ...SCHEDULER_CONFIG, sdBinary: "sd-test", disabled: true },
+			// warren-6234: the scheduled pass routes through the tracker
+			// seam; a SeedsTracker over the same sdBinary + projectSpawn
+			// pair keeps the shell-out assertions meaningful.
+			issueTracker: new SeedsTracker({ sdBinary: "sd-test", spawn: projectSpawn }),
 			now: () => NOW,
 			spawnRunFn,
 			cloneExists: () => true,
@@ -226,6 +243,12 @@ describe("bootScheduler", () => {
 		expect(result?.scheduled).toHaveLength(1);
 		const fired = result?.scheduled[0];
 		expect(fired?.kind).toBe("fired");
+		// warren-9ce3: scheduled origin + seedId land on the spawn input
+		// (and therefore on runs.seed_id) rather than only in metadata.
+		expect(scheduledSpawnCalls).toHaveLength(1);
+		expect(scheduledSpawnCalls[0]?.dispatchOrigin).toBe("scheduled");
+		expect(scheduledSpawnCalls[0]?.seedId).toBe("warren-zzzz");
+		expect(scheduledSpawnCalls[0]?.trigger).toBe("scheduled");
 		const runId = fired?.kind === "fired" ? fired.runId : "";
 		const listCall = spawnCalls.find((c) => c.cmd[1] === "list");
 		const updateCall = spawnCalls.find((c) => c.cmd[1] === "update");
@@ -280,6 +303,7 @@ describe("bootScheduler", () => {
 		try {
 			const handle = bootScheduler({
 				repos,
+				forge: FORGE,
 				runtimeProvider: RUNTIME_PROVIDER,
 				bridges: makeBridges([]),
 				warrenConfigs,
@@ -304,10 +328,94 @@ describe("bootScheduler", () => {
 		}
 	});
 
+	test("ci-fixer dispatch stamps dispatchOrigin=ci_fixer (warren-9ce3)", async () => {
+		// Seed an opener run with a failing PR so the ci-fixer pass fires.
+		const opener = await repos.runs.create({
+			agentName: "claude-code",
+			projectId,
+			prompt: "open the PR",
+			renderedAgentJson: { sections: {} },
+			trigger: "manual",
+		});
+		await repos.runs.markRunning(opener.id, NOW);
+		await repos.runs.setPrUrl(opener.id, "fake://x/y/pulls/9");
+
+		const { DEFAULT_RUN_BRANCH_PREFIX } = await import("../runs/branch.ts");
+		const forge = new FakeForge();
+		const ref = forge.parseRepoRef("fake://x/y/pulls/9");
+		if (ref === null) throw new Error("fake forge must own fake:// urls");
+		forge.setChecks(ref, `${DEFAULT_RUN_BRANCH_PREFIX}/${opener.id}`, [
+			{
+				name: "test",
+				status: "completed",
+				conclusion: "failure",
+				jobId: "1",
+				detailsUrl: null,
+			},
+		]);
+
+		const spawnRunCalls: SpawnRunInput[] = [];
+		const spawnRunFn = async (input: SpawnRunInput): Promise<SpawnRunResult> => {
+			spawnRunCalls.push(input);
+			const run = await repos.runs.create({
+				agentName: input.agentName,
+				projectId: input.projectId,
+				prompt: input.prompt,
+				renderedAgentJson: { sections: {} },
+				trigger: input.trigger ?? "manual",
+			});
+			return {
+				run,
+				sandbox: { id: "bur_fix", workspacePath: "/ws" },
+				sandboxRun: { id: "rb_fix" },
+				agent: { name: input.agentName, sections: {} } as never,
+			};
+		};
+
+		const handle = bootScheduler({
+			repos,
+			forge,
+			runtimeProvider: RUNTIME_PROVIDER,
+			bridges: makeBridges([]),
+			warrenConfigs: createWarrenConfigCache({
+				load: async () => ({
+					triggers: null,
+					defaults: {
+						ciFixer: {
+							enabled: true,
+							maxRetries: 2,
+							cooldownMinutes: 10,
+							logTailLines: 200,
+							role: "claude-code",
+						},
+					},
+					prTemplate: null,
+					sourceFile: null,
+					errors: [],
+					warnings: [],
+				}),
+			}),
+			projectsConfig: PROJECTS_CONFIG,
+			projectSpawn: (async () => ({ stdout: "", stderr: "", exitCode: 0 })) as SpawnFn,
+			config: { ...SCHEDULER_CONFIG, disabled: true },
+			now: () => NOW,
+			spawnRunFn,
+			cloneExists: () => true,
+		});
+
+		await handle.runOnce();
+		await handle.stop();
+
+		const fixerCall = spawnRunCalls.find((c) => c.trigger === "ci-fixer");
+		expect(fixerCall).toBeDefined();
+		expect(fixerCall?.dispatchOrigin).toBe("ci_fixer");
+	});
+
 	test("disabled config does not schedule an interval", async () => {
 		const setIntervalCalls: { ms: number }[] = [];
 		const handle = bootScheduler({
 			repos,
+			forge: FORGE,
 			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({
@@ -339,6 +447,7 @@ describe("bootScheduler", () => {
 		const clearCalls: number[] = [];
 		const handle = bootScheduler({
 			repos,
+			forge: FORGE,
 			runtimeProvider: RUNTIME_PROVIDER,
 			bridges: makeBridges([]),
 			warrenConfigs: createWarrenConfigCache({

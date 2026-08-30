@@ -1,126 +1,84 @@
 /**
  * `warren run <agent> <project> -p "..."` — one-shot, no UI.
  *
- * Spawns a run via the docs/design/agent-composition.md composition flow, opens a stream bridge so
- * events land in the warren events table, and tails them as NDJSON to
- * stdout until the burrow run terminates. When the bridge ends, fetches
- * the burrow run's terminal state, runs `reapRun` to finalize the warren
- * row + roundtrip mulch/seeds, and exits with a code that mirrors the
- * outcome (succeeded → 0, failed/cancelled → 1).
+ * Post-warren-97a2 (owner decision D3) this command is a REMOTE client of
+ * the warren HTTP API: a local user is a remote user pointed at
+ * localhost. The serverless local-SQLite path (spawn via `withCliDb` +
+ * an in-process stream bridge + CLI-side reap) is killed — the server
+ * owns spawn, bridge, reap, and the mulch/seeds round-trip. The CLI:
  *
- * Why bridge + tail rather than just `client.http.runs.stream` directly:
- * keeping the events going through the warren bridge means a CLI-driven
- * run lands in the same events table the HTTP UI would read, so an
- * operator can switch surfaces mid-run without losing scrollback. It
- * also ensures the dedup-by-seq logic exercises the same code path as
- * the server.
+ *   1. probes the server (down warren → friendly stderr, not a fetch
+ *      stack),
+ *   2. dispatches via `POST /runs`,
+ *   3. tails `GET /runs/:id/events?follow=1` as NDJSON until the server
+ *      closes the stream (warren-7bff). Reap events can land after that
+ *      close, so stream end is not terminal (warren-22cf),
+ *   4. polls `GET /runs/:id` via the SDK's `waitForRun` until the run is
+ *      actually terminal, then maps the state to the exit code
+ *      (`succeeded` → 0, anything else → 1), so the command slots into
+ *      CI pipelines. A bounded post-stream timeout surfaces as a
+ *      distinct `run.stream_ended` line rather than a bogus terminal.
  *
- * SIGINT during a live run aborts the local tail but does not cancel
- * the burrow run — that's what `warren cancel` (deferred to V2) or the
- * UI does. The CLI prints a hint on first SIGINT, exits on the second.
+ * SIGINT during a live tail aborts the local stream but does **not**
+ * cancel the remote run — cancellation is `POST /runs/:id/cancel` (the
+ * SDK's `cancelRun`). The first SIGINT prints a hint and detaches
+ * (exit 130); a second force-exits.
  */
 
-import type { Repos } from "../../db/repos/index.ts";
-import type { RunTerminalState } from "../../db/schema.ts";
-import {
-	type AutoOpenPrConfig,
-	type BridgeRunStreamResult,
-	bridgeRunStream,
-	loadAutoOpenPrConfigFromEnv,
-	loadRunBranchPrefixFromEnv,
-	RunEventBroker,
-	reapRun,
-	type SpawnRunResult,
-	spawnRun,
-	tailRunEvents,
-} from "../../runs/index.ts";
-import type { RunHandle, RuntimeProvider } from "../../runtime/contract.ts";
-import type { LocalSidecarsResolver } from "../../runtime/local/preview/sidecars.ts";
-import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
-import { loadTriggerSchedulerConfigFromEnv } from "../../triggers/index.ts";
-import { createWarrenConfigCache, type WarrenConfigCache } from "../../warren-config/index.ts";
+import { WarrenClientError } from "../../client/errors.ts";
+import type { WaitForRunOptions } from "../../client/index.ts";
+import type { RunRow } from "../../client/types.ts";
+import { isTerminalRunState, type RunTerminalState } from "../../core/wire.ts";
 import type { CliContext } from "../output.ts";
-import { defaultSpawn, formatError, writeJsonLine } from "../output.ts";
+import {
+	EXIT_RUN_FAILED,
+	EXIT_SERVER_UNREACHABLE,
+	EXIT_SUCCESS,
+	EXIT_USAGE,
+	exitCodeForError,
+	formatError,
+	outputMode,
+	writeJsonLine,
+} from "../output.ts";
+import { renderEventLine, terminalGlyph } from "../plan-run-renderer.ts";
+import { probeOrReport } from "./probe.ts";
+import { type RemoteTailDeps, tailOutcomeExit, tailWithDetach } from "./remote-tail.ts";
+
+/**
+ * Bound on how long `warren run` waits for a true terminal state after the
+ * event stream closes (warren-22cf). Reap is normally seconds; five minutes
+ * covers a slow finalize without hanging a CI job forever. Overridable in
+ * tests via {@link RunDeps.waitForRunOptions}.
+ */
+export const POST_STREAM_TERMINAL_TIMEOUT_MS = 5 * 60 * 1_000;
 
 export interface RunArgs {
 	readonly agent: string;
 	readonly project: string;
 	readonly prompt: string;
+	/** Run trigger label (default `cli`), forwarded to `POST /runs`. */
 	readonly trigger?: string;
-	/**
-	 * Optional per-run override of the agent's `frontmatter.provider`. Empty
-	 * / whitespace-only values are ignored. Per warren-618b, takes precedence
-	 * over `.warren/defaults.json.defaultProvider`, which in turn takes
-	 * precedence over the agent's own frontmatter.
-	 */
+	/** Per-run override of the agent's `frontmatter.provider`. */
 	readonly providerOverride?: string;
-	/** Optional per-run override of the agent's `frontmatter.model`. */
+	/** Per-run override of the agent's `frontmatter.model`. */
 	readonly modelOverride?: string;
+	/** Per-run USD spend cap (warren-a63d): wins over the agent's own and the project default. */
+	readonly maxCostUsd?: number;
+	/** Seeds issue to link the run to (warren-ca2f), forwarded to `POST /runs` seedId. */
+	readonly seedId?: string;
+	/** Base-commit pin (warren-aaf7): 40-hex SHA the workspace is cut at. */
+	readonly baseCommit?: string;
+	/** Opt-in existing-branch dispatch (warren-326f), forwarded to `POST /runs`. */
+	readonly existingBranch?: string;
 }
 
-export interface RunDeps {
-	readonly repos: Repos;
+export interface RunDeps extends RemoteTailDeps {
 	/**
-	 * Boot-resolved runtime provider for the whole run lifecycle (warren-11cc).
-	 * REQUIRED: `main.ts` resolves it once (honoring `WARREN_RUNTIME`) via
-	 * `resolveLocalRunBackend` and threads it here; `spawnRun`, `bridgeRunStream`,
-	 * `reapRun`, and the terminal-state read all dispatch through it — the run
-	 * command no longer touches a burrow client. Tests inject a stub.
+	 * Options forwarded to `client.waitForRun` after the event stream closes
+	 * (warren-22cf). Tests pass a short `timeoutMs` / `intervalMs`; production
+	 * leaves this unset and uses {@link POST_STREAM_TERMINAL_TIMEOUT_MS}.
 	 */
-	readonly runtimeProvider: RuntimeProvider;
-	/**
-	 * Preview sidecar seam (warren-11cc), capability-gated by `main.ts` on
-	 * `runtimeProvider.capabilities.previewPorts`. Present only for the local
-	 * backend; absent under `WARREN_RUNTIME=k8s`, so reap's preview sub-step goes
-	 * dark exactly as it does for a project without preview config.
-	 */
-	readonly previewSidecars?: LocalSidecarsResolver;
-	/** Optional broker injection — defaults to a fresh broker per run. */
-	readonly broker?: RunEventBroker;
-	/** Override the bridge factory (tests). Defaults to the live `bridgeRunStream`. */
-	readonly bridge?: typeof bridgeRunStream;
-	/** Override the spawn function (tests). Defaults to the live `spawnRun`. */
-	readonly spawn?: typeof spawnRun;
-	/** Override reap (tests). Defaults to the live `reapRun`. */
-	readonly reap?: typeof reapRun;
-	/**
-	 * Override the terminal-state fallback lookup (tests). Consulted only when
-	 * the bridge detected no in-stream terminal envelope (warren-2909).
-	 * Defaults to a bounded-retry `provider.status(handle)` read — the
-	 * provider seam, not a burrow client.
-	 */
-	readonly fetchBurrowRunState?: (handle: RunHandle) => Promise<RunTerminalState>;
-	/**
-	 * Auto-open-PR config (warren-f6af). Defaults to
-	 * `loadAutoOpenPrConfigFromEnv(process.env)`. Tests pass an explicit
-	 * `{ enabled: false, ... }` to keep the network out of the surface.
-	 */
-	readonly autoOpenPr?: AutoOpenPrConfig;
-	/**
-	 * Per-project `.warren/` config cache (warren-618b). When wired, spawnRun
-	 * picks up `defaultProvider` / `defaultModel` from `.warren/defaults.json`
-	 * with the precedence operator override > project default > agent
-	 * frontmatter. Defaults to a fresh cache so the CLI honors project
-	 * defaults the same way the HTTP server does; tests inject their own.
-	 */
-	readonly warrenConfigs?: WarrenConfigCache;
-	/**
-	 * Deployment-wide run-branch prefix fallback (warren-9993). Defaults to
-	 * `loadRunBranchPrefixFromEnv(process.env)` so the CLI honors
-	 * `WARREN_RUN_BRANCH_PREFIX` the same way the HTTP server does. Tests
-	 * pass an explicit value (or `null` to force the built-in "burrow"
-	 * default).
-	 */
-	readonly runBranchPrefixDefault?: string | null;
-	/**
-	 * Seeds-CLI seam (warren-41d5). Forwarded to reap so the auto_plan_run
-	 * sub-step validates a new plan's child seeds before dispatching a
-	 * plan-run. Defaults to `{ sdBinary: WARREN_SD_BINARY, spawn:
-	 * defaultSpawn }` so the CLI matches the HTTP server; tests inject a
-	 * stub (or rely on the default, since the one-shot run rarely creates a
-	 * plan).
-	 */
-	readonly seedsCli?: SeedsCliDeps;
+	readonly waitForRunOptions?: WaitForRunOptions;
 }
 
 export interface RunResult {
@@ -136,220 +94,260 @@ export async function runRun(
 ): Promise<RunResult> {
 	if (args.agent === "" || args.project === "" || args.prompt === "") {
 		context.stdio.stderr.write("warren: agent, project, and --prompt are all required\n");
-		return { exitCode: 2 };
+		return { exitCode: EXIT_USAGE };
 	}
 
-	const broker = deps.broker ?? new RunEventBroker();
-	const spawn = deps.spawn ?? spawnRun;
-	const bridge = deps.bridge ?? bridgeRunStream;
-	const reap = deps.reap ?? reapRun;
-	const autoOpenPr = deps.autoOpenPr ?? loadAutoOpenPrConfigFromEnv();
-	const warrenConfigs = deps.warrenConfigs ?? createWarrenConfigCache();
-	const runBranchPrefixDefault =
-		deps.runBranchPrefixDefault === null
-			? undefined
-			: (deps.runBranchPrefixDefault ?? loadRunBranchPrefixFromEnv());
-	// The active runtime provider is boot-resolved in `main.ts` (honoring
-	// WARREN_RUNTIME) and shared across spawn + the stream bridge + reap + the
-	// terminal-state read: every burrow interaction crosses the provider seam,
-	// not a burrow client (warren-11cc).
-	const runtimeProvider = deps.runtimeProvider;
-	const fetchBurrowRunState = deps.fetchBurrowRunState ?? defaultFetchRunState(runtimeProvider);
-	const seedsCli: SeedsCliDeps = deps.seedsCli ?? {
-		sdBinary: loadTriggerSchedulerConfigFromEnv().sdBinary,
-		spawn: defaultSpawn,
-	};
+	if (!(await probeOrReport(context, deps.client, deps.probeTimeoutMs))) {
+		return { exitCode: EXIT_SERVER_UNREACHABLE };
+	}
 
-	let handle: RunHandle | undefined;
-	let spawnResult: SpawnRunResult;
+	const mode = outputMode(context);
+	let runId: string;
 	try {
-		spawnResult = await spawn({
-			repos: deps.repos,
-			runtimeProvider,
-			agentName: args.agent,
-			projectId: args.project,
+		const spawned = await deps.client.createRun({
+			agent: args.agent,
+			project: args.project,
 			prompt: args.prompt,
 			trigger: args.trigger ?? "cli",
-			warrenConfigs,
 			...(args.providerOverride !== undefined ? { providerOverride: args.providerOverride } : {}),
 			...(args.modelOverride !== undefined ? { modelOverride: args.modelOverride } : {}),
-			...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
-			...(context.now !== undefined ? { now: context.now } : {}),
+			...(args.maxCostUsd !== undefined ? { maxCostUsd: args.maxCostUsd } : {}),
+			...(args.seedId !== undefined ? { seedId: args.seedId } : {}),
+			...(args.baseCommit !== undefined ? { baseCommit: args.baseCommit } : {}),
+			...(args.existingBranch !== undefined ? { existingBranch: args.existingBranch } : {}),
 		});
+		runId = spawned.run.id;
+		if (mode === "ndjson") {
+			writeJsonLine(context.stdio.stdout, {
+				event: "run.spawned",
+				runId,
+				agent: spawned.run.agentName,
+				project: spawned.run.projectId,
+				sandboxId: spawned.sandbox.id,
+			});
+		} else if (mode === "pretty") {
+			context.stdio.stdout.write(
+				`▶ run ${runId} dispatched — agent ${spawned.run.agentName}, project ${spawned.run.projectId}\n`,
+			);
+		}
+		// json mode stays silent until the single final document.
 	} catch (err) {
 		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1 };
+		return { exitCode: exitCodeForError(err) };
 	}
 
-	const runId = spawnResult.run.id;
-	handle = {
-		runId,
-		sandboxId: spawnResult.burrow.id,
-		providerRunId: spawnResult.burrowRun.id,
-	};
-	writeJsonLine(context.stdio.stdout, {
-		event: "run.spawned",
-		runId,
-		agent: spawnResult.run.agentName,
-		project: spawnResult.run.projectId,
-		burrowId: spawnResult.burrow.id,
-		burrowRunId: spawnResult.burrowRun.id,
-	});
+	return tailUntilTerminal(context, deps, runId);
+}
 
-	const bridgeAbort = new AbortController();
-	const tailAbort = new AbortController();
-
-	const bridgePromise: Promise<BridgeRunStreamResult> = bridge({
-		runId,
-		burrowRunId: spawnResult.burrowRun.id,
-		burrowId: spawnResult.burrow.id,
-		repos: deps.repos,
-		broker,
-		runtimeProvider,
-		signal: bridgeAbort.signal,
-	});
-
-	// When the bridge finishes (burrow run reached a terminal state and
-	// the stream closed), close the broker so the tail iterator returns.
-	const bridgeDone = bridgePromise.finally(() => {
-		broker.close(runId);
-	});
-
-	try {
-		for await (const event of tailRunEvents({
-			runId,
-			repos: { events: deps.repos.events },
-			broker,
-			follow: true,
-			signal: tailAbort.signal,
-		})) {
+/**
+ * Tail `/runs/:id/events` as NDJSON until the server closes the stream or
+ * the operator detaches with SIGINT, then poll until a true terminal state
+ * (warren-22cf) and map it to an exit code.
+ */
+async function tailUntilTerminal(
+	context: CliContext,
+	deps: RunDeps,
+	runId: string,
+): Promise<RunResult> {
+	const outcome = await tailWithDetach({
+		context,
+		detachHint:
+			`warren: detaching from run ${runId} (the remote run keeps going; ` +
+			`cancel it with POST /runs/${runId}/cancel). Ctrl-C again to exit.\n`,
+		stream: (signal) => deps.client.streamRunEvents(runId, { follow: true, signal }),
+		onEvent: (event) => {
+			const mode = outputMode(context);
+			if (mode === "pretty") {
+				context.stdio.stdout.write(`${renderEventLine(event)}\n`);
+				return;
+			}
+			if (mode === "json") return; // stream suppressed; one final document
 			writeJsonLine(context.stdio.stdout, {
 				event: "run.event",
 				runId,
-				seq: event.burrowEventSeq,
+				seq: event.seq,
 				ts: event.ts,
 				kind: event.kind,
 				stream: event.stream,
-				payload: event.payloadJson,
+				payload: event.payload,
 			});
-		}
-	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		bridgeAbort.abort();
-		await bridgeDone.catch(() => undefined);
-		return { exitCode: 1, runId };
+		},
+		onSigint: deps.onSigint,
+		exit: deps.exit,
+	});
+
+	if (outcome.kind !== "completed") {
+		return { exitCode: tailOutcomeExit(context, outcome), runId };
 	}
 
-	await bridgeDone.catch(() => undefined);
-	const bridgeResult = await bridgePromise.catch(() => undefined);
+	return resolveTerminal(context, deps, runId);
+}
 
-	// warren-2909 / GH #663: prefer the bridge's in-stream terminal
-	// detection (`detectRuntimeTerminal` on the result envelope's
-	// `is_error`) over the status() probe. The probe races burrow's
-	// finalize — the terminal envelope can arrive while burrow still
-	// reports `running`, and a one-shot read then mislabels a clean run
-	// as failed/crashed, skipping PR auto-open. The probe is the fallback
-	// for runs whose runtime emits no in-stream terminal envelope (or
-	// whose bridge errored).
-	const terminal = bridgeResult?.terminalDetected;
-
-	let outcome: RunTerminalState;
-	if (terminal !== undefined) {
-		outcome = terminal.outcome;
-	} else {
-		try {
-			outcome = await fetchBurrowRunState(handle);
-		} catch (err) {
-			context.stdio.stderr.write(`warren: failed to read burrow run state: ${formatError(err)}\n`);
-			// Best-effort: assume failed so the warren row finalizes rather than stays running.
-			outcome = "failed";
-		}
-	}
-
-	let finalState: RunTerminalState = outcome;
+/**
+ * Poll until the run is actually terminal, then emit `run.terminal` and map
+ * the state to an exit code (warren-22cf). Stream close alone is not enough:
+ * reap.* can land after the follow stream ends (warren-7bff). On timeout the
+ * CLI emits a distinct `run.stream_ended` line and exits 1 without pretending
+ * the run finished.
+ */
+async function resolveTerminal(
+	context: CliContext,
+	deps: RunDeps,
+	runId: string,
+): Promise<RunResult> {
+	const waitOpts: WaitForRunOptions = {
+		timeoutMs: POST_STREAM_TERMINAL_TIMEOUT_MS,
+		...deps.waitForRunOptions,
+	};
 	try {
-		const reaped = await reap({
-			runId,
-			outcome,
-			// warren-2909: an explicit failure reason the bridge distilled
-			// in-stream (e.g. `oom_killed`) overrides reap's inference.
-			...(terminal?.failureReason !== undefined ? { failureReason: terminal.failureReason } : {}),
-			repos: deps.repos,
-			runtimeProvider,
-			// warren-11cc: preview sidecar seam, capability-gated by main.ts on the
-			// runtime's preview-port capability (absent under K8s).
-			...(deps.previewSidecars !== undefined ? { previewSidecars: deps.previewSidecars } : {}),
-			broker,
-			autoOpenPr,
-			seedsCli,
-			...(context.now !== undefined ? { now: context.now } : {}),
-		});
-		finalState = reaped.state;
-		writeJsonLine(context.stdio.stdout, {
-			event: "run.reaped",
-			runId,
-			state: finalState,
-			alreadyTerminal: reaped.alreadyTerminal,
-			mulch: {
-				updated: reaped.mulchUpdated,
-				skipped: reaped.mulchSkipped,
-				appended: reaped.mulchAppended,
-			},
-			seedsClosed: reaped.seedsClosed,
-			seedsCreated: reaped.seedsCreated,
-			branchPushed: reaped.branchPushed,
-			commitsAhead: reaped.commitsAhead,
-			prUrl: reaped.prUrl,
-			errors: reaped.errors,
-		});
+		const run = await deps.client.waitForRun(runId, waitOpts);
+		return emitTerminal(context, runId, run);
 	} catch (err) {
-		context.stdio.stderr.write(`warren: reap failed: ${formatError(err)}\n`);
-		return { exitCode: 1, runId, state: outcome };
+		if (isWaitTimeout(err)) {
+			return emitStreamEnded(context, deps, runId, err);
+		}
+		context.stdio.stderr.write(`warren: failed to read run state: ${formatError(err)}\n`);
+		return { exitCode: exitCodeForError(err), runId };
 	}
+}
 
-	return {
-		exitCode: finalState === "succeeded" ? 0 : 1,
+function isWaitTimeout(err: unknown): err is WarrenClientError {
+	return err instanceof WarrenClientError && err.code === "wait_timeout";
+}
+
+function emitTerminal(context: CliContext, runId: string, run: RunRow): RunResult {
+	const state = run.state;
+	const final = {
+		event: "run.terminal" as const,
 		runId,
-		state: finalState,
+		state,
+		failureReason: run.failureReason,
+		prUrl: run.prUrl,
+	};
+	const mode = outputMode(context);
+	if (mode === "pretty") {
+		const pr = run.prUrl !== null && run.prUrl !== "" ? ` — ${run.prUrl}` : "";
+		context.stdio.stdout.write(`${terminalGlyph(state)} run ${runId} ${state}${pr}\n`);
+	} else if (mode === "json") {
+		context.stdio.stdout.write(`${JSON.stringify(final, null, 2)}\n`);
+	} else {
+		writeJsonLine(context.stdio.stdout, final);
+	}
+	// waitForRun only resolves on a terminal state; defend in depth.
+	const terminal: RunTerminalState = isTerminalRunState(state) ? state : "failed";
+	return {
+		exitCode: terminal === "succeeded" ? EXIT_SUCCESS : EXIT_RUN_FAILED,
+		runId,
+		state: terminal,
 	};
 }
 
-/** Fallback status()-probe poll cadence (ms) — see warren-2909. */
-const FINALIZE_POLL_MS = 250;
-/**
- * Fallback status()-probe budget (ms). burrow finalizes the run row a few
- * hundred ms after the terminal envelope; 5s is comfortably past a healthy
- * finalize while staying bounded for a genuinely wedged one.
- */
-const FINALIZE_TIMEOUT_MS = 5_000;
-
-export function defaultFetchRunState(
-	provider: RuntimeProvider,
-	opts?: {
-		readonly pollMs?: number;
-		readonly timeoutMs?: number;
-		readonly sleep?: (ms: number) => Promise<void>;
-	},
-): (handle: RunHandle) => Promise<RunTerminalState> {
-	const pollMs = opts?.pollMs ?? FINALIZE_POLL_MS;
-	const timeoutMs = opts?.timeoutMs ?? FINALIZE_TIMEOUT_MS;
-	const sleep =
-		opts?.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-	return async (handle) => {
-		// warren-11cc: read the run's terminal state through the provider seam
-		// (`status()` never throws on a missing run — it reports `exists:false`).
-		// warren-2909: tolerate burrow's finalize lag — while the phase is still
-		// `queued`/`running`, retry on a bounded budget instead of mapping the
-		// first non-terminal read straight to `failed`. A run that never reaches
-		// terminal within the budget maps to `failed` so the warren row finalizes
-		// rather than stranding as running.
-		const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs));
-		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const status = await provider.status(handle);
-			const phase = status.phase;
-			if (phase === "succeeded" || phase === "failed" || phase === "cancelled") return phase;
-			if (attempt < maxAttempts - 1) await sleep(pollMs);
-		}
-		return "failed";
+async function emitStreamEnded(
+	context: CliContext,
+	deps: RunDeps,
+	runId: string,
+	err: WarrenClientError,
+): Promise<RunResult> {
+	let lastState: string | null = null;
+	let failureReason: string | null = null;
+	try {
+		const snap = await deps.client.getRun(runId);
+		lastState = snap.state;
+		failureReason = snap.failureReason;
+	} catch {
+		// Best-effort snapshot; the timeout message still stands alone.
+	}
+	const payload = {
+		event: "run.stream_ended" as const,
+		runId,
+		state: lastState,
+		failureReason,
+		reason: "await_terminal_timeout",
+		message: err.message,
 	};
+	const mode = outputMode(context);
+	if (mode === "pretty") {
+		const stateBit = lastState !== null ? ` (last state: ${lastState})` : "";
+		context.stdio.stdout.write(
+			`⚠ run ${runId} stream ended but run is not terminal yet${stateBit}\n`,
+		);
+		context.stdio.stderr.write(`warren: ${err.message}\n`);
+	} else if (mode === "json") {
+		context.stdio.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+		context.stdio.stderr.write(`warren: ${err.message}\n`);
+	} else {
+		writeJsonLine(context.stdio.stdout, payload);
+		context.stdio.stderr.write(`warren: ${err.message}\n`);
+	}
+	return { exitCode: EXIT_RUN_FAILED, runId };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Command registration (extracted from main.ts, warren-326f size budget)     */
+/* -------------------------------------------------------------------------- */
+
+import type { Command } from "commander";
+import { addClientFlags, type RemoteOpts, resolveCommandClient } from "../client.ts";
+import { parseMaxCostUsd } from "../flags.ts";
+
+/** Register the `warren run` command on the built program. */
+export function registerRunCommand(program: Command, context: CliContext): void {
+	addClientFlags(
+		program
+			.command("run")
+			.description(
+				"dispatch a one-shot run against the warren server, tail events as NDJSON, and exit",
+			)
+			.argument("<agent>", "registered agent name")
+			.argument("<project>", "project id (prj_xxx)")
+			.requiredOption("-p, --prompt <text>", "prompt text the agent receives")
+			.option("--trigger <label>", "run trigger label", "cli")
+			.option("--provider <name>", "per-run override of agent frontmatter.provider")
+			.option("--model <name>", "per-run override of agent frontmatter.model")
+			.option(
+				"--max-cost-usd <usd>",
+				"per-run USD spend cap; wins over the agent's own and the project default",
+				parseMaxCostUsd,
+			)
+			.option("--seed <id>", "link the run to a seeds issue (POST /runs seedId)")
+			.option("--base-commit <sha>", "pin the workspace cut to a 40-hex commit SHA")
+			.option(
+				"--existing-branch <branch>",
+				"run on an existing push-remote branch and push back to it; no PR",
+			),
+	).action(
+		async (
+			agent: string,
+			project: string,
+			opts: {
+				prompt: string;
+				trigger?: string;
+				provider?: string;
+				model?: string;
+				maxCostUsd?: number;
+				seed?: string;
+				baseCommit?: string;
+				existingBranch?: string;
+			} & RemoteOpts,
+		) => {
+			const { client, context: ctx } = resolveCommandClient(context, opts);
+			const result = await runRun(
+				ctx,
+				{ client },
+				{
+					agent,
+					project,
+					prompt: opts.prompt,
+					...(opts.trigger !== undefined ? { trigger: opts.trigger } : {}),
+					...(opts.provider !== undefined ? { providerOverride: opts.provider } : {}),
+					...(opts.model !== undefined ? { modelOverride: opts.model } : {}),
+					...(opts.maxCostUsd !== undefined ? { maxCostUsd: opts.maxCostUsd } : {}),
+					...(opts.seed !== undefined ? { seedId: opts.seed } : {}),
+					...(opts.baseCommit !== undefined ? { baseCommit: opts.baseCommit } : {}),
+					...(opts.existingBranch !== undefined ? { existingBranch: opts.existingBranch } : {}),
+				},
+			);
+			process.exit(result.exitCode);
+		},
+	);
 }

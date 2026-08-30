@@ -14,6 +14,8 @@ import type { AgentDefinition } from "../../registry/schema.ts";
 import type { RuntimeProvider } from "../../runtime/contract.ts";
 import type { SeedsCliDeps } from "../../seeds-cli/index.ts";
 import type { WarrenConfigCache } from "../../warren-config/index.ts";
+import type { GitSpawnCredential } from "../../workspace/git/credential-env.ts";
+import type { MigrationHealFn } from "./migration-preflight.ts";
 
 /**
  * Narrow structured logger for the spawn flow (warren-c686 / pl-f700
@@ -27,15 +29,40 @@ export interface SpawnLogger {
 	info(obj: object, msg?: string): void;
 	warn(obj: object, msg?: string): void;
 	error(obj: object, msg?: string): void;
+	/** warren-6234: optional debug channel for capability-gated skips. */
+	debug?(obj: object, msg?: string): void;
 	child?(bindings: object): SpawnLogger;
 }
+
+/**
+ * Explicit dispatch provenance for the dispatch-context log
+ * (warren-9ce3 / pl-a37b Track A). Closed vocabulary stamped at every
+ * production `spawnRun` call site. Distinct from `runs.trigger`: both
+ * retry paths inherit the original run's trigger, so deriving origin
+ * from trigger is lossy. Underscore spellings match the issue surface
+ * warren-d6ca will persist; they deliberately differ from the
+ * hyphenated `RUN_TRIGGER_KINDS` column values.
+ */
+export const DISPATCH_ORIGINS = [
+	"api",
+	"cli",
+	"cron",
+	"scheduled",
+	"manual_trigger",
+	"ci_fixer",
+	"healer",
+	"plan_run",
+	"retry_infra_lost",
+	"retry_provider",
+] as const;
+export type DispatchOrigin = (typeof DISPATCH_ORIGINS)[number];
 
 export interface SpawnRunInput {
 	readonly repos: Repos;
 	/**
 	 * Runtime-provider seam (warren-c42c: burrow-client eviction, bucket 2).
 	 * `spawnRun` dispatches EXCLUSIVELY through `provider.create(spec)` — the
-	 * single call that collapses burrow's `burrowsUp` + `runs.create` (and, on
+	 * single call that collapses burrow's `sandboxUp` + `runs.create` (and, on
 	 * a partial failure, owns the sandbox-half teardown). Required: the spawn
 	 * path no longer knows about burrow, so callers resolve the boot-selected
 	 * provider (`resolveRuntimeProvider`, honoring `WARREN_RUNTIME`) and thread
@@ -75,12 +102,14 @@ export interface SpawnRunInput {
 	/** Optional per-run override of the agent's `frontmatter.model`. */
 	readonly modelOverride?: string;
 	/**
-	 * Per-trigger spend cap (warren-a63d). When set, the spawn composer
-	 * folds it onto `frontmatter.maxCostUsd` (overriding the agent's own
-	 * value) before freezing `runs.rendered_agent_json`, so the bridge
-	 * enforces a single trigger > agent precedence cap. Omitted for runs
-	 * with no per-trigger cap — the agent's own `maxCostUsd` (if any)
-	 * still applies.
+	 * Per-trigger / per-dispatch spend cap (warren-a63d). Set by a
+	 * `.warren/triggers.yaml` cron entry or a `POST /runs` `maxCostUsd`
+	 * body field. When set, the spawn composer folds it onto
+	 * `frontmatter.maxCostUsd` (overriding the agent's own value) before
+	 * freezing `runs.rendered_agent_json`, so the bridge enforces a single
+	 * override > agent precedence cap. Omitted for runs with no explicit
+	 * cap — the agent's own `maxCostUsd` (or, failing that, the project's
+	 * `.warren/config.yaml` `maxCostUsd` default) still applies.
 	 */
 	readonly maxCostUsdOverride?: number;
 	readonly now?: () => Date;
@@ -97,14 +126,21 @@ export interface SpawnRunInput {
 	readonly projectsConfig?: ProjectsConfig;
 	readonly projectSpawn?: ProjectSpawnFn;
 	/**
-	 * GitHub token for the pre-dispatch refresh's `git fetch` against a
-	 * private repo (`AutoOpenPrConfig.gitToken`, forwarded to
-	 * `refreshProject`). Needed wherever no supervisor-installed global
-	 * `insteadOf` rule exists (K8s control plane). Absent → anonymous.
+	 * GitHub credential for the pre-dispatch refresh's `git fetch`
+	 * against a private repo (minted per-spawn via
+	 * `mintGitCredential`, forwarded to `refreshProject`).
+	 * Absent → anonymous.
 	 */
-	readonly githubToken?: string;
+	readonly gitCredential?: GitSpawnCredential;
 	/** Branch, tag, or SHA to refresh to. Defaults to the project's tracked default branch. */
 	readonly ref?: string;
+	/**
+	 * Base-commit pin (warren-aaf7): a full 40-hex commit SHA the workspace
+	 * is cut at. Overrides `ref` (and the continuation parent branch) for the
+	 * workspace materialization ONLY — the PR base stays `ref`-shaped, so a
+	 * SHA never reaches the GitHub PR call. Persisted on `runs.base_commit`.
+	 */
+	readonly baseCommit?: string;
 	/**
 	 * Continuation parent (warren-4b11). When set, this run is a "re-run with
 	 * follow-up" of a prior terminal run: its workspace is seeded from the
@@ -126,6 +162,17 @@ export interface SpawnRunInput {
 	 */
 	readonly cloneKind?: CloneKind;
 	/**
+	 * Infra-lost auto-retry back-link (warren-4af7). Set only by the
+	 * run-level retry path (`src/runs/retry/infra-lost-retry.ts`): this run is the single
+	 * automatic re-dispatch of a run that terminalized `failed` with an
+	 * infra-lost failure reason (`sandbox_run_lost`). Persisted to
+	 * `runs.retry_of`; the retry budget reads it (a run carrying `retryOf`
+	 * never earns a further automatic retry). Distinct from `parentRunId`:
+	 * no continuation base-ref semantics — the retry re-dispatches the same
+	 * prompt against the same ref.
+	 */
+	readonly retryOf?: string;
+	/**
 	 * Existing branch the run must push to instead of the composed
 	 * `${prefix}/${runId}` (warren-a993). The CI-fixer poller sets this to
 	 * the PR head branch so the fixer's commits push to the open PR and its
@@ -137,6 +184,17 @@ export interface SpawnRunInput {
 	 * workspace also forks from that same branch tip.
 	 */
 	readonly targetBranch?: string;
+	/**
+	 * Opt-in dispatch onto an EXISTING branch (warren-326f). When set, the
+	 * branch must already exist on the push remote (verified before any side
+	 * effect; a missing branch is a fail-closed 400), the workspace is cut
+	 * from its remote tip, and reap pushes back to the same branch with no
+	 * PR. Formalized as ref + targetBranch on the run row, so providers and
+	 * reap need no special-casing. Mutually exclusive with `ref`,
+	 * `targetBranch`, and `parentRunId`. Default dispatches (field absent)
+	 * are byte-identical to the composed `${prefix}/${runId}` path.
+	 */
+	readonly existingBranch?: string;
 	/** Override the project refresher; defaults to `refreshProject`. */
 	readonly refreshProjectFn?: typeof refreshProject;
 	/**
@@ -150,8 +208,8 @@ export interface SpawnRunInput {
 	 * Deployment-wide run-branch prefix fallback (warren-9993), resolved
 	 * from `WARREN_RUN_BRANCH_PREFIX` by the caller. Project-default
 	 * (`.warren/defaults.json.runBranchPrefix`) wins over this when both
-	 * are set; if neither is set, spawnRun falls back to "burrow" so
-	 * existing deployments are unchanged.
+	 * are set; if neither is set, spawnRun falls back to the built-in default
+	 * ("warren").
 	 */
 	readonly runBranchPrefixDefault?: string;
 	/**
@@ -167,7 +225,7 @@ export interface SpawnRunInput {
 	 * Seeds CLI shell-out deps for the post-dispatch extension write
 	 * (pl-bb70 step 4, warren-46cd). When both `seedId` and this are
 	 * provided, spawnRun fires a single `sd update --extensions` after
-	 * `attachBurrow(burrowRunId)` succeeds, merging `{role, trigger,
+	 * `attachBurrow(sandboxRunId)` succeeds, merging `{role, trigger,
 	 * lastRunId, lastRunAt}` onto the seed. Failure is fire-and-log
 	 * (mirrors the pl-2f15 risk #4 mitigation in src/triggers/tick.ts):
 	 * a `seeds_extension_write_failed` system event lands on the run,
@@ -177,10 +235,29 @@ export interface SpawnRunInput {
 	 */
 	readonly seedsCli?: SeedsCliDeps;
 	/**
+	 * Boot-resolved IssueTracker (warren-5819, pl-a37b Track B). The
+	 * post-dispatch extension write routes through `tracker.mergeIssueMetadata`
+	 * (warren-6234); when omitted but `seedsCli` is wired, spawnRun wraps the
+	 * facade in a SeedsTracker so legacy callers keep the write. Tests may
+	 * omit both.
+	 */
+	readonly issueTracker?: import("../../tracker/contract.ts").IssueTracker;
+	/**
 	 * Handle of the user dispatching the run (warren-e848). Persisted onto
 	 * plan-run bookkeeping; carried through unchanged by the spawn flow.
+	 * Read by {@link spawnRun} so the dispatch-context writer (warren-d6ca)
+	 * can stamp who dispatched without a second pass over the input.
 	 */
 	readonly dispatcherHandle?: string;
+	/**
+	 * Explicit dispatch provenance (warren-9ce3 / pl-a37b Track A).
+	 * Who/what kicked this run off — distinct from `trigger`, which both
+	 * retry paths inherit from the original run and is therefore lossy for
+	 * "why was THIS row created". Set at every production `spawnRun` call
+	 * site; the dispatch-context writer (warren-d6ca) records it. Internal
+	 * to the spawn seam today — not on the HTTP wire yet.
+	 */
+	readonly dispatchOrigin?: DispatchOrigin;
 	/**
 	 * Structured logger for the spawn flow (warren-c686 / pl-f700 step 1).
 	 * The HTTP handlers pass `ctx.logger` (pre-bound with `request_id`);
@@ -199,6 +276,14 @@ export interface SpawnRunInput {
 	 * runs list with. Best-effort: the callback must not throw.
 	 */
 	readonly onRunRowCreated?: (runId: string) => void;
+	/**
+	 * Migration journal preflight seam (warren-1f03). For ref-dispatches onto
+	 * an existing branch, spawnRun runs a drizzle journal-slot collision check
+	 * against fresh main after the refresh and heals prompt-free (delete the
+	 * colliding migration, re-run `bun run db:generate`, commit). Tests
+	 * override; production resolves to `healMigrationJournalCollisions`.
+	 */
+	readonly migrationHealFn?: MigrationHealFn;
 }
 
 export interface SpawnRunResult {
@@ -208,10 +293,10 @@ export interface SpawnRunResult {
 	 * ids the callers use (`bridges.start`, the HTTP response). The runtime seam
 	 * returns only an opaque `RunHandle`, so `burrow.workspacePath` — a host path
 	 * with no provider-neutral home — is a display-only carry-over (empty on the
-	 * real dispatch path) kept for wire/UI compatibility until the `/burrows`
+	 * real dispatch path) kept for wire/UI compatibility until the `/sandboxes`
 	 * surface is retired (plan §5.C).
 	 */
-	readonly burrow: { readonly id: string; readonly workspacePath: string };
-	readonly burrowRun: { readonly id: string };
+	readonly sandbox: { readonly id: string; readonly workspacePath: string };
+	readonly sandboxRun: { readonly id: string };
 	readonly agent: AgentDefinition;
 }

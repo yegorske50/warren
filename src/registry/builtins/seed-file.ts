@@ -19,13 +19,16 @@ import { readFile } from "node:fs/promises";
 import { z } from "zod";
 
 import type { AgentsRepo } from "../../db/repos/agents.ts";
+import { AgentNameSchema } from "../agent-name.ts";
 import type { AgentDefinition } from "../schema.ts";
-import { seedBuiltinAgents } from "./index.ts";
+import { type RejectedAgentSeed, seedBuiltinAgents } from "./index.ts";
 
 export const SEED_AGENTS_FILE_ENV = "WARREN_SEED_AGENTS_FILE";
 
 const SeedAgentSchema = z.object({
-	name: z.string().min(1),
+	// warren-2b75: same kebab grammar as RoleNameSchema / canopy render output,
+	// so a name the router would refuse fails at boot with a useful message.
+	name: AgentNameSchema,
 	version: z.number().int().positive(),
 	sections: z.record(z.string(), z.string()),
 	resolvedFrom: z.array(z.string()),
@@ -79,6 +82,8 @@ export async function loadSeedAgentsFromFile(path: string): Promise<AgentDefinit
 export interface SeedAgentsFromEnvResult {
 	readonly path: string;
 	readonly seeded: readonly string[];
+	/** Definitions the seeder refused; boot warns and continues (warren-c4be). */
+	readonly rejected: readonly RejectedAgentSeed[];
 }
 
 /**
@@ -97,5 +102,5 @@ export async function seedAgentsFromEnvFile(
 	if (path === undefined || path === "") return null;
 	const agents = await loadSeedAgentsFromFile(path);
 	const result = await seedBuiltinAgents(repo, agents, now);
-	return { path, seeded: result.seeded };
+	return { path, seeded: result.seeded, rejected: result.rejected };
 }

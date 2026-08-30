@@ -1,3 +1,4 @@
+import { ValidationError } from "../core/errors.ts";
 import { pollUntilTerminal } from "./client-helpers.ts";
 import { type EnvLike, loadWarrenClientConfigFromEnv, type WarrenClientConfig } from "./config.ts";
 import { WarrenClientError, WarrenUnreachableError } from "./errors.ts";
@@ -5,11 +6,14 @@ import { errorFromResponse, readNdjsonStream } from "./ndjson.ts";
 import {
 	type AgentRow,
 	type CancelPlanRunResponse,
+	type CancelRunInput,
+	type CancelRunResponse,
 	type CreatePlanRunInput,
 	type CreatePlanRunResponse,
 	type CreateProjectInput,
 	type CreateRunInput,
 	type DispatchRunInput,
+	type GetRunResponse,
 	isTerminalPlanRunState,
 	isTerminalRunState,
 	type ListAgentsResponse,
@@ -30,10 +34,25 @@ import {
 	type SteerRunResponse,
 	type StreamPlanRunEventsOptions,
 	type StreamRunEventsOptions,
+	type VersionResponse,
 	type WhoamiResponse,
 } from "./types.ts";
 
 export const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Guard the per-run spend cap before JSON serialization (warren-a63d).
+ * `JSON.stringify` turns `NaN` / `±Infinity` into `null`, which the
+ * server reads as "field absent" — the dispatch would then succeed
+ * silently UNCAPPED instead of failing the documented positive-finite
+ * validation. Fail here with the same rule the server enforces.
+ */
+function assertValidMaxCostUsd(value: number | undefined): void {
+	if (value === undefined) return;
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+		throw new ValidationError("maxCostUsd must be a positive finite number of USD");
+	}
+}
 
 export { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS } from "./client-helpers.ts";
 
@@ -175,6 +194,7 @@ export class WarrenClient {
 	}
 
 	async createRun(input: CreateRunInput): Promise<SpawnRunResponse> {
+		assertValidMaxCostUsd(input.maxCostUsd);
 		return this.request<SpawnRunResponse>("/runs", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -190,13 +210,17 @@ export class WarrenClient {
 			prompt: input.prompt,
 		};
 		if (input.branch !== undefined) body.ref = input.branch;
+		if (input.baseCommit !== undefined) body.baseCommit = input.baseCommit;
 		if (input.targetBranch !== undefined) body.targetBranch = input.targetBranch;
+		if (input.existingBranch !== undefined) body.existingBranch = input.existingBranch;
 		if (input.model !== undefined) body.modelOverride = input.model;
 		if (input.provider !== undefined) body.providerOverride = input.provider;
+		if (input.trigger !== undefined) body.trigger = input.trigger;
 		if (input.seedId !== undefined) body.seedId = input.seedId;
 		if (input.dispatcherHandle !== undefined) body.dispatcherHandle = input.dispatcherHandle;
 		if (input.continueFromRunId !== undefined) body.continueFromRunId = input.continueFromRunId;
 		if (input.cloneFromRunId !== undefined) body.cloneFromRunId = input.cloneFromRunId;
+		if (input.maxCostUsd !== undefined) body.maxCostUsd = input.maxCostUsd;
 		return this.createRun(body);
 	}
 
@@ -217,7 +241,34 @@ export class WarrenClient {
 	}
 
 	async getRun(runId: string): Promise<RunRow> {
-		return this.request<RunRow>(`/runs/${encodeURIComponent(runId)}`);
+		// warren-7d84: `GET /runs/:id` wraps the row in `{run}` like every
+		// other detail envelope; the SDK unwraps it for callers.
+		const res = await this.request<GetRunResponse>(`/runs/${encodeURIComponent(runId)}`);
+		return res.run;
+	}
+
+	/**
+	 * `POST /runs/:id/cancel` — cancel a non-terminal run. Idempotent: a run
+	 * already in a terminal state returns `{ alreadyTerminal: true }` without
+	 * issuing a second cancel.
+	 */
+	async cancelRun(runId: string, input: CancelRunInput = {}): Promise<CancelRunResponse> {
+		const body: Record<string, unknown> = {};
+		if (input.reason !== undefined) body.reason = input.reason;
+		return this.request<CancelRunResponse>(`/runs/${encodeURIComponent(runId)}/cancel`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	}
+
+	/**
+	 * `GET /version` — the running warren build's semver. Auth-exempt, so it
+	 * doubles as a richer probe than `/healthz` when a client wants to know
+	 * what it is talking to (warren-968c).
+	 */
+	async version(signal?: AbortSignal): Promise<VersionResponse> {
+		return this.request<VersionResponse>("/version", signal ? { signal } : {});
 	}
 
 	async listRuns(): Promise<ListRunsResponse> {
@@ -251,7 +302,7 @@ export class WarrenClient {
 	 * - `follow: true` keeps the connection open so new events stream as
 	 *   the run progresses. Without it, the server closes once the
 	 *   current backlog is drained.
-	 * - `sinceSeq` replays only events with `burrowEventSeq > sinceSeq`,
+	 * - `sinceSeq` replays only events with `sandboxEventSeq > sinceSeq`,
 	 *   matching the server's `?since=` semantics.
 	 * - `signal` aborts the underlying fetch so callers can tear the
 	 *   connection down on unmount / cancel.
@@ -296,6 +347,7 @@ export class WarrenClient {
 	 * (idempotent resume contract).
 	 */
 	async createPlanRun(input: CreatePlanRunInput): Promise<CreatePlanRunResponse> {
+		assertValidMaxCostUsd(input.maxCostUsd);
 		return this.request<CreatePlanRunResponse>("/plan-runs", {
 			method: "POST",
 			headers: { "content-type": "application/json" },

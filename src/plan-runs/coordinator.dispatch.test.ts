@@ -17,7 +17,7 @@ describe("advancePlanRun — dispatch phase", () => {
 		const result = await advancePlanRun({
 			planRun: h.planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "run_x"),
 			emit: h.emit,
@@ -47,7 +47,7 @@ describe("advancePlanRun — dispatch phase", () => {
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -58,6 +58,52 @@ describe("advancePlanRun — dispatch phase", () => {
 		expect(children.find((c) => c.seq === 1)?.state).toBe("running");
 	});
 
+	test("renders the default template with the child seed id", async () => {
+		const prompts: string[] = [];
+		const capturingSpawn: CoordinatorSpawnFn = async ({ prompt }) => {
+			prompts.push(prompt);
+			return { runId: await h.makeRun("warren-a") };
+		};
+		await advancePlanRun({
+			planRun: h.planRun,
+			repos: h.repos,
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: capturingSpawn,
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(prompts).toEqual(["work on sd warren-a"]);
+	});
+
+	// warren-b3be: String.replace substitutes only the first occurrence.
+	test("substitutes every {seed_id} occurrence in the template", async () => {
+		const { planRun } = await h.repos.planRuns.create({
+			planId: "pl-multi",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			promptTemplate: "read {seed_id}, fix {seed_id}, close {seed_id}",
+			children: [{ seq: 1, seedId: "warren-z" }],
+			now: NOW,
+		});
+		const prompts: string[] = [];
+		const capturingSpawn: CoordinatorSpawnFn = async ({ prompt }) => {
+			prompts.push(prompt);
+			return { runId: await h.makeRun("warren-z") };
+		};
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: neverPoll,
+			spawn: capturingSpawn,
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("dispatched");
+		expect(prompts).toEqual(["read warren-z, fix warren-z, close warren-z"]);
+	});
+
 	test("dispatch failure → plan_failed with dispatch_failed:<message>", async () => {
 		const failingSpawn: CoordinatorSpawnFn = async () => {
 			throw new Error("burrow unreachable");
@@ -65,7 +111,7 @@ describe("advancePlanRun — dispatch phase", () => {
 		const result = await advancePlanRun({
 			planRun: h.planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: failingSpawn,
 			emit: h.emit,

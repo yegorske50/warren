@@ -15,18 +15,31 @@
  *
  *   queued    → running, cancelled
  *   running   → succeeded, failed, cancelled
- *   succeeded → ø    failed → ø    cancelled → ø
+ *   failed    → running   (warren-1eff same-row resume after a merge timeout)
+ *   succeeded → ø    cancelled → ø
  *
- * Child state transitions are NOT guarded here — the coordinator's
- * decision tree is the source of truth for which advance is legal at any
- * given moment, and the repo's job is to persist that decision. The repo
- * merely refuses to write a child patch against a non-existent
- * (planRunId, seq) pair (require-style read first).
+ * Child state transitions ARE guarded here as of warren-66d2:
+ *
+ *   pending    → dispatched, failed, skipped
+ *   dispatched → running, pr_open, merged, failed
+ *   running    → pr_open, merged, failed
+ *   pr_open    → merged, failed
+ *   failed     → pr_open   (warren-1eff merge-timeout resume re-arms the poll)
+ *   merged → ø    skipped → ø
+ *
+ * Every writer (the coordinator and the in-flight poller, the only two
+ * live call sites) goes through `updateChild`, so one guard covers them
+ * all. A same-state write is a no-op re-assert and stays legal so
+ * idempotent ticks keep working. The repo also refuses to write a child
+ * patch against a non-existent (planRunId, seq) pair (require-style read
+ * first).
  */
 
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
 import { generateId } from "../../core/ids.ts";
+import { DEFAULT_PLAN_RUN_PROMPT_TEMPLATE } from "../../core/plan-run-prompt.ts";
+import type { PlanRunSource } from "../../core/wire.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type { PlanRunChildRow, PlanRunChildState, PlanRunRow, PlanRunState } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
@@ -35,13 +48,55 @@ const ALLOWED_TRANSITIONS: Record<PlanRunState, readonly PlanRunState[]> = {
 	queued: ["running", "cancelled"],
 	running: ["succeeded", "failed", "cancelled"],
 	succeeded: [],
-	failed: [],
+	// warren-1eff: POST /plan-runs/:id/resume re-drives the SAME row after a
+	// merge-timeout failure. Only the resume domain function is gated on the
+	// failure reason; the repo allows the bare transition.
+	failed: ["running"],
 	cancelled: [],
 };
 
 export function assertPlanRunTransition(from: PlanRunState, to: PlanRunState): void {
 	if (!ALLOWED_TRANSITIONS[from].includes(to)) {
 		throw new StateTransitionError(`invalid plan_run transition: ${from} → ${to}`);
+	}
+}
+
+/**
+ * Legal per-child advances (warren-66d2). Enumerated from the two live
+ * writers — `src/plan-runs/coordinator.ts` (dispatch / skip / seed-not-found
+ * and dispatch failures) and `src/plan-runs/in-flight.ts` (run sync, PR
+ * open, trivial merge, poll-confirmed merge, terminal failure). The three
+ * states in PLAN_RUN_CHILD_TERMINAL_STATES have no exits, with one
+ * exception: `failed → pr_open` is the warren-1eff same-row resume,
+ * which re-opens the merge-timed-out child so the coordinator re-polls
+ * its existing PR. A re-dispatch resume (fresh POST /plan-runs) still
+ * inserts a fresh plan_run row with fresh children.
+ */
+const CHILD_ALLOWED_TRANSITIONS: Record<PlanRunChildState, readonly PlanRunChildState[]> = {
+	pending: ["dispatched", "failed", "skipped"],
+	dispatched: ["running", "pr_open", "merged", "failed"],
+	// running → dispatched is the warren-6de9 automatic child retry: the
+	// first run terminalized with a retryable cause and the coordinator
+	// re-dispatched a fresh run for the same child.
+	running: ["pr_open", "merged", "failed", "dispatched"],
+	pr_open: ["merged", "failed"],
+	merged: [],
+	// warren-1eff: resume resets the merge-timed-out child back to pr_open so
+	// the coordinator re-polls the EXISTING PR (runId/prUrl preserved).
+	failed: ["pr_open"],
+	skipped: [],
+};
+
+/**
+ * Guard one child advance. A same-state write is an idempotent re-assert
+ * (the coordinator's ticks are replayable) and passes; anything not in the
+ * table throws StateTransitionError, which `src/server/errors.ts` renders
+ * as HTTP 409.
+ */
+export function assertPlanRunChildTransition(from: PlanRunChildState, to: PlanRunChildState): void {
+	if (from === to) return;
+	if (!CHILD_ALLOWED_TRANSITIONS[from].includes(to)) {
+		throw new StateTransitionError(`invalid plan_run_child transition: ${from} → ${to}`);
 	}
 }
 
@@ -53,13 +108,21 @@ export interface CreatePlanRunChildInput {
 
 export interface CreatePlanRunInput {
 	id?: string;
-	planId: string;
+	/**
+	 * Tracker plan id (`pl-XXXX`). Null on the warren-de42 `issues` form —
+	 * the child sequence came from an explicit ordered issue-id list.
+	 */
+	planId?: string | null;
+	/** warren-de42: 'plan' (classic) | 'issues' (explicit issue-id list). */
+	source?: PlanRunSource;
 	projectId: string;
 	agentName: string;
 	promptTemplate?: string;
 	ref?: string | null;
 	providerOverride?: string | null;
 	modelOverride?: string | null;
+	/** warren-a63d: per-child USD spend cap the coordinator forwards on each dispatch. */
+	maxCostUsd?: number | null;
 	dispatcherHandle?: string;
 	trigger?: string;
 	/**
@@ -82,6 +145,8 @@ export interface TransitionPlanRunOptions {
 	failureReason?: string | null;
 	startedAt?: string | null;
 	endedAt?: string | null;
+	/** warren-1eff: stamp the same-row resume time (re-arms the merge clock). */
+	resumedAt?: string | null;
 }
 
 export interface UpdateChildInput {
@@ -98,6 +163,8 @@ export interface PlanRunChildPatch {
 	endedAt?: string | null;
 	prMergedAt?: string | null;
 	failureReason?: string | null;
+	/** warren-6de9: bump the persisted automatic-retry budget on re-dispatch. */
+	retryCount?: number;
 }
 
 const CHILD_PATCH_KEYS = [
@@ -107,6 +174,7 @@ const CHILD_PATCH_KEYS = [
 	"endedAt",
 	"prMergedAt",
 	"failureReason",
+	"retryCount",
 ] as const satisfies readonly (keyof PlanRunChildPatch)[];
 
 export class PlanRunsRepo {
@@ -139,13 +207,15 @@ export class PlanRunsRepo {
 		const id = input.id ?? generateId("planRun");
 		const planRunRow: PlanRunRow = {
 			id,
-			planId: input.planId,
+			planId: input.planId ?? null,
+			source: input.source ?? "plan",
 			projectId: input.projectId,
 			agentName: input.agentName,
-			promptTemplate: input.promptTemplate ?? "work on sd {seed_id}",
+			promptTemplate: input.promptTemplate ?? DEFAULT_PLAN_RUN_PROMPT_TEMPLATE,
 			ref: input.ref ?? null,
 			providerOverride: input.providerOverride ?? null,
 			modelOverride: input.modelOverride ?? null,
+			maxCostUsd: input.maxCostUsd ?? null,
 			dispatcherHandle: input.dispatcherHandle ?? "operator",
 			trigger: input.trigger ?? "manual",
 			parentRunId: input.parentRunId ?? null,
@@ -154,6 +224,7 @@ export class PlanRunsRepo {
 			createdAt: nowIso,
 			startedAt: null,
 			endedAt: null,
+			resumedAt: null,
 		};
 		const childRows: PlanRunChildRow[] = input.children.map((c) => ({
 			planRunId: id,
@@ -167,6 +238,7 @@ export class PlanRunsRepo {
 			endedAt: null,
 			prMergedAt: null,
 			failureReason: null,
+			retryCount: 0,
 		}));
 		return this.adapter.runInTransaction(async (tx) => {
 			const txDb = tx.drizzle as SqliteDrizzleDb;
@@ -201,7 +273,7 @@ export class PlanRunsRepo {
 	 */
 	async resolvePlanForRunIds(
 		runIds: readonly string[],
-	): Promise<{ runId: string; planId: string; planRunId: string }[]> {
+	): Promise<{ runId: string; planId: string | null; planRunId: string }[]> {
 		if (runIds.length === 0) return [];
 		const rows = await this.adapter.pickAll(
 			this.db
@@ -214,12 +286,25 @@ export class PlanRunsRepo {
 				.innerJoin(this.planRuns, eq(this.planRuns.id, this.planRunChildren.planRunId))
 				.where(inArray(this.planRunChildren.runId, runIds as string[])),
 		);
-		const out: { runId: string; planId: string; planRunId: string }[] = [];
+		const out: { runId: string; planId: string | null; planRunId: string }[] = [];
 		for (const r of rows) {
 			if (r.runId === null) continue;
 			out.push({ runId: r.runId, planId: r.planId, planRunId: r.planRunId });
 		}
 		return out;
+	}
+
+	/**
+	 * Reverse lookup: the plan-run child a run was dispatched for, if any
+	 * (warren-4af7). The run-level infra-lost retry uses this to stand down
+	 * on plan-run children — the coordinator's own child-retry shape
+	 * (warren-6de9) owns those, and a double retry must never fire.
+	 */
+	async findChildByRunId(runId: string): Promise<PlanRunChildRow | null> {
+		const row = await this.adapter.pickOne(
+			this.db.select().from(this.planRunChildren).where(eq(this.planRunChildren.runId, runId)),
+		);
+		return row ?? null;
 	}
 
 	async listChildren(planRunId: string): Promise<PlanRunChildRow[]> {
@@ -266,7 +351,8 @@ export class PlanRunsRepo {
 				.from(this.planRuns)
 				.where(eq(this.planRuns.projectId, projectId)),
 		);
-		return rows.map((r) => r.planId);
+		// warren-de42: null plan ids (the `issues` form) are not plan ids.
+		return rows.map((r) => r.planId).filter((id): id is string => id !== null);
 	}
 
 	/**
@@ -303,6 +389,7 @@ export class PlanRunsRepo {
 		if (opts.startedAt !== undefined) patch.startedAt = opts.startedAt;
 		if (opts.endedAt !== undefined) patch.endedAt = opts.endedAt;
 		if (opts.failureReason !== undefined) patch.failureReason = opts.failureReason;
+		if (opts.resumedAt !== undefined) patch.resumedAt = opts.resumedAt;
 		await this.adapter.runWrite(
 			this.db.update(this.planRuns).set(patch).where(eq(this.planRuns.id, id)),
 		);
@@ -336,6 +423,9 @@ export class PlanRunsRepo {
 			throw new NotFoundError(
 				`plan_run_child not found: planRunId=${input.planRunId} seq=${input.seq}`,
 			);
+		}
+		if (input.patch.state !== undefined) {
+			assertPlanRunChildTransition(current.state, input.patch.state);
 		}
 		const patch: Partial<PlanRunChildRow> = {
 			updatedAt: (input.now ?? new Date()).toISOString(),

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { DEFAULT_PLAN_RUN_PROMPT_TEMPLATE } from "../../core/plan-run-prompt.ts";
 import type { WarrenDb } from "../../db/client.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import { NO_AUTH } from "../auth.ts";
@@ -91,6 +92,73 @@ describe("POST /plan-runs", () => {
 		// Persisted shape — pickNextPending returns the first open child.
 		const next = await repos.planRuns.pickNextPending(body.planRun.id);
 		expect(next?.seedId).toBe("wa-a");
+	});
+
+	test("issues form (warren-de42): ordered issue-id list drives the same walk, no plan read", async () => {
+		const calls: SdCall[] = [];
+		const sdSpawn = makeSdSpawn(calls, [
+			{
+				match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+				result: seedShowResult("wa-a", "open"),
+			},
+			{
+				match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-b",
+				result: seedShowResult("wa-b", "open"),
+			},
+		]);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				issues: ["wa-a", "wa-b"],
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as {
+			planRun: { id: string; planId: string | null; source: string; state: string };
+			children: { seq: number; seedId: string }[];
+		};
+		expect(body.planRun.planId).toBeNull();
+		expect(body.planRun.source).toBe("issues");
+		expect(body.children.map((c) => ({ seq: c.seq, seedId: c.seedId }))).toEqual([
+			{ seq: 1, seedId: "wa-a" },
+			{ seq: 2, seedId: "wa-b" },
+		]);
+		// The plan form's `sd plan show` never fired — the list form skips getPlan.
+		expect(calls.some((c) => c.cmd[1] === "plan")).toBe(false);
+	});
+
+	test("rejects a body with both planId and issues: 400", async () => {
+		const sdSpawn = makeSdSpawn([], []);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-acc",
+				issues: ["wa-a"],
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { error: { code: string } };
+		expect(body.error.code).toBe("validation_error");
 	});
 
 	test("rejects projects without .seeds/: 400 + code=project_lacks_seeds", async () => {
@@ -252,6 +320,106 @@ describe("POST /plan-runs", () => {
 		});
 		expect(res.status).toBe(201);
 		expect(refreshCalled).toBe(false);
+	});
+
+	// warren-b3be: a template with no {seed_id} would dispatch every child
+	// with an identical, seed-less prompt.
+	test("rejects a promptTemplate without {seed_id}: 400 + validation_error", async () => {
+		const sdSpawn = makeSdSpawn([], []);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-acc",
+				agent: "claude-code",
+				promptTemplate: "work on the next issue",
+			}),
+		});
+		expect(res.status).toBe(400);
+		const body = (await res.json()) as { error: { code: string; message: string } };
+		expect(body.error.code).toBe("validation_error");
+		expect(body.error.message).toContain("{seed_id}");
+	});
+
+	test("accepts a promptTemplate carrying {seed_id} and persists it", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-acc", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-acc",
+				agent: "claude-code",
+				promptTemplate: "read {seed_id}; close {seed_id}",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { id: string } };
+		const stored = await repos.planRuns.require(body.planRun.id);
+		expect(stored.promptTemplate).toBe("read {seed_id}; close {seed_id}");
+	});
+
+	test("default template applies when promptTemplate is omitted", async () => {
+		const sdSpawn = makeSdSpawn(
+			[],
+			[
+				{
+					match: (cmd) => cmd[1] === "plan" && cmd[2] === "show",
+					result: planShowResult("pl-acc", "active", ["wa-a"]),
+				},
+				{
+					match: (cmd) => cmd[1] === "show" && cmd[2] === "wa-a",
+					result: seedShowResult("wa-a", "open"),
+				},
+			],
+		);
+		const deps = await depsFor({ repos, sdSpawn });
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/plan-runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				project: seedyProjectId,
+				planId: "pl-acc",
+				agent: "claude-code",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { planRun: { id: string } };
+		const stored = await repos.planRuns.require(body.planRun.id);
+		expect(stored.promptTemplate).toBe(DEFAULT_PLAN_RUN_PROMPT_TEMPLATE);
 	});
 
 	test("404 when project doesn't exist", async () => {

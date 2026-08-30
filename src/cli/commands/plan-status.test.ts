@@ -39,12 +39,14 @@ function planRunRow(over: Partial<PlanRunRow> = {}): PlanRunRow {
 	return {
 		id: "pr-1",
 		planId: "pl-abc",
+		source: "plan",
 		projectId: "prj_1",
 		agentName: "claude-code",
 		promptTemplate: "",
 		ref: null,
 		providerOverride: null,
 		modelOverride: null,
+		maxCostUsd: null,
 		dispatcherHandle: "cli",
 		trigger: "cli",
 		state: "running",
@@ -69,6 +71,7 @@ function childRow(over: Partial<PlanRunChildRow> = {}): PlanRunChildRow {
 		endedAt: null,
 		prMergedAt: null,
 		failureReason: null,
+		retryCount: 0,
 		...over,
 	};
 }
@@ -78,21 +81,35 @@ function runRow(over: Partial<RunRow> = {}): RunRow {
 		id: "run-a",
 		agentName: "claude-code",
 		projectId: "prj_1",
-		burrowId: null,
-		burrowRunId: null,
+		sandboxId: null,
+		sandboxRunId: null,
 		seedId: null,
 		parentRunId: null,
+		retryOf: null,
 		cloneKind: null,
 		mode: "batch",
+		costBasis: "api",
 		renderedAgentJson: {},
 		state: "succeeded",
 		failureReason: null,
+		createdAt: null,
+		commitsAhead: null,
+		filesChanged: null,
+		insertions: null,
+		deletions: null,
 		startedAt: "2026-06-21T08:00:00.000Z",
 		endedAt: "2026-06-21T08:00:12.500Z",
 		prompt: "",
 		trigger: "cli",
 		prUrl: null,
+		prState: null,
+		prMergedAt: null,
 		targetBranch: null,
+		branch: null,
+		ref: null,
+		provider: null,
+		baseCommit: null,
+		model: null,
 		salvageRef: null,
 		salvagePath: null,
 		costUsd: 0.1234,
@@ -142,7 +159,7 @@ describe("runPlanStatus", () => {
 		expect(err.join("")).toContain("required");
 	});
 
-	test("reports-unreachable-warren-with-exit-1", async () => {
+	test("reports-unreachable-warren-with-exit-3", async () => {
 		const { context, err } = captureContext();
 		const res = await runPlanStatus(
 			context,
@@ -155,7 +172,7 @@ describe("runPlanStatus", () => {
 			},
 			{ planRunId: "pr-1" },
 		);
-		expect(res.exitCode).toBe(1);
+		expect(res.exitCode).toBe(3);
 		expect(err.join("")).toContain("unreachable");
 	});
 
@@ -233,7 +250,7 @@ describe("runPlanStatus", () => {
 });
 
 describe("runPlanList", () => {
-	test("reports-unreachable-warren-with-exit-1", async () => {
+	test("reports-unreachable-warren-with-exit-3", async () => {
 		const { context, err } = captureContext();
 		const res = await runPlanList(
 			context,
@@ -246,7 +263,7 @@ describe("runPlanList", () => {
 			},
 			{},
 		);
-		expect(res.exitCode).toBe(1);
+		expect(res.exitCode).toBe(3);
 		expect(err.join("")).toContain("unreachable");
 	});
 

@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { ScheduledIssue } from "../core/wire.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
 import { agents } from "../db/schema.ts";
-import type { ScheduledSeed } from "../seeds-cli/index.ts";
 import { type DispatchSpawnFn, dispatchScheduledSeed } from "./dispatch.ts";
 
 interface RecordedSpawn {
 	agentName: string;
 	prompt: string;
 	trigger: string;
+	seedId?: string;
 	metadata?: unknown;
 	maxCostUsd?: number;
 }
@@ -28,6 +29,7 @@ function spawnRecorder(
 			agentName: input.agentName,
 			prompt: input.prompt,
 			trigger: input.trigger,
+			...(input.seedId !== undefined ? { seedId: input.seedId } : {}),
 			metadata: input.metadata,
 			...(input.maxCostUsd !== undefined ? { maxCostUsd: input.maxCostUsd } : {}),
 		});
@@ -79,7 +81,11 @@ describe("dispatchScheduledSeed", () => {
 		await db.close();
 	});
 
-	function seed(scheduledFor: string, status = "open", id = "warren-s1"): ScheduledSeed {
+	function seed(
+		scheduledFor: string,
+		status: ScheduledIssue["status"] = "open",
+		id = "warren-s1",
+	): ScheduledIssue {
 		return { id, status, scheduledFor: new Date(scheduledFor), title: "sched seed" };
 	}
 
@@ -114,6 +120,8 @@ describe("dispatchScheduledSeed", () => {
 		// lastScheduledRun}` in a single sd update.
 		expect(result.role).toBe("claude-code");
 		expect(calls[0]?.trigger).toBe("scheduled");
+		// warren-9ce3: first-class seedId on the seam (not only in metadata).
+		expect(calls[0]?.seedId).toBe("warren-s1");
 		expect(calls[0]?.agentName).toBe("claude-code");
 		expect(calls[0]?.prompt).toBe("Sched body.");
 	});

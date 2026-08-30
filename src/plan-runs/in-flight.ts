@@ -9,24 +9,30 @@
  * `AdvanceResult`.
  */
 
+import { formatError } from "../core/errors.ts";
+import { renderPlanRunPrompt } from "../core/plan-run-prompt.ts";
+import { IssueNotFoundError } from "../core/wire.ts";
 import type { PlanRunChildRow, PlanRunRow, RunRow } from "../db/schema.ts";
-import { SeedNotFoundError } from "../seeds-cli/index.ts";
+import type { PrMergeChecker } from "../runs/pr-merge.ts";
 import type {
 	AdvanceResult,
 	CoordinatorCloseChildSeedFn,
 	CoordinatorEmitFn,
+	CoordinatorGetIssueFn,
 	CoordinatorRepos,
-	CoordinatorShowSeedFn,
+	CoordinatorSpawnFn,
+	CoordinatorSpawnResult,
 } from "./coordinator.ts";
 import {
 	type CoordinatorReopenPrFn,
 	hasEmptyPushEvent,
-	isFatalHttpError,
+	isFatalForgeError,
 	isTerminalRun,
 	mergeDeadlineExceeded,
+	mergeWaitBaseline,
 	resolveChildPrReopen,
 } from "./merge-gate.ts";
-import type { PrMergeChecker } from "./pr-merge.ts";
+import { shouldRetryChild } from "./retry.ts";
 
 export interface HandleInFlightInput {
 	readonly planRun: PlanRunRow;
@@ -34,11 +40,12 @@ export interface HandleInFlightInput {
 	readonly repos: CoordinatorRepos;
 	readonly checkPrMerged: PrMergeChecker;
 	readonly emit: CoordinatorEmitFn;
-	readonly showSeed: CoordinatorShowSeedFn;
+	readonly getIssue: CoordinatorGetIssueFn;
 	readonly mergeTimeoutMs: number;
 	readonly now: () => Date;
 	readonly reopenPr?: CoordinatorReopenPrFn; // warren-22de: (re)open PR before failing
 	readonly closeChildSeed?: CoordinatorCloseChildSeedFn; // warren-3806: host-side seed close on merge
+	readonly spawn: CoordinatorSpawnFn; // warren-6de9: automatic child re-dispatch
 }
 
 /**
@@ -152,17 +159,17 @@ type ChildSeedResolution = "resolved" | "unresolved" | "transient";
  * an unmerged branch) pushed nothing because it *could not do the work* —
  * that must fail with a typed reason, not be scored a phantom success.
  *
- * Only a definitive `SeedNotFoundError` is terminal; any other (transient:
- * timeout / lock / malformed) failure stays retryable so a flaky seed
- * store never converts a genuine trivial merge into a spurious failure.
+ * Only a definitive `IssueNotFoundError` is terminal; any other (transient:
+ * timeout / lock / malformed) failure stays retryable so a flaky tracker
+ * never converts a genuine trivial merge into a spurious failure.
  * This mirrors the dispatch-arm semantics in coordinator.ts.
  */
 async function resolveChildSeed(input: HandleInFlightInput): Promise<ChildSeedResolution> {
 	try {
-		await input.showSeed(input.planRun.projectId, input.child.seedId);
+		await input.getIssue(input.planRun.projectId, input.child.seedId);
 		return "resolved";
 	} catch (err) {
-		return err instanceof SeedNotFoundError ? "unresolved" : "transient";
+		return err instanceof IssueNotFoundError ? "unresolved" : "transient";
 	}
 }
 
@@ -252,7 +259,11 @@ async function handleOpenPr(
 	effectivePrUrl: string,
 ): Promise<HandleInFlightDecision> {
 	const { emit, planRun, child, mergeTimeoutMs, now } = input;
-	if (mergeDeadlineExceeded(run.endedAt, now, mergeTimeoutMs)) {
+	// warren-1eff: the clock baseline is the later of run.endedAt and the
+	// plan-run's last resume stamp, so a same-row resume re-arms the budget
+	// instead of instantly re-timing out on the stale run.endedAt.
+	const baseline = mergeWaitBaseline(run.endedAt, planRun.resumedAt);
+	if (mergeDeadlineExceeded(baseline, now, mergeTimeoutMs)) {
 		return await failChild(input, run, "child_pr_merge_timeout", { prUrl: effectivePrUrl });
 	}
 	await emit(run.id, "plan_run.waiting_for_merge", {
@@ -297,16 +308,63 @@ async function pollMergeState(
 	if (polled.kind === "open") {
 		return await handleOpenPr(input, run, effectivePrUrl);
 	}
-	if (polled.kind === "closed_unmerged" || isFatalHttpError(polled)) {
+	if (polled.kind === "closed_unmerged" || isFatalForgeError(polled)) {
 		const extra: Record<string, unknown> = { prUrl: effectivePrUrl };
-		if (polled.kind === "http_error") {
-			extra.httpStatus = polled.status;
+		if (polled.kind === "forge_error") {
+			extra.errorKind = polled.errorKind;
 		}
 		return await failChild(input, run, "pr_closed_without_merge", extra);
 	}
-	// `missing_token`, `rate_limited` (429 that survived pr-merge.ts
-	// retries), or transient `http_error` (status 0 or 5xx) — keep waiting.
+	// `unparseable` (foreign-host PR) or any non-fatal `forge_error` —
+	// `no_credential`, `unauthorized` (the checker already fired its loud
+	// per-repo notice), `rate_limited` / transient `http_error` that
+	// survived pr-merge.ts retries — keep waiting.
 	return { kind: "result", result: { kind: "waiting_for_merge" } };
+}
+
+/**
+ * warren-6de9: re-dispatch the in-flight child once after a retryable
+ * failure (see ./retry.ts). Spawns a fresh run for the same seed with the
+ * same rendered prompt, re-points the child row at the new run, and bumps
+ * the persisted `retryCount` so a resumed/re-driven plan-run never grants
+ * a second retry. Emits `plan_run.child_retried` on the NEW run id so the
+ * plan-run event tail (which fans out over current child run ids) keeps
+ * the retry visible on the UI timeline. A spawn failure falls back to the
+ * ordinary terminal failure path rather than losing the diagnostic.
+ */
+async function retryChild(
+	input: HandleInFlightInput,
+	run: RunRow,
+): Promise<HandleInFlightDecision> {
+	const { repos, planRun, child, emit, spawn, now } = input;
+	const prompt = renderPlanRunPrompt(planRun.promptTemplate, child.seedId);
+	let spawnResult: CoordinatorSpawnResult;
+	try {
+		spawnResult = await spawn({ planRun, child, prompt });
+	} catch (err) {
+		return await failChild(input, run, `dispatch_failed:${formatError(err)}`);
+	}
+	const retryCount = child.retryCount + 1;
+	await repos.planRuns.updateChild({
+		planRunId: planRun.id,
+		seq: child.seq,
+		patch: {
+			runId: spawnResult.runId,
+			state: "dispatched",
+			startedAt: now().toISOString(),
+			retryCount,
+		},
+		now: now(),
+	});
+	await emit(spawnResult.runId, "plan_run.child_retried", {
+		planRunId: planRun.id,
+		seq: child.seq,
+		seedId: child.seedId,
+		previousRunId: run.id,
+		failureReason: run.failureReason,
+		retryCount,
+	});
+	return { kind: "result", result: { kind: "dispatched", childRunId: spawnResult.runId } };
 }
 
 export async function handleInFlight(input: HandleInFlightInput): Promise<HandleInFlightDecision> {
@@ -328,6 +386,11 @@ export async function handleInFlight(input: HandleInFlightInput): Promise<Handle
 		return await handleNonTerminalRun(input, run);
 	}
 	if (run.state === "failed" || run.state === "cancelled") {
+		// warren-6de9: one automatic re-dispatch for a retryable failure
+		// cause (provider_error) before the plan-run fails terminally.
+		if (run.state === "failed" && shouldRetryChild(child, run.failureReason)) {
+			return await retryChild(input, run);
+		}
 		return await failChild(input, run, `child_${run.failureReason ?? run.state}`);
 	}
 	// run.state === 'succeeded': advance to pr_open, then poll the PR.

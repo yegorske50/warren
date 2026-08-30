@@ -1,5 +1,12 @@
 # Agent Composition + Pi Runtime Contract
 
+**Kind:** contract
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-08-01
+**Shipped:** before this record; live contract salvaged in v0.13.2
+**Current truth:** `src/registry/schema.ts`, `src/registry/builtins/`, and `src/runs/seed.ts`
+
 > **Salvage provenance:** lifted from the retired top-level spec §4.1 (the four sides of
 > a custom agent), the still-live schema parts of §4.2, §4.3 (the
 > composition flow), and §11.K (pi runtime support) as part of the SPEC
@@ -21,7 +28,7 @@
 | **Mind** (persona, skills) | inline built-ins in `src/registry/builtins/`, frozen onto the run row | warren registry |
 | **Memory** (expertise) | `.mulch/expertise/<domain>.jsonl` (per-project) | mulch |
 | **Worklist** (tasks) | `.seeds/issues.jsonl` (per-project) | seeds |
-| **Body** (loop, tools) | `pi`, `claude-code`, or `sapling` | the runtime |
+| **Body** (loop, tools) | `pi` or `claude-code` | the runtime |
 
 Burrow is the cell the agent runs in. Warren is the operator that picks
 who runs where, when, and on what. The os-eco canopy tool lives on to
@@ -68,7 +75,7 @@ sections:
 `system`, `skills`, `expertise_seed`, `burrow_config`, `workflow`. Only
 `system` is required (`REQUIRED_AGENT_SECTIONS`); the rest are consumed
 at run-spawn time. Pi-namespaced sections (consumed only by the `pi`
-built-in; ignored by `claude-code` / `sapling`): `pi_skills`,
+built-in; ignored by `claude-code`): `pi_skills`,
 `pi_prompts`. Pi-section bodies are JSON-Lines envelopes of
 `{name, body}` — one artifact per line — which `src/runs/seed.ts`
 materializes into `.pi/skills/<name>/SKILL.md` and
@@ -85,7 +92,7 @@ rev — `readProviderFrontmatter` / `readToolsFrontmatter` in
 - `provider`, `model` — free-form strings the multi-provider surface
   reads (see the pi contract below).
 - `runtime` — burrow runtime id the agent dispatches onto (`pi`,
-  `claude-code`, `sapling`). When unset, warren falls back to
+  `claude-code`). When unset, warren falls back to
   `DEFAULT_RUNTIME_ID` (`"pi"`); `claude-code` is opt-in via this field
   (warren-16f8).
 - `auto_plan_run` (boolean, warren-a32a) — on run success, reap diffs
@@ -120,7 +127,8 @@ When warren spawns a run:
    by warren as `${prefix}/${run.id}` where the prefix resolves project
    default (`.warren/config.yaml.runBranchPrefix`, or the same field in
    legacy `.warren/defaults.json`) > `WARREN_RUN_BRANCH_PREFIX` env >
-   built-in `"burrow"` (warren-9993; the legacy default preserves
+   built-in `"warren"` (warren-9993; warren-2de0 flipped the default — the
+   legacy `"burrow"` value survives
    backward compatibility). The warren `run_xxx` suffix makes the branch
    back-reference the warren run row on `git log` / PR review without a
    separate lookup.
@@ -286,7 +294,7 @@ appear in one stream (mixed runtimes — unlikely in practice), pi wins
 for parity with the pre-warren-87f9 behavior. `sapling` runs leave every
 column `null` (no terminal cost emission yet — separate seed). RPC
 failures are logged as a system event and do not fail the run.
-`RunDetail.tsx` renders a header cost badge using `formatCostUsd()`
+`run-detail.tsx` renders a header cost badge using `formatCostUsd()`
 (`mx-9d987a`): `≥$1` → 2 decimals, `<$1` → 3 decimals; badge omitted
 when `cost_usd` is `null`. `Runs.tsx` adds an opt-in Cost column
 (hidden by default, toggled via the toolbar).
@@ -302,7 +310,7 @@ reporting (observability); the budget rollups remain the deferred half.
 `auto_retry_start`/`end`, `extension_error`, `queue_update`) is
 collapsed by burrow's pi parser (`src/runtime/parsers/pi.ts`) into
 burrow's stable event taxonomy, with the original pi envelope `type`
-preserved in `payload.type`. `RunDetail.tsx` `EventLine` detects pi
+preserved in `payload.type`. `run-detail.tsx` `EventLine` detects pi
 sub-kinds by peeking at `payload.type` when `event.kind` is
 `state_change` or `telemetry` (`mx-66ff69`); `PI_SUBKIND_LABELS` maps
 each to a friendlier display label; `extension_error` additionally tints

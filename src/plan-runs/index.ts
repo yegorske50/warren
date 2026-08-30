@@ -6,6 +6,27 @@
  */
 
 export {
+	assertPlanRunPromptTemplate,
+	DEFAULT_PLAN_RUN_PROMPT_TEMPLATE,
+	hasSeedIdPlaceholder,
+	renderPlanRunPrompt,
+	SEED_ID_PLACEHOLDER,
+} from "../core/plan-run-prompt.ts";
+// Row type re-exports at the domain seam (warren-02c9): the drizzle schema
+// stays the source of the inferred types; handlers import them from here.
+export type { PlanRunChildRow, PlanRunRow } from "../db/schema.ts";
+export {
+	type CreatePrMergeCheckerInput,
+	createPrMergeChecker,
+	type PrMergeChecker,
+} from "../runs/pr-merge.ts";
+export {
+	type CancelPlanRunInput,
+	type CancelPlanRunLogger,
+	type CancelPlanRunResult,
+	cancelPlanRun,
+} from "./cancel.ts";
+export {
 	type CloseMergedChildSeedInput,
 	type CloseMergedChildSeedResult,
 	closeMergedChildSeed,
@@ -23,9 +44,9 @@ export {
 	advancePlanRun,
 	type CoordinatorCloseChildSeedFn,
 	type CoordinatorEmitFn,
+	type CoordinatorGetIssueFn,
 	type CoordinatorReopenPrFn,
 	type CoordinatorRepos,
-	type CoordinatorShowSeedFn,
 	type CoordinatorSpawnFn,
 	type CoordinatorSpawnInput,
 	type CoordinatorSpawnResult,
@@ -33,13 +54,13 @@ export {
 	PLAN_RUN_EVENT_KINDS,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
-export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts";
-export { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "./errors.ts";
 export {
-	type CreatePrMergeCheckerInput,
-	createPrMergeChecker,
-	type PrMergeChecker,
-} from "./pr-merge.ts";
+	type CreatePlanRunOrchestrationInput,
+	createPlanRun,
+	PLAN_RUN_ACCEPTED_PLAN_STATUSES,
+} from "./create.ts";
+export { type CreatePlanRunSpawnInput, createPlanRunSpawn } from "./dispatch.ts";
+export { PlanHasNoOpenChildrenError, ProjectLacksTrackerError } from "./errors.ts";
 export {
 	type ComputeReadyPlansInput,
 	computeReadyPlans,
@@ -47,8 +68,30 @@ export {
 	type ReadyPlanInput,
 } from "./ready-plans.ts";
 export {
+	isResumablePlanRunFailure,
+	RESUMABLE_PLAN_RUN_FAILURE_REASONS,
+	type ResumablePlanRunFailureReason,
+	type ResumePlanRunInput,
+	type ResumePlanRunResult,
+	resumePlanRun,
+} from "./resume.ts";
+export {
+	hasChildRetryBudget,
+	isRetryableChildFailure,
+	MAX_CHILD_RETRIES,
+	RETRYABLE_CHILD_FAILURE_REASONS,
+	type RetryableChildFailureReason,
+	shouldRetryChild,
+} from "./retry.ts";
+export {
+	type PlanRunEventRow,
+	type TailPlanRunEventsInput,
+	tailPlanRunEvents,
+} from "./tail-events.ts";
+export {
 	type BootPlanRunCoordinatorInput,
 	bootPlanRunCoordinator,
+	buildDefaultPlanRunEmit,
 	type PlanRunAdvanceLog,
 	type PlanRunCoordinatorHandle,
 	type PlanRunCoordinatorTimerHandle,

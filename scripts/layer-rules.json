@@ -1,39 +1,6 @@
 {
-	"$comment": "Declared seams for scripts/check-layers.ts (warren-89a6). One entry per architectural boundary. `from` and `allow` hold repo-relative POSIX paths: a trailing slash is a directory prefix, anything else is an exact file. `forbidImports` holds module targets — a relative specifier is resolved against the importing file first, so `src/server/` catches `../server/types.ts` but not `../seeds-cli/index.ts`; a bare entry matches a package and its subpaths; `*` matches every target. `exceptImports` carves targets back out of `forbidImports`. `forbidPattern` is a JS regex applied to each non-comment source line, for a rule that is not about imports. Every `allow` entry states why the exception is legitimate. Adding a seam here is a data edit — new seams are born enforced.",
+	"$comment": "Declared seams for scripts/check-layers.ts (warren-89a6). One entry per architectural boundary. `from` and `allow` hold repo-relative POSIX paths: a trailing slash is a directory prefix, anything else is an exact file. `forbidImports` holds module targets \u2014 a relative specifier is resolved against the importing file first, so `src/server/` catches `../server/types.ts` but not `../seeds-cli/index.ts`; a bare entry matches a package and its subpaths; `*` matches every target. `exceptImports` carves targets back out of `forbidImports`. `forbidPattern` is a JS regex applied to each non-comment source line, for a rule that is not about imports. Every `allow` entry states why the exception is legitimate. Adding a seam here is a data edit \u2014 new seams are born enforced.",
 	"rules": [
-		{
-			"name": "burrow-facade-is-local-only",
-			"why": "The src/burrow-client/ facade is local-topology only. Route runtime calls through the RuntimeProvider seam (src/runtime/contract.ts) instead, or move the coupling under src/runtime/local/.",
-			"from": ["src/"],
-			"forbidImports": ["src/burrow-client/"],
-			"allow": [
-				{ "path": "src/burrow-client/", "why": "the facade itself" },
-				{
-					"path": "src/runtime/local/",
-					"why": "the LocalProvider and its seams, including diagnostics/burrow.ts and boot-backend.ts"
-				},
-				{
-					"path": "src/supervisor/",
-					"why": "local-topology by definition — it spawns burrow serve"
-				},
-				{ "path": "src/runtime/registry.ts", "why": "the () => BurrowClient factory seam" }
-			]
-		},
-		{
-			"name": "burrow-package-is-local-only",
-			"why": "@os-eco/burrow-cli is burrow's own library (transport and error types plus the in-pod agent framework). It is local-topology only; under WARREN_RUNTIME=k8s there is no burrow at all.",
-			"from": ["src/"],
-			"forbidImports": ["@os-eco/burrow-cli"],
-			"allow": [
-				{ "path": "src/burrow-client/", "why": "the facade itself" },
-				{ "path": "src/runtime/local/", "why": "the LocalProvider and its seams" },
-				{ "path": "src/supervisor/", "why": "local-topology by definition" },
-				{
-					"path": "src/runtime/k8s/",
-					"why": "the pod agent harness uses burrow-cli's AgentRegistry / AgentRuntime — residual burrow surface, deliberately left"
-				}
-			]
-		},
 		{
 			"name": "domain-owns-the-logic",
 			"why": "The domain modules own the logic. The HTTP handlers and the CLI are surfaces over them, so the dependency points inward only. A type the domain needs belongs in the domain; src/server/types.ts may re-export it outward.",
@@ -58,21 +25,74 @@
 			"allow": [
 				{
 					"path": "src/cli/commands/serve.ts",
-					"why": "`warren serve` boots the server in-process — this command IS the server's entry point, so importing bootServer is the command's whole job"
+					"why": "`warren serve` boots the server in-process \u2014 this command IS the server's entry point, so importing bootServer is the command's whole job"
 				}
 			]
 		},
 		{
 			"name": "handlers-are-a-thin-surface",
-			"why": "HTTP handlers talk to repos, never to drizzle tables. Reaching into src/db/schema/ puts a query in the request path instead of in the repo that owns it.",
+			"why": "HTTP handlers talk to repos, never to drizzle tables. Reaching into src/db/schema/ puts a query in the request path instead of in the repo that owns it. The barrel src/db/schema.ts is banned too (warren-02c9): the row types handlers legitimately need are re-exported at the domain seams (src/runs/, src/projects/, src/plan-runs/, src/registry/ index.ts), so no handler import of the barrel remains legitimate.",
 			"from": ["src/server/handlers/"],
-			"forbidImports": ["src/db/schema/"]
+			"forbidImports": ["src/db/schema/", "src/db/schema.ts"]
 		},
 		{
 			"name": "handlers-do-not-build-repos",
 			"why": "Assembling the persistence layer is boot wiring, not request handling. Consume the seams ServerDeps already carries (deps.repos, deps.dbAdapter, deps.runPreviews); add a new one in src/server/db-seams.ts rather than building one per request.",
 			"from": ["src/server/handlers/"],
 			"forbidPattern": "[A-Za-z_$][\\w$.]*\\(\\s*deps\\.db\\b"
+		},
+		{
+			"name": "extensions-are-standalone",
+			"why": "An extension is a standalone package a third party could have built against warren's published HTTP surface (docs/design/extensions.md). Importing src/ or scripts/ couples it to internals that are not API, and the coupling would be invisible to the friction report that is the whole point of the flagship.",
+			"from": ["extensions/"],
+			"forbidImports": ["src/", "scripts/"]
+		},
+		{
+			"name": "core-does-not-import-extensions",
+			"why": "Warren core stays free of extension-specific code: an extension is delivered and runs out-of-process, so an import from src/ or scripts/ into extensions/ compiles the extension into core and makes its removal a breaking change.",
+			"from": ["src/", "scripts/"],
+			"forbidImports": ["extensions/"]
+		},
+		{
+			"name": "github-api-literal-is-forge-only",
+			"why": "The api.github.com literal lives only inside the forge seam (docs/design/forge-contract.md \u00a70). Domain code names a RepoRef, never a GitHub URL; a new literal outside src/forge/ is a leak across the seam. scripts/ joined `from` in warren-c042 when the walk widened to cover it.",
+			"from": ["src/", "scripts/"],
+			"forbidPattern": "api\\.github\\.com",
+			"allow": [
+				{
+					"path": "src/forge/",
+					"why": "the forge seam itself \u2014 it owns the GitHub transport"
+				}
+			]
+		},
+		{
+			"name": "forge-transport-is-forge-only",
+			"why": "GitHub transport (src/forge/github/ internals, octokit-family packages) is reached only through the Forge contract (src/forge/contract.ts). The allow list below is the phase-3 ratchet (plan pl-d1c9): it only shrinks, and reaches zero when the callers migrate onto the seam.",
+			"from": ["src/", "scripts/"],
+			"forbidImports": [
+				"src/forge/github/",
+				"octokit",
+				"@octokit/rest",
+				"@octokit/core",
+				"@octokit/request"
+			],
+			"allow": [
+				{
+					"path": "src/forge/",
+					"why": "the seam itself"
+				},
+				{
+					"path": "scripts/acceptance/lib/github.ts",
+					"why": "the acceptance harness's GitHub helper deliberately reuses the seam's header builder and GITHUB_API_BASE instead of carrying a fifth copy (warren-2740) \u2014 it adds no new transport"
+				}
+			]
+		},
+		{
+			"name": "ui-is-a-browser-consumer",
+			"why": "The UI is a Vite browser bundle. It consumes the import-nothing kernel (src/core/) and the SDK's browser-safe NDJSON reader, and nothing else in src/: any other module drags bun:sqlite or drizzle toward the browser. tsconfig.app.json's `include` list failing with TS6307 is a build accident, not a seam guard \u2014 this rule is the guard. Mirrors AGENTS.md: the UI consumes src/core, its own code, and the re-exported client types.",
+			"from": ["src/ui/"],
+			"forbidImports": ["src/"],
+			"exceptImports": ["src/ui/", "src/core/", "src/client/ndjson.ts"]
 		},
 		{
 			"name": "core-kernel-imports-nothing",

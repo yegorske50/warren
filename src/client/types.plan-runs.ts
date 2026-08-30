@@ -2,7 +2,12 @@
  * Plan-run wire types (warren-8ffc), split out of `./types.ts`
  * (warren-fcc8) to keep that file under its line budget.
  */
-import type { PlanRunChildState, PlanRunState } from "../core/wire.ts";
+import type {
+	PlanRunChildState,
+	PlanRunSource,
+	PlanRunState,
+	PlanRunStateFilter,
+} from "../core/wire.ts";
 import type { RunRow } from "./types.ts";
 
 /* Plan-runs — typed facade over /plan-runs (warren-8ffc).                 */
@@ -22,13 +27,18 @@ export {
 
 export interface PlanRunRow {
 	id: string;
-	planId: string;
+	/** Null on the warren-de42 `issues` form. */
+	planId: string | null;
+	/** warren-de42: 'plan' (classic plan id) | 'issues' (explicit issue-id list). */
+	source: PlanRunSource;
 	projectId: string;
 	agentName: string;
 	promptTemplate: string;
 	ref: string | null;
 	providerOverride: string | null;
 	modelOverride: string | null;
+	/** warren-a63d: per-child USD spend cap forwarded to every child dispatch. */
+	maxCostUsd: number | null;
 	dispatcherHandle: string;
 	trigger: string;
 	state: PlanRunState;
@@ -50,17 +60,23 @@ export interface PlanRunChildRow {
 	endedAt: string | null;
 	prMergedAt: string | null;
 	failureReason: string | null;
+	/** warren-6de9: automatic child re-dispatch budget consumed so far. */
+	retryCount: number;
 }
 
-/** `POST /plan-runs` request body. Wire envelope is camelCase. */
+/** `POST /plan-runs` request body. Exactly one of `planId` / `issues` (warren-de42). */
 export interface CreatePlanRunInput {
 	project: string;
-	planId: string;
+	planId?: string;
+	/** warren-de42: ordered issue-id list; the tracker need not support plans. */
+	issues?: string[];
 	agent: string;
 	promptTemplate?: string;
 	ref?: string;
 	providerOverride?: string;
 	modelOverride?: string;
+	/** Per-child USD spend cap (warren-a63d); same validation as `POST /runs` maxCostUsd. */
+	maxCostUsd?: number;
 	dispatcherHandle?: string;
 }
 
@@ -77,7 +93,8 @@ export interface PlanRunDetailResponse {
 
 export interface ListPlanRunsFilter {
 	project?: string;
-	state?: PlanRunState;
+	/** Omit for every state; `active` is the live view (warren-302a). */
+	state?: PlanRunStateFilter;
 }
 
 export interface ListPlanRunsResponse {

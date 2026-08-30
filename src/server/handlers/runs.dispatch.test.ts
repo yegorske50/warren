@@ -4,7 +4,13 @@ import { createRepos, type Repos } from "../../db/repos/index.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { BridgeRegistry, ServeHandle } from "../types.ts";
-import { depsFor, makeBurrowClient, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
+import {
+	depsFor,
+	makeRecordingLogger,
+	makeSandboxClient,
+	silentLogger,
+	tcpUrl,
+} from "./runs.test-helpers.ts";
 
 describe("POST /runs — spawn flow", () => {
 	let db: WarrenDb;
@@ -62,22 +68,22 @@ describe("POST /runs — spawn flow", () => {
 		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-"));
 
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: tmpWs },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_xxxxxxxxxxxx", sandboxRunId: "run_zzzzzzzzzzzz", workspacePath: tmpWs },
 			calls,
 		);
 
 		// Stub bridge so the handler's deps.bridges.start() lands in our
 		// registry without needing a real burrow stream.
-		const bridgeStarted: { runId: string; burrowRunId: string }[] = [];
+		const bridgeStarted: { runId: string; sandboxRunId: string }[] = [];
 		const bridges: BridgeRegistry = {
-			start: (runId, burrowRunId) => {
-				bridgeStarted.push({ runId, burrowRunId });
+			start: (runId, sandboxRunId) => {
+				bridgeStarted.push({ runId, sandboxRunId });
 			},
 			stopAll: async () => {},
 			size: () => bridgeStarted.length,
 		};
-		const deps = await depsFor(repos, burrowClient, bridges);
+		const deps = await depsFor(repos, sandboxClient, bridges);
 
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
@@ -97,15 +103,90 @@ describe("POST /runs — spawn flow", () => {
 		expect(res.status).toBe(201);
 		const body = (await res.json()) as {
 			run: { id: string; state: string };
-			burrow: { id: string };
+			sandbox: { id: string };
 		};
 		expect(body.run.id).toMatch(/^run_/);
 		expect(body.run.state).toBe("queued");
-		expect(body.burrow.id).toBe("bur_xxxxxxxxxxxx");
+		expect(body.sandbox.id).toBe("bur_xxxxxxxxxxxx");
 		expect(bridgeStarted.length).toBe(1);
-		expect(bridgeStarted[0]?.burrowRunId).toBe("run_zzzzzzzzzzzz");
-		expect(calls.some((c) => c.method === "POST" && c.path === "/burrows")).toBe(true);
-		expect(calls.some((c) => c.path === "/burrows/bur_xxxxxxxxxxxx/runs")).toBe(true);
+		expect(bridgeStarted[0]?.sandboxRunId).toBe("run_zzzzzzzzzzzz");
+		expect(calls.some((c) => c.method === "POST" && c.path === "/sandboxes")).toBe(true);
+		expect(calls.some((c) => c.path === "/sandboxes/bur_xxxxxxxxxxxx/runs")).toBe(true);
+	});
+
+	test("stamps dispatchOrigin=api on a plain POST /runs (warren-9ce3)", async () => {
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-origin-"));
+
+		const { logger, lines } = makeRecordingLogger();
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_origin00000", sandboxRunId: "run_origin00000", workspacePath: tmpWs },
+			[],
+		);
+		const deps = { ...(await depsFor(repos, sandboxClient)), logger };
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				agent: "refactor-bot",
+				project: project.id,
+				prompt: "hello",
+				dispatcherHandle: "@operator",
+			}),
+		});
+		expect(res.status).toBe(201);
+
+		const provisioned = lines.find((l) => l.obj.event === "spawn.provisioned");
+		expect(provisioned?.obj.dispatch_origin).toBe("api");
+		expect(provisioned?.obj.dispatcher_handle).toBe("@operator");
+	});
+
+	test("stamps dispatchOrigin=cli when body.trigger is cli (warren-9ce3)", async () => {
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-cli-"));
+
+		const { logger, lines } = makeRecordingLogger();
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_cli00000000", sandboxRunId: "run_cli00000000", workspacePath: tmpWs },
+			[],
+		);
+		const deps = { ...(await depsFor(repos, sandboxClient)), logger };
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				agent: "refactor-bot",
+				project: project.id,
+				prompt: "hello",
+				trigger: "cli",
+			}),
+		});
+		expect(res.status).toBe(201);
+
+		const provisioned = lines.find((l) => l.obj.event === "spawn.provisioned");
+		expect(provisioned?.obj.dispatch_origin).toBe("cli");
 	});
 
 	test("optional seedId persists onto runs.seed_id (warren-805a)", async () => {
@@ -118,11 +199,11 @@ describe("POST /runs — spawn flow", () => {
 		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-seedid-"));
 
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_seed00000000", burrowRunId: "run_seedrun00000", workspacePath: tmpWs },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_seed00000000", sandboxRunId: "run_seedrun00000", workspacePath: tmpWs },
 			calls,
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -157,11 +238,11 @@ describe("POST /runs — spawn flow", () => {
 		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-target-"));
 
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_target000000", burrowRunId: "run_targetrun000", workspacePath: tmpWs },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_target000000", sandboxRunId: "run_targetrun000", workspacePath: tmpWs },
 			calls,
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -187,8 +268,61 @@ describe("POST /runs — spawn flow", () => {
 
 		// targetBranch short-circuits the composed `${prefix}/${runId}` branch:
 		// the burrow workspace branch equals the push target.
-		const up = calls.find((c) => c.method === "POST" && c.path === "/burrows");
+		const up = calls.find((c) => c.method === "POST" && c.path === "/sandboxes");
 		expect((up?.body as { branch?: string } | undefined)?.branch).toBe("fix/pr-head");
+	});
+
+	test("optional ref persists onto runs.ref and echoes in the POST /runs response (warren-afeb)", async () => {
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+
+		const { mkdtemp } = await import("node:fs/promises");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const tmpWs = await mkdtemp(join(tmpdir(), "warren-handlers-ref-"));
+
+		const calls: { method: string; path: string; body: unknown }[] = [];
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_ref000000000", sandboxRunId: "run_refrun000000", workspacePath: tmpWs },
+			calls,
+		);
+		const deps = await depsFor(repos, sandboxClient);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const res = await fetch(`${tcpUrl(handle)}/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				agent: "refactor-bot",
+				project: project.id,
+				prompt: "repair the PR",
+				ref: "fix/pr-head",
+			}),
+		});
+		expect(res.status).toBe(201);
+		const body = (await res.json()) as { run: { id: string; ref: string | null } };
+		expect(body.run.ref).toBe("fix/pr-head");
+
+		const persisted = await repos.runs.require(body.run.id);
+		expect(persisted.ref).toBe("fix/pr-head");
+
+		// A ref-less dispatch echoes null, not a dropped field.
+		const res2 = await fetch(`${tcpUrl(handle)}/runs`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				agent: "refactor-bot",
+				project: project.id,
+				prompt: "ordinary run",
+			}),
+		});
+		expect(res2.status).toBe(201);
+		const body2 = (await res2.json()) as { run: { id: string; ref: string | null } };
+		expect(body2.run.ref).toBeNull();
 	});
 
 	test("continueFromRunId persists onto runs.parent_run_id (warren-4b11)", async () => {
@@ -204,11 +338,11 @@ describe("POST /runs — spawn flow", () => {
 		});
 
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_cont00000000", burrowRunId: "run_contrun00000", workspacePath: "/tmp/ws" },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_cont00000000", sandboxRunId: "run_contrun00000", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -250,11 +384,11 @@ describe("POST /runs — spawn flow", () => {
 			trigger: "manual",
 		});
 
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_clone0000000", burrowRunId: "run_clonerun0000", workspacePath: "/tmp/ws" },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_clone0000000", sandboxRunId: "run_clonerun0000", workspacePath: "/tmp/ws" },
 			[],
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -288,11 +422,11 @@ describe("POST /runs — spawn flow", () => {
 
 	test("invalid body params → 400 validation_error", async () => {
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_xxxxxxxxxxxx", sandboxRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -309,13 +443,46 @@ describe("POST /runs — spawn flow", () => {
 		expect(body.error.code).toBe("validation_error");
 	});
 
-	test("empty body → 400 validation_error", async () => {
+	test("non-object metadata → 400 validation_error, no burrow call (warren-b27c)", async () => {
 		const calls: { method: string; path: string; body: unknown }[] = [];
-		const burrowClient = makeBurrowClient(
-			{ burrowId: "bur_xxxxxxxxxxxx", burrowRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_xxxxxxxxxxxx", sandboxRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
 			calls,
 		);
-		const deps = await depsFor(repos, burrowClient);
+		const deps = await depsFor(repos, sandboxClient);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+		for (const metadata of [[1, 2], "nope", 7]) {
+			const res = await fetch(`${tcpUrl(handle)}/runs`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					agent: "refactor-bot",
+					project: project.id,
+					prompt: "p",
+					metadata,
+				}),
+			});
+			expect(res.status).toBe(400);
+			const body = (await res.json()) as { error: { code: string } };
+			expect(body.error.code).toBe("validation_error");
+		}
+		expect(calls).toEqual([]);
+	});
+
+	test("empty body → 400 validation_error", async () => {
+		const calls: { method: string; path: string; body: unknown }[] = [];
+		const sandboxClient = makeSandboxClient(
+			{ sandboxId: "bur_xxxxxxxxxxxx", sandboxRunId: "run_zzzzzzzzzzzz", workspacePath: "/tmp/ws" },
+			calls,
+		);
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,

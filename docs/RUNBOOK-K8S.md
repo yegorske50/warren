@@ -5,7 +5,7 @@ This runbook is the durable operations document.
 It covers deploy, secrets, RBAC, garbage collection, admission control, observability, and incident response.
 
 **Scope.** This runbook covers the `WARREN_RUNTIME=k8s` topology only.
-For the default self-host topology (one container, burrow-backed `LocalProvider`), see the [README](../README.md) quickstart.
+For the default self-host topology, which runs warren's `LocalProvider` in one container, see the [Docker self-host guide](self-host/docker.md) and the [Operators section](../README.md#operators) of the root README.
 That path needs none of this document.
 
 **Cross-references** (read these documents, do not duplicate them here):
@@ -18,17 +18,17 @@ That path needs none of this document.
 ## 0. The runtime-provider model
 
 Warren selects its run backend once at boot from `WARREN_RUNTIME` (`src/runtime/registry.ts`).
-Unset or `local` selects the burrow-backed `LocalProvider`, the self-host default.
-The value `k8s` selects the `K8sProvider`.
-Both implement the same eight-method `RuntimeProvider` contract (`src/runtime/contract.ts`), so the domain (`src/runs/*`) is identical across topologies.
-Only workspace materialization, event streaming, steering transport, and finalize differ.
+Unset or `local` selects the warren-owned `LocalProvider`, the self-host default.
+The values `docker` and `k8s` select the sibling-container and pod providers.
+All providers implement the same `RuntimeProvider` contract (`src/runtime/contract.ts`), so the domain (`src/runs/*`) is identical across topologies.
+Only workspace materialization, event streaming, steering transport, and finalization differ.
 
-Under `k8s` **there is no burrow**: no `burrow serve` sibling, no unix socket, no bwrap.
+Under `k8s`, there is no `bwrap` sandbox or local supervisor child for the run.
 Each run is a bare pod (`restartPolicy: Never`) in the `warren-runs` namespace, and the pod boundary is the sandbox.
-A bad `WARREN_RUNTIME` value fails loud at boot (`UnknownRuntimeError`) — it never falls back silently.
+A bad `WARREN_RUNTIME` value fails loud at boot (`UnknownRuntimeError`) and never falls back silently.
 
-Key consequence for operators: everything burrow-shaped in the self-host docs is **dead weight under `k8s`** and must stay unset (§2.4).
-That list covers the four bwrap security flags, `BURROW_API_TOKEN` / `WARREN_BURROW_TOKEN`, `BURROW_DATA_DIR`, and the supervisor.
+The four `bwrap` security flags belong only to the local container topology and must stay absent from the Kubernetes deployment.
+Retired burrow token, socket, and data-directory variables also stay unset.
 
 ---
 
@@ -67,7 +67,7 @@ See [`deploy/k8s/README.md`](../deploy/k8s/README.md) for `--load-k3d`, `--load-
 | Image | Env var | Dockerfile | Role |
 |---|---|---|---|
 | `warren` (control plane) | referenced by the Deployment | root `Dockerfile` | boots `warren serve` directly (Deployment overrides ENTRYPOINT away from the supervisor — no burrow child under k8s) |
-| `warren-agent` | `WARREN_K8S_AGENT_IMAGE` (default `warren-agent:latest`) | `deploy/docker/Dockerfile.agent` | the run pod's toolchain: bun, node, git, the coding-agent CLIs + os-eco CLIs; runs `bun run agent:run` (`src/runtime/k8s/agent-entrypoint.ts`) |
+| `warren-agent` | `WARREN_K8S_AGENT_IMAGE` (default `warren-agent:latest`) | `deploy/docker/Dockerfile.agent` | the run pod's toolchain: bun, node, git, python3 + uv (warren-fabb), the coding-agent CLIs + os-eco CLIs; runs `bun run agent:run` (`src/runtime/k8s/agent-entrypoint.ts`) |
 | `warren-workspace-init` | `WARREN_K8S_INIT_IMAGE` (default `warren-workspace-init:latest`) | `deploy/docker/Dockerfile.workspace-init` | lightweight bun+git init container; runs `bun run workspace:init` (`src/runtime/k8s/workspace-init.ts`) |
 
 The `:latest` defaults name no registry.
@@ -85,11 +85,18 @@ kubectl apply -k deploy/k8s/overlays/gke     # GKE Autopilot
 kubectl apply -k deploy/k8s/overlays/kind    # local kind / k3d dev
 ```
 
+Both overlays **delete the placeholder Secret templates** from the render —
+the apply will not create them. Create the real Secrets imperatively
+BEFORE applying (commands in [`deploy/k8s/README.md`](../deploy/k8s/README.md),
+"Secrets — never commit real values"), because without `warren-secrets`
+the pod blocks in CreateContainerConfigError (warren-df5c).
+
 The base creates:
 
 - Two namespaces: `warren` for the control plane, `warren-runs` for run pods.
 - A ServiceAccount plus the RBAC Role and RoleBinding (§4).
 - A ResourceQuota with its paired LimitRange.
+- Run-pod NetworkPolicies (default-deny ingress + coarse egress — §4.1).
 - One PVC: `warren-data` (5Gi). The `warren-repo-cache` claim is opt-in via overlay (§5.3, warren-554f).
 - The Deployment, the Service, and the Ingress.
 
@@ -131,8 +138,9 @@ The job runs when `release.yml` calls this workflow after it cuts a release (`wo
 There is deliberately **no push trigger** (warren-8b5f).
 A push to `main` used to build, the release from that same push then called this workflow again, and thus every release built twice.
 
-The job builds all three images with `docker buildx --platform linux/amd64` — Autopilot is amd64, and arm64 CrashLoops with `exec format error`.
+The job builds all four images with `docker buildx --platform linux/amd64` — Autopilot is amd64, and arm64 CrashLoops with `exec format error`.
 The images are: root `Dockerfile` → `warren`, `deploy/docker/Dockerfile.agent` → `warren-agent`, and `deploy/docker/Dockerfile.workspace-init` → `warren-workspace-init`.
+The fourth image is `extensions/judge/Dockerfile` → `warren-ext-judge` (warren-eecb), built from the extension directory alone.
 The job tags each image with the full commit SHA **and** `latest`.
 It pushes to the same `<region>-docker.pkg.dev/<project>/<repo>` Artifact Registry that `cloudbuild.yaml` targets.
 The layer cache is GHA-scoped per image.
@@ -148,10 +156,20 @@ The render pins all three images to the commit SHA: control-plane image via kust
 Then `kubectl apply -k` runs, with a `rollout status` gate after it.
 That render is exactly the documented `gke-live` pattern (`deploy/k8s/overlays/gke/kustomization.yaml` header), produced from CI vars instead of a hand-maintained local overlay.
 
-**Post-deploy checks** close the job with two assertions, both fatal.
+**Post-deploy checks** close the warren rollout with two assertions, both fatal.
 First, the rolled-out control-plane image must be the exact SHA the job just built.
 Second, on the release path, the job polls `GET https://$WARREN_INGRESS_HOST/version` until it reports the released semver.
 That poll proves that the ingress serves the new code, not just that the Deployment spec points at it (warren-8b5f).
+
+**Judge extension roll** (warren-eecb) closes the job.
+If a `judge` Deployment exists in the `warren` namespace, the job moves it to `warren-ext-judge:<sha>` with `kubectl set image`.
+The job then waits for the rollout and verifies the live image against the built SHA.
+`set image` touches only the image.
+The operator's provider/model/budget env and the imperative Secrets, both owned by the gitignored `gke-live-judge` overlay, stay as deployed.
+If no judge Deployment exists, the step skips — the judge is opt-in, and CI never creates it.
+
+After a CI roll, refresh the local overlay's `newTag` from the live Deployment before any manual `kubectl apply -k`.
+A stale manual apply rolls the image back (the warren-0028 hazard).
 
 Auth is **GCP Workload Identity Federation** (`google-github-actions/auth`) — no long-lived JSON service-account keys.
 A repo admin must configure:
@@ -241,6 +259,10 @@ That key is only correct while DNS stays unproxied.
 If a proxy ever sits in front of the LB, every request keys off the proxy's address.
 The rule must then move to `--enforce-on-key=XFF-IP`.
 
+The per-client event-stream cap has the same keying problem in-process (warren-46a7): GCLB appends `<client-ip>, <lb-ip>` after whatever X-Forwarded-For the caller supplied, so the left-most hop is client-forgeable.
+`eventStreamClientKey` therefore counts from the right, skipping `WARREN_EVENT_STREAM_TRUSTED_PROXY_HOPS` infrastructure hops — the GKE overlay pins it to `1` (the LB's own address).
+If a proxy ever sits in front of the LB, raise it by the hops that proxy appends — otherwise every spectator shares one per-client allowance.
+
 **Do not burst-test from your own network.** The warren-63e4 synthetic burst verification trips rule 1000 exactly as designed — and the 300s ban then applies to *your* IP too.
 Your own browser gets 429s off the UI and API for five minutes, mid-verification.
 Run the burst from an external vantage point instead (Cloud Shell is the cheap one), or accept the self-lockout.
@@ -328,14 +350,14 @@ Two namespaces hold secrets — the run namespace deliberately gets a smaller cr
 
 | Secret / key | Namespace | Consumed as | Purpose |
 |---|---|---|---|
-| `warren-secrets/warren-api-token` | `warren` | `WARREN_API_TOKEN` | bearer auth on every route except `/healthz`; also the in-pod callback token and the preview-cookie HMAC seed |
+| `warren-secrets/warren-api-token` | `warren` | `WARREN_API_TOKEN` | persisted operator bearer and signing seed for derived run callback tokens and preview cookies |
 | `warren-secrets/warren-db-url` | `warren` | `WARREN_DB_URL` | Postgres DSN (omit → SQLite on `warren-data`) |
 | `warren-secrets/github-token` | `warren` | `GITHUB_TOKEN` | control-plane git push / private clone |
 | `warren-secrets/anthropic-api-key` | `warren` | `ANTHROPIC_API_KEY` | injected into agent pod env at dispatch |
 | `warren-secrets/sentry-dsn` | `warren` | `SENTRY_DSN` | error reporting (optional) |
 | `warren-secrets/warren-auth` | `warren` | `WARREN_AUTH` | auth posture: `token` (default) or `public`; **not a secret** — it lives here so the flip and the revert stay a Secret edit plus a rollout restart |
 | `warren-secrets/warren-public-allowlist` | `warren` | `WARREN_PUBLIC_ALLOWLIST` | comma-separated owners (`my-org`) and/or repos (`some-owner/some-repo`) a public instance may hold; read **only** under `WARREN_AUTH=public`, where an empty value refuses the boot |
-| `warren-git-token/token` | `warren-runs` | `WARREN_GIT_TOKEN` (init pod) | init-container clone/push; **optional** — public repos clone without it, private repos **fail silently** if it is missing |
+| `warren-git-token/token` | `warren-runs` | `WARREN_GIT_TOKEN` (init pod) | optional init clone/push token. A private-repo run reaches `Init:Error` without it. |
 | `warren-anthropic-key/api-key` | `warren-runs` | agent pod `secretKeyRef` | OPTIONAL agent key source (`WARREN_K8S_ANTHROPIC_SECRET_NAME`/`_KEY`); a run whose key rides the dispatch env still schedules when this Secret is absent |
 
 `base/secrets.yaml` ships **placeholder templates** so that `kustomize build` resolves — never `kubectl apply` it as-is.
@@ -344,21 +366,25 @@ The exact `kubectl create secret generic` commands are in [`deploy/k8s/README.md
 
 ### 2.2 The `warren-runs` isolation boundary
 
-Run pods receive only the credentials a compromised pod is permitted to hold: the Anthropic key (agent), `WARREN_API_TOKEN` (callback), and `WARREN_GIT_TOKEN` (init clone/push).
-They do **not** get the DB URL, and they cannot read Secrets from the K8s API — the RBAC Role grants no `secrets` verb (§4).
-Secrets reach pods as env values that the control plane stamps into the pod spec, not as API reads by the pod.
+Run pods receive the agent key, an init Git token, and a derived callback bearer. The callback bearer uses the `WARREN_API_TOKEN` env name inside the pod.
+
+That callback bearer is not the persisted operator token. It is bound to one live run and reaches that run's inbox, finalize, and salvage routes. This scope does not yet admit App-mode K8s credential remint. `warren-5a5c` tracks that gap.
+
+Run pods do **not** get the DB URL. They cannot read Secrets from the K8s API because the RBAC Role grants no `secrets` verb (§4). The control plane stamps permitted credentials into the pod spec as env values.
 
 ### 2.3 Rotation
 
-There is one bearer token, and it is not scoped or versioned (see [SECURITY.md](../SECURITY.md)).
+There is one persisted operator bearer token. Warren derives narrower per-run callback tokens from it (see [SECURITY.md](../SECURITY.md)).
 
-- **`WARREN_API_TOKEN`.** A rotation invalidates in-flight callback auth and every preview cookie (the HMAC key derives from it). Rotate during a quiet window: update `warren-secrets`, then `kubectl -n warren rollout restart deploy/warren`. In-flight run pods hold the old token in their env, so their finalize callback will fail. Drain first (§7.6), or accept that active runs reap degraded.
+- **`WARREN_API_TOKEN`.** Rotating the operator secret invalidates derived callback tokens for in-flight runs and every preview cookie. Rotate during a quiet window: update `warren-secrets`, then `kubectl -n warren rollout restart deploy/warren`. In-flight run pods hold callback tokens signed with the old secret, so their finalize callback will fail. Drain first (§7.6), or accept that active runs reap degraded.
 - **`GITHUB_TOKEN` / `WARREN_GIT_TOKEN`.** Update both copies — the control-plane `warren-secrets/github-token` and the run-namespace `warren-git-token/token` are the same PAT by convention. Rollout-restart the control plane. New run pods pick the new value up at the next dispatch. Old pods keep the token in their spec until they exit.
 - **`ANTHROPIC_API_KEY`.** Update `warren-secrets` (the control-plane env source) and the optional `warren-anthropic-key` if you use the `secretKeyRef` path. Rollout-restart.
 
 Rotation is coarse (edit the Secret, restart) because V1 has no token expiry or scopes.
 The restart is not optional. The public event stream builds its secret-literal matcher from `process.env` once, at the first public event, and never rebuilds it. Rotate any secret that reaches warren via env, then restart warren. Until the restart, public event projections do not redact the new value.
-Per-user identity and short-lived per-run GitHub App tokens are roadmap items (R-09, R-18).
+
+GitHub App mode ships short-lived installation tokens, minted per operation. Set `WARREN_FORGE=app` and follow §2.6.
+[ROADMAP.md](../ROADMAP.md) defers per-user identity until paid — the deployment, not the user account, is warren's unit of trust.
 
 ### 2.4 Secrets you must NOT set under k8s
 
@@ -399,6 +425,49 @@ The allowlist proves the OWNER, not that each repo under it is public.
 Put an org on the list only when you accept every repo in it becoming visible.
 `scripts/public-auth-wiring.test.ts` guards the wiring that carries both keys into the container.
 
+### 2.6 GitHub App mode (`WARREN_FORGE=app`)
+
+App mode replaces the static PAT with short-lived installation tokens.
+The control plane mints a token per operation and re-mints it on expiry (design: [`docs/design/forge-contract.md`](design/forge-contract.md) §4).
+No bearer token ever sits on a config object.
+The only long-lived secret is the App's PEM private key.
+A misconfigured value fails the boot loudly, never silently at first dispatch.
+
+**Register the App (once).** Open `GET /github-app/register` in a browser that can reach the warren UI.
+You need no bearer token.
+
+The registration surface sits behind an existence gate (warren-e320), and a gated-off route answers 404.
+Set `WARREN_GITHUB_APP_REGISTRATION=on` or `=off` to override the gate outright.
+The default derives fail-safe: OFF under `WARREN_AUTH=public`, OFF once `WARREN_FORGE=app` holds working credentials, and ON only for a private instance without App credentials.
+That last case is the first-boot flow the surface exists for.
+Boot logs the resolved verdict, so you can see why the surface is or is not there.
+
+The page shows the exact manifest (contents and pull-requests write, checks read, private visibility) and one button that hands it to GitHub's create-App flow.
+
+GitHub then redirects back to `/github-app/callback`.
+The callback converts the single-use code with no authentication and renders the credential set once: App id, slug, client id and secret, and the PEM private key.
+
+Warren stores nothing, so copy the values into your secret store from that page.
+For an organization-owned App, use `/github-app/register?org=<login>`.
+
+**Install the App.** The credentials page links to `https://github.com/apps/<slug>/installations/new`.
+Install the App on the account or repositories warren may touch.
+Then read the installation id from the URL GitHub lands on (`.../settings/installations/<id>`).
+
+**Supply the credentials.** Add these keys to `warren-secrets` (or to the env of a non-k8s deploy) and rollout-restart:
+
+| Secret key | Env var | Value |
+|---|---|---|
+| `warren-forge` | `WARREN_FORGE` | `app` |
+| `github-app-id` | `WARREN_GITHUB_APP_ID` | the App id from the callback page |
+| `github-app-installation-id` | `WARREN_GITHUB_APP_INSTALLATION_ID` | from the install step above |
+| `github-app-private-key` | `WARREN_GITHUB_APP_PRIVATE_KEY` | the PEM, verbatim (warren unfolds literal `\n` sequences if your store needs the single-line form) |
+
+From then on the control plane mints installation tokens from the cached triple.
+The static `GITHUB_TOKEN` is no longer the forge credential.
+
+**Update the auto-merge bot login (migrating from PAT mode).** On every repo warren dispatches against, set the `AUTO_MERGE_BOT_LOGIN` repository variable to the App's `<slug>[bot]` login (for example `warren-forge-abc123[bot]`), replacing the old PAT account's login. Under App mode the App's bot identity authors agent PRs, and the auto-merge workflow's enable-auto-merge job matches the PR author login against this variable. Leave it on the PAT login and the job silently skips every agent PR with no error surfaced.
+
 ---
 
 ## 3. Control-plane configuration (env)
@@ -410,9 +479,9 @@ Manifest values live in `deploy/k8s/base/deployment.yaml` plus the overlays.
 |---|---|---|
 | `WARREN_RUNTIME` | `k8s` | selects `K8sProvider` (default `local`) |
 | `WARREN_K8S_NAMESPACE` | `warren-runs` | namespace run pods land in |
-| `WARREN_K8S_AGENT_IMAGE` / `WARREN_K8S_INIT_IMAGE` | registry paths | the run pod + init images (§1.2) |
+| `WARREN_K8S_AGENT_IMAGE` / `WARREN_K8S_INIT_IMAGE` | registry paths | the run pod + init images (§1.2). Per-project override: a project's `.warren/config.yaml` `agentImage` pins its own run-pod image — precedence: project `agentImage` > `WARREN_K8S_AGENT_IMAGE` > default (warren-fabb; the init image is not overridable) |
 | `WARREN_K8S_CALLBACK_SERVICE` / `_NAMESPACE` / `_PORT` | `warren` / `warren` / `8080` | the in-pod callback URL = Service DNS `warren.warren.svc.cluster.local:8080` (provider-owned; do not set `WARREN_API_URL` by hand) |
-| `WARREN_K8S_REPO_CACHE_PVC` | unset (cache OFF by default, warren-554f) | opt-in: names the shared repo-cache claim; set it (plus the PVC) via an overlay to enable the cache — see §5.3 |
+| `WARREN_K8S_REPO_CACHE_PVC` | unset (cache OFF by default, warren-554f) | opt-in: names the shared repo-cache claim; set it (plus the PVC) via an overlay — or, on the deploy-gke pipeline, via the repo variable of the same name (warren-8175) — see §5.3 |
 | `WARREN_K8S_REPO_CACHE_PATH` | `/repo-cache` | mount path for the cache |
 | `WARREN_K8S_MAX_QUEUE_DEPTH` | `50` | admission: total non-terminal pods; `0` disables (§5.5) |
 | `WARREN_K8S_MAX_PENDING_PODS` | `20` | admission: Pending pods; `0` disables |
@@ -422,6 +491,9 @@ Manifest values live in `deploy/k8s/base/deployment.yaml` plus the overlays.
 | `WARREN_K8S_EPHEMERAL_STORAGE_REQUEST_MIB` / `_LIMIT_MIB` | `10240` / `10240` (10Gi) | cluster-wide default ephemeral-storage budget (request + limit + emptyDir `sizeLimit`). A per-project `resources` block beats it (§7.3.1) |
 | `WARREN_AUTH` | unset ⇒ `token` | auth posture (§2.5); `public` admits credential-less spectators to the public projection |
 | `WARREN_PUBLIC_ALLOWLIST` | unset | owners and/or `owner/repo` entries a public instance may hold; required under `WARREN_AUTH=public` |
+| `WARREN_GITHUB_APP_REGISTRATION` | unset (fail-safe default, §2.6) | existence gate for the `/github-app/*` registration surface (warren-e320). `on`/`off` overrides the default. Gated-off routes answer 404 |
+| `WARREN_JUDGE_BASE_URL` | `http://judge.warren.svc.cluster.local:8080` | base URL of the judge extension Service; with the token below it enables the server-side `GET /verdicts.jsonl` proxy (the judge Service stays cluster-internal — the browser only talks to warren). Set in `deploy/k8s/base/deployment.yaml` |
+| `WARREN_JUDGE_EXPORT_TOKEN` | from `judge-secrets/judge-export-token` (optional) | bearer credential the proxy presents to the judge's export endpoint (`deploy/k8s/extensions/judge/secrets.yaml`). Both knobs unset ⇒ the surface is disabled |
 
 The provider injects these into pods (never set them by hand): `WARREN_API_URL`, `WARREN_RUN_ID`, `WARREN_REPO_URL`, `WARREN_BRANCH`, `WARREN_BASE_BRANCH`, `WARREN_WORKSPACE_PATH`, `WARREN_SEED_MANIFEST`.
 
@@ -457,6 +529,165 @@ kubectl auth can-i --as=system:serviceaccount:warren:warren \
 If dispatch fails with a `403 Forbidden` from the K8s API, check this Role first.
 A missing verb shows up as pods that never get created, or as an informer that never attaches.
 `configmaps` and `watch` are the common gaps — the plan text under-specified them.
+
+### 4.1 NetworkPolicy — run-pod egress contract (warren-8dbb)
+
+`deploy/k8s/base/networkpolicy.yaml` is the network-layer backstop for every
+warren-managed run pod (`warren.io/managed-by=warren`).
+
+Without a NetworkPolicy-capable CNI these objects are inert no-ops and the
+cluster keeps the flat-pod behaviour. With one (kind + Calico/Cilium, GKE
+Dataplane V2, most managed clusters) they take effect on apply.
+
+Live validation on kind and GKE is an operator follow-up. This tree only ships
+the manifests and offline-renders them via `kubectl kustomize`.
+
+Four policies ship, all in `warren-runs`:
+
+| Policy | Selects | Effect |
+|---|---|---|
+| `warren-runs-default-deny-ingress` | `warren.io/managed-by=warren` | **Deny all ingress.** Run pods are clients only — nothing (peer run pods, the control-plane pod network, anything else) should dial them. `kubectl logs`/`exec` ride the apiserver→kubelet path and are unaffected. |
+| `warren-runs-restricted-egress` | `warren.io/network=restricted` (the project default, `DEFAULT_K8S_NETWORK`) | **Coarse egress allowlist** — see contract below. |
+| `warren-runs-none-egress` | `warren.io/network=none` | **Deny all egress.** Mirrors LocalProvider/bwrap unshared-net and DockerProvider `--network none`. |
+| `warren-runs-open-egress` | `warren.io/network=open` | **Allow all egress.** Explicit so a future namespace-wide default-deny egress an operator adds does not surprise an `open` run. Ingress stays denied. |
+
+**`restricted` egress contract** (what a default run pod may dial):
+
+1. **DNS** — UDP/TCP port 53 to any destination. CoreDNS / kube-dns placement
+   differs across kind, k3d, and GKE. Pinning a namespace/podSelector would break
+   one of them, so the port alone is the allow.
+2. **Warren control-plane Service** — TCP 8080 to pods in namespace `warren`
+   labelled `app.kubernetes.io/name=warren,app.kubernetes.io/component=control-plane`.
+   This is the in-cluster callback (`http://warren.warren.svc.cluster.local:8080`)
+   the agent uses for events, inbox, and finalize. If you rename the control-plane
+   namespace or labels, update this rule in lockstep with
+   `WARREN_K8S_CALLBACK_*` / `pod-spec.ts`.
+3. **External world** — `0.0.0.0/0`. Git clone/push, model providers, and package
+   registries all leave the cluster. **No CIDR or FQDN pin** ships in-tree.
+   GitHub and provider ranges move, and FQDN-based policy needs Cilium or GKE
+   Dataplane V2. That tightening is operator territory at release time — widen
+   or narrow this rule in a live overlay, never by guessing CIDRs into base.
+
+What the policy set deliberately does **not** cover:
+
+- The control-plane pod in namespace `warren` (Ingress, ServiceMonitor, and
+  operator traffic stay unrestricted).
+- Per-domain allowlisting (`networkPolicy: "coarse"` in
+  `K8S_PROVIDER_CAPABILITIES` — see §8).
+- IPv6 egress (`::/0`). Add it in a live overlay if the cluster is dual-stack
+  and agents need it.
+
+Sanity checks after apply:
+
+```bash
+kubectl -n warren-runs get networkpolicy
+# A running restricted pod should resolve DNS, reach the warren Service on :8080,
+# and reach an external host (e.g. api.github.com). It must NOT accept a connect
+# from another run pod:
+kubectl -n warren-runs get pods -l warren.io/managed-by=warren -o wide
+# (from a debug pod in warren-runs) nc -zv <run-pod-ip> 1-65535  → times out
+```
+
+### 4.2 In-pod entrypoint/agent uid split (warren-cb93)
+
+Every run pod's agent container runs warren's entrypoint (pid 1, uid 1000)
+and the agent process under a second uid (`WARREN_POD_AGENT_UID` = 1001, gid
+stays 1000). The entrypoint wraps the agent argv in `setpriv`
+(`src/runtime/k8s/agent-uid-drop.ts`).
+
+The agent container carries `capabilities: add: [SETUID, SETGID, KILL]` for
+the entrypoint only. setpriv empties the agent's own capability sets and
+sets `no_new_privs`.
+
+The purpose is provenance. The warren-authored marker on pod-log lines
+(warren-6646) is in-band, so the agent must not be able to write at the
+entrypoint's stdout fd.
+
+A cross-uid open of `/proc/1/fd/1` fails EACCES.
+
+The setpriv privilege comes from file capabilities (warren-950d).
+containerd 2.x puts `capabilities.add` for a non-root pid 1 in the
+bounding set only. A bare setpriv then fails setresuid with EPERM, exit
+127. A GKE node auto-upgrade caused exactly this on 2026-08-25.
+
+The fix has two halves:
+
+- The agent image bakes file capabilities on the setpriv binary
+  (`setcap cap_setuid,cap_setgid+ep`, `deploy/docker/Dockerfile.agent`).
+- The agent container sets `allowPrivilegeEscalation: true` while the split
+  is on. This keeps `no_new_privs` off for the entrypoint, which lets the
+  file caps take effect on exec. The `capabilities.add` list still matters
+  because file caps only grant what the bounding set contains.
+
+The agent side cannot climb back with the same binary. setpriv runs it
+under `--no-new-privs` (inherited and irrevocable — file caps are inert)
+with `--bounding-set=-all` (SETUID gone from bounding regardless). Live
+canary pods on GKE Autopilot / containerd 2.1.7 proved both halves.
+
+The stdin-hold watchdog's force-kill is a cross-uid signal the entrypoint
+can no longer deliver directly. It routes through the same setpriv drop
+(`withCrossUidKill` in `src/runtime/k8s/agent-uid-drop.ts`).
+
+The entrypoint pre-flights the drop before launching the agent.
+
+When setpriv cannot gain the caps, the run fails legibly with a `uid-drop
+preflight failed` system event instead of running the agent at the
+entrypoint's uid. Reap finalizes it `spawn_failed` (an infrastructure
+fault, warren-950d) — never `no_model_response`.
+
+The deploy workflow gates on the split. After every rollout,
+`scripts/k8s-uid-drop-canary.ts` runs the exact preflight in a canary pod
+built from the run-pod builders, with the freshly built agent image.
+
+A cluster or image that can no longer privilege the drop turns the deploy
+red before any run dispatches. Run it by hand against any cluster:
+
+```bash
+bun run scripts/k8s-uid-drop-canary.ts --image <agent-image> --namespace warren-runs
+```
+
+`WARREN_K8S_AGENT_UID_DROP=0` on the control plane restores the legacy
+shared-uid pod shape (and the forgeable residual). Use it only as an
+escape hatch while you fix a runtime or image.
+
+Removal procedure: deploy an agent image with the file-caps setpriv, and
+run the canary above until it passes. Then run
+`kubectl -n warren set env deploy/warren WARREN_K8S_AGENT_UID_DROP-` and
+confirm the next run's pod log shows the `dropping agent to uid 1001` line.
+
+Live validation (operator step: dispatch any run, wait for the pod to reach
+`Running`, then substitute the pod name):
+
+```bash
+POD=$(kubectl -n warren-runs get pods -l warren.io/run-id=<run-id> -o name)
+
+# 1. The agent process really runs as uid 1001 while pid 1 stays uid 1000:
+kubectl -n warren-runs exec $POD -c agent -- \
+  sh -c 'for s in /proc/[0-9]*/status; do echo "$s $(grep -E "^(Name|Uid):" $s | tr "\n" " ")"; done'
+# expect: the entrypoint (bun) lines show Uid: 1000, the agent (claude/pi) shows Uid: 1001.
+
+# 2. The marker forge FAILS from the agent's uid (EACCES = the fix working):
+kubectl -n warren-runs exec $POD -c agent -- \
+  setpriv --reuid=1001 --regid=1000 --clear-groups --no-new-privs \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+  sh -c 'echo "{\"kind\":\"state_change\",\"origin\":\"warren\"}" > /proc/1/fd/1'
+# expect: "sh: can't create /proc/1/fd/1: Permission denied", non-zero exit,
+# and NOTHING appears in `kubectl logs $POD -c agent`.
+
+# 3. The agent's real work still functions under the split (group-writable
+#    workspace, uid-agnostic git safe.directory, readable bun global store):
+kubectl -n warren-runs exec $POD -c agent -- \
+  setpriv --reuid=1001 --regid=1000 --clear-groups --no-new-privs \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all -- \
+    sh -c 'touch /workspace/.uid-split-ok && rm /workspace/.uid-split-ok \
+      && git -C /workspace status --short \
+      && git -C /workspace -c user.name=uidcheck -c user.email=uidcheck@invalid \
+           commit --allow-empty -m uid-split-check \
+      && git -C /workspace reset --soft HEAD~1 \
+      && bun --version && sd --version && ml --version'
+# expect: all succeed (a uid-1001 commit inside the uid-1000-owned checkout
+# proves the warren-fd08 assumptions survived the split).
+```
 
 ---
 
@@ -504,6 +735,12 @@ RWX storage (like GKE Filestore, 1TiB minimum) costs too much to share a disk of
 Single-node clusters may opt back in via an overlay that adds the claim and re-sets the env — see `deploy/k8s/README.md` "Repo cache (opt-in)".
 Before adding a second node, either turn the cache back off or migrate the claim to a `ReadWriteMany` class (design R2).
 
+Multi-node clusters enable the cache with an RWX claim instead (warren-8175).
+Create `warren-repo-cache` in `warren-runs` on an RWX class (GKE: `standard-rwx`, Filestore Basic HDD, 1TiB tier minimum).
+Then set the repo variable `WARREN_K8S_REPO_CACHE_PVC=warren-repo-cache` — the render step in `deploy-gke.yml` re-wires the env on every deploy.
+The cost trade flips when a repo is large.
+Before the live cluster enabled the cache (2026-08), each openclaw run (~2.9GB) spent ~20min in Init on a fresh clone.
+
 When enabled, `warren-repo-cache` is a **shared clone cache**, never a working tree — the working tree is the per-pod `emptyDir`.
 The init container keeps a per-repo bare mirror at `/repo-cache` (`<sha256(url)>.git`, `git clone --mirror`, then `git fetch` on reuse).
 A run then costs a `git fetch` plus a fast local clone instead of a full network clone (warren-e908, design §4.3 / R2).
@@ -511,6 +748,11 @@ A run then costs a `git fetch` plus a fast local clone instead of a full network
 The number of distinct repos times their object-store size bounds growth — run count does not.
 If the cache fills: expand the PVC, or clear `WARREN_K8S_REPO_CACHE_PVC` to turn the cache off (runs then clone fresh — slower, with no disk growth).
 A wedged or corrupt mirror never blocks a run: any cache failure falls back to a direct network clone automatically (§7.5).
+
+Known refspec limit (warren-232d, accepted): the mirror update fetches only `refs/heads/*` and `refs/tags/*`.
+A `baseCommit`-pinned run whose SHA no branch or tag reaches therefore misses the cache.
+The local clone's `git checkout <sha>` fails, so the init container falls back to a direct network clone, which carries the full object store.
+This costs one uncached clone for unreachable-SHA replays and preserves correctness.
 
 ### 5.4 Namespace quota (the hard backstop)
 
@@ -567,9 +809,9 @@ The file stays out of the kustomize base because it needs the `monitoring.coreos
 ### 6.2 `/readyz` per topology
 
 `GET /readyz` (`src/server/handlers/diagnostics.ts`) runs deeper checks than the liveness `/healthz`.
-It is **topology-aware**: the burrow socket, bwrap, and stale-burrow-workspace probes only run when `resolveRuntimeKind() === "local"`, and return `[]` under k8s (warren-c128).
-Without that gate they would forever report "burrow unreachable" and wrongly degrade a healthy K8s control plane.
-Under k8s, `/readyz` covers: DB reachable, agents registered, the warren-config parse, and the preview-allocator and auth checks.
+It is **topology-aware**: local sandbox and stale-workspace probes only run when `resolveRuntimeKind() === "local"`, and return `[]` under k8s (warren-c128).
+Without that gate, local-only checks would wrongly degrade a healthy Kubernetes control plane.
+Under k8s, `/readyz` covers the database, registered agents, warren-config parsing, pod-watcher sync, preview allocation, and auth checks.
 
 The Deployment probes point at the **auth-exempt `/healthz`**.
 `/readyz` needs the bearer, so gate readiness on it only via a probe with `httpHeaders: [{name: Authorization, value: "Bearer …"}]`.
@@ -777,7 +1019,7 @@ Warren loses in-flight runs — it does not resume them.
 ### 7.8 Run stuck `running` after its pod completed (reap hang, warren-c433)
 
 **Symptom.** A run row stays `state=running` with `endedAt=null` long after `kubectl -n warren-runs get pods` shows the pod as `Succeeded`/`Failed`.
-The last log line is the run-state poller's `observed burrow terminal; draining stream before abort`.
+The last log line is the run-state poller's terminal-observation message before stream teardown.
 
 **Root cause (fixed).** The pod-log follow never hit EOF after the pod exited.
 The post-terminal stream teardown parked on `iterator.return()` forever.
@@ -804,7 +1046,7 @@ Operators must know the gaps:
 
 - **Preview environments are off** (`previewPorts: false`). A `.warren/preview.yaml` produces no preview and logs `reap.preview_skipped_unsupported`. Service/Ingress previews are a deferred feature.
 - **Steering latency is ~5s, not real-time.** Steer writes a `run_inbox` row, and the in-pod agent polls `GET /runs/:id/inbox`. That trade gains reliability (it survives pod and control-plane restarts) at a latency cost against the LocalProvider stdin path.
-- **Network policy is coarse.** No per-domain allowlist exists under k8s v1 (`networkPolicy: "coarse"`, against the LocalProvider's `domain-allowlist`).
+- **Network policy is coarse.** No per-domain allowlist exists under k8s v1 (`networkPolicy: "coarse"`, against the LocalProvider's `domain-allowlist`). The base manifests ship default-deny ingress plus DNS/Service/open-external egress for `restricted` runs (§4.1). FQDN allowlisting is operator territory (Cilium / GKE Dataplane V2).
 - **The repo cache is opt-in and RWO — single-node only.** The cache is off by default (warren-554f). If you enable it, move `warren-repo-cache` to a `ReadWriteMany` class (GKE Filestore CSI, or Longhorn on bare metal) **before** you add a second node. Otherwise concurrent run pods deadlock on the RWO claim (Multi-Attach, design R2). Do not provision Filestore only to run single-node. Leaving the cache off is the cheaper default.
 
 ---
@@ -826,6 +1068,9 @@ kubectl -n warren-runs describe pod run-<id>                # scheduling / OOM e
 
 # RBAC sanity
 kubectl auth can-i --as=system:serviceaccount:warren:warren create pods -n warren-runs
+
+# NetworkPolicy (run-pod egress contract, §4.1)
+kubectl -n warren-runs get networkpolicy
 
 # Edge (Cloud Armor, §1.7)
 gcloud compute backend-services list --global --format='table(name,securityPolicy)'

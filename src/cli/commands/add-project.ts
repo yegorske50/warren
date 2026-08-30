@@ -1,17 +1,26 @@
 /**
- * `warren add-project <git-url>` — clone a GitHub repo into the projects
- * root and persist a row. Thin wrapper around `addProject` from
- * `projects/manage.ts`; same atomicity contract (row + dir on disk, or
- * neither). Maps `--default-branch` to the optional override the cloner
- * accepts.
+ * `warren add-project <git-url>` — register a project on a (possibly
+ * remote) warren server.
+ *
+ * Post-warren-97a2 (owner decision D3) this command is a thin client of
+ * `POST /projects`: the server clones the repo into its projects root,
+ * enforces the public-instance allowlist (warren-ce9b / warren-0883),
+ * and persists the row. The CLI no longer opens a local SQLite handle
+ * or re-implements any of that — it probes, POSTs, and prints the
+ * created project row as NDJSON. Maps `--default-branch` to the optional
+ * override the route accepts.
  */
 
-import type { ProjectsRepo } from "../../db/repos/projects.ts";
-import type { ProjectsConfig } from "../../projects/config.ts";
-import { addProject } from "../../projects/index.ts";
-import type { PublicAllowlist } from "../../projects/public-allowlist.ts";
+import type { WarrenClient } from "../../client/index.ts";
 import type { CliContext } from "../output.ts";
-import { formatError, writeJsonLine } from "../output.ts";
+import {
+	EXIT_SERVER_UNREACHABLE,
+	EXIT_USAGE,
+	exitCodeForError,
+	formatError,
+	writeResult,
+} from "../output.ts";
+import { probeOrReport } from "./probe.ts";
 
 export interface AddProjectArgs {
 	readonly gitUrl: string;
@@ -19,14 +28,10 @@ export interface AddProjectArgs {
 }
 
 export interface AddProjectDeps {
-	readonly projects: ProjectsRepo;
-	readonly projectsConfig: ProjectsConfig;
-	/**
-	 * Public-instance allowlist (warren-ce9b), forwarded into `addProject`
-	 * so the CLI enforces the same registration gate as `POST /projects`
-	 * (warren-0883). `undefined` (token mode) ⇒ no restriction.
-	 */
-	readonly publicAllowlist?: PublicAllowlist;
+	/** Remote warren client. Production wires `resolveCommandClient(context, opts)`. */
+	readonly client: WarrenClient;
+	/** Override the probe timeout (tests). */
+	readonly probeTimeoutMs?: number;
 }
 
 export interface AddProjectResult {
@@ -40,34 +45,37 @@ export async function runAddProject(
 ): Promise<AddProjectResult> {
 	if (args.gitUrl === "") {
 		context.stdio.stderr.write("warren: git-url is required\n");
-		return { exitCode: 2 };
+		return { exitCode: EXIT_USAGE };
+	}
+
+	if (!(await probeOrReport(context, deps.client, deps.probeTimeoutMs))) {
+		return { exitCode: EXIT_SERVER_UNREACHABLE };
 	}
 
 	try {
-		const row = await addProject({
-			repo: deps.projects,
-			config: deps.projectsConfig,
+		const row = await deps.client.createProject({
 			gitUrl: args.gitUrl,
-			...(deps.publicAllowlist !== undefined ? { publicAllowlist: deps.publicAllowlist } : {}),
 			...(args.defaultBranch !== undefined && args.defaultBranch !== ""
 				? { defaultBranch: args.defaultBranch }
 				: {}),
-			spawn: context.spawn,
-			...(context.now !== undefined ? { now: context.now } : {}),
 		});
-		writeJsonLine(context.stdio.stdout, {
-			ok: true,
-			project: {
-				id: row.id,
-				gitUrl: row.gitUrl,
-				localPath: row.localPath,
-				defaultBranch: row.defaultBranch,
-				addedAt: row.addedAt,
+		writeResult(
+			context,
+			{
+				ok: true,
+				project: {
+					id: row.id,
+					gitUrl: row.gitUrl,
+					localPath: row.localPath,
+					defaultBranch: row.defaultBranch,
+					addedAt: row.addedAt,
+				},
 			},
-		});
+			`✔ project ${row.id} registered — ${row.gitUrl} (branch ${row.defaultBranch})`,
+		);
 		return { exitCode: 0 };
 	} catch (err) {
 		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1 };
+		return { exitCode: exitCodeForError(err) };
 	}
 }

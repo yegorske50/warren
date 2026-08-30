@@ -1,6 +1,4 @@
-// Wire-side response shapes for warren's HTTP API.
-//
-// The ENUM VOCABULARY (run / plan-run / preview lifecycle states, the
+// Wire-side response shapes for warren's HTTP API. The ENUM VOCABULARY (run / plan-run / preview lifecycle states, the
 // failure-cause discriminator, run mode, clone kind, event stream) is NOT
 // declared here. It is defined once in `src/core/wire.ts` — warren's
 // dependency-free kernel — and re-exported below, so the UI and the server
@@ -16,16 +14,24 @@
 export {
 	type AgentRow,
 	type AgentSource,
+	EVENT_STREAMS,
+	type EventStream,
+	type ForgeErrorKind,
 	isActivePreviewState,
+	isPullRequestLifecycle,
 	isTerminalPlanRunChildState,
 	isTerminalPlanRunState,
 	isTerminalRunState,
 	PLAN_RUN_ACTIVE_STATES,
 	PLAN_RUN_TERMINAL_STATES,
 	type PlanRunChildState,
+	type PlanRunSource,
 	type PlanRunState,
+	type PlanRunStateFilter,
 	PREVIEW_ACTIVE_STATES,
 	type PreviewState,
+	type PullRequestLifecycle,
+	RUN_STATES,
 	RUN_TERMINAL_STATES,
 	type RunFailureReason,
 	type RunMode,
@@ -33,11 +39,17 @@ export {
 } from "../../../core/wire.ts";
 
 import type {
+	ActorKind,
+	CapabilityName,
 	CloneKind,
+	ErrorEnvelope,
 	EventStream,
 	PlanRunChildState,
+	PlanRunSource,
 	PlanRunState,
 	PreviewState,
+	PullRequestLifecycle,
+	RunCostBasis,
 	RunFailureReason,
 	RunMode,
 	RunState,
@@ -47,9 +59,8 @@ export interface ProjectRow {
 	id: string;
 	gitUrl: string;
 	/**
-	 * OPTIONAL on the wire: an absolute server filesystem path, so the
-	 * public projection drops it (warren-4f6c / warren-f53e). Operator-only
-	 * surfaces may read it; anything a spectator reaches must test presence.
+	 * OPTIONAL on the wire: absolute server path, dropped by the public
+	 * projection (warren-4f6c / warren-f53e) — test presence, not null.
 	 */
 	localPath?: string;
 	defaultBranch: string;
@@ -90,16 +101,13 @@ export interface RunRow {
 	 * the public projection drops both (warren-946f), so consumers must
 	 * test presence, not `!== null` (warren-f53e).
 	 */
-	burrowId?: string | null;
-	burrowRunId?: string | null;
+	sandboxId?: string | null;
+	sandboxRunId?: string | null;
 	/**
 	 * Back-link to the seeds issue this run was dispatched against
 	 * (pl-bb70 step 3 / warren-805a). Null encodes "no seed" — manual
-	 * prompts from POST /runs without `seedId`, or legacy rows written
-	 * before the column existed. Surfaced as a MetaCard on RunDetail so
-	 * operators can navigate from a run back to its issue (pl-bb70 step
-	 * 6 / warren-c845). R-04 will turn this into a proper hyperlink
-	 * when the issues page lands.
+	 * prompts from POST /runs without `seedId`, or legacy rows. Surfaced
+	 * as a MetaCard on RunDetail (pl-bb70 step 6 / warren-c845).
 	 */
 	seedId: string | null;
 	/**
@@ -118,6 +126,8 @@ export interface RunRow {
 	 * the project default base). Null for root runs.
 	 */
 	cloneKind: CloneKind | null;
+	/** Infra-lost auto-retry back-link (warren-4af7); null for first-attempt runs. */
+	retryOf: string | null;
 	/**
 	 * Run mode discriminator (pl-0344 step 1 / warren-67b6). Pinned at row
 	 * creation; warren-side only (burrow doesn't know about run mode).
@@ -127,33 +137,53 @@ export interface RunRow {
 	renderedAgentJson: unknown;
 	state: RunState;
 	failureReason: RunFailureReason | null;
+	/**
+	 * The queued instant as epoch ms (warren-0af9 / pl-103e step 1). Null on
+	 * rows written before the column existed — render as "unknown", never as
+	 * zero queue wait.
+	 */
+	createdAt: number | null;
 	startedAt: string | null;
 	endedAt: string | null;
+	/**
+	 * Reap-time measured outcome facts (warren-ab2b / pl-103e): commits the
+	 * pushed branch was ahead of the base, plus the parsed diff totals.
+	 * Null = unknown (pre-column rows, unmeasured finalize) — render as
+	 * "unknown", never as zero.
+	 */
+	commitsAhead: number | null;
+	filesChanged: number | null;
+	insertions: number | null;
+	deletions: number | null;
 	prompt: string;
 	trigger: string;
 	/**
-	 * URL of the PR reap opened (warren-f6af). Null when reap's `pr_open`
-	 * sub-step was skipped (auto-open disabled, no commits, push failed,
-	 * branch == defaultBranch) or the GitHub call errored.
+	 * URL of the PR reap opened (warren-f6af). Null when reap's `pr_open` sub-step
+	 * was skipped or the GitHub call errored.
 	 */
 	prUrl: string | null;
+	/**
+	 * Merge-watcher PR facts (warren-3bc6): forge-reported lifecycle + merge
+	 * instant. Null reads as "unknown" (historical rows, no PR), never "not merged".
+	 */
+	prState: PullRequestLifecycle | null;
+	prMergedAt: string | null;
 	/** Existing branch reap pushes the workspace back to (#419). Null when unset. */
 	targetBranch: string | null;
-	/**
-	 * Salvage-before-destroy (warren-cd3b): where a finalize_failed run's
-	 * committed work was captured — `salvageRef` is the `warren/rescue/<runId>`
-	 * branch on origin, `salvagePath` the durable git-bundle file. Both null
-	 * when nothing was captured (or needed).
-	 */
+	branch: string | null; // composed workspace branch frozen at dispatch (warren-5255)
+	/** Dispatch-supplied clone ref (warren-afeb) / base-commit pin (warren-aaf7). Null when unset. */
+	ref: string | null;
+	baseCommit: string | null;
+	/** Declared provider/model frozen at dispatch (warren-2ede / #860). Null = predates the columns. */
+	provider: string | null;
+	model: string | null;
+	/** Salvage-before-destroy (warren-cd3b): rescue branch + git bundle of a finalize_failed run's work. */
 	salvageRef: string | null;
 	salvagePath: string | null;
-	/**
-	 * Per-run cost in USD (warren-a7dc). Currently populated only for runs
-	 * dispatched against the `pi` runtime — the bridge snapshots
-	 * `get_session_stats` at run-start + run-end and persists the delta.
-	 * Null for non-pi runtimes and for pi runs whose stats RPC failed.
-	 */
+	/** Per-run cost in USD (warren-a7dc), the bridge's `get_session_stats` start/end delta. Null for non-pi runtimes. */
 	costUsd: number | null;
+	costBasis: RunCostBasis; // warren-f3c3: `subscription_estimate` = estimate, not a bill
+	maxCostUsd?: number | null; // warren-f8a2: runs-list cap overlay; absent for spectators and detail GETs
 	/** Input tokens consumed (warren-a7dc); see `costUsd` for nullability. */
 	tokensInput: number | null;
 	/** Output tokens produced (warren-a7dc); see `costUsd` for nullability. */
@@ -202,22 +232,21 @@ export interface PreviewTeardownResponse {
 /**
  * Wire envelope of `POST /runs/:id/preview/login` (R-19 / docs/design/preview-environments.md,
  * warren-e1b0). The credential-bearing half of the handshake is the
- * `Set-Cookie` header the browser stores implicitly; `url` is the
- * mode-correct preview target the caller navigates to afterwards.
+ * `Set-Cookie` header; `url` is the mode-correct preview target.
  */
 export interface PreviewLoginResponse {
 	url: string;
 }
 
-export interface BurrowSummary {
+export interface SandboxSummary {
 	id: string;
 	workspacePath: string;
 }
 
 /**
- * Wire-side input for `POST /runs`. `ref` is an optional branch / tag /
- * SHA the project clone should be checked out at before the run; omit
- * (or pass empty) to use `project.defaultBranch` (warren-1bb6, warren-7589).
+ * Wire-side input for `POST /runs`. `ref` is an optional branch name the clone
+ * is cut at (pin a commit with `baseCommit`, warren-aaf7); omit to use
+ * `project.defaultBranch` (warren-1bb6, warren-7589).
  *
  * `providerOverride` / `modelOverride` are optional per-run overrides of
  * the agent's `frontmatter.provider` / `frontmatter.model`. Empty strings
@@ -230,6 +259,7 @@ export interface CreateRunInput {
 	project: string;
 	prompt: string;
 	ref?: string;
+	baseCommit?: string;
 	/** Existing branch reap pushes the workspace back to (#419). */
 	targetBranch?: string;
 	providerOverride?: string;
@@ -253,11 +283,25 @@ export interface CreateRunInput {
 	 * the same project.
 	 */
 	continueFromRunId?: string;
+	/**
+	 * Optional replicate parent (warren-e96f): re-dispatch this run's exact
+	 * agent / model / project / prompt / cap against the project default
+	 * base. Mutually exclusive with `continueFromRunId` (continuation wins
+	 * server-side).
+	 */
+	cloneFromRunId?: string;
+	/**
+	 * Optional per-run USD spend cap (warren-a63d): wins over the agent's
+	 * own `frontmatter.maxCostUsd` and the project's `.warren/config.yaml`
+	 * default. Must be a positive finite number; the server rejects zero,
+	 * negatives, and numeric strings.
+	 */
+	maxCostUsd?: number;
 }
 
 export interface SpawnRunResponse {
 	run: RunRow;
-	burrow: BurrowSummary;
+	sandbox: SandboxSummary;
 }
 
 /**
@@ -285,7 +329,7 @@ export interface ListRunsResponse {
 export interface CancelRunResponse {
 	state: RunState;
 	alreadyTerminal: boolean;
-	burrowRun: { state: string } | null;
+	sandboxRun: { state: string } | null;
 }
 
 export interface SteerRunResponse {
@@ -314,6 +358,19 @@ export interface RunEvent {
 }
 
 /**
+ * One slim line on the global lifecycle stream (`GET /events/stream`,
+ * warren-f566): a pure invalidation hint — the server carries no replay,
+ * so the consumer re-reads its list queries on receipt. `state` is the
+ * run's best-known state after the transition, or null if no change.
+ */
+export interface LifecycleStreamNotification {
+	runId: string;
+	hook: string;
+	state: RunState | null;
+	ts: string;
+}
+
+/**
  * Payload shape of the `reap.completed` system event (warren-f3bb,
  * warren-3c40). Fields are typed loosely because the wire is JSON; use
  * narrow guards before reading. `commitsAhead` is null when reap could
@@ -333,24 +390,30 @@ export interface ReapCompletedPayload {
 	errors?: { step: string; message: string; path?: string }[];
 }
 
-export interface ApiErrorEnvelope {
-	error: { code: string; message: string; hint?: string };
-}
+export type { ErrorEnvelope } from "../../../core/wire.ts";
+
+/**
+ * UI-compat alias for the canonical error envelope in `src/core/wire.ts`
+ * (warren-42f1). Alias, never re-list — `check:wire-types` enforces.
+ */
+export type ApiErrorEnvelope = ErrorEnvelope;
 
 /* ----------------------------------------------------------------------- */
 /* Caller identity — `GET /whoami` (warren-e195).                          */
 /*                                                                         */
-/* Mirrors `ActorKind` / `CapabilityName` / the whoami body in             */
-/* src/server/types.ts + src/server/handlers/whoami.ts — kept manually in  */
-/* sync because src/ui/ is excluded from the root tsconfig and the         */
-/* boundary is the HTTP wire, not a TS import (mx-2e4a1a).                 */
+/* `ActorKind` and `CapabilityName` are declared once in src/core/wire.ts  */
+/* (warren-3754) and re-exported here, the way this file already treats    */
+/* the rest of the wire vocabulary. The hand-kept copies they replace had  */
+/* already lost the `run` arm that per-run scoped tokens added.            */
 /* ----------------------------------------------------------------------- */
 
-/** Who warren admitted this browser as. */
-export type ActorIdentity = "operator" | "anonymous";
+export type { ActorCapabilities, ActorKind, CapabilityName } from "../../../core/wire.ts";
 
-/** One capability name. `readPublic` is all a public-instance visitor holds. */
-export type CapabilityName = "readPublic" | "readOperator" | "dispatch" | "admin";
+/**
+ * Who warren admitted this browser as. Kept as the UI's own spelling and
+ * derived from `ActorKind`, so the two can never disagree.
+ */
+export type ActorIdentity = ActorKind;
 
 /**
  * Wire envelope of `GET /whoami`. `capabilities` lists only the granted
@@ -380,6 +443,13 @@ export type PreviewMode = "path" | "subdomain";
 export interface PreviewConfigResponse {
 	mode: PreviewMode;
 	host: string | null;
+	/**
+	 * Public port of the dedicated path-mode preview listener
+	 * (warren-3f8a): path-mode previews live on their own browser origin
+	 * (same hostname, this port). Null in subdomain mode and on legacy
+	 * same-origin deployments — the URL then keeps the inbound port.
+	 */
+	port: number | null;
 }
 
 /* ----------------------------------------------------------------------- */
@@ -438,6 +508,12 @@ export interface DefaultsConfig {
 	 */
 	runBranchPrefix?: string;
 	qualityGate?: string;
+	/**
+	 * warren-a63d: project-wide default per-run USD spend cap, the weakest
+	 * source in the cap chain (dispatch override > agent frontmatter > this).
+	 * Surfaced read-only on the ProjectDetail config panel.
+	 */
+	maxCostUsd?: number;
 }
 
 export interface WarrenConfigResponse {
@@ -479,6 +555,8 @@ export interface TriggerSummary {
 	role: string;
 	timezone?: string;
 	prompt?: string;
+	/** warren-a63d: the entry's per-run spend cap, surfaced so operators can verify it. */
+	maxCostUsd?: number;
 	lastFiredAt: string | null;
 	nextFireAt: string | null;
 	lastRunId: string | null;
@@ -504,22 +582,16 @@ export interface SeedStatusResponse {
 
 /**
  * `GET /projects/:id/seeds/plans` — wire-lean seeds plan summary
- * (warren-9b49 / pl-dfb5 step 3). Mirrors `PlanSummary` in
- * src/seeds-cli/schema.ts; the heavyweight `sections` body is dropped
- * server-side because the only consumer (the plan-run dispatch form's
- * plan-id selector) just needs a label and status.
+ * (warren-9b49 / pl-dfb5 step 3). Canonical declaration lives in
+ * `src/core/wire-tracker.ts` (warren-6c29); re-exported here so the
+ * browser bundle cannot drift from the server truth. The heavyweight
+ * `sections` body is dropped server-side because the only consumer (the
+ * plan-run dispatch form's plan-id selector) just needs a label and
+ * status.
  */
-export interface PlanSummary {
-	id: string;
-	status: string;
-	seed?: string;
-	template?: string;
-	revision?: number;
-	name?: string;
-	childCount: number;
-	createdAt?: string;
-	updatedAt?: string;
-}
+import type { PlanSummary } from "../../../core/wire.ts";
+
+export type { PlanSummary };
 
 export interface SeedPlansResponse {
 	plans: PlanSummary[];
@@ -547,7 +619,7 @@ export interface ReadyPlansResponse {
  */
 export interface RunTriggerResponse {
 	run: RunRow;
-	burrow: BurrowSummary;
+	sandbox: SandboxSummary;
 }
 
 /* ----------------------------------------------------------------------- */
@@ -561,13 +633,17 @@ export interface RunTriggerResponse {
 
 export interface PlanRunRow {
 	id: string;
-	planId: string;
+	/** Null on the warren-de42 `issues` form (source: 'plan' | 'issues'). */
+	planId: string | null;
+	source: PlanRunSource;
 	projectId: string;
 	agentName: string;
 	promptTemplate: string;
 	ref: string | null;
 	providerOverride: string | null;
 	modelOverride: string | null;
+	/** warren-a63d: per-child USD spend cap forwarded to every child dispatch. */
+	maxCostUsd: number | null;
 	dispatcherHandle: string;
 	trigger: string;
 	state: PlanRunState;
@@ -589,17 +665,23 @@ export interface PlanRunChildRow {
 	endedAt: string | null;
 	prMergedAt: string | null;
 	failureReason: string | null;
+	/** warren-6de9: automatic child re-dispatch budget consumed so far. */
+	retryCount: number;
 }
 
-/** `POST /plan-runs` request body (warren-f923). */
+/** `POST /plan-runs` request body (warren-f923). Exactly one of `planId` / `issues` (warren-de42). */
 export interface CreatePlanRunInput {
 	project: string;
-	planId: string;
+	planId?: string;
+	/** warren-de42: ordered issue-id list; the tracker need not support plans. */
+	issues?: string[];
 	agent: string;
 	promptTemplate?: string;
 	ref?: string;
 	providerOverride?: string;
 	modelOverride?: string;
+	/** Per-child USD spend cap (warren-a63d); same validation as `POST /runs` maxCostUsd. */
+	maxCostUsd?: number;
 	dispatcherHandle?: string;
 }
 

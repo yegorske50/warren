@@ -15,9 +15,13 @@
  *     meaningless. Returns `ValidationError`, not `StateTransitionError`,
  *     to match the error envelope (src/core/wire.ts) used by the rest of warren's HTTP
  *     surface for "operator asked for an impossible action".
- *   - run must have a `burrow_id` attached. A queued warren row without a
- *     burrowId is the spawn-rollback window; sending an inbox message in
+ *   - run must have a `sandbox_id` attached. A queued warren row without a
+ *     sandboxId is the spawn-rollback window; sending an inbox message in
  *     that window has nothing to attach to.
+ *   - the run's harness must be able to consume the steer (warren-3305):
+ *     `frontmatter.steering` "none" always rejects 409; "spawn-only"
+ *     rejects a running run 409 (the harness only folds inbox messages into
+ *     the prompt at spawn). Undeclared = legacy fail-open.
  *
  * The state of the run row is NOT modified here. Steering is purely an
  * out-of-band signal; the run's lifecycle continues to be observed via
@@ -28,8 +32,10 @@
  * route can map them onto the appropriate response envelope.
  */
 
-import { ValidationError } from "../core/errors.ts";
+import { StateTransitionError, ValidationError } from "../core/errors.ts";
+import type { SteeringCapability } from "../core/wire.ts";
 import type { Repos } from "../db/repos/index.ts";
+import { readSteeringCapability } from "../registry/steering.ts";
 import type { Message, MessagePriority, RuntimeProvider } from "../runtime/contract.ts";
 // The seam neutralizes burrow's `NotFoundError` into the provider-neutral
 // `RuntimeRunNotFoundError` (warren-1f56), so steer catches THAT to map a ghost
@@ -73,18 +79,19 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 			recoveryHint: "steering is only valid while the run is queued or running",
 		});
 	}
-	if (run.burrowId === null) {
-		throw new ValidationError("run has no burrow_id; cannot steer", {
+	assertHarnessCanSteer(run.agentName, steeringCapabilityOf(run.renderedAgentJson), run.state);
+	if (run.sandboxId === null) {
+		throw new ValidationError("run has no sandbox_id; cannot steer", {
 			recoveryHint: "the burrow is provisioned during spawn — wait for spawn to complete",
 		});
 	}
 
-	const burrowId = run.burrowId;
-	// The seam `RunHandle`: `sandboxId` is the burrowId the inbox is scoped to
+	const sandboxId = run.sandboxId;
+	// The seam `RunHandle`: `sandboxId` is the sandboxId the inbox is scoped to
 	// (the only field `sendMessage` reads). `providerRunId` is carried for
 	// completeness — burrow attributes delivery itself when a turn claims the
 	// message, so a fresh send doesn't need it.
-	const handle = { runId: run.id, sandboxId: burrowId, providerRunId: run.burrowRunId ?? "" };
+	const handle = { runId: run.id, sandboxId: sandboxId, providerRunId: run.sandboxRunId ?? "" };
 	let message: Message;
 	try {
 		message = await input.runtimeProvider.sendMessage(handle, {
@@ -99,7 +106,7 @@ export async function steerRun(input: SteerRunInput): Promise<SteerRunResult> {
 			// ValidationError so the UI knows to refresh — the bridge or the
 			// next bootBridges pass will reconcile the warren row to `failed`.
 			throw new ValidationError(
-				`burrow '${burrowId}' is unknown to the worker; the run is likely lost`,
+				`burrow '${sandboxId}' is unknown to the worker; the run is likely lost`,
 				{ recoveryHint: "refresh — the bridge will reconcile this run to failed" },
 			);
 		}
@@ -119,7 +126,7 @@ async function emitSteerEvent(
 	const seq = ((await input.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
 	const row = await input.repos.events.append({
 		runId,
-		burrowEventSeq: seq,
+		sandboxEventSeq: seq,
 		ts: now().toISOString(),
 		kind: "steer.sent",
 		stream: "system",
@@ -135,4 +142,52 @@ async function emitSteerEvent(
 
 function isTerminal(state: string): boolean {
 	return state === "succeeded" || state === "failed" || state === "cancelled";
+}
+
+/**
+ * Extract the frozen agent frontmatter from `runs.rendered_agent_json` (same
+ * defensive shape `resolveCostCapUsd` uses) and read its declared steering
+ * capability. `undefined` = the agent predates the flag (warren-3305) and
+ * stays legacy fail-open.
+ */
+function steeringCapabilityOf(renderedAgentJson: unknown): SteeringCapability | undefined {
+	if (renderedAgentJson === null || typeof renderedAgentJson !== "object") return undefined;
+	const frontmatter = (renderedAgentJson as Record<string, unknown>).frontmatter;
+	if (frontmatter === null || typeof frontmatter !== "object") return undefined;
+	return readSteeringCapability(frontmatter as Record<string, unknown>);
+}
+
+/**
+ * warren-3305: fail loudly when the run's harness cannot consume the steer,
+ * instead of recording `steer.sent` for a message nobody reads. 409
+ * (`StateTransitionError`) because the conflict is between the request and
+ * the run's current state/capability, not malformed input. An undeclared
+ * capability is fail-open (pre-flag agents keep the historical behavior).
+ *
+ * `"spawn-only"` still allows steering a QUEUED run: the message waits in the
+ * inbox and the runtime's `encodeInboxMessage` folds it into the prompt at
+ * spawn. (The existing `sandbox_id` gate below may still reject a queued run
+ * on the local topology — that error is already loud.)
+ */
+function assertHarnessCanSteer(
+	agentName: string,
+	capability: SteeringCapability | undefined,
+	runState: string,
+): void {
+	if (capability === undefined || capability === "mid-run") return;
+	if (capability === "none") {
+		throw new StateTransitionError(`agent "${agentName}" cannot consume steering messages`, {
+			recoveryHint:
+				"this harness declares steering: none — re-dispatch with the corrected prompt instead",
+		});
+	}
+	if (runState !== "queued") {
+		throw new StateTransitionError(
+			`agent "${agentName}" only consumes steering at spawn; this run is already ${runState}`,
+			{
+				recoveryHint:
+					"the harness folds inbox messages into the prompt at spawn and never reads them mid-run — re-dispatch with the corrected prompt, or steer before the run leaves queued",
+			},
+		);
+	}
 }

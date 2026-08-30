@@ -1,23 +1,32 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { getTableColumns } from "drizzle-orm";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import { agents, type ProjectRow, projects } from "../../db/schema.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { bearerAuth, publicReadAuth } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle } from "../types.ts";
 import { PUBLIC_AGENT_FIELDS, REDACTED_AGENT_FIELDS, withAgentSource } from "./agents.ts";
 import { PUBLIC_PROJECT_FIELDS, REDACTED_PROJECT_FIELDS } from "./projects.ts";
 import {
+	PUBLIC_COST_PER_MERGED_PR_BUCKET_FIELDS,
+	PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS,
 	PUBLIC_RUN_ANALYTICS_FIELDS,
 	PUBLIC_RUN_GROUP_FIELDS,
 	PUBLIC_RUN_TOTALS_FIELDS,
+	REDACTED_COST_PER_MERGED_PR_OVERALL_FIELDS,
 	REDACTED_RUN_ANALYTICS_FIELDS,
 	REDACTED_RUN_GROUP_FIELDS,
 	REDACTED_RUN_TOTALS_FIELDS,
 } from "./runs/analytics.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
+import {
+	PUBLIC_CONTEXT_WASTE_FIELDS,
+	PUBLIC_CONTEXT_WASTE_SHARE_FIELDS,
+	REDACTED_CONTEXT_WASTE_FIELDS,
+	REDACTED_CONTEXT_WASTE_SHARE_FIELDS,
+} from "./runs/analytics-waste.ts";
+import { depsFor, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
 
 /**
  * Public projections for `GET /projects`, `GET /agents`, `GET /agents/:name`
@@ -35,13 +44,8 @@ import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
 const TOKEN = "s3cret";
 
 /** A burrow client that 404s everything — no route here reaches it. */
-function inertBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(
-			async () => new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 }),
-		),
-	});
+function inertSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 const RENDERED_CLAUDE_CODE = {
@@ -129,6 +133,72 @@ describe("project + agent field classification (warren-4f6c)", () => {
 	});
 });
 
+describe("context-waste field classification (warren-6d41)", () => {
+	test("every ContextWasteProxy field is classified exactly once, all operator-only", () => {
+		// `/analytics/behavior` — the section's only surface — is readOperator,
+		// so the public lists are empty and every field sits in the redacted
+		// (operator-only) list: per-tool/per-command keys are internal tooling
+		// detail, and the byte/token totals ride along.
+		expect(PUBLIC_CONTEXT_WASTE_FIELDS).toHaveLength(0);
+		const fields: string[] = [...REDACTED_CONTEXT_WASTE_FIELDS];
+		expect(fields.sort()).toEqual(
+			[
+				"byCommand",
+				"byTool",
+				"confidence",
+				"contextTokensTotal",
+				"resultBytesTotal",
+				"runsInWindow",
+				"runsMeasured",
+				"runsWithRollup",
+				"share",
+			].sort(),
+		);
+	});
+
+	test("every ContextWasteShare field is classified exactly once, all operator-only", () => {
+		expect(PUBLIC_CONTEXT_WASTE_SHARE_FIELDS).toHaveLength(0);
+		const shareFields: string[] = [...REDACTED_CONTEXT_WASTE_SHARE_FIELDS];
+		expect(shareFields.sort()).toEqual(
+			[
+				"contextTokensTotal",
+				"invocations",
+				"key",
+				"resultBytesKnown",
+				"resultBytesTotal",
+				"runs",
+				"runsMeasured",
+				"share",
+			].sort(),
+		);
+	});
+});
+
+// warren-6163: walk a parsed response body and report every cost-named key
+// (except the public costPerMergedPr rollup, whose counts are public) and
+// every occurrence of the seeded cost figure. Structural, so it cannot
+// collide with ISO millisecond timestamps the way a substring match can.
+function flattenEntries(body: unknown): [string, unknown][] {
+	const out: [string, unknown][] = [];
+	const stack: [string, unknown][] = [["", body]];
+	while (stack.length > 0) {
+		const [key, value] = stack.pop() as [string, unknown];
+		out.push([key, value]);
+		if (value === null || typeof value !== "object") continue;
+		const children: [string, unknown][] = Array.isArray(value)
+			? value.map((item) => ["", item])
+			: Object.entries(value);
+		stack.push(...children);
+	}
+	return out;
+}
+
+function findCostLeaks(body: unknown, seededCost: number): string[] {
+	return flattenEntries(body)
+		.filter(([key, value]) => /cost(?!PerMergedPr)/i.test(key) || value === seededCost)
+		.map(([key, value]) => (value === seededCost ? `value:${key}` : `key:${key}`));
+}
+
 describe("public projections over the wire (warren-4f6c)", () => {
 	let db: WarrenDb;
 	let repos: Repos;
@@ -167,12 +237,15 @@ describe("public projections over the wire (warren-4f6c)", () => {
 			null,
 		);
 		await repos.runs.attachStats(run.id, {
-			costUsd: 1.25,
+			costUsd: 987.6543,
 			tokensInput: 100,
 			tokensOutput: 20,
 			tokensCacheRead: 40,
 		});
-		handle = startServer(await depsFor(repos, inertBurrowClient()), {
+		// warren-bd57: a resolved merge-watcher state so the landed-work
+		// fields flow through both projections below.
+		await repos.runs.setPrState(run.id, "merged", startedAt.toISOString());
+		handle = startServer(await depsFor(repos, inertSandboxClient()), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: publicReadAuth(bearerAuth(TOKEN)),
 			logger: silentLogger,
@@ -270,7 +343,19 @@ describe("public projections over the wire (warren-4f6c)", () => {
 		expect(Object.keys(byAgent ?? {}).sort()).toEqual(
 			[...PUBLIC_RUN_GROUP_FIELDS, ...REDACTED_RUN_GROUP_FIELDS].sort(),
 		);
-		expect(totals.cost).toEqual({ total: 1.25, avg: 1.25, priced: 1 });
+		// warren-be04: the operator body carries the full outcome-joined
+		// rollup, cost figures included.
+		const outcomes = body.outcomes as {
+			costPerMergedPr: { overall: Record<string, unknown> };
+		};
+		expect(Object.keys(outcomes.costPerMergedPr.overall).sort()).toEqual(
+			[
+				...PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS,
+				...REDACTED_COST_PER_MERGED_PR_OVERALL_FIELDS,
+			].sort(),
+		);
+		expect(outcomes.costPerMergedPr.overall.costUsd).toBe(987.6543);
+		expect(totals.cost).toEqual({ total: 987.6543, avg: 987.6543, priced: 1 });
 		expect(body.topSeedsByContext).toHaveLength(1);
 	});
 
@@ -281,6 +366,26 @@ describe("public projections over the wire (warren-4f6c)", () => {
 		const totals = body.totals as Record<string, unknown>;
 		expect(Object.keys(totals).sort()).toEqual([...PUBLIC_RUN_TOTALS_FIELDS].sort());
 		expect(totals).not.toHaveProperty("cost");
+		// warren-be04: outcomes survives — steering tallies and merged counts
+		// are public — but every USD figure inside is redacted.
+		const outcomes = body.outcomes as {
+			steering: { steered: { prStateKnown: number }; unsteered: { prStateKnown: number } };
+			costPerMergedPr: {
+				overall: Record<string, unknown>;
+				byAgent: Record<string, unknown>[];
+			};
+		};
+		expect(outcomes.steering.unsteered.prStateKnown).toBe(1);
+		expect(Object.keys(outcomes.costPerMergedPr.overall).sort()).toEqual(
+			[...PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS].sort(),
+		);
+		expect(outcomes.costPerMergedPr.overall).not.toHaveProperty("costUsd");
+		expect(outcomes.costPerMergedPr.overall.prsMerged).toBe(1);
+		for (const bucket of outcomes.costPerMergedPr.byAgent) {
+			expect(Object.keys(bucket).sort()).toEqual(
+				[...PUBLIC_COST_PER_MERGED_PR_BUCKET_FIELDS].sort(),
+			);
+		}
 		for (const dimension of ["byAgent", "byModel", "byProvider"] as const) {
 			const buckets = body[dimension] as Record<string, unknown>[];
 			expect(buckets.length).toBeGreaterThan(0);
@@ -296,6 +401,12 @@ describe("public projections over the wire (warren-4f6c)", () => {
 		expect(totals.runs).toBe(1);
 		expect(totals.succeeded).toBe(1);
 		expect(totals.successRate).toBe(1);
+		// warren-bd57: landed-work fields are public — a rate, not a private fact.
+		expect(totals.prStateKnown).toBe(1);
+		expect(totals.prsMerged).toBe(1);
+		expect(totals.mergedPrRate).toBe(1);
+		const bucket = (body.byAgent as Record<string, unknown>[])[0];
+		expect(bucket?.mergedPrRate).toBe(1);
 		expect((totals.tokens as Record<string, unknown>).total).toBe(160);
 		expect(body.filter).toMatchObject({ projectId: null });
 		// warren-30cc: the resolved window is always bounded — both bounds echo as strings.
@@ -308,9 +419,13 @@ describe("public projections over the wire (warren-4f6c)", () => {
 	});
 
 	test("no cost figure survives anywhere in the anonymous analytics body", async () => {
-		const body = JSON.stringify(await get("/analytics/runs"));
-		expect(body).not.toContain("costUsd");
-		expect(body).not.toContain("1.25");
-		expect(body).not.toContain("warren-4f6c");
+		const body = await get("/analytics/runs");
+		// warren-6163: structural check, not a raw substring match — a seeded
+		// figure like "1.25" can collide with an ISO millisecond timestamp
+		// ("...:01.250Z") and flake the assertion. Walk the parsed body and
+		// fail on any cost-named key or any occurrence of the seeded figure.
+		const leaks = findCostLeaks(body, 987.6543);
+		expect(leaks).toEqual([]);
+		expect(JSON.stringify(body)).not.toContain("warren-4f6c");
 	});
 });

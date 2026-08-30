@@ -101,3 +101,107 @@ describe("repo-cache wiring through buildRunPod (warren-e908, §4.3/R2)", () => 
 		expect(agent?.volumeMounts?.some((m) => m.name === REPO_CACHE_VOLUME_NAME)).toBe(false);
 	});
 });
+
+describe("agent-container env (warren-6016)", () => {
+	test("WARREN_GIT_TOKEN rides as an optional secretKeyRef for the salvage window", () => {
+		const agent = buildRunPod(baseSpec(), config).spec?.containers?.[0];
+		const token = (agent?.env ?? []).find((e) => e.name === "WARREN_GIT_TOKEN");
+		expect(token?.valueFrom?.secretKeyRef).toEqual({
+			name: config.gitTokenSecret.name,
+			key: config.gitTokenSecret.key,
+			optional: true,
+		});
+	});
+
+	test("a domain-supplied WARREN_GIT_TOKEN is not shadowed by the secret ref", () => {
+		const pod = buildRunPod(
+			baseSpec({ env: { WARREN_API_TOKEN: "tok", WARREN_GIT_TOKEN: "inline-tok" } }),
+			config,
+		);
+		const token = (pod.spec?.containers?.[0]?.env ?? []).filter(
+			(e) => e.name === "WARREN_GIT_TOKEN",
+		);
+		expect(token).toHaveLength(1);
+		expect(token[0]?.value).toBe("inline-tok");
+		expect(token[0]?.valueFrom).toBeUndefined();
+	});
+
+	test("the operator bot-identity override threads onto the agent env, both halves or nothing", () => {
+		const withIdentity = buildRunPod(
+			baseSpec(),
+			resolveK8sPodConfig({ WARREN_BOT_NAME: "acme-bot", WARREN_BOT_EMAIL: "bot@acme.example" }),
+		);
+		const env = Object.fromEntries(
+			(withIdentity.spec?.containers?.[0]?.env ?? []).map((e) => [e.name, e.value]),
+		);
+		expect(env.WARREN_BOT_NAME).toBe("acme-bot");
+		expect(env.WARREN_BOT_EMAIL).toBe("bot@acme.example");
+		// A half-set pair is ignored (mirrors resolveWarrenBotIdentity).
+		const halfSet = buildRunPod(baseSpec(), resolveK8sPodConfig({ WARREN_BOT_NAME: "acme-bot" }));
+		const halfNames = (halfSet.spec?.containers?.[0]?.env ?? []).map((e) => e.name);
+		expect(halfNames).not.toContain("WARREN_BOT_NAME");
+		expect(halfNames).not.toContain("WARREN_BOT_EMAIL");
+		// Unset: neither var rides the pod env; the canonical default applies.
+		const defaultNames = (buildRunPod(baseSpec(), config).spec?.containers?.[0]?.env ?? []).map(
+			(e) => e.name,
+		);
+		expect(defaultNames).not.toContain("WARREN_BOT_NAME");
+	});
+});
+
+describe("generic provider Secret mapping (warren-fb8d)", () => {
+	test("a third registry provider maps generically to its own Secret", () => {
+		const agent = buildRunPod(baseSpec(), config).spec?.containers?.[0];
+		const groq = (agent?.env ?? []).find((e) => e.name === "GROQ_API_KEY");
+		expect(groq?.valueFrom?.secretKeyRef).toEqual({
+			name: "warren-groq-key",
+			key: "api-key",
+			optional: true,
+		});
+	});
+
+	test("provider Secret coordinates honor the per-provider env override", () => {
+		const overridden = resolveK8sPodConfig({
+			WARREN_K8S_GROQ_SECRET_NAME: "custom-groq",
+			WARREN_K8S_GROQ_SECRET_KEY: "creds",
+		});
+		expect(overridden.providerSecrets.groq).toEqual({ name: "custom-groq", key: "creds" });
+		const agent = buildRunPod(baseSpec(), overridden).spec?.containers?.[0];
+		const groq = (agent?.env ?? []).find((e) => e.name === "GROQ_API_KEY");
+		expect(groq?.valueFrom?.secretKeyRef).toEqual({
+			name: "custom-groq",
+			key: "creds",
+			optional: true,
+		});
+	});
+
+	test("every registry provider's canonical key rides an optional secretKeyRef", () => {
+		const env = buildRunPod(baseSpec(), config).spec?.containers?.[0]?.env ?? [];
+		for (const [provider, envKey] of [
+			["anthropic", "ANTHROPIC_API_KEY"],
+			["openrouter", "OPENROUTER_API_KEY"],
+			["groq", "GROQ_API_KEY"],
+		] as const) {
+			const found = env.find((e) => e.name === envKey);
+			expect(found?.valueFrom?.secretKeyRef).toEqual({
+				name: `warren-${provider}-key`,
+				key: "api-key",
+				optional: true,
+			});
+		}
+	});
+
+	test("an unknown provider contributes no secretKeyRef and breaks nothing", () => {
+		const pod = buildRunPod(
+			baseSpec({ metadata: { frontmatter: { provider: "acme-custom" } } }),
+			config,
+		);
+		const secretRefs = (pod.spec?.containers?.[0]?.env ?? []).filter(
+			(e) => e.valueFrom?.secretKeyRef !== undefined,
+		);
+		for (const ref of secretRefs) {
+			expect(ref.valueFrom?.secretKeyRef?.name).toMatch(/^warren-/);
+		}
+		expect(secretRefs.some((e) => e.name.includes("ACME"))).toBe(false);
+	});
+});

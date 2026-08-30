@@ -25,18 +25,18 @@
 import { formatError } from "../core/errors.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { PlanRunRow } from "../db/schema.ts";
+import type { PrMergeChecker } from "../runs/pr-merge.ts";
 import {
 	type AdvanceResult,
 	advancePlanRun,
 	type CoordinatorCloseChildSeedFn,
 	type CoordinatorEmitFn,
+	type CoordinatorGetIssueFn,
 	type CoordinatorReopenPrFn,
 	type CoordinatorRepos,
-	type CoordinatorShowSeedFn,
 	type CoordinatorSpawnFn,
 	type PlanRunEventKind,
 } from "./coordinator.ts";
-import type { PrMergeChecker } from "./pr-merge.ts";
 
 export interface PlanRunTickLogger {
 	info(obj: Record<string, unknown>, msg?: string): void;
@@ -46,7 +46,7 @@ export interface PlanRunTickLogger {
 
 export interface PlanRunTickDeps {
 	readonly repos: Pick<Repos, "planRuns" | "runs" | "events">;
-	readonly showSeed: CoordinatorShowSeedFn;
+	readonly getIssue: CoordinatorGetIssueFn;
 	readonly checkPrMerged: PrMergeChecker;
 	readonly spawn: CoordinatorSpawnFn;
 	readonly now?: () => Date;
@@ -87,7 +87,7 @@ export interface PlanRunTickResult {
 export async function runPlanRunTick(deps: PlanRunTickDeps): Promise<PlanRunTickResult> {
 	const advances: PlanRunAdvanceLog[] = [];
 	const errors: { planRunId: string; reason: string }[] = [];
-	const emit = deps.emit ?? buildDefaultEmit(deps.repos as CoordinatorRepos, deps.now);
+	const emit = deps.emit ?? buildDefaultPlanRunEmit(deps.repos as CoordinatorRepos, deps.now);
 
 	const active: PlanRunRow[] = await deps.repos.planRuns.listActive();
 	for (const planRun of active) {
@@ -119,7 +119,7 @@ function buildAdvanceInput(
 	return {
 		planRun,
 		repos: deps.repos as CoordinatorRepos,
-		showSeed: deps.showSeed,
+		getIssue: deps.getIssue,
 		checkPrMerged: deps.checkPrMerged,
 		spawn: deps.spawn,
 		emit,
@@ -156,13 +156,16 @@ function logAdvance(
  * a write failure is logged via the coordinator's own try/catch and the
  * tick continues.
  */
-function buildDefaultEmit(repos: CoordinatorRepos, now?: () => Date): CoordinatorEmitFn {
+export function buildDefaultPlanRunEmit(
+	repos: CoordinatorRepos,
+	now?: () => Date,
+): CoordinatorEmitFn {
 	return async (runId: string, kind: PlanRunEventKind, payload: Record<string, unknown>) => {
 		const seq = ((await repos.events.maxSeqForRun(runId)) ?? 0) + 1;
 		const ts = (now?.() ?? new Date()).toISOString();
 		await repos.events.append({
 			runId,
-			burrowEventSeq: seq,
+			sandboxEventSeq: seq,
 			ts,
 			kind,
 			stream: "system",

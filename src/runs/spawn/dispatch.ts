@@ -1,43 +1,17 @@
 /**
- * `spawnRun` — the composition flow (docs/design/agent-composition.md).
- *
- * One call drives the ritual that turns "the operator picked an agent +
- * project + prompt" into "the runtime has a dispatched run":
- *
- *   1. Resolve the cached agent definition (registry refresh seeded it
- *      via `cn render`). The rendered envelope is what gets frozen onto
- *      `runs.rendered_agent_json` — re-rendering at run time is
- *      deliberately not done here. Operators trigger a fresh render via
- *      `POST /agents/refresh` if they want one.
- *
- *   2. Build the neutral `RunSpec` (workspace inputs from the project clone,
- *      `network` from the agent's `burrow_config`, the `.canopy/.mulch/
- *      .seeds/.pi` workspace drops from `../seed.ts` as `seedFiles`, plus the
- *      composed env + prompt) and dispatch through the runtime seam,
- *      `provider.create(spec)` (warren-c42c). The provider — `LocalProvider`
- *      (burrow) or `K8sProvider` (pod) — materializes the workspace, seeds it,
- *      and starts the run, collapsing what used to be burrow's two-call
- *      provision-then-dispatch into one, and owns destroying any partially
- *      provisioned sandbox on a mid-flight failure.
- *
- * The warren run row is created BEFORE `provider.create`, with both
- * correlation ids nulled — `attachBurrow` writes back the handle's
- * `sandboxId` / `providerRunId` only after `create` fully succeeds, so the
- * warren `run_xxx` id is in hand throughout the flow while a failed dispatch
- * leaves no sandbox id on the row (the provider already tore it down). These
- * ids are the LocalProvider resume correlation the bridge reconnect path
- * reads after a host restart.
- *
- * Failure handling: anything before the `create` call just throws (no warren
- * row exists yet, or the row unwinds via the domain rollback). Failures from
- * `create` onward are caught — `rollback` finalizes the warren row
- * `failed`/`never_started` (the sandbox half is the provider's job). The
- * original error is rethrown for the caller (HTTP route, CLI).
+ * `spawnRun` — composition flow (docs/design/agent-composition.md). Resolves the cached
+ * agent, builds a neutral `RunSpec`, and dispatches via `provider.create(spec)`
+ * (warren-c42c). The run row is created BEFORE `create`; `attachBurrow` writes
+ * correlation ids only after success. A failed `create` rolls the row back
+ * `failed`/`never_started`. Dispatch-context (warren-d6ca) snapshots right after.
  */
 
 import { NotFoundError, ValidationError } from "../../core/errors.ts";
+import { resolveRunCostBasis } from "../../core/providers.ts";
+import { withProjectCloneLock } from "../../projects/clone-lock.ts";
 import { refreshProject } from "../../projects/manage.ts";
 import {
+	readProviderFrontmatter,
 	readRuntimeId,
 	withMaxCostUsdOverride,
 	withProviderOverrides,
@@ -46,10 +20,18 @@ import type { RunSpec, RuntimeProvider } from "../../runtime/contract.ts";
 import { interactiveRuntimeOverride } from "../../warren-config/schema.ts";
 import { composeRunBranch, resolveRunBranchPrefix } from "../branch.ts";
 import { parseBurrowConfig } from "../burrow-config.ts";
+import { resolveCapOverride } from "../cost-cap.ts";
 import { lifecycleBus } from "../lifecycle-bus.ts";
 import { buildSeedFiles } from "../seed.ts";
+import { validateTargetBranch } from "../target-branch.ts";
 import { readCachedAgent, readProjectDefaults, resolveOverride } from "./agent-cache.ts";
-import { type EnvLike, injectWarrenCallbackEnv } from "./callback-env.ts";
+import { injectWarrenCallbackEnv } from "./callback-env.ts";
+import { resolveContinuationRef, resolveExistingBranch } from "./continuation.ts";
+import { writeDispatchContext } from "./dispatch-context.ts";
+import { injectGitIdentityEnv, warnIfGitIdentityUnconfigured } from "./git-identity.ts";
+import { healMigrationJournalCollisions, recordMigrationHealEvent } from "./migration-preflight.ts";
+import { gateAgentPrompts } from "./prompt-capabilities.ts";
+import { assertNoKnownProviderModelMismatch } from "./provider-model.ts";
 import {
 	bindRunLogger,
 	logDispatched,
@@ -58,16 +40,14 @@ import {
 	logSpawnFailed,
 	rollback,
 } from "./rollback.ts";
-import { writeSeedExtensions } from "./seed-extensions.ts";
+import { resolveSeedTracker, writeSeedExtensions } from "./seed-extensions.ts";
 import type { SpawnRunInput, SpawnRunResult } from "./types.ts";
 
 /**
- * Vestigial worker-placement label carried on the `spawn.placement` /
+ * Vestigial worker-placement label on the `spawn.placement` /
  * `spawn.provisioned` log lines (warren-c42c). Multi-worker placement was
- * retired with the K8s migration (warren-76c5 / warren-3743) — a run has no
- * "worker" on either backend — so this is a fixed log field, not a routing
- * decision. Kept a local neutral constant now that the spawn path no longer
- * imports burrow-client's `LOCAL_WORKER_NAME`.
+ * retired with the K8s migration (warren-76c5 / warren-3743), so this is a
+ * fixed log field, not a routing decision.
  */
 const WORKER_PLACEMENT_LABEL = "local";
 
@@ -75,12 +55,37 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	if (input.prompt.trim() === "") {
 		throw new ValidationError("prompt cannot be empty");
 	}
+	// warren-232d: serialize the per-project dispatch critical section — the
+	// clone refresh (`checkout --force` / `reset --hard`), the working-tree
+	// defaults read, and the provider's worktree materialization all mutate or
+	// read the SAME shared host clone, so two concurrent dispatches on one
+	// project with different base refs must not interleave. Different projects
+	// dispatch in parallel; see src/projects/clone-lock.ts.
+	return withProjectCloneLock(input.projectId, () => dispatchRun(input));
+}
 
+async function dispatchRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	const agentRow = await input.repos.agents.get(input.agentName);
 	if (!agentRow) {
 		throw new NotFoundError(`agent not found: ${input.agentName}`);
 	}
 	const project = await input.repos.projects.require(input.projectId);
+	// warren-3a75: `targetBranch` is a push target the finalize step writes to
+	// directly, with no PR and therefore no Article IX gate. Enforce the ref
+	// grammar and refuse the project default branch BEFORE any side effect (no
+	// clone refresh, no run row). Repair runs targeting an existing PR head
+	// branch are unaffected.
+	const targetBranch = validateTargetBranch(input.targetBranch, project.defaultBranch);
+	// warren-326f: the explicit opt-in to run on an EXISTING branch. Shape-validated
+	// and fail-closed against the push remote BEFORE any side effect, then folded
+	// into the repair-run pattern (branch = base ref = push target); see
+	// resolveExistingBranch. Downstream keeps reading `ref`/`targetBranch`, so
+	// providers and reap need no special-casing and default dispatches are
+	// byte-identical.
+	const existingBranch = await resolveExistingBranch(input, project);
+	const baseRefField = existingBranch ?? input.ref;
+	const pushTarget = existingBranch ?? targetBranch;
+
 	const baseAgent = readCachedAgent(agentRow.renderedJson, agentRow.name);
 	const burrowConfig = parseBurrowConfig(baseAgent.sections.burrow_config);
 
@@ -91,22 +96,26 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 	// before burrow forks the new run branch off it. The parent link is also
 	// recorded on the new run row below so the UI can render a chain indicator
 	// and chain cost/token totals are derivable by walking the link.
-	const baseRef = await resolveContinuationRef(input, project);
+	const baseRef = input.baseCommit ?? (await resolveContinuationRef(input, project, pushTarget));
 
-	// Refresh the project clone to origin/<ref> so the run sees the
-	// latest commits. Skipped only when the caller didn't wire the
-	// projects-config + spawn seam (tests that pre-stage their own
-	// fixtures). Refresh failure aborts the spawn before we create a
-	// warren row — a stale workspace is worse than a clean error
-	// (warren-1bb6).
+	// warren-232d: a baseCommit dispatch NEVER moves the host clone's HEAD.
+	// The refresh runs in fetch-only mode (the pinned SHA's objects come
+	// down, HEAD/working tree untouched — see refreshProjectClone's
+	// `fetchCommit` leg) and the workspace is cut at the SHA directly by
+	// the provider (`git worktree add -b <runBranch> <ws> <sha>`), so the
+	// shared clone's checked-out branch never moves for a pinned replay.
 	const refreshed =
 		input.projectsConfig !== undefined && input.projectSpawn !== undefined
 			? await (input.refreshProjectFn ?? refreshProject)({
 					repo: input.repos.projects,
 					config: input.projectsConfig,
 					id: project.id,
-					...(baseRef !== undefined ? { ref: baseRef } : {}),
-					token: input.githubToken,
+					...(input.baseCommit !== undefined
+						? { fetchCommit: input.baseCommit }
+						: baseRef !== undefined
+							? { ref: baseRef }
+							: {}),
+					gitCredential: input.gitCredential,
 					spawn: input.projectSpawn,
 					...(input.now !== undefined ? { now: input.now } : {}),
 					...(input.warrenConfigs !== undefined ? { warrenConfigs: input.warrenConfigs } : {}),
@@ -128,14 +137,36 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		projectDefaults?.defaultProvider,
 	);
 	const effectiveModel = resolveOverride(input.modelOverride, projectDefaults?.defaultModel);
-	// warren-a63d: fold the per-trigger spend cap on top (trigger > agent).
-	const agent = withMaxCostUsdOverride(
-		withProviderOverrides(baseAgent, {
-			...(effectiveProvider !== undefined ? { providerOverride: effectiveProvider } : {}),
-			...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
-		}),
-		input.maxCostUsdOverride,
+	// warren-a63d: fold the per-dispatch spend cap on top. The full chain
+	// (override > agent frontmatter > project default, with malformed agent
+	// values still failing open) lives in resolveCapOverride — cost-cap.ts
+	// owns the semantics, this site only feeds it the three sources.
+	const capOverride = resolveCapOverride({
+		...(input.maxCostUsdOverride !== undefined ? { overrideUsd: input.maxCostUsdOverride } : {}),
+		frontmatter: baseAgent.frontmatter,
+		...(projectDefaults?.maxCostUsd !== undefined
+			? { projectDefaultUsd: projectDefaults.maxCostUsd }
+			: {}),
+	});
+	// warren-cb46: gate tracker/mulch prompt fragments on the project's real
+	// capabilities before anything freezes the agent (prompt-capabilities.ts).
+	const agent = gateAgentPrompts(
+		withMaxCostUsdOverride(
+			withProviderOverrides(baseAgent, {
+				...(effectiveProvider !== undefined ? { providerOverride: effectiveProvider } : {}),
+				...(effectiveModel !== undefined ? { modelOverride: effectiveModel } : {}),
+			}),
+			capOverride,
+		),
+		projectAfterRefresh,
+		input.issueTracker,
 	);
+	// warren-bad5: validate only after the override > project default >
+	// agent frontmatter chain has been fully resolved.
+	const { provider: declaredProvider, model: declaredModel } = readProviderFrontmatter(
+		agent.frontmatter,
+	);
+	assertNoKnownProviderModelMismatch(declaredProvider, declaredModel);
 
 	// Build the seed payload BEFORE creating the warren row so a malformed
 	// expertise_seed / pi_skills / pi_prompts section surfaces as a clean
@@ -145,30 +176,61 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 
 	// warren-76c5 / warren-3743: multi-worker placement is retired — the
 	// self-host backend is a single local burrow. `runs.worker_id` is no longer
-	// written (the workers/burrows tables were dropped); it stays NULL for new
+	// written (the workers/sandboxes tables were dropped); it stays NULL for new
 	// runs and every reader (preview / proxy) treats NULL as the local worker.
 	logPlacement(input.logger, WORKER_PLACEMENT_LABEL, projectAfterRefresh.id);
 
+	// warren-2ede / pl-103e: freeze the DECLARED provider/model onto real
+	// columns so analytics group-bys read the columns instead of re-parsing
+	// rendered_agent_json per query. This is the resolved frontmatter value
+	// (override chain already folded in above), not what the harness used.
 	const run = await input.repos.runs.create({
 		agentName: agent.name,
 		projectId: projectAfterRefresh.id,
 		prompt: input.prompt,
 		renderedAgentJson: agent,
+		...(declaredProvider !== undefined ? { provider: declaredProvider } : {}),
+		...(declaredModel !== undefined ? { model: declaredModel } : {}),
+		// warren-f3c3: freeze how the run's cost will be priced. A run whose
+		// anthropic credential is CLAUDE_CODE_OAUTH_TOKEN (subscription auth)
+		// gets `subscription_estimate` so costUsd reads as an estimate, not a
+		// bill. Resolved beside the provider env registry (core/providers.ts).
+		costBasis: resolveRunCostBasis(declaredProvider, input.serverEnv ?? process.env),
 		trigger: input.trigger ?? "manual",
 		...(input.seedId !== undefined ? { seedId: input.seedId } : {}),
 		...(input.mode !== undefined ? { mode: input.mode } : {}),
 		...(input.parentRunId !== undefined && input.parentRunId !== ""
 			? { parentRunId: input.parentRunId, cloneKind: input.cloneKind ?? "continue" }
 			: {}),
-		...(input.targetBranch?.trim() ? { targetBranch: input.targetBranch } : {}),
+		...(input.retryOf !== undefined && input.retryOf !== "" ? { retryOf: input.retryOf } : {}),
+		...(pushTarget !== undefined ? { targetBranch: pushTarget } : {}),
+		// warren-afeb: freeze the explicit dispatch-supplied clone ref onto the
+		// row so POST /runs and GET /runs/:id can echo that it took.
+		...(baseRefField !== undefined ? { ref: baseRefField } : {}),
+		// warren-aaf7: freeze the base-commit pin so the projections can echo
+		// it; the PR base resolution (reap) reads `ref` only, never this.
+		...(input.baseCommit !== undefined ? { baseCommit: input.baseCommit } : {}),
 		now: input.now?.(),
 	});
 	// warren-a0a2: expose the run id the instant the row exists so the cron
 	// bounded-retry GC can reclaim it if the dispatch below throws (see types).
 	input.onRunRowCreated?.(run.id);
 
+	// warren-d6ca: dispatch-context snapshot BEFORE any runtime contact so a
+	// never-started failure still gets a row. Fire-and-log — see writeDispatchContext.
+	await writeDispatchContext({
+		spawn: input,
+		run,
+		agent,
+		baseAgent,
+		declaredProvider,
+		declaredModel,
+		projectDefaults,
+		network: burrowConfig.network ?? "none",
+	});
+
 	// warren-9993/a993: burrow branch = `${prefix}/${run.id}` (prefix precedence
-	// project default > env > "burrow"); a CI-fixer run's `targetBranch` pins it
+	// project default > env > built-in "warren" default); a CI-fixer run's `targetBranch` pins it
 	// to the open PR head ref instead, so the fixer's commits re-run that PR's CI.
 	const branch = composeRunBranch(
 		resolveRunBranchPrefix({
@@ -176,26 +238,30 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			envDefault: input.runBranchPrefixDefault,
 		}),
 		run.id,
-		input.targetBranch,
+		pushTarget,
 	);
 
 	const runEnv = composeRunEnv(run.id, projectDefaults?.qualityGate, input.serverEnv);
 
-	// warren-b802: resolve per-project runtime override for the planner
-	// interactive agent at dispatch time so the agent row
-	// stays honest as 'builtin'.
+	// warren-b802: per-project runtime override (planner stays 'builtin').
 	const runtimeOverride = interactiveRuntimeOverride(agent.name, projectDefaults);
+	const runtimeId = readRuntimeId(agent, runtimeOverride);
 
-	const log = bindRunLogger(input.logger, run.id);
+	// warren-9ce3: read dispatcherHandle + dispatchOrigin (were dropped silently).
+	const log = bindRunLogger(input.logger, run.id, {
+		dispatcherHandle: input.dispatcherHandle,
+		dispatchOrigin: input.dispatchOrigin,
+	});
+	// warren-e7b7: warn once per dispatch when agent git identity is unset (K8s).
+	warnIfGitIdentityUnconfigured(log, input.serverEnv ?? process.env);
 	// Runtime-provider seam (warren-c42c: burrow-client eviction, bucket 2).
-	// `provider.create` collapses burrow's provision + dispatch (`burrowsUp` +
+	// `provider.create` collapses burrow's provision + dispatch (`sandboxUp` +
 	// `runs.create`) into one call and owns the sandbox-half rollback on a partial
 	// failure (best-effort destroy + rethrow). The spawn path is now EXCLUSIVELY
 	// the provider path — no burrow-direct fallback. Callers resolve the
 	// boot-selected provider (`resolveRuntimeProvider`, honoring `WARREN_RUNTIME`)
-	// and thread it in; there is no `burrowClient` on this seam to fall back to.
+	// and thread it in; there is no `sandboxClient` on this seam to fall back to.
 	const provider: RuntimeProvider = input.runtimeProvider;
-	const runtimeId = readRuntimeId(agent, runtimeOverride);
 	// Neutral RunSpec (provider maps it to the two burrow calls). `network` is
 	// REQUIRED on the seam, so resolve burrow's own default (`none`) here — the
 	// domain now owns the "no explicit network ⇒ default" decision that
@@ -227,8 +293,18 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		...(projectDefaults?.resources !== undefined
 			? { projectResources: projectDefaults.resources }
 			: {}),
+		// warren-fabb: per-project agent image override (docker + k8s consume it;
+		// LocalProvider ignores it — host toolchain). Precedence: project override
+		// > WARREN_DOCKER_AGENT_IMAGE / WARREN_K8S_AGENT_IMAGE env > default.
+		...(projectDefaults?.agentImage !== undefined
+			? { agentImage: projectDefaults.agentImage }
+			: {}),
 		runtimeId,
-		prompt: composeDispatchPrompt(agent.sections.system, input.prompt),
+		prompt: composeDispatchPrompt(
+			agent.sections.system,
+			input.prompt,
+			projectDefaults?.repoContext,
+		),
 		metadata: composeBurrowMetadata(input.metadata, agent.frontmatter),
 		mode: input.mode ?? "batch",
 		network: burrowConfig.network ?? "none",
@@ -236,17 +312,63 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		env: runEnv,
 	};
 	try {
+		// warren-5255: freeze the composed workspace branch onto the row so
+		// HTTP consumers (the campaign-controller's cross-fork head ref) read
+		// it instead of re-deriving the prefix composition. Inside the try so
+		// a failure unwinds through the same rollback as the dispatch itself.
+		await input.repos.runs.setBranch(run.id, branch);
+		// warren-1f03: dispatch-time drizzle migration preflight. A ref-dispatch
+		// onto an existing branch whose generated migrations collide with a
+		// journal slot main landed after the branch was cut is healed prompt-free
+		// (colliding artifacts deleted, `bun run db:generate`, heal commit on the
+		// host clone branch) BEFORE the provider forks the workspace. A fresh
+		// dispatch from the default branch cannot collide, so it is skipped.
+		// warren-232d: a baseCommit dispatch skips the preflight too — its host
+		// clone was NOT checked out onto the base ref (fetch-only refresh), so
+		// the heal path would commit onto whatever branch the clone happens to
+		// sit on (or a detached HEAD), not the pinned base.
+		if (
+			refreshed !== null &&
+			input.baseCommit === undefined &&
+			baseRef !== undefined &&
+			baseRef !== projectAfterRefresh.defaultBranch &&
+			input.projectSpawn !== undefined
+		) {
+			const heal = await (input.migrationHealFn ?? healMigrationJournalCollisions)({
+				spawn: input.projectSpawn,
+				projectPath: projectAfterRefresh.localPath,
+				defaultBranch: projectAfterRefresh.defaultBranch,
+				baseRef,
+				...(input.projectsConfig?.gitBinary !== undefined
+					? { gitBinary: input.projectsConfig.gitBinary }
+					: {}),
+				...(input.serverEnv !== undefined ? { env: input.serverEnv } : {}),
+			});
+			if (heal.collisions.length > 0) {
+				log.info(
+					{ collisions: heal.collisions, commit_sha: heal.commitSha, base_ref: baseRef },
+					"spawn.migration_journal_heal",
+				);
+				await recordMigrationHealEvent(
+					input.repos,
+					run.id,
+					heal,
+					baseRef,
+					input.now?.() ?? new Date(),
+				);
+			}
+		}
 		const dispatchStart = Date.now();
 		const handle = await provider.create(spec);
 		logProvisioned(log, handle.sandboxId, WORKER_PLACEMENT_LABEL, dispatchStart);
 		// warren-3743: the provider owns partial-failure cleanup, so the burrow
 		// correlation ids are written back onto the run only after `create` fully
-		// succeeds — a dispatch that fails mid-flight leaves no burrow_id on the
+		// succeeds — a dispatch that fails mid-flight leaves no sandbox_id on the
 		// run (the provider already destroyed the burrow). These ids are
 		// load-bearing for LocalProvider resume across a host restart.
-		await input.repos.runs.attachBurrow(run.id, { burrowId: handle.sandboxId });
+		await input.repos.runs.attachBurrow(run.id, { sandboxId: handle.sandboxId });
 		const updated = await input.repos.runs.attachBurrow(run.id, {
-			burrowRunId: handle.providerRunId,
+			sandboxRunId: handle.providerRunId,
 		});
 		logDispatched(log, handle.sandboxId, handle.providerRunId, dispatchStart);
 		// warren-4e74: fire the observe-only `run_dispatched` lifecycle hook.
@@ -262,32 +384,34 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 			sandboxId: handle.sandboxId,
 			providerRunId: handle.providerRunId,
 		});
-		// pl-bb70 step 4: stamp the seed's warren-namespaced extensions after
-		// dispatch lands. Fire-and-log — anything that throws here (sd not
-		// on PATH, project clone vanished, write race) emits a system event
-		// on the run and DOES NOT roll the dispatch back. Mirrors the cron
-		// tick's clearScheduledFor recovery shape in src/triggers/tick.ts.
-		if (input.seedId !== undefined && input.seedsCli !== undefined) {
+		// pl-bb70 step 4 + warren-6234: stamp the run's tracker metadata
+		// after dispatch via the IssueTracker seam, fire-and-log (see
+		// seed-extensions.ts). A legacy `seedsCli` (plan-runs port pending,
+		// warren-2d98) wraps in SeedsTracker here.
+		const seedTracker = resolveSeedTracker(input.issueTracker, input.seedsCli);
+		if (input.seedId !== undefined && seedTracker !== undefined) {
 			await writeSeedExtensions({
 				repos: input.repos,
-				seedsCli: input.seedsCli,
+				issueTracker: seedTracker,
+				projectId: projectAfterRefresh.id,
 				projectPath: projectAfterRefresh.localPath,
 				seedId: input.seedId,
 				runId: run.id,
 				agentName: agent.name,
 				trigger: input.trigger,
 				now: input.now?.() ?? new Date(),
+				logger: log,
 			});
 		}
 		// `workspacePath` is a burrow host path with no provider-neutral home, so
 		// the seam's `RunHandle` drops it (design §: the domain must never leak a
 		// host path). It survives as a display-only field on the HTTP response +
-		// UI, slated for removal with the multi-worker/`/burrows` surface (plan
+		// UI, slated for removal with the multi-worker/`/sandboxes` surface (plan
 		// §5.C); no value is available across the seam, so it is empty here.
 		return {
 			run: updated,
-			burrow: { id: handle.sandboxId, workspacePath: "" },
-			burrowRun: { id: handle.providerRunId },
+			sandbox: { id: handle.sandboxId, workspacePath: "" },
+			sandboxRun: { id: handle.providerRunId },
 			agent,
 		};
 	} catch (err) {
@@ -298,63 +422,6 @@ export async function spawnRun(input: SpawnRunInput): Promise<SpawnRunResult> {
 		await rollback(input, run.id, log, err);
 		throw err;
 	}
-}
-
-/**
- * Resolve the git ref the project clone should be refreshed to before the
- * burrow forks the new run branch (warren-4b11).
- *
- * - No `parentRunId` → explicit `ref`, else the `targetBranch` push target
- *   (warren-709e), else undefined → refreshProject's project default branch.
- * - `parentRunId` set with `cloneKind: "replicate"` (warren-e96f) → the
- *   caller's explicit `ref` (or the project default branch). A replicate is a
- *   fresh re-dispatch of the parent's config, NOT a continuation, so it must
- *   NOT check out the parent's pushed branch — that branch may be stale or may
- *   never have been pushed (parent failed early).
- * - `parentRunId` set (default `cloneKind: "continue"`) → the parent run's
- *   pushed branch, recomposed from the
- *   same prefix precedence the parent's spawn used
- *   (`composeRunBranch(resolveRunBranchPrefix(...), parentRunId)`). We read
- *   the project defaults here (a lightweight pre-refresh peek) only to get
- *   the prefix; the working tree's `.warren/` is stable across a project's
- *   runs, so this matches the branch the parent actually pushed.
- *
- * The parent must belong to the same project — a continuation forks the
- * parent's branch on the same origin, so a cross-project parent would be a
- * meaningless base. We reject it with a typed ValidationError rather than
- * silently checking out a branch that doesn't exist on this origin.
- */
-async function resolveContinuationRef(
-	input: SpawnRunInput,
-	project: { id: string; localPath: string },
-): Promise<string | undefined> {
-	if (!input.parentRunId) return input.ref ?? input.targetBranch; // warren-709e
-	// Replicate (warren-e96f): fresh re-dispatch against the explicit ref /
-	// project default base, not the parent's pushed branch. We still validate
-	// the parent below (same-project guard), but the base ref is the caller's.
-	if (input.cloneKind === "replicate") {
-		const parent = await input.repos.runs.require(input.parentRunId);
-		if (parent.projectId !== project.id) {
-			throw new ValidationError(
-				`parent run ${parent.id} belongs to a different project; a re-run must reuse the same project`,
-				{ recoveryHint: "re-run with a cloneFromRunId from the same project, or omit it" },
-			);
-		}
-		return input.ref;
-	}
-	const parent = await input.repos.runs.require(input.parentRunId);
-	if (parent.projectId !== project.id) {
-		throw new ValidationError(
-			`parent run ${parent.id} belongs to a different project; a continuation must reuse the same project's branch`,
-			{ recoveryHint: "re-run with a parentRunId from the same project, or omit it" },
-		);
-	}
-	const defaults = await readProjectDefaults(input.warrenConfigs, project.id, project.localPath);
-	const prefix = resolveRunBranchPrefix({
-		projectDefault: defaults?.runBranchPrefix,
-		envDefault: input.runBranchPrefixDefault,
-	});
-	return composeRunBranch(prefix, parent.id);
 }
 
 // warren-b893: route Bun cache outside the workspace so `git add .` never sweeps it.
@@ -376,27 +443,8 @@ function composeRunEnv(
 	return env;
 }
 
-/**
- * Forward the operator's agent-commit identity (`WARREN_GIT_AUTHOR_NAME` /
- * `WARREN_GIT_AUTHOR_EMAIL`, see `.env.example`) into the sandbox as the four
- * `GIT_AUTHOR_*` / `GIT_COMMITTER_*` env vars git reads ahead of any config.
- *
- * On the Local path the supervisor already exports these into its own process
- * env (`src/supervisor/git-identity.ts`) and burrow passes them through, so
- * this is a no-op re-assertion of the same values. On the K8s path there is NO
- * supervisor and the run pod has no gitconfig at all — without this every
- * agent `git commit` dies with "Author identity unknown" exit 128 (hit live on
- * GKE, warren-4e36). Mirrors the supervisor's rule: both halves or nothing.
- */
-function injectGitIdentityEnv(env: Record<string, string>, serverEnv: EnvLike): void {
-	const name = serverEnv.WARREN_GIT_AUTHOR_NAME?.trim();
-	const email = serverEnv.WARREN_GIT_AUTHOR_EMAIL?.trim();
-	if (name === undefined || name === "" || email === undefined || email === "") return;
-	env.GIT_AUTHOR_NAME = name;
-	env.GIT_AUTHOR_EMAIL = email;
-	env.GIT_COMMITTER_NAME = name;
-	env.GIT_COMMITTER_EMAIL = email;
-}
+// warren-4e36 / warren-e7b7: the git-identity env helpers moved to
+// `./git-identity.ts` (size budget, warren-4553).
 
 /**
  * Prefix the user's run prompt with the agent's `system` section so the
@@ -407,25 +455,25 @@ function injectGitIdentityEnv(env: Record<string, string>, serverEnv: EnvLike): 
  * body is dead text on disk.
  *
  * `runs.prompt` (warren-side) keeps the user-typed input verbatim; only
- * the body sent on POST /burrows/:id/runs is composed.
+ * the body sent on POST /sandboxes/:id/runs is composed.
  */
-export function composeDispatchPrompt(systemBody: string | undefined, userPrompt: string): string {
+export function composeDispatchPrompt(
+	systemBody: string | undefined,
+	userPrompt: string,
+	repoContext?: string,
+): string {
 	const trimmed = (systemBody ?? "").trim();
-	if (trimmed === "") return userPrompt;
-	return `${trimmed}\n\n---\n\n${userPrompt}`;
+	// warren-540f: the project's `.warren/config.yaml` `repoContext` block
+	// rides between the system section and the user prompt, clearly
+	// delimited. Absent/whitespace-only → byte-identical to the pre-540f
+	// composition.
+	const context = (repoContext ?? "").trim();
+	const parts = [trimmed, context].filter((part) => part !== "");
+	if (parts.length === 0) return userPrompt;
+	return `${parts.join("\n\n---\n\n")}\n\n---\n\n${userPrompt}`;
 }
 
-/**
- * Merge the operator-supplied dispatch metadata with the post-override agent
- * frontmatter so burrow's piRuntime can read provider/model from
- * `Run.metadataJson.frontmatter` (burrow-b5b4). Without this, ctx.frontmatter
- * is undefined inside burrow and buildPiArgv falls back to PI_DEFAULT_MODEL
- * even when warren resolved a non-default per warren-618b / warren-f8c0.
- *
- * Operator metadata wins on key collisions except for `frontmatter`, which is
- * always sourced from the agent — it's the resolved envelope, not a
- * caller-supplied field.
- */
+/** Fold agent frontmatter onto operator metadata (burrow-b5b4 / warren-618b). */
 function composeBurrowMetadata(
 	operatorMetadata: unknown,
 	frontmatter: Record<string, unknown>,

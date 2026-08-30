@@ -2,7 +2,7 @@
  * Repository for the `events` table.
  *
  * Warren's events table is a write-through cache of burrow's stream (docs/design/runtime-and-supervisor.md). Each row carries the burrow-side `seq` so we can resume the stream
- * at MAX(burrow_event_seq) + 1 after a warren restart mid-run, and so the UI
+ * at MAX(sandbox_event_seq) + 1 after a warren restart mid-run, and so the UI
  * replays events in the same order burrow emitted them.
  */
 
@@ -11,19 +11,18 @@ import type { SqliteDrizzleDb } from "../client.ts";
 import type { EventRow, EventStream } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
 
-/**
- * Default row cap for {@link EventsRepo.listToolEventsForRuns}. Bounds the
- * cost of scanning the events table for the analytics behavior view; callers
- * that need a tighter (or looser) bound pass an explicit `limit`.
- */
-export const DEFAULT_TOOL_EVENT_CAP = 20_000;
-
 export interface AppendEventInput {
 	runId: string;
-	burrowEventSeq: number;
+	sandboxEventSeq: number;
 	ts: string;
 	kind: string;
 	stream?: EventStream | null;
+	/**
+	 * Parse-boundary provenance (warren-5a07). Threaded from the stream
+	 * view's `origin`; NULL on historical rows and on warren-authored
+	 * internal appends reads as unknown — never fold into a real bucket.
+	 */
+	origin?: string | null;
 	payload: unknown;
 }
 
@@ -44,10 +43,11 @@ export class EventsRepo {
 				.insert(this.events)
 				.values({
 					runId: input.runId,
-					burrowEventSeq: input.burrowEventSeq,
+					sandboxEventSeq: input.sandboxEventSeq,
 					ts: input.ts,
 					kind: input.kind,
 					stream: input.stream ?? null,
+					origin: input.origin ?? null,
 					payloadJson: input.payload,
 				})
 				.returning(),
@@ -78,13 +78,13 @@ export class EventsRepo {
 	): Promise<EventRow[]> {
 		const where =
 			opts.sinceSeq !== undefined
-				? and(eq(this.events.runId, runId), gt(this.events.burrowEventSeq, opts.sinceSeq))
+				? and(eq(this.events.runId, runId), gt(this.events.sandboxEventSeq, opts.sinceSeq))
 				: eq(this.events.runId, runId);
 		const q = this.db
 			.select()
 			.from(this.events)
 			.where(where)
-			.orderBy(asc(this.events.burrowEventSeq));
+			.orderBy(asc(this.events.sandboxEventSeq));
 		return this.adapter.pickAll(opts.limit ? q.limit(opts.limit) : q);
 	}
 
@@ -100,21 +100,50 @@ export class EventsRepo {
 				.select()
 				.from(this.events)
 				.where(eq(this.events.runId, runId))
-				.orderBy(desc(this.events.burrowEventSeq))
+				.orderBy(desc(this.events.sandboxEventSeq))
 				.limit(limit),
 		);
 		return rows.reverse();
 	}
 
 	/**
-	 * Highest burrow_event_seq we've persisted for a run, or null if none.
+	 * Does the run carry at least one event of `kind`? Powers the cancel-intent
+	 * probe (warren-fe9b): the watchdog terminal-reconcile net checks for a
+	 * `cancel.requested` row so a pod warren deleted itself reconciles to
+	 * `cancelled` rather than `failed(sandbox_run_lost)`.
+	 *
+	 * `stream` (optional, warren-7f0b) narrows the match — used by the
+	 * watchdog-kill witness probe so an agent-origin line that merely CARRIES
+	 * the `stdin_hold_timeout` kind on the stdout stream (the provenance gate
+	 * downgrades agent-claimed system lines) cannot trigger an `agent_died`
+	 * reap. System-stream events only ever originate from warren-owned writers.
+	 */
+	async hasKind(runId: string, kind: string, stream?: EventStream): Promise<boolean> {
+		const row = await this.adapter.pickOne<{ id: number }>(
+			this.db
+				.select({ id: this.events.id })
+				.from(this.events)
+				.where(
+					and(
+						eq(this.events.runId, runId),
+						eq(this.events.kind, kind),
+						...(stream !== undefined ? [eq(this.events.stream, stream)] : []),
+					),
+				)
+				.limit(1),
+		);
+		return row !== undefined;
+	}
+
+	/**
+	 * Highest sandbox_event_seq we've persisted for a run, or null if none.
 	 * Used at warren startup to compute the resume offset for live runs
-	 * ("MAX(events.burrow_event_seq) + 1", docs/design/runtime-and-supervisor.md).
+	 * ("MAX(events.sandbox_event_seq) + 1", docs/design/runtime-and-supervisor.md).
 	 */
 	async maxSeqForRun(runId: string): Promise<number | null> {
 		const row = await this.adapter.pickOne<{ max: number | null }>(
 			this.db
-				.select({ max: sql<number | null>`max(${this.events.burrowEventSeq})` })
+				.select({ max: sql<number | null>`max(${this.events.sandboxEventSeq})` })
 				.from(this.events)
 				.where(eq(this.events.runId, runId)),
 		);
@@ -145,40 +174,28 @@ export class EventsRepo {
 						eq(this.events.stream, "system"),
 					),
 				)
-				.orderBy(asc(this.events.runId), asc(this.events.burrowEventSeq)),
+				.orderBy(asc(this.events.runId), asc(this.events.sandboxEventSeq)),
 		);
 	}
 
 	/**
-	 * Tool-call trace rows (`kind=tool_use` / `kind=tool_result`) across many
-	 * runs, for the run-analytics behavior view (warren-e355 / pl-ad0f step 6).
-	 * The command-mining aggregator parses `payload.input.command` from the
-	 * `tool_use` rows and correlates outcomes by joining `tool_result` rows on
-	 * `tool_use_id`, so both kinds must come back together.
-	 *
-	 * Ordered by (runId, seq) so callers can group + correlate in a single
-	 * pass. Capped at `opts.limit` (default {@link DEFAULT_TOOL_EVENT_CAP}) to
-	 * bound the scan cost on busy instances. Empty `runIds` short-circuits
-	 * without a DB hit.
+	 * One run's tool-call trace rows (`kind=tool_use` / `kind=tool_result`)
+	 * in seq order. Sole consumer is the tool-calls rollup backfill
+	 * (`src/runs/tool-calls-backfill.ts`, warren-7746), which re-extracts a
+	 * whole run's history in one pass — per-run bounded, so no row cap. The
+	 * analytics behavior view itself reads the `tool_calls` rollup
+	 * (`ToolCallsRepo.listForRuns`); the retired multi-run capped variant of
+	 * this scan truncated silently at 20k rows.
 	 */
-	async listToolEventsForRuns(
-		runIds: readonly string[],
-		opts: { limit?: number } = {},
-	): Promise<EventRow[]> {
-		if (runIds.length === 0) return [];
-		const limit = opts.limit ?? DEFAULT_TOOL_EVENT_CAP;
+	async listToolEventsForRun(runId: string): Promise<EventRow[]> {
 		return this.adapter.pickAll(
 			this.db
 				.select()
 				.from(this.events)
 				.where(
-					and(
-						inArray(this.events.runId, runIds as string[]),
-						inArray(this.events.kind, ["tool_use", "tool_result"]),
-					),
+					and(eq(this.events.runId, runId), inArray(this.events.kind, ["tool_use", "tool_result"])),
 				)
-				.orderBy(asc(this.events.runId), asc(this.events.burrowEventSeq))
-				.limit(limit),
+				.orderBy(asc(this.events.sandboxEventSeq)),
 		);
 	}
 
@@ -201,19 +218,49 @@ export class EventsRepo {
 						inArray(this.events.kind, ["steer.sent"]),
 					),
 				)
-				.orderBy(asc(this.events.runId), asc(this.events.burrowEventSeq)),
+				.orderBy(asc(this.events.runId), asc(this.events.sandboxEventSeq)),
 		);
 	}
 
 	/**
+	 * Attempt history for one `payload_json` string key across every event of
+	 * a kind (warren-55cf). Returns the total matching row count and the
+	 * newest `ts`, both computed in SQL, so the healer's max-retries and
+	 * cooldown gates are correct by construction: no global row window can
+	 * scroll an exhausted fingerprint out of view.
+	 *
+	 * The JSON extraction is the one dialect-specific bit — sqlite stores
+	 * `payload_json` as TEXT (`json_extract`), postgres as `jsonb` (`->>`).
+	 * Both narrow on `kind` first, which `events_kind_ts_idx` covers.
+	 */
+	async payloadKeyHistory(
+		kind: string,
+		key: string,
+		value: string,
+	): Promise<{ count: number; lastTs: string | null }> {
+		const column = this.events.payloadJson;
+		const extracted =
+			this.adapter.dialect === "postgres"
+				? sql<string | null>`${column} ->> ${key}`
+				: sql<string | null>`json_extract(${column}, ${`$.${key}`})`;
+		const row = await this.adapter.pickOne<{ n: number | string; last: string | null }>(
+			this.db
+				.select({
+					n: sql<number>`count(*)`,
+					last: sql<string | null>`max(${this.events.ts})`,
+				})
+				.from(this.events)
+				.where(and(eq(this.events.kind, kind), eq(extracted, value))),
+		);
+		return { count: Number(row?.n ?? 0), lastTs: row?.last ?? null };
+	}
+
+	/**
 	 * Most-recent events of a single kind across all runs (warren-3db0).
-	 * Backs the healer's per-fingerprint attempt history: the intake
-	 * fetches recent `heal.dispatched` rows and filters them by the
-	 * `payload.fingerprint` in JS (the payload is opaque JSON, so a
-	 * dialect-agnostic SQL filter isn't available). Ordered newest-first
-	 * and capped so a long alert history never fans out into an unbounded
-	 * scan. `heal.dispatched` is a rare system event, so the cap is
-	 * generous relative to real volume.
+	 * Ordered newest-first and capped so a long history never fans out into
+	 * an unbounded scan. Read-only consumers (tests, ad-hoc inspection) only;
+	 * gating decisions must use an aggregate such as
+	 * {@link payloadKeyHistory} rather than this bounded window.
 	 */
 	async listByKind(kind: string, limit = 500): Promise<EventRow[]> {
 		if (limit <= 0) return [];

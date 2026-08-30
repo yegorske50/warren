@@ -16,7 +16,7 @@
  *   coverage/summary.json            — line + function totals (preferred, written by check-coverage.ts)
  *   coverage/lcov.info               — line + function totals (fallback only; diverges from Bun text reporter)
  *   scripts/coverage-budgets.json    — coverage floors
- *   biome.json                       — complexity & line-per-fn overrides
+ *   biome.jsonc                      — complexity & line-per-fn overrides
  *   scripts/file-size-budgets.json   — grandfathered file-size entries
  *   scripts/debt-marker-allowlist.json — grandfathered debt markers
  *   src/ui/dist/assets/              — bundle sizes (raw + gzip)
@@ -100,13 +100,60 @@ export interface ComplexityOverrides {
 
 /**
  * Count files grandfathered out of biome's two complexity rules by
- * scanning biome.json's `overrides` array. Any override block whose
+ * scanning biome.jsonc's `overrides` array. Any override block whose
  * `linter.rules.complexity.<rule>` is "off" contributes its `includes`
  * count. We don't try to dedupe across multiple blocks — by convention
  * each file appears in at most one override block per rule.
  */
+/**
+ * Parse JSONC. `Bun.JSONC` only exists on Bun >= 1.3 while the repo
+ * declares `bun >=1.1.0`, so fall back to stripping comments and
+ * trailing commas (string-aware) on older runtimes.
+ */
+function parseJsonc(text: string): unknown {
+	const jsonc = (Bun as unknown as { JSONC?: { parse: (s: string) => unknown } }).JSONC;
+	if (jsonc) return jsonc.parse(text);
+	return JSON.parse(stripJsoncComments(text).replace(/,(\s*[}\]])/g, "$1"));
+}
+
+/** Strip // and block comments while leaving string contents untouched. */
+function stripJsoncComments(text: string): string {
+	let out = "";
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i] as string;
+		const next = text[i + 1];
+		if (ch === '"') {
+			const end = endOfJsonString(text, i);
+			out += text.slice(i, end);
+			i = end - 1;
+		} else if (ch === "/" && (next === "/" || next === "*")) {
+			i = endOfJsonComment(text, i) - 1;
+		} else out += ch;
+	}
+	return out;
+}
+
+/** Index just past the closing quote of the JSON string starting at `start`. */
+function endOfJsonString(text: string, start: number): number {
+	for (let i = start + 1; i < text.length; i++) {
+		if (text[i] === "\\") i++;
+		else if (text[i] === '"') return i + 1;
+	}
+	return text.length;
+}
+
+/** Index just past the end of the comment starting at `start` (at `/`). */
+function endOfJsonComment(text: string, start: number): number {
+	if (text[start + 1] === "/") {
+		const nl = text.indexOf("\n", start);
+		return nl === -1 ? text.length : nl;
+	}
+	const close = text.indexOf("*/", start + 2);
+	return close === -1 ? text.length : close + 2;
+}
+
 export function countComplexityOverrides(biomeJson: string): ComplexityOverrides {
-	const parsed = JSON.parse(biomeJson) as {
+	const parsed = parseJsonc(biomeJson) as {
 		overrides?: Array<{
 			includes?: string[];
 			linter?: { rules?: { complexity?: Record<string, unknown> } };
@@ -364,7 +411,7 @@ async function main(): Promise<void> {
 		summaryJson: readIfExists(resolve(REPO_ROOT, "coverage/summary.json")),
 		lcov: readIfExists(lcovPath),
 		coverageBudgets: readIfExists(resolve(REPO_ROOT, "scripts/coverage-budgets.json")),
-		biomeJson: readIfExists(resolve(REPO_ROOT, "biome.json")),
+		biomeJson: readIfExists(resolve(REPO_ROOT, "biome.jsonc")),
 		fileSizeBudgets: readIfExists(resolve(REPO_ROOT, "scripts/file-size-budgets.json")),
 		debtAllowlist: readIfExists(resolve(REPO_ROOT, "scripts/debt-marker-allowlist.json")),
 		bundleSizes,

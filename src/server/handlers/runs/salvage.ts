@@ -27,18 +27,40 @@
  * the same file and re-stamps the same location, so redelivery is safe.
  */
 
-import { mkdir, rename, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { ValidationError } from "../../../core/errors.ts";
 import { parseSalvageEnvelope, type SalvageEnvelope } from "../../../runtime/k8s/finalize-wire.ts";
-import { MAX_SALVAGE_BUNDLE_BYTES, salvageBundleFileName } from "../../../runtime/salvage.ts";
+import { MAX_SALVAGE_BUNDLE_BYTES, salvageBundlePath } from "../../../runtime/salvage.ts";
 import { jsonResponse } from "../../response.ts";
+import { EventStreamLimiter } from "../../stream-limits.ts";
 import type { RouteContext, RouteHandler, ServerDeps } from "../../types.ts";
 import { readJsonBody, requireParam } from "../index.ts";
 import { stampRunSystemEvent } from "../stamp-event.ts";
 
 /** Run event kind emitted when a salvage lands (best-effort, stream=system). */
 export const WORKSPACE_SALVAGED_EVENT = "reap.workspace_salvaged";
+
+/**
+ * Per-run in-flight cap on salvage uploads (warren-adc1). Without it, N
+ * concurrent POSTs for one run stage N tmp files of up to 32MiB each on the
+ * control-plane volume before any of them collapse onto the single final
+ * path — and the pod's run-scoped token is reachable by the agent, so the
+ * untrusted side holds this write path. One upload per run id at a time is
+ * all the intake ever needs: a retried POST is idempotent, so a rejected
+ * concurrent upload loses nothing (the pod retries on non-2xx).
+ *
+ * Reuses the event-stream per-key limiter (warren-25f6) rather than a new
+ * counter: keyed on the run id, per-key cap 1, no global cap, no lifetime
+ * (an upload is bounded by the 32MiB body, not a wall-clock budget). A
+ * second concurrent upload for the same run gets the family's usual
+ * rejection — `EventStreamCapacityError` → 503 + `Retry-After`.
+ */
+export const salvageUploadLimiter = new EventStreamLimiter({
+	maxPerClient: 1,
+	maxGlobal: 0,
+	maxLifetimeMs: 0,
+	trustedProxyHops: 0,
+});
 
 /**
  * Decode + cap the base64 bundle. Over-cap or malformed base64 is a 400 the
@@ -64,18 +86,35 @@ function decodeBundle(bundleBase64: string | null): Uint8Array | null {
 	return bytes;
 }
 
-/** Store the bundle durably (atomic tmp+rename); null when none was sent. */
+/**
+ * Store the bundle durably (atomic tmp+rename); null when none was sent.
+ *
+ * `salvageBundlePath` — not a bare `join` — resolves the target, because
+ * `runId` is a percent-decoded route param (warren-7c1e). It throws a
+ * `ValidationError` (→ 400) for anything that would land outside
+ * `salvageDir`, and it throws BEFORE the `mkdir`, so a refused id creates
+ * nothing on disk.
+ */
 async function storeBundle(
 	salvageDir: string,
 	runId: string,
 	bundleBytes: Uint8Array | null,
 ): Promise<string | null> {
 	if (bundleBytes === null) return null;
+	const bundlePath = salvageBundlePath(salvageDir, runId);
 	await mkdir(salvageDir, { recursive: true });
-	const bundlePath = join(salvageDir, salvageBundleFileName(runId));
 	const tmpPath = `${bundlePath}.tmp-${crypto.randomUUID()}`;
-	await writeFile(tmpPath, bundleBytes);
-	await rename(tmpPath, bundlePath);
+	try {
+		await writeFile(tmpPath, bundleBytes);
+		await rename(tmpPath, bundlePath);
+	} finally {
+		// Remove the staged tmp file on EVERY path (warren-adc1), not just a
+		// successful rename — a failed write must not leak up-to-32MiB files
+		// onto the control-plane volume. The rename already moved the file on
+		// success, so `force` absorbs the missing-file case; swallow any
+		// unlink error so it never masks the original failure.
+		await rm(tmpPath, { force: true }).catch(() => {});
+	}
 	return bundlePath;
 }
 
@@ -123,21 +162,32 @@ async function recordSalvage(
 export function postRunSalvageHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
-		const body = await readJsonBody(ctx);
-		const envelope = parseSalvageEnvelope(body);
-		if (deps.salvageDir === undefined) {
-			// Fail LOUD: silently dropping the only recoverable copy is exactly
-			// the defect warren-cd3b exists to close. The pod retries on non-2xx.
-			throw new Error(
-				"salvage intake is not configured (ServerDeps.salvageDir is unset); refusing to drop the run's recoverable work",
+		// Hold the per-run slot for the WHOLE intake, body read included, so a
+		// second concurrent POST is refused BEFORE we buffer its bundle.
+		const slot = salvageUploadLimiter.acquire(id);
+		try {
+			const body = await readJsonBody(ctx);
+			const envelope = parseSalvageEnvelope(body);
+			if (deps.salvageDir === undefined) {
+				// Fail LOUD: silently dropping the only recoverable copy is exactly
+				// the defect warren-cd3b exists to close. The pod retries on non-2xx.
+				throw new Error(
+					"salvage intake is not configured (ServerDeps.salvageDir is unset); refusing to drop the run's recoverable work",
+				);
+			}
+			const bundlePath = await storeBundle(
+				deps.salvageDir,
+				id,
+				decodeBundle(envelope.bundleBase64),
 			);
+			await recordSalvage(deps, ctx, id, envelope, bundlePath);
+			ctx.logger.info(
+				{ runId: id, trigger: envelope.trigger, rescueRef: envelope.rescueRef, bundlePath },
+				"salvage captured for run",
+			);
+			return jsonResponse(200, { stored: bundlePath !== null, rescueRef: envelope.rescueRef });
+		} finally {
+			slot.release();
 		}
-		const bundlePath = await storeBundle(deps.salvageDir, id, decodeBundle(envelope.bundleBase64));
-		await recordSalvage(deps, ctx, id, envelope, bundlePath);
-		ctx.logger.info(
-			{ runId: id, trigger: envelope.trigger, rescueRef: envelope.rescueRef, bundlePath },
-			"salvage captured for run",
-		);
-		return jsonResponse(200, { stored: bundlePath !== null, rescueRef: envelope.rescueRef });
 	};
 }

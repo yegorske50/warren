@@ -6,7 +6,7 @@
  *   - bwrap binary reachable (Phase 13),
  *   - projects root resolvable (non-fatal),
  *   - per-project `.warren/` config validity (R-02, pl-5d74 step 6),
- *   - burrow socket reachable.
+ *   - the local runtime is the in-process sandbox engine (warren-9a26).
  *
  * The Phase-13 bwrap probe lives in
  * `src/diagnostics/checks.ts` so `GET /readyz` mirrors it without
@@ -22,8 +22,10 @@ import { createRepos } from "../../db/repos/index.ts";
 import {
 	checkBwrap,
 	checkDatabaseReachable,
+	checkGitIdentity,
 	checkPreviewAuthStrength,
 	checkPreviewPortAllocator,
+	checkSandboxGit,
 	checkWarrenConfig,
 	checkWarrenConfigDeprecations,
 	checkWarrenDb,
@@ -31,12 +33,13 @@ import {
 	type DiagnosticLogger,
 	type WarrenConfigCheckProject,
 } from "../../diagnostics/checks.ts";
-import { checkStaleBurrowWorkspaces } from "../../diagnostics/stale-workspaces.ts";
+import { checkStaleSandboxWorkspaces } from "../../diagnostics/stale-workspaces.ts";
 import { loadPreviewPortRangeFromEnv, PreviewPortAllocator } from "../../preview/port-allocator.ts";
 import { loadProjectsConfigFromEnv } from "../../projects/config.ts";
 import { loadWorkspaceGcConfigFromEnv } from "../../runs/reap/gc.ts";
-import { doctorBurrowCheck } from "../../runtime/local/diagnostics/burrow.ts";
+import { doctorLocalRuntimeCheck } from "../../runtime/local/diagnostics/local-runtime.ts";
 import { resolveRuntimeKind } from "../../runtime/registry.ts";
+import type { SandboxGitPreflightResult } from "../../sandbox/git-preflight.ts";
 import type { CliContext, EnvLike } from "../output.ts";
 import { writeJsonLine } from "../output.ts";
 
@@ -55,8 +58,8 @@ export interface DoctorArgs {
 }
 
 export interface DoctorDeps {
-	/** Override the live `BurrowClient.probe` (tests). */
-	readonly probeBurrow?: (env: EnvLike) => Promise<void>;
+	/** Override the local-runtime probe (tests). */
+	readonly probeLocalRuntime?: (env: EnvLike) => Promise<void>;
 	/** Override `existsSync` (tests). */
 	readonly existsSync?: (path: string) => boolean;
 	/**
@@ -79,6 +82,12 @@ export interface DoctorDeps {
 	 * the probe path runs identically on macOS dev machines.
 	 */
 	readonly platform?: NodeJS.Platform;
+	/**
+	 * Override the sandbox-git preflight probe (warren-1219). Production
+	 * omits it (the boot-cached real probe runs, host bwrap/sandbox-exec
+	 * included); tests stub the result.
+	 */
+	readonly probeSandboxGit?: () => Promise<SandboxGitPreflightResult>;
 }
 
 export interface DoctorResult {
@@ -93,14 +102,18 @@ export async function runDoctor(
 ): Promise<DoctorResult> {
 	const exists = deps.existsSync ?? existsSync;
 	const checks: DoctorCheck[] = [];
-	// Burrow/bwrap/stale-workspace probes only make sense for the LOCAL backend,
-	// where warren co-tenants a burrow daemon. Under `WARREN_RUNTIME=k8s` agents
-	// run in pods with no co-tenanted burrow, so we skip them cleanly and emit a
-	// single informational line saying so — mirroring the `/readyz` behavior
-	// (warren-c128, src/server/handlers/diagnostics.ts).
+	// The local-sandbox probes (bwrap, stale workspaces, the local-runtime line)
+	// only make sense for the LOCAL backend, where warren runs sandboxes
+	// in-process on the host. Under `WARREN_RUNTIME=k8s` agents run in pods, so
+	// we skip them cleanly and emit a single informational line saying so —
+	// mirroring the `/readyz` behavior (warren-c128,
+	// src/server/handlers/diagnostics.ts).
 	const isLocalTopology = resolveRuntimeKind(context.env) === "local";
 
 	checks.push(envCheck("WARREN_API_TOKEN", context.env, args.noAuth ?? false));
+	// warren-e7b7: unset agent git identity is a WARNING (always ok:true),
+	// surfaced here because the K8s topology has no supervisor to warn.
+	checks.push(checkGitIdentity(context.env));
 
 	// Threaded per-call, never a global: only the probes that already
 	// accept a `log` seam (warren-51de) receive it, and only under
@@ -124,6 +137,15 @@ export async function runDoctor(
 				...(deps.platform !== undefined ? { platform: deps.platform } : {}),
 			}),
 		);
+		// warren-1219: prove the resolved git EXECUTES inside the composed
+		// sandbox profile — the macOS nix-git dyld failure class, caught at
+		// doctor time instead of as a dropped_commit run failure. Runs only
+		// when a probe is wired: `main.ts` wires the real (boot-cached)
+		// probe, tests stub it — a bare `runDoctor` call stays hermetic
+		// (no host bwrap/sandbox-exec spawn from the unit suite).
+		if (deps.probeSandboxGit !== undefined) {
+			checks.push(await checkSandboxGit({ probe: deps.probeSandboxGit }));
+		}
 	}
 
 	checks.push(
@@ -143,16 +165,27 @@ export async function runDoctor(
 	checks.push(checkPreviewAuthStrength({ env: context.env }));
 
 	if (isLocalTopology) {
-		checks.push(await doctorBurrowCheck(context.env, deps.probeBurrow));
+		checks.push(await doctorLocalRuntimeCheck(context.env, deps.probeLocalRuntime));
 	} else {
 		checks.push({
 			name: "runtime_backend",
 			ok: true,
-			message:
-				"k8s: burrow / bwrap / stale-workspace probes skipped (agents run in pods, no co-tenanted burrow)",
+			message: "k8s: bwrap / stale-workspace / local-runtime probes skipped (agents run in pods)",
 		});
 	}
 
+	return emitDoctorReport(context, checks);
+}
+
+/**
+ * Write the checks as NDJSON, emit the stderr banner on any failure, and
+ * map all-ok to the exit code. Shared by both doctor halves (warren-97a2):
+ * the local half here and the client half in `doctor-remote.ts`.
+ */
+export function emitDoctorReport(
+	context: CliContext,
+	checks: readonly DoctorCheck[],
+): { readonly exitCode: number; readonly checks: readonly DoctorCheck[] } {
 	for (const check of checks) {
 		writeJsonLine(context.stdio.stdout, check);
 	}
@@ -222,16 +255,16 @@ async function staleBurrowWorkspacesCheck(
 		ttlMs = loadWorkspaceGcConfigFromEnv(env).ttlMs;
 	} catch (err) {
 		return {
-			name: "stale_burrow_workspaces",
+			name: "stale_sandbox_workspaces",
 			ok: false,
 			message: err instanceof Error ? err.message : String(err),
 		};
 	}
 	if (db === undefined) {
-		return { name: "stale_burrow_workspaces", ok: true, message: "no db handle wired" };
+		return { name: "stale_sandbox_workspaces", ok: true, message: "no db handle wired" };
 	}
 	const repos = createRepos(db);
-	return checkStaleBurrowWorkspaces({
+	return checkStaleSandboxWorkspaces({
 		probe: {
 			listByState: (state) => repos.runs.listByState(state),
 		},

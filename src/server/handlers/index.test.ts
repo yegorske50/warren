@@ -69,16 +69,37 @@ describe("ROUTE_TABLE policy classification", () => {
 		"GET /healthz",
 		"GET /version",
 		"GET /whoami", // reflects the caller's own request back at it (warren-e195)
+		"GET /instance", // reduced static facts projection (warren-2eec)
 		"GET /agents",
 		"GET /agents/:name",
 		"GET /projects",
+		"GET /projects/:id", // same projection as the list (warren-2a89)
 		"GET /analytics/runs",
+		// pl-7e38 step 12 (warren-d850): run-counts-only reduced projection —
+		// spend/delivery/interventions/services are stripped (./ops-overview.ts).
+		"GET /ops/overview",
+		// pl-7e38 step 15 (warren-5eec): per-row `projectEvent` reduction —
+		// exactly what the per-run public stream shows for each row.
+		"GET /events",
 		"GET /runs",
 		"GET /runs/:id",
 		"GET /runs/:id/events",
 		"GET /plan-runs",
 		"GET /plan-runs/:id",
 		"GET /plan-runs/:id/events",
+		// warren-a647: App registration is a browser flow (no bearer rides a
+		// navigation/redirect); /register discloses nothing server-side and
+		// /callback refuses without a live single-use state nonce.
+		"GET /github-app/register",
+		"GET /github-app/callback",
+		// warren-54c7: GitHub's post-install redirect target; renders only what
+		// the query string carries (the installation id), nothing server-side.
+		"GET /github-app/installed",
+		// warren-48f8: one-time setup code redemption — anonymous by necessity
+		// (browser navigation carries no bearer); the single-use code IS the
+		// auth, and the handoff never arms under WARREN_AUTH=public (the route
+		// 404s there, so a spectator learns nothing from it).
+		"GET /setup",
 	];
 
 	/** Reads that must stay operator-only — each with the reason it is here. */
@@ -87,6 +108,7 @@ describe("ROUTE_TABLE policy classification", () => {
 		"GET /metrics", // cumulative cost + operational shape (warren-682a)
 		"GET /analytics/cost", // instance-wide USD rollup
 		"GET /analytics/behavior", // cross-run tool/command mining
+		"GET /analytics/dispatch", // dispatch-context log (warren-5423)
 		"GET /runs/:id/inbox", // DESTRUCTIVE ON READ — drains the steering queue
 		"GET /runs/:id/finalize-intent", // pod callback; pollable to race the pod
 		"GET /projects/:id/triggers", // trigger prompts + qualityGate commands

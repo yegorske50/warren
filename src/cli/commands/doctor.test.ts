@@ -32,7 +32,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{},
 		);
@@ -47,7 +47,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{},
 		);
@@ -63,7 +63,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{ noAuth: true },
 		);
@@ -82,15 +82,15 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => {
+				probeLocalRuntime: async () => {
 					throw new Error("ECONNREFUSED /var/run/burrow.sock");
 				},
 			},
 			{},
 		);
-		const burrowCheck = result.checks.find((c: DoctorCheck) => c.name === "burrow_reachable");
-		expect(burrowCheck?.ok).toBe(false);
-		expect(burrowCheck?.message).toContain("ECONNREFUSED");
+		const sandboxCheck = result.checks.find((c: DoctorCheck) => c.name === "local_runtime");
+		expect(sandboxCheck?.ok).toBe(false);
+		expect(sandboxCheck?.message).toContain("ECONNREFUSED");
 		expect(result.exitCode).toBe(1);
 	});
 
@@ -102,7 +102,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{},
 		);
@@ -127,7 +127,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 				platform: "linux",
 			},
 			{},
@@ -146,13 +146,14 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{},
 		);
 		const names = result.checks.map((c) => c.name);
 		expect(names).toEqual([
 			"WARREN_API_TOKEN",
+			"git_identity",
 			"warren_db",
 			"db_reachable",
 			"projects_root",
@@ -160,9 +161,9 @@ describe("runDoctor", () => {
 			"warren_config",
 			"warren_config_deprecations",
 			"preview_port_allocator",
-			"stale_burrow_workspaces",
+			"stale_sandbox_workspaces",
 			"preview_auth_strength",
-			"burrow_reachable",
+			"local_runtime",
 		]);
 	});
 
@@ -178,7 +179,7 @@ describe("runDoctor", () => {
 				existsSync: () => true,
 				// A throwing probe would fail the check under local; under k8s it must
 				// never be consulted at all.
-				probeBurrow: async () => {
+				probeLocalRuntime: async () => {
 					throw new Error("burrow must not be probed under k8s");
 				},
 			},
@@ -186,12 +187,74 @@ describe("runDoctor", () => {
 		);
 		const names = result.checks.map((c) => c.name);
 		expect(names).not.toContain("bwrap");
-		expect(names).not.toContain("stale_burrow_workspaces");
-		expect(names).not.toContain("burrow_reachable");
+		expect(names).not.toContain("stale_sandbox_workspaces");
+		expect(names).not.toContain("local_runtime");
 		const runtime = result.checks.find((c: DoctorCheck) => c.name === "runtime_backend");
 		expect(runtime?.ok).toBe(true);
 		expect(runtime?.message).toContain("k8s");
 		expect(result.exitCode).toBe(0);
+	});
+
+	// warren-1219: the sandbox git preflight check runs only on the local
+	// topology, only when a probe is wired (main.ts wires the real one).
+	test("sandbox_git check reports ok for a passing probe", async () => {
+		const { context } = captureContext({ WARREN_API_TOKEN: "tok" });
+		const result = await runDoctor(
+			context,
+			{
+				existsSync: () => true,
+				probeLocalRuntime: async () => undefined,
+				probeSandboxGit: async () => ({
+					ok: true,
+					gitPath: "/usr/bin/git",
+					effectiveGit: "/usr/bin/git",
+					substituted: false,
+					message: "/usr/bin/git executes inside the sandbox profile (git --version ok)",
+				}),
+			},
+			{},
+		);
+		const check = result.checks.find((c: DoctorCheck) => c.name === "sandbox_git");
+		expect(check?.ok).toBe(true);
+		expect(check?.message).toContain("git --version");
+		expect(result.exitCode).toBe(0);
+	});
+
+	test("sandbox_git check fails (and fails doctor) naming the binary for a broken sandbox git", async () => {
+		const { context } = captureContext({ WARREN_API_TOKEN: "tok" });
+		const result = await runDoctor(
+			context,
+			{
+				existsSync: () => true,
+				probeLocalRuntime: async () => undefined,
+				probeSandboxGit: async () => ({
+					ok: false,
+					gitPath: "/nix/store/abc-git-2.44/bin/git",
+					effectiveGit: "/nix/store/abc-git-2.44/bin/git",
+					substituted: false,
+					message:
+						"/nix/store/abc-git-2.44/bin/git does not execute inside the sandbox: dyld: Library not loaded",
+					hint: "this git cannot run inside the sandbox; install a system git",
+				}),
+			},
+			{},
+		);
+		const check = result.checks.find((c: DoctorCheck) => c.name === "sandbox_git");
+		expect(check?.ok).toBe(false);
+		expect(check?.message).toContain("/nix/store/abc-git-2.44/bin/git");
+		expect(check?.message).toContain("dyld");
+		expect(check?.hint).toContain("sandbox");
+		expect(result.exitCode).toBe(1);
+	});
+
+	test("sandbox_git check is absent without a wired probe (hermetic default)", async () => {
+		const { context } = captureContext({ WARREN_API_TOKEN: "tok" });
+		const result = await runDoctor(
+			context,
+			{ existsSync: () => true, probeLocalRuntime: async () => undefined },
+			{},
+		);
+		expect(result.checks.map((c) => c.name)).not.toContain("sandbox_git");
 	});
 
 	test("warren_db reports the resolved dialect for WARREN_DB_URL", async () => {
@@ -201,7 +264,7 @@ describe("runDoctor", () => {
 		});
 		const result = await runDoctor(
 			context,
-			{ existsSync: () => true, probeBurrow: async () => undefined },
+			{ existsSync: () => true, probeLocalRuntime: async () => undefined },
 			{},
 		);
 		const dbCheck = result.checks.find((c: DoctorCheck) => c.name === "warren_db");
@@ -217,7 +280,7 @@ describe("runDoctor", () => {
 		});
 		const result = await runDoctor(
 			context,
-			{ existsSync: () => true, probeBurrow: async () => undefined },
+			{ existsSync: () => true, probeLocalRuntime: async () => undefined },
 			{},
 		);
 		const dbCheck = result.checks.find((c: DoctorCheck) => c.name === "warren_db");
@@ -233,7 +296,7 @@ describe("runDoctor", () => {
 		});
 		const result = await runDoctor(
 			context,
-			{ existsSync: () => true, probeBurrow: async () => undefined },
+			{ existsSync: () => true, probeLocalRuntime: async () => undefined },
 			{},
 		);
 		const db = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
@@ -251,7 +314,7 @@ describe("runDoctor", () => {
 			});
 			const result = await runDoctor(
 				context,
-				{ existsSync: () => true, probeBurrow: async () => undefined, db },
+				{ existsSync: () => true, probeLocalRuntime: async () => undefined, db },
 				{},
 			);
 			const reach = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
@@ -271,7 +334,7 @@ describe("runDoctor", () => {
 			context,
 			{
 				existsSync: () => true,
-				probeBurrow: async () => undefined,
+				probeLocalRuntime: async () => undefined,
 			},
 			{},
 		);
@@ -302,7 +365,7 @@ describe("runDoctor", () => {
 			const { context, err } = captureContext({ WARREN_API_TOKEN: "tok" });
 			const result = await runDoctor(
 				context,
-				{ existsSync: () => true, probeBurrow: async () => undefined, db: failingDb() },
+				{ existsSync: () => true, probeLocalRuntime: async () => undefined, db: failingDb() },
 				{ verbose: true },
 			);
 			const reach = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
@@ -317,13 +380,46 @@ describe("runDoctor", () => {
 			const { context, err } = captureContext({ WARREN_API_TOKEN: "tok" });
 			const result = await runDoctor(
 				context,
-				{ existsSync: () => true, probeBurrow: async () => undefined, db: failingDb() },
+				{ existsSync: () => true, probeLocalRuntime: async () => undefined, db: failingDb() },
 				{},
 			);
 			const reach = result.checks.find((c: DoctorCheck) => c.name === "db_reachable");
 			expect(reach?.ok).toBe(false);
 			expect(reach?.message).toBe("probe failed (reason=unreachable)");
 			expect(err.join("")).not.toContain(RAW_DRIVER_TEXT);
+		});
+	});
+
+	describe("git_identity check (warren-e7b7)", () => {
+		test("warns on unset WARREN_GIT_AUTHOR_* (ok:true — a warning, not a failure)", async () => {
+			const { context } = captureContext({ WARREN_API_TOKEN: "tok" });
+			const result = await runDoctor(
+				context,
+				{ existsSync: () => true, probeLocalRuntime: async () => undefined },
+				{},
+			);
+			const check = result.checks.find((c: DoctorCheck) => c.name === "git_identity");
+			expect(check?.ok).toBe(true);
+			expect(check?.message).toContain("warning");
+			expect(check?.hint).toContain("machine account");
+			expect(result.exitCode).toBe(0);
+		});
+
+		test("reports configured when both WARREN_GIT_AUTHOR_* vars are set", async () => {
+			const { context } = captureContext({
+				WARREN_API_TOKEN: "tok",
+				WARREN_GIT_AUTHOR_NAME: "warren-bot",
+				WARREN_GIT_AUTHOR_EMAIL: "12345+warren-bot@users.noreply.github.com",
+			});
+			const result = await runDoctor(
+				context,
+				{ existsSync: () => true, probeLocalRuntime: async () => undefined },
+				{},
+			);
+			const check = result.checks.find((c: DoctorCheck) => c.name === "git_identity");
+			expect(check?.ok).toBe(true);
+			expect(check?.message).toContain("configured");
+			expect(check?.hint).toBeUndefined();
 		});
 	});
 });

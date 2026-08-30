@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { CommanderError } from "commander";
+import { resolveCliExitCode } from "./flags.ts";
 import { buildProgram } from "./main.ts";
 import type { CliContext } from "./output.ts";
 
@@ -19,13 +21,21 @@ describe("buildProgram", () => {
 		const names = program.commands.map((c) => c.name()).sort();
 		expect(names).toEqual([
 			"add-project",
+			"cancel",
 			"config",
 			"db",
 			"doctor",
 			"init",
+			"login",
 			"plan",
+			"prime",
+			"projects",
 			"run",
 			"serve",
+			"show",
+			"tail",
+			"up",
+			"wait",
 		]);
 	});
 
@@ -80,5 +90,82 @@ describe("buildProgram", () => {
 		expect(runCmd).toBeDefined();
 		const promptOpt = runCmd?.options.find((o) => o.long === "--prompt");
 		expect(promptOpt?.mandatory).toBe(true);
+	});
+});
+
+describe("global --output contract (warren-b61e)", () => {
+	test("the program registers a global --output option", () => {
+		const program = buildProgram(silentContext());
+		const opt = program.options.find((o) => o.long === "--output");
+		expect(opt).toBeDefined();
+	});
+
+	test("help epilogue renders the stable exit-code table", () => {
+		const program = buildProgram(silentContext());
+		let help = "";
+		program.configureOutput({
+			writeOut: (chunk) => {
+				help += chunk;
+			},
+		});
+		program.outputHelp();
+		expect(help).toContain("Exit codes:");
+		expect(help).toContain("server-unreachable");
+		expect(help).toContain("auth-rejected");
+		expect(help).toContain("sigint-detach");
+	});
+
+	test("an invalid --output value exits 2 before the command runs", async () => {
+		const errChunks: string[] = [];
+		const context: CliContext = {
+			env: {},
+			stdio: {
+				stdout: { write: () => undefined },
+				stderr: {
+					write: (chunk) => {
+						errChunks.push(chunk);
+					},
+				},
+			},
+			spawn: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+		};
+		const program = buildProgram(context);
+		program.exitOverride();
+		const err = await program
+			.parseAsync(["node", "warren", "--output", "yaml", "doctor"])
+			.catch((e: unknown) => e);
+		expect((err as { exitCode?: number }).exitCode).toBe(2);
+		expect(errChunks.join("")).toContain("invalid --output mode");
+	});
+});
+
+describe("resolveCliExitCode", () => {
+	test("maps every non-zero commander usage error to the documented exit 2", () => {
+		expect(resolveCliExitCode(new CommanderError(1, "commander.invalidArgument", "bad"))).toBe(2);
+		expect(resolveCliExitCode(new CommanderError(1, "commander.missingArgument", "bad"))).toBe(2);
+		expect(resolveCliExitCode(new CommanderError(1, "commander.unknownCommand", "bad"))).toBe(2);
+	});
+
+	test("keeps --help/--version at exit 0 and non-commander failures at exit 1", () => {
+		expect(resolveCliExitCode(new CommanderError(0, "commander.helpDisplayed", "help"))).toBe(0);
+		expect(resolveCliExitCode(new Error("boom"))).toBe(1);
+	});
+
+	test("an invalid --max-cost-usd maps to the usage-error exit 2 (warren-b61e)", async () => {
+		const program = buildProgram(silentContext());
+		program.configureOutput({ writeErr: () => undefined });
+		const err = await program
+			.parseAsync(["node", "warren", "run", "agent", "prj_x", "-p", "x", "--max-cost-usd", "abc"])
+			.catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(CommanderError);
+		expect(resolveCliExitCode(err)).toBe(2);
+	});
+});
+
+describe("cli entry shebang", () => {
+	test("keeps --env-file=/dev/null so a cwd .env never reaches the CLI (warren-8807)", async () => {
+		const source = await Bun.file(`${import.meta.dir}/main.ts`).text();
+		const firstLine = source.split("\n", 1)[0];
+		expect(firstLine).toBe("#!/usr/bin/env -S bun --env-file=/dev/null");
 	});
 });

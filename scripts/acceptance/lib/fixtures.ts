@@ -14,19 +14,21 @@
  * so a canopy version bump doesn't silently break the fixture.
  *
  * The sample project carries:
- *   - `burrow.toml` — declares the `stub-shell` agent (../burrow/SPEC.md §12.3
- *     declarative AgentConfig) pointing at the bash script the harness
- *     runs on every dispatch.
- *   - `tools/stub-agent.sh` — the deterministic stub committed via
- *     scripts/acceptance/lib/stub-agent/agent.sh.
+ *   - `burrow.toml` — the `[sandbox]` section the local profile still
+ *     reads (src/runtime/local/profile.ts). The legacy `[env]`
+ *     envPassthrough list and `[[agents]]` registry block left with the
+ *     stub-shell burrow runtime (warren-dc19): dispatch resolves the
+ *     agent through the WARREN_SEED_AGENTS_FILE payload + PATH shims,
+ *     and the knob contract is prompt-driven ([sleep_ms]/[mulch_*]/
+ *     [seed_*] — see lib/stub-agent/claude-code-path-shim.sh).
  *   - `README.md` — so `git commit` has at least one tracked file
  *     warren's git clone can resolve a default branch from.
  *
  * Cleanup: the in-proc launcher removes `tmpRoot` recursively on stop.
  * Builders here just write files; lifecycle is the launcher's problem.
  */
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, copyFile, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 export interface FixtureRoots {
 	readonly tmpRoot: string;
@@ -43,8 +45,15 @@ export interface BuiltFixtures {
 	readonly knownSeedTitle: string;
 	readonly knownMulchDomain: string;
 	readonly knownMulchRecordId: string;
-	/** Path to the stub bash script committed inside the sample project. */
-	readonly stubAgentScriptInProject: string;
+	/**
+	 * Directory holding the `claude` PATH-shim stub
+	 * (lib/stub-agent/claude-code-path-shim.sh). The harness prepends it
+	 * to PATH before booting warren so the internalized local engine's
+	 * claude-code adapter execs the deterministic stub instead of a real
+	 * claude binary (warren-dc19 — replaces the retired stub-shell burrow
+	 * runtime for scenarios 05/07/09/10).
+	 */
+	readonly claudeShimBinDir: string;
 	readonly gitConfigPath: string;
 	/**
 	 * Path to a JSON array of AgentDefinition objects the booted warren
@@ -53,6 +62,13 @@ export interface BuiltFixtures {
 	 * (pl-3a79) and the registry seeds on boot only.
 	 */
 	readonly seedAgentsFilePath: string;
+	/**
+	 * PATH-shim directory holding the stub `pi` and `claude` binaries
+	 * (warren-ea0a — the internalized engine execs the bare names, so a
+	 * shim dir on the booted warren's PATH is the deterministic-agent
+	 * injection point, replacing the burrow-side runtime registry).
+	 */
+	readonly shimBinDir: string;
 }
 
 const FAKE_CANOPY_OWNER = "warren-acceptance";
@@ -81,6 +97,10 @@ export async function buildFixtures(roots: FixtureRoots): Promise<BuiltFixtures>
 	await buildSampleProject(sampleProjectPath);
 	const seedAgentsFilePath = join(fixturesRoot, "stub-agents.json");
 	await buildSeedAgentsFile(seedAgentsFilePath);
+	const shimBinDir = join(fixturesRoot, "shim-bin");
+	await buildShimBin(shimBinDir);
+	const claudeShimBinDir = join(fixturesRoot, "bin");
+	await buildPathShims(claudeShimBinDir);
 	await writeGitConfigRedirects(gitConfigPath, [
 		{ fakeUrl: canopyRepoUrl, localPath: canopyRepoPath },
 		{ fakeUrl: sampleProjectGitUrl, localPath: sampleProjectPath },
@@ -107,18 +127,50 @@ export async function buildFixtures(roots: FixtureRoots): Promise<BuiltFixtures>
 		knownSeedTitle: KNOWN_SEED_TITLE,
 		knownMulchDomain: KNOWN_MULCH_DOMAIN,
 		knownMulchRecordId: KNOWN_MULCH_RECORD_ID,
-		stubAgentScriptInProject: join(sampleProjectPath, "tools", "stub-agent.sh"),
+		claudeShimBinDir,
 		gitConfigPath,
 		seedAgentsFilePath,
+		shimBinDir,
 	};
 }
 
 /**
+ * Install the PATH shims the internalized engine resolves by bare name
+ * (warren-0f18 / warren-ea0a): `claude` and `pi`. The sandbox profile
+ * probes each name via Bun.which against the booted warren's PATH and
+ * binds the shim dir into the sandbox.
+ */
+async function buildShimBin(dir: string): Promise<void> {
+	await mkdir(dir, { recursive: true });
+	const shims: Array<readonly [string, string]> = [
+		["claude", "./stub-agent/claude-code-path-shim.sh"],
+		["pi", "./stub-agent/pi-path-shim.sh"],
+	];
+	// warren-8a6e / warren-dc19: Bun.spawn resolves the bare `bwrap` name
+	// against the *sandbox* PATH (toolchain dirs only — see src/sandbox/env.ts),
+	// not the host process PATH. The sandbox PATH is built from the bin dir of
+	// the resolved agent binary, so bwrap must sit next to `claude`/`pi` in
+	// EVERY shim dir the harness may put first on PATH. Without it, every
+	// stub run fails spawn_failed with `Executable not found in $PATH: "bwrap"`
+	// on hosts that lack a real bubblewrap.
+	if (Bun.which("bwrap") === null) {
+		shims.push(["bwrap", "./stub-agent/bwrap-shim.sh"]);
+	}
+	for (const [name, rel] of shims) {
+		const source = new URL(rel, import.meta.url).pathname;
+		const target = join(dir, name);
+		await copyFile(source, target);
+		await chmod(target, 0o755);
+	}
+}
+
+/**
  * Write the WARREN_SEED_AGENTS_FILE payload: the `stub-shell` agent as a
- * warren AgentDefinition (mirrors the canopy fixture's sections and
- * `runtime=stub-shell` frontmatter so dispatch resolves the runtime the
- * burrow-with-stub wrapper registered). `source: "builtin"` lets
- * seedBuiltinAgents upsert on drift across reboots.
+ * warren AgentDefinition. Its `runtime=claude-code` frontmatter resolves
+ * the internalized local engine's claude-code adapter (src/runtime/
+ * adapters/), whose `claude` binary the harness stubs via the PATH shim
+ * (buildPathShims below). `source: "builtin"` lets seedBuiltinAgents
+ * upsert on drift across reboots.
  */
 async function buildSeedAgentsFile(path: string): Promise<void> {
 	const stubAgent = {
@@ -133,10 +185,41 @@ async function buildSeedAgentsFile(path: string): Promise<void> {
 			source: "builtin",
 			tags: ["agent"],
 			description: "Deterministic stub agent for warren acceptance",
-			runtime: STUB_AGENT_NAME,
+			runtime: "claude-code",
 		},
 	};
 	await writeFile(path, `${JSON.stringify([stubAgent], null, 2)}\n`);
+}
+
+/**
+ * Install the `claude` PATH-shim stub (lib/stub-agent/
+ * claude-code-path-shim.sh) into a bin dir the harness prepends to the
+ * booted warren's PATH. Warren's internalized local engine execs the
+ * bare name `claude` inside its sandbox; profile generation probes it
+ * via Bun.which and binds the shim dir in (src/runtime/local/profile.ts).
+ */
+async function buildPathShims(binDir: string): Promise<void> {
+	const shims: Array<readonly [string, string]> = [
+		["claude", "./stub-agent/claude-code-path-shim.sh"],
+	];
+	// Fake bwrap (warren-dc19): the internalized engine spawns agents
+	// through `bwrap`, which acceptance hosts may neither ship nor be able
+	// to unshare. The shim applies the workspace/home mappings and execs
+	// the child — see lib/stub-agent/bwrap-shim.sh. It must live in the
+	// SAME bin dir as the claude shim (Bun.spawn resolves the bare `bwrap`
+	// against the composed sandbox PATH, which only carries probed
+	// toolchain dirs), so install it only when the host has no real bwrap
+	// — a nightly runner with bubblewrap keeps the real sandbox.
+	if (Bun.which("bwrap") === null) {
+		shims.push(["bwrap", "./stub-agent/bwrap-shim.sh"]);
+	}
+	await mkdir(binDir, { recursive: true });
+	for (const [name, relSource] of shims) {
+		const source = new URL(relSource, import.meta.url);
+		const target = join(binDir, name);
+		await copyFile(source, target);
+		await chmod(target, 0o755);
+	}
 }
 
 // The stub agent's two sections, shared between the canopy fixture
@@ -176,8 +259,9 @@ async function buildCanopyRepo(repoPath: string): Promise<void> {
 			"--section",
 			`burrow_config=${burrowConfigSection}`,
 			// Pin the burrow runtime to the declarative stub-shell runtime
-			// (agent.sh — honors the [sleep_ms]/[mulch_*]/[seed_*] prompt
-			// knobs). Without this, readRuntimeId() (src/registry/schema.ts)
+			// (the legacy agent.sh honored the [sleep_ms]/[mulch_*]/[seed_*]
+			// prompt knobs; the PATH shim carries that contract now).
+			// Without this, readRuntimeId() (src/registry/schema.ts)
 			// falls back to DEFAULT_RUNTIME_ID="pi", so warren dispatches
 			// stub-shell runs onto the pi runtime (pi-agent.sh), which ignores
 			// those knobs — completing before cancel can land (scenario 08) and
@@ -202,8 +286,11 @@ async function buildSampleProject(repoPath: string): Promise<void> {
 
 	await runIn(repoPath, ["git", "init", "--initial-branch=main"], env);
 
-	// Project's burrow.toml — declares the stub-shell [[agents]] entry
-	// burrow uses to resolve the agentId warren passes on dispatch.
+	// Project's burrow.toml — only the `[sandbox]` section survives the
+	// burrow excision: the local profile reads it for network/allowed
+	// domains (src/runtime/local/profile.ts). The `[env]` WARREN_STUB_*
+	// passthrough list and the `[[agents]]` stub-shell registry entry
+	// were burrow-runtime concerns and are gone with it (warren-75dd).
 	const burrowToml = [
 		"# warren acceptance — sample project burrow.toml",
 		"[project]",
@@ -214,40 +301,15 @@ async function buildSampleProject(repoPath: string): Promise<void> {
 		`network = "restricted"`,
 		`allowed_domains = ["github.com", "registry.npmjs.org"]`,
 		"",
-		// Forward the four WARREN_STUB_* knobs the agent.sh script reads
-		// from the harness env into the sandbox. burrow's resolveEnv()
-		// silently drops keys missing from the host env, so scenarios
-		// that don't set them (03, 04) are unaffected; scenarios 05/06
-		// rely on WARREN_STUB_SLEEP_MS to keep the agent alive across the
-		// kill window.
-		"[env]",
-		`optional = ["WARREN_STUB_SLEEP_MS", "WARREN_STUB_MULCH_DOMAIN", "WARREN_STUB_MULCH_ID", "WARREN_STUB_SEED_ID", "WARREN_STUB_NO_COMMIT_SEEDS"]`,
-		"",
-		"[[agents]]",
-		`id = "${STUB_AGENT_NAME}"`,
-		`displayName = "Stub Shell (acceptance)"`,
-		`command = "bash"`,
-		`args = ["./tools/stub-agent.sh", "{{prompt}}"]`,
-		`promptDelivery = "arg"`,
-		`outputFormat = "raw-text"`,
-		`supportsResume = false`,
-		`inboxDelivery = "none"`,
-		"",
 	].join("\n");
 	await writeFile(join(repoPath, "burrow.toml"), burrowToml);
 
-	// Stub agent script — copied from the harness's stub-agent dir so
-	// edits to scripts/acceptance/lib/stub-agent/agent.sh propagate.
-	const harnessStubScript = new URL("./stub-agent/agent.sh", import.meta.url);
-	const targetScript = join(repoPath, "tools", "stub-agent.sh");
-	await mkdir(dirname(targetScript), { recursive: true });
-	await copyFile(harnessStubScript, targetScript);
+	await mkdir(join(repoPath, "tools"), { recursive: true });
 
 	// Pi-shaped stub agent script (warren-17a4) — emits pi RPC JSONL with
 	// `turn_end` usage so scenario 16 can assert non-null cost/token
 	// columns after the run completes. Registered as the `pi` runtime in
-	// burrow-with-stub.ts with a custom AgentRuntime whose parseEvents is
-	// burrow's parsePiEvents.
+	// the harness under the pi PATH shim (warren-ea0a).
 	const harnessPiScript = new URL("./stub-agent/pi-agent.sh", import.meta.url);
 	const targetPiScript = join(repoPath, "tools", "pi-stub-agent.sh");
 	await copyFile(harnessPiScript, targetPiScript);
@@ -256,8 +318,7 @@ async function buildSampleProject(repoPath: string): Promise<void> {
 	// stream-json with a terminal `result` envelope carrying
 	// `total_cost_usd` + `usage.*_tokens` so scenario 17 can assert
 	// non-null cost/token columns after the run completes. Registered as
-	// the `claude-code` runtime in burrow-with-stub.ts (overriding
-	// burrow's built-in) with `parseJsonlClaude` as the event parser.
+	// the harness under the claude PATH shim (warren-0f18).
 	const harnessClaudeScript = new URL("./stub-agent/claude-code-agent.sh", import.meta.url);
 	const targetClaudeScript = join(repoPath, "tools", "claude-code-stub-agent.sh");
 	await copyFile(harnessClaudeScript, targetClaudeScript);
@@ -279,13 +340,12 @@ async function buildSampleProject(repoPath: string): Promise<void> {
 		"# warren acceptance sample project",
 		"",
 		"This repo is a fixture used by warren's acceptance harness.",
-		"It declares the `stub-shell` agent (see `burrow.toml`) which",
-		"runs `tools/stub-agent.sh` for deterministic, no-network runs.",
+		"Runs dispatch against the boot-seeded `stub-shell` agent, which",
+		"the harness PATH shims drive for deterministic, no-network runs.",
 		"",
 	].join("\n");
 	await writeFile(join(repoPath, "README.md"), readme);
 
-	await runIn(repoPath, ["chmod", "+x", "tools/stub-agent.sh"], env);
 	await runIn(repoPath, ["chmod", "+x", "tools/pi-stub-agent.sh"], env);
 	await runIn(repoPath, ["chmod", "+x", "tools/claude-code-stub-agent.sh"], env);
 	await runIn(repoPath, ["git", "add", "."], env);

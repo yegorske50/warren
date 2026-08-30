@@ -1,7 +1,7 @@
 /**
  * `LocalProvider.finalize` body (pl-829f step 12 / warren-371a; events+dirty+
  * plans parity refinement warren-1f56, step 13) — the load-bearing §4 seam. Runs
- * the workspace-DEPENDENT half of reap while the burrow workspace is still live
+ * the workspace-DEPENDENT half of reap while the run workspace is still live
  * and returns structured deltas the domain applies to its project clone.
  *
  * A THIN host-side WRAPPER over the EXISTING reap merge functions (`mergeMulch`,
@@ -9,13 +9,13 @@
  * `finalizeSeedReset`) — it calls them, it does NOT fork their logic; the pushed
  * branch stays reap's.
  *
- * ## Burrow file-reads live HERE (warren-fbbf)
+ * ## Tracker file-reads (warren-fbbf, warren-ea0a)
  *
- * `mirrorSeeds`/`mirrorPlans` are pure string→clone merges now; the burrow
- * `http.files.read` for `.seeds/{issues,plans}.jsonl` was evicted from
- * `src/runs/reap/seeds.ts` into this module (`readWorkspaceTracker`) — the ONE
- * finalize-path burrow read. `NotFoundError` maps to `null` (no-op mirror),
- * keeping reap core free of burrow-client imports.
+ * `mirrorSeeds`/`mirrorPlans` are pure string→clone merges; reading the
+ * workspace-side `.seeds/{issues,plans}.jsonl` lives behind the
+ * `FinalizeTarget.readTracker` seam — a missing file reads as `null` (no-op
+ * mirror), keeping reap core free of backend concerns. The in-process engine
+ * resolves the target off its run store and reads straight off the host FS.
  *
  * - **Event capture**: the merge functions emit ~10 per-record kinds
  *   (`mulch.record.*`, `seeds.closed/created`, `seeds.plan_mirrored`,
@@ -26,19 +26,23 @@
  *   `commit` (default = the merge set) gates the seeds bookkeeping commit.
  * - **Deliberately NOT here** (domain-owned, §4): PR-open / preview /
  *   auto-plan-run / terminal-state; `reap.empty_push` (needs the run outcome —
- *   finalize returns `dirty` + dirtyPaths for it); `intent.closeSeedId`.
+ *   finalize returns `dirty` + dirtyPaths for it).
  *   finalize DOES capture `workspacePlansBody` so auto-plan-run survives terminate.
  */
 
 import { join } from "node:path";
-import { NotFoundError } from "@os-eco/burrow-cli";
-import { type BurrowClient, withTransportMapping } from "../../burrow-client/index.ts";
 import type { EventRow } from "../../db/schema.ts";
 import { mergeMulch } from "../../runs/reap/mulch.ts";
 import { mirrorPlans, mirrorSeeds } from "../../runs/reap/seeds.ts";
 import { stageSeedsForCommit } from "../../runs/reap/stage.ts";
 import type { ReapExec, ReapFs, ReapStep } from "../../runs/reap/types.ts";
-import { defaultExec, defaultFs, workspaceDirtyPaths } from "../../runs/reap/util.ts";
+import {
+	defaultExec,
+	defaultFs,
+	repairBaseTrackingRef,
+	workspaceDirtyPaths,
+} from "../../runs/reap/util.ts";
+import { gitCredentialGitEnv } from "../../workspace/git/credential-env.ts";
 import type {
 	ArtifactDelta,
 	ArtifactDeltaFile,
@@ -47,9 +51,10 @@ import type {
 	FinalizeResult,
 	FinalizeStage,
 	FinalizeStageOutcome,
-	RunHandle,
 } from "../contract.ts";
+import { finalizeCommitStage, finalizeMergeStage } from "../contract.ts";
 import { RuntimeProviderError } from "../errors.ts";
+import { PUSH_REJECTED_EVENT, parsePushRejection } from "../push-rejection.ts";
 import { finalizeSeedReset } from "./finalize-seed-reset.ts";
 
 /** Clone-relative (posix) tracker paths — the delta `path` fields + read-back keys. */
@@ -105,13 +110,24 @@ export interface FinalizeDeps {
 }
 
 /**
- * Run the workspace-dependent half of reap against the run's live burrow
- * workspace and assemble a `FinalizeResult`. `client` is the resolved
- * single-container burrow client; `handle.sandboxId` is the burrowId.
+ * The finalize TARGET the pipeline runs against (warren-413d): a live
+ * workspace path plus a tracker-file reader. The in-process backend resolves
+ * the path off its run store and reads tracker files straight off the host
+ * FS — the workspace is a local worktree.
  */
-export async function finalizeLocalRun(
-	client: BurrowClient,
-	handle: RunHandle,
+export interface FinalizeTarget {
+	readonly workspacePath: string;
+	/** Read a workspace-relative tracker file; `null` when absent. */
+	readonly readTracker: (relPath: string) => Promise<string | null>;
+}
+
+/**
+ * The finalize pipeline over an already-resolved target (warren-413d). The
+ * in-process LocalProvider calls this directly with its store-resolved
+ * workspace path + host-FS tracker reads.
+ */
+export async function finalizeLocalWorkspace(
+	target: FinalizeTarget,
 	intent: FinalizeIntent,
 	deps: FinalizeDeps = {},
 ): Promise<FinalizeResult> {
@@ -122,17 +138,17 @@ export async function finalizeLocalRun(
 	const artifacts = new Set(intent.artifacts);
 	// Commit-gating decouples from merge-gating (warren-1f56); default to the merge set.
 	const commit = new Set(intent.commit ?? intent.artifacts);
-	const workspacePath = await resolveWorkspacePath(client, handle.sandboxId);
+	const workspacePath = target.workspacePath;
 	const clonePath = resolveClonePath(intent, artifacts);
 
 	const mulch = artifacts.has("mulch")
 		? await finalizeMulch(workspacePath, clonePath, fs, trail, collector)
 		: undefined;
 	const seeds = artifacts.has("seeds")
-		? await finalizeSeeds(client, handle.sandboxId, clonePath, fs, trail, collector)
+		? await finalizeSeeds(target, clonePath, fs, trail, collector)
 		: undefined;
 	const plans = artifacts.has("plans")
-		? await finalizePlans(client, handle.sandboxId, clonePath, fs, trail, collector)
+		? await finalizePlans(target, clonePath, fs, trail, collector)
 		: undefined;
 
 	// Snapshot the workspace plans.jsonl BEFORE the seeds commit copies the
@@ -153,6 +169,7 @@ export async function finalizeLocalRun(
 	return {
 		pushed: push.pushed,
 		commitsAhead: push.commitsAhead,
+		...(push.commitsAheadBase !== null ? { commitsAheadBase: push.commitsAheadBase } : {}),
 		emptyPush: push.emptyPush,
 		dirty: push.dirty,
 		dirtyPaths: push.dirtyPaths,
@@ -169,27 +186,9 @@ export async function finalizeLocalRun(
 }
 
 /**
- * Look up the live workspace path from burrow (`GET /burrows/:id`). Transport-
- * mapped so a dead socket surfaces as `BurrowUnreachableError`.
- */
-async function resolveWorkspacePath(client: BurrowClient, sandboxId: string): Promise<string> {
-	const burrow = await withTransportMapping(client.config, () =>
-		client.http.burrows.get(sandboxId),
-	);
-	const workspacePath = burrow.workspacePath;
-	if (typeof workspacePath !== "string" || workspacePath === "") {
-		throw new RuntimeProviderError(
-			`LocalProvider.finalize: burrow ${sandboxId} exposed no workspace path`,
-			{ recoveryHint: "a burrow with no workspacePath cannot be finalized (already torn down?)" },
-		);
-	}
-	return workspacePath;
-}
-
-/**
  * Resolve the host project-clone path the merges write into. `""` (unused
  * sentinel) when `artifacts` is empty; otherwise the hint is mandatory — the
- * burrow backend cannot merge without it (mirrors `create()`'s `hostClonePathHint`).
+ * local backend cannot merge without it (mirrors `create()`'s `hostClonePathHint`).
  */
 function resolveClonePath(intent: FinalizeIntent, artifacts: Set<string>): string {
 	if (artifacts.size === 0) return "";
@@ -222,14 +221,14 @@ async function finalizeMulch(
 	try {
 		const result = await mergeMulch(workspacePath, clonePath, fs, collector.emit, collector.fail);
 		const files = await readMergedMulchFiles(workspacePath, clonePath, fs);
-		trail.ok("mulch_merge");
+		trail.ok(finalizeMergeStage("mulch"));
 		return {
 			version: 1,
 			files,
 			counts: { updated: result.updated, skipped: result.skipped, appended: result.appended },
 		};
 	} catch (err) {
-		trail.failed("mulch_merge", err);
+		trail.failed(finalizeMergeStage("mulch"), err);
 		await collector.fail("mulch_merge", err);
 		return { version: 1, files: [], counts: { updated: 0, skipped: 0, appended: 0 } };
 	}
@@ -259,36 +258,15 @@ async function readMergedMulchFiles(
 	return files;
 }
 
-/**
- * Read a workspace tracker file off the live burrow (warren-fbbf). `null` on
- * `NotFoundError`; any other error propagates to a failed stage.
- */
-async function readWorkspaceTracker(
-	client: BurrowClient,
-	sandboxId: string,
-	relPath: string,
-): Promise<string | null> {
-	try {
-		const out = await withTransportMapping(client.config, () =>
-			client.http.files.read(sandboxId, relPath),
-		);
-		return out.contents;
-	} catch (err) {
-		if (err instanceof NotFoundError) return null;
-		throw err;
-	}
-}
-
 async function finalizeSeeds(
-	client: BurrowClient,
-	sandboxId: string,
+	target: FinalizeTarget,
 	clonePath: string,
 	fs: ReapFs,
 	trail: StageTrail,
 	collector: EventCollector,
 ): Promise<ArtifactDelta> {
 	try {
-		const workspaceBody = await readWorkspaceTracker(client, sandboxId, ".seeds/issues.jsonl");
+		const workspaceBody = await target.readTracker(".seeds/issues.jsonl");
 		const result = await mirrorSeeds({
 			workspaceBody,
 			projectPath: clonePath,
@@ -299,14 +277,14 @@ async function finalizeSeeds(
 		const mergedBody = changed
 			? ((await fs.readFile(join(clonePath, ".seeds", "issues.jsonl"))) ?? null)
 			: null;
-		trail.ok("seeds_mirror");
+		trail.ok(finalizeMergeStage("seeds"));
 		return {
 			version: 1,
 			files: singleFile(SEEDS_ISSUES_REL, mergedBody),
 			counts: { closed: result.closed, created: result.created },
 		};
 	} catch (err) {
-		trail.failed("seeds_mirror", err);
+		trail.failed(finalizeMergeStage("seeds"), err);
 		// reap's `mirrorSeedsStep` reports this failure as step `seeds_close`.
 		await collector.fail("seeds_close", err);
 		return { version: 1, files: [], counts: { closed: 0, created: 0 } };
@@ -319,15 +297,14 @@ function singleFile(path: string, mergedBody: string | null): ArtifactDeltaFile[
 }
 
 async function finalizePlans(
-	client: BurrowClient,
-	sandboxId: string,
+	target: FinalizeTarget,
 	clonePath: string,
 	fs: ReapFs,
 	trail: StageTrail,
 	collector: EventCollector,
 ): Promise<ArtifactDelta> {
 	try {
-		const workspaceBody = await readWorkspaceTracker(client, sandboxId, ".seeds/plans.jsonl");
+		const workspaceBody = await target.readTracker(".seeds/plans.jsonl");
 		const appended = await mirrorPlans({
 			workspaceBody,
 			projectPath: clonePath,
@@ -336,10 +313,10 @@ async function finalizePlans(
 		});
 		const mergedBody =
 			appended > 0 ? ((await fs.readFile(join(clonePath, ".seeds", "plans.jsonl"))) ?? null) : null;
-		trail.ok("plans_mirror");
+		trail.ok(finalizeMergeStage("plans"));
 		return { version: 1, files: singleFile(SEEDS_PLANS_REL, mergedBody), counts: { appended } };
 	} catch (err) {
-		trail.failed("plans_mirror", err);
+		trail.failed(finalizeMergeStage("plans"), err);
 		await collector.fail("plans_mirror", err);
 		return { version: 1, files: [], counts: { appended: 0 } };
 	}
@@ -361,9 +338,9 @@ async function finalizeSeedsCommit(
 			exec,
 			emit: collector.emit,
 		});
-		trail.ok("seeds_commit");
+		trail.ok(finalizeCommitStage("seeds"));
 	} catch (err) {
-		trail.failed("seeds_commit", err);
+		trail.failed(finalizeCommitStage("seeds"), err);
 		await collector.fail("seeds_commit", err, join(workspacePath, ".seeds"));
 	}
 }
@@ -371,9 +348,51 @@ async function finalizeSeedsCommit(
 interface PushOutcome {
 	pushed: boolean;
 	commitsAhead: number | null;
+	/** The ref `commitsAhead` was counted against; null when not measured. */
+	commitsAheadBase: string | null;
 	emptyPush: boolean;
 	dirty: boolean;
 	dirtyPaths: readonly string[];
+}
+
+const NO_PUSH: PushOutcome = {
+	pushed: false,
+	commitsAhead: null,
+	commitsAheadBase: null,
+	emptyPush: false,
+	dirty: false,
+	dirtyPaths: [],
+};
+
+/**
+ * The base ref `commits_ahead` counts from, resolved BEFORE the push: the
+ * intent's `baseBranch` as-is, except on a ref-dispatch repair run where the
+ * pre-push tip of `origin/<baseBranch>` must be pinned to a SHA first (see
+ * `repairBaseTrackingRef`). `null` ⇒ no `baseBranch`, count skipped; an
+ * `error` ⇒ the tracking ref could not be resolved, count fails (never a
+ * structural `0`).
+ */
+type CountBase = { ref: string } | { error: unknown } | null;
+
+async function resolveCountBase(
+	intent: FinalizeIntent,
+	workspacePath: string,
+	exec: ReapExec,
+): Promise<CountBase> {
+	if (intent.baseBranch === undefined || intent.baseBranch === "") return null;
+	const trackingRef = repairBaseTrackingRef(intent.branch, intent.baseBranch);
+	if (trackingRef === null) return { ref: intent.baseBranch };
+	try {
+		const out = await exec.run("git", ["rev-parse", "--verify", trackingRef], {
+			cwd: workspacePath,
+			timeoutMs: 10_000,
+		});
+		const sha = out.stdout.trim();
+		if (sha === "") throw new Error(`git rev-parse ${trackingRef} returned no object`);
+		return { ref: sha };
+	} catch (err) {
+		return { error: err };
+	}
 }
 
 /**
@@ -393,40 +412,62 @@ async function finalizePush(
 	if (!intent.push) {
 		trail.skipped("branch_push");
 		trail.skipped("commits_ahead");
-		return { pushed: false, commitsAhead: null, emptyPush: false, dirty: false, dirtyPaths: [] };
+		return NO_PUSH;
 	}
+	// warren-ba08: pin the count base before the push rewrites the
+	// remote-tracking ref on a repair run; the count itself stays post-push.
+	const countBase = await resolveCountBase(intent, workspacePath, exec);
 	const refspec = intent.branch === "" ? "HEAD" : `HEAD:${intent.branch}`;
 	try {
+		// warren-4e1c: the push authenticates with the per-spawn credential the
+		// domain minted onto the intent (forge-contract.md §4); empty/absent
+		// yields `{}` and anonymous push, the pre-forge behavior.
 		await exec.run("git", ["push", "origin", refspec], {
 			cwd: workspacePath,
 			timeoutMs: 60_000,
+			env: gitCredentialGitEnv(intent.gitCredential),
 		});
 		trail.ok("branch_push");
 	} catch (err) {
 		trail.failed("branch_push", err);
 		await collector.fail("branch_push", err, workspacePath);
 		trail.skipped("commits_ahead");
-		return { pushed: false, commitsAhead: null, emptyPush: false, dirty: false, dirtyPaths: [] };
+		// warren-b68d: `ReapExec.run` rejects with an Error whose message carries
+		// stderr, so the remote's own refusal text is what gets parsed here.
+		const rejection = parsePushRejection(err instanceof Error ? err.message : String(err));
+		if (rejection !== null) {
+			collector.events.push({ kind: PUSH_REJECTED_EVENT, payload: rejection });
+		}
+		return NO_PUSH;
 	}
-	const commitsAhead = await countCommitsAhead(intent, workspacePath, exec, trail);
+	const commitsAhead = await countCommitsAhead(countBase, workspacePath, exec, trail);
 	// warren-72b9/89b0: capture dirty PATHS on a zero-commit push (dropped commit vs no-op).
 	const dirtyPaths = commitsAhead === 0 ? await workspaceDirtyPaths(exec, workspacePath) : [];
 	const dirty = dirtyPaths.length > 0;
-	return { pushed: true, commitsAhead, emptyPush: commitsAhead === 0, dirty, dirtyPaths };
+	return {
+		pushed: true,
+		commitsAhead,
+		commitsAheadBase:
+			commitsAhead !== null && countBase !== null && "ref" in countBase ? countBase.ref : null,
+		emptyPush: commitsAhead === 0,
+		dirty,
+		dirtyPaths,
+	};
 }
 
 async function countCommitsAhead(
-	intent: FinalizeIntent,
+	countBase: CountBase,
 	workspacePath: string,
 	exec: ReapExec,
 	trail: StageTrail,
 ): Promise<number | null> {
-	if (intent.baseBranch === undefined || intent.baseBranch === "") {
+	if (countBase === null) {
 		trail.skipped("commits_ahead");
 		return null;
 	}
 	try {
-		const out = await exec.run("git", ["rev-list", "--count", `${intent.baseBranch}..HEAD`], {
+		if ("error" in countBase) throw countBase.error;
+		const out = await exec.run("git", ["rev-list", "--count", `${countBase.ref}..HEAD`], {
 			cwd: workspacePath,
 			timeoutMs: 10_000,
 		});

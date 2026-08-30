@@ -15,6 +15,7 @@ import { join } from "node:path";
 
 import { AcceptanceError } from "../lib/assert.ts";
 import type { WarrenHttp } from "../lib/http.ts";
+import { pollAcceptance } from "../lib/poll.ts";
 
 export interface ProjectRow {
 	readonly id: string;
@@ -74,7 +75,9 @@ export interface EventRow {
 	readonly payload: Record<string, unknown> | null;
 }
 
-export const PLAN_PROJECT_URL = "https://github.com/warren-acceptance/sample-plan-run.git";
+// warren-2600: FakeForge owns the `fake://` grammar — the plan-run
+// roundtrip merges through the fake's state file, not a GH stub.
+export const PLAN_PROJECT_URL = "fake://warren-acceptance/sample-plan-run";
 export const PLAN_ID = "pl-acc-26";
 export const SEED_A = "ah-acc-26-a";
 export const SEED_B = "ah-acc-26-b";
@@ -83,7 +86,6 @@ export const SEED_TS = "2026-05-15T00:00:00.000Z";
 
 export const TERMINAL_PLAN_STATES = new Set(["succeeded", "failed", "cancelled"]);
 export const PLAN_DEADLINE_MS = 90_000;
-export const POLL_INTERVAL_MS = 500;
 
 export interface BuildPlanRunFixtureInput {
 	readonly fixturePath: string;
@@ -109,10 +111,6 @@ export async function buildPlanRunFixture(input: BuildPlanRunFixtureInput): Prom
 
 	const burrowToml = await readFile(join(input.sourceSamplePath, "burrow.toml"), "utf8");
 	await writeFile(join(input.fixturePath, "burrow.toml"), burrowToml);
-	await copyFile(
-		join(input.sourceSamplePath, "tools", "stub-agent.sh"),
-		join(input.fixturePath, "tools", "stub-agent.sh"),
-	);
 	// claude-code stub is the agent scenario 26 dispatches against — raw-text
 	// stub-shell never emits a runtime-terminal envelope, so the bridge
 	// would never finalize the child runs. The claude-stub emits a `result`
@@ -139,7 +137,6 @@ export async function buildPlanRunFixture(input: BuildPlanRunFixtureInput): Prom
 
 	const env = withGitIdentity();
 	await runIn(input.fixturePath, ["git", "init", "--initial-branch=main"], env);
-	await runIn(input.fixturePath, ["chmod", "+x", "tools/stub-agent.sh"], env);
 	await runIn(input.fixturePath, ["chmod", "+x", "tools/claude-code-stub-agent.sh"], env);
 	await runIn(input.fixturePath, ["git", "add", "."], env);
 	await runIn(input.fixturePath, ["git", "commit", "-m", "init: plan-run acceptance fixture"], env);
@@ -237,26 +234,26 @@ export async function waitForPlanState(
 	target: string,
 	timeoutMs: number,
 ): Promise<PlanRunDetailResponse> {
-	const start = Date.now();
-	let last = "unknown";
-	while (Date.now() - start < timeoutMs) {
-		const row = await http.expectJson<PlanRunDetailResponse>(
-			"GET",
-			`/plan-runs/${encodeURIComponent(planRunId)}`,
-			200,
-		);
-		last = row.planRun.state;
-		if (row.planRun.state === target) return row;
-		if (TERMINAL_PLAN_STATES.has(row.planRun.state)) {
-			throw new AcceptanceError(
-				`plan-run ${planRunId}: expected '${target}', reached terminal '${row.planRun.state}'`,
-			);
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new AcceptanceError(
-		`plan-run ${planRunId} did not reach '${target}' within ${timeoutMs}ms (last state=${last})`,
-	);
+	return pollAcceptance({
+		label: "plan-run",
+		id: planRunId,
+		timeoutMs,
+		fetchRow: () =>
+			http.expectJson<PlanRunDetailResponse>(
+				"GET",
+				`/plan-runs/${encodeURIComponent(planRunId)}`,
+				200,
+			),
+		isDone: (row) => row.planRun.state === target,
+		describe: (row) => row.planRun.state,
+		onRow: (row) => {
+			if (row.planRun.state !== target && TERMINAL_PLAN_STATES.has(row.planRun.state)) {
+				throw new AcceptanceError(
+					`plan-run ${planRunId}: expected '${target}', reached terminal '${row.planRun.state}'`,
+				);
+			}
+		},
+	});
 }
 
 export async function fetchAllPlanRunEvents(
@@ -310,8 +307,4 @@ export function withGitIdentity(): Record<string, string> {
 		GIT_COMMITTER_NAME: "Warren Acceptance",
 		GIT_COMMITTER_EMAIL: "acceptance@warren.invalid",
 	};
-}
-
-export function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

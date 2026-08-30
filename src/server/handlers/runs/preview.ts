@@ -43,10 +43,16 @@ function validatePreviewConfig(deps: ServerDeps, mode: "subdomain" | "path"): Pr
  *     `https://run-<id>.<previewHost>/...`.
  *   - **Path mode** (default; `deps.previewMode === "path"`): cookie name
  *     `warren_preview_<runId>` (per-run literal suffix, warren-63e1),
- *     `Path=/` with no `Domain`; redirect must be same-origin as the
- *     inbound request and live under `/p/<id>/`. The cookie ships on
- *     every same-origin request so referer-based asset routing in the
- *     proxy preamble can authenticate sub-resource loads.
+ *     `Path=/` with no `Domain`; redirect must live under `/p/<id>/` on
+ *     the PREVIEW origin — the inbound request's scheme + hostname with
+ *     the port swapped to `deps.previewPort`, the dedicated preview
+ *     listener (warren-3f8a). When no dedicated listener runs
+ *     (`previewPort` undefined: unix transport's legacy mounting, or
+ *     tests) the preview origin is the inbound origin, the pre-split
+ *     behaviour. The cookie is host-scoped (cookies ignore ports), so
+ *     a cookie set on the warren origin ships on every same-host
+ *     request including the preview port — which is what lets
+ *     referer-based asset routing authenticate sub-resource loads.
  *
  * warren-e1b0 replaced the original `GET …?token=<bearer>` shape: a
  * bearer in a query string lands in browser history, `Referer` headers,
@@ -75,14 +81,17 @@ export function previewLoginHandler(deps: ServerDeps): RouteHandler {
 
 		const body = await readJsonBodyOrEmpty(ctx);
 		const redirect = body !== null ? (optionalString(body, "redirect") ?? null) : null;
+		// warren-3f8a: path-mode previews live on the dedicated listener's
+		// origin — same hostname, `deps.previewPort`.
+		const previewOrigin = mode === "path" ? resolvePreviewOrigin(ctx.url, deps.previewPort) : null;
 		const redirectTarget =
 			mode === "path"
-				? resolvePathPreviewRedirect(redirect, runId, ctx.url.origin)
+				? resolvePathPreviewRedirect(redirect, runId, previewOrigin as string)
 				: resolveSubdomainPreviewRedirect(redirect, runId, deps.previewHost as string);
 		if (redirectTarget === null) {
 			const hint =
 				mode === "path"
-					? `redirect must be a same-origin URL under ${ctx.url.origin}/p/${runId}/`
+					? `redirect must be a URL under ${previewOrigin}/p/${runId}/ (the preview origin)`
 					: `redirect must be an absolute URL under https://run-${runId}.${deps.previewHost}/`;
 			return jsonResponse(400, {
 				error: {
@@ -120,23 +129,36 @@ function resolveSubdomainPreviewRedirect(
 	return parsed.toString();
 }
 
+/**
+ * The path-mode preview origin for an inbound request (warren-3f8a):
+ * scheme + hostname from the request, port swapped to the dedicated
+ * preview listener's. Undefined `previewPort` (legacy unix mounting,
+ * tests without the listener) keeps the inbound origin.
+ */
+function resolvePreviewOrigin(url: URL, previewPort: number | undefined): string {
+	if (previewPort === undefined) return url.origin;
+	const origin = new URL(url.origin);
+	origin.port = String(previewPort);
+	return origin.origin;
+}
+
 function resolvePathPreviewRedirect(
 	raw: string | null,
 	runId: string,
-	inboundOrigin: string,
+	previewOrigin: string,
 ): string | null {
-	const fallback = `${inboundOrigin}/p/${runId}/`;
+	const fallback = `${previewOrigin}/p/${runId}/`;
 	if (raw === null || raw.length === 0) return fallback;
 	let parsed: URL;
 	try {
-		// Relative URLs (`/p/<id>/foo`) resolve against the inbound origin so
-		// callers don't have to know the scheme/host upfront. Absolute URLs are
-		// then origin-checked below.
-		parsed = new URL(raw, inboundOrigin);
+		// Relative URLs (`/p/<id>/foo`) resolve against the preview origin so
+		// callers don't have to know the scheme/host/port upfront. Absolute
+		// URLs are then origin-checked below.
+		parsed = new URL(raw, previewOrigin);
 	} catch {
 		return null;
 	}
-	if (parsed.origin !== inboundOrigin) return null;
+	if (parsed.origin !== previewOrigin) return null;
 	if (!parsed.pathname.startsWith(`/p/${runId}/`)) return null;
 	return parsed.toString();
 }

@@ -6,19 +6,19 @@
  * does host-side in the LocalProvider path.
  *
  * With pod-per-run there is no `burrow serve` driving the agent, so this thin
- * Bun entrypoint REUSES burrow's agent-launch machinery rather than inventing a
- * parallel one: it resolves the selected runtime off burrow's `AgentRegistry`
- * (`@os-eco/burrow-cli`), calls the runtime's own `buildSpawnCommand` (argv +
- * stdin) and `parseEvents` (stdout line → structured event), and drives them
- * with a minimal spawn loop. The only thing it replaces is the sandbox: the pod
- * IS the sandbox (design §2.2), so the agent argv is spawned directly instead of
+ * Bun entrypoint REUSES warren's agent-runtime adapters (`../adapters/`,
+ * warren-7933) rather than inventing a parallel harness layer: it resolves the
+ * selected runtime's adapter, calls its `buildSpawnCommand` (argv + stdin) and
+ * `parseEvents` (stdout line → structured event), and drives them with a
+ * minimal spawn loop. The only thing it replaces is the sandbox: the pod IS
+ * the sandbox (design §2.2), so the agent argv is spawned directly instead of
  * through bwrap/`runSandboxed`.
  *
  * Lifecycle (the contract the agent image wires around, design §5.1):
  *
  *   1. DRAIN the steering inbox once over `GET /runs/:id/inbox`. A batch runtime
- *      (claude-code/sapling) closes stdin at spawn, so pending steering rides as
- *      the turn's `pendingMessages`, folded into the prompt by the runtime's own
+ *      (claude-code) closes stdin at spawn, so pending steering rides as the
+ *      turn's `pendingMessages`, folded into the prompt by the adapter's own
  *      encoder. A stdin-held runtime (pi — one that declares
  *      `shouldCloseStdinOnEvent`) instead KEEPS stdin open past the prompt and,
  *      if it also declares `encodeSteeringMessage`, receives later inbox messages
@@ -38,6 +38,9 @@
  *      (the envelope shape here round-trips through `toNormalizedEvent`). The
  *      agent's own terminal envelope (claude `state_change`/`result`) rides this
  *      stream, which is how warren detects logical completion and drives reap.
+ *      An agent that exits WITHOUT one (a watchdog-killed pi, a crash) gets a
+ *      synthesized `agent_end` emitted post-exit so the run still terminalizes
+ *      instead of hanging `running` forever (warren-9a4a).
  *   4. On agent exit, run the finalize entrypoint in-process (`./finalize-
  *      entrypoint.ts`): it polls warren's parked reap intent, collects the
  *      workspace-dependent artifacts, and POSTs the `FinalizeResult`.
@@ -55,10 +58,21 @@
  * a real agent binary, or a real network.
  */
 
-import { AgentRegistry, type AgentRuntime, type SpawnCommand } from "@os-eco/burrow-cli";
+import { extractAgentEventEnvelope } from "../../core/event-envelope.ts";
+import {
+	type AdapterRuntimeEvent,
+	type AgentRuntimeAdapter,
+	allAdapters,
+} from "../adapters/index.ts";
+import {
+	type AgentEntrypointEnv,
+	type AgentEnvSource,
+	parseAgentEntrypointEnv,
+} from "./agent-entrypoint-env.ts";
 import {
 	type AgentInboxHttp,
 	type AgentSpawn,
+	type AgentSpawnCommand,
 	buildSpawnContext,
 	defaultHttp,
 	defaultSpawn,
@@ -68,119 +82,37 @@ import {
 	readLines,
 } from "./agent-io.ts";
 import { createStdinHoldController } from "./agent-stdin-hold.ts";
+import {
+	applyAgentUidDrop,
+	uidDropPreflightErrorMessage,
+	withCrossUidKill,
+} from "./agent-uid-drop.ts";
 import { type FinalizeEntrypointDeps, runFinalizeEntrypoint } from "./finalize-entrypoint.ts";
 
 /* -------------------------------------------------------------------------- */
-/* Env                                                                        */
+/* Env — lives in `./agent-entrypoint-env.ts` (file-size ratchet, warren-cb93)  */
 /* -------------------------------------------------------------------------- */
 
-export interface AgentEntrypointEnv {
-	runId: string;
-	runtimeId: string;
-	prompt: string;
-	workspacePath: string;
-	/** Callback base URL (Service DNS) — inbox drain + finalize; absent ⇒ both skipped. */
-	apiUrl: string | undefined;
-	/** Bearer for the callback; absent ⇒ inbox drain + finalize skipped. */
-	apiToken: string | undefined;
-	/** Agent frontmatter (provider/model overrides the runtime honors), if any. */
-	frontmatter: Record<string, unknown> | undefined;
-	/** Poll interval for the steering-inbox drain (ms). */
-	inboxPollIntervalMs: number;
-	/**
-	 * Watchdog for stdin-held runtimes (pi): if the child produces no stdout for
-	 * this many ms while stdin is still held open, warren closes stdin (nudging
-	 * the runtime to exit on EOF) and force-kills as a backstop — so a hung
-	 * inference can't pin the pod forever waiting on a close-trigger event that
-	 * never arrives. `0` disables the watchdog. Runtimes that close stdin at
-	 * spawn (claude-code, sapling) never arm it. (warren-7a43)
-	 */
-	stdinHoldIdleTimeoutMs: number;
-}
-
-export type AgentEnvSource = Readonly<Record<string, string | undefined>>;
-
-function required(env: AgentEnvSource, key: string): string {
-	const raw = env[key]?.trim();
-	if (raw === undefined || raw === "") {
-		throw new Error(`agent-entrypoint: missing required env ${key}`);
-	}
-	return raw;
-}
-
-function optional(env: AgentEnvSource, key: string): string | undefined {
-	const raw = env[key]?.trim();
-	return raw === undefined || raw === "" ? undefined : raw;
-}
-
-function positiveIntEnv(env: AgentEnvSource, key: string, fallback: number): number {
-	const raw = env[key]?.trim();
-	if (raw === undefined || raw === "") return fallback;
-	const n = Number(raw);
-	return Number.isInteger(n) && n > 0 ? n : fallback;
-}
-
-/** Like `positiveIntEnv` but allows `0` (a knob's disable sentinel). */
-function nonNegativeIntEnv(env: AgentEnvSource, key: string, fallback: number): number {
-	const raw = env[key]?.trim();
-	if (raw === undefined || raw === "") return fallback;
-	const n = Number(raw);
-	return Number.isInteger(n) && n >= 0 ? n : fallback;
-}
-
-/**
- * Parse the agent frontmatter carried on `WARREN_AGENT_METADATA` (the domain's
- * `composeBurrowMetadata` folds `{ frontmatter }` into the run metadata). A
- * malformed / non-object value yields `undefined` (the runtime falls back to its
- * pinned provider/model defaults) rather than failing the run.
- */
-export function parseAgentFrontmatter(
-	raw: string | undefined,
-): Record<string, unknown> | undefined {
-	if (raw === undefined || raw === "") return undefined;
-	try {
-		const value: unknown = JSON.parse(raw);
-		if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
-		const frontmatter = (value as { frontmatter?: unknown }).frontmatter;
-		if (frontmatter !== null && typeof frontmatter === "object" && !Array.isArray(frontmatter)) {
-			return frontmatter as Record<string, unknown>;
-		}
-		return undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-/** Default stdin-hold idle watchdog: 30 min. */
-export const DEFAULT_STDIN_HOLD_IDLE_TIMEOUT_MS = 1_800_000;
-
-/** Parse + validate the agent entrypoint env. Pure. */
-export function parseAgentEntrypointEnv(env: AgentEnvSource): AgentEntrypointEnv {
-	const apiUrlRaw = optional(env, "WARREN_API_URL");
-	return {
-		runId: required(env, "WARREN_RUN_ID"),
-		runtimeId: required(env, "WARREN_AGENT_RUNTIME"),
-		prompt: env.WARREN_PROMPT ?? "",
-		workspacePath: optional(env, "WARREN_WORKSPACE_PATH") ?? "/workspace",
-		apiUrl: apiUrlRaw?.replace(/\/+$/, ""),
-		apiToken: optional(env, "WARREN_API_TOKEN"),
-		frontmatter: parseAgentFrontmatter(env.WARREN_AGENT_METADATA),
-		inboxPollIntervalMs: positiveIntEnv(env, "WARREN_INBOX_POLL_INTERVAL_MS", 5_000),
-		stdinHoldIdleTimeoutMs: nonNegativeIntEnv(
-			env,
-			"WARREN_AGENT_STDIN_HOLD_IDLE_MS",
-			DEFAULT_STDIN_HOLD_IDLE_TIMEOUT_MS,
-		),
-	};
-}
+export type { AgentEntrypointEnv, AgentEnvSource } from "./agent-entrypoint-env.ts";
+export {
+	DEFAULT_STDIN_HOLD_IDLE_TIMEOUT_MS,
+	DEFAULT_STDIN_HOLD_KILL_GRACE_MS,
+	parseAgentEntrypointEnv,
+	parseAgentFrontmatter,
+} from "./agent-entrypoint-env.ts";
 
 /* -------------------------------------------------------------------------- */
 /* Injectable deps                                                            */
 /* -------------------------------------------------------------------------- */
 
+/** The default adapter registry: warren's built-in runtime adapters. */
+const DEFAULT_ADAPTER_REGISTRY: { get(id: string): AgentRuntimeAdapter | undefined } = {
+	get: (id) => allAdapters().find((adapter) => adapter.runtimeId === id),
+};
+
 export interface AgentEntrypointDeps {
-	/** Runtime registry — defaults to burrow's built-ins (`new AgentRegistry()`). */
-	registry?: { get(id: string): AgentRuntime | undefined };
+	/** Adapter registry — defaults to warren's built-ins (`allAdapters()`). */
+	registry?: { get(id: string): AgentRuntimeAdapter | undefined };
 	/** Spawn seam — defaults to `Bun.spawn`. */
 	spawn?: AgentSpawn;
 	/** Inbox-poll HTTP seam — defaults to `fetch`. */
@@ -193,6 +125,13 @@ export interface AgentEntrypointDeps {
 	finalize?: FinalizeEntrypointDeps;
 	/** Skip the in-pod finalize step entirely (tests that only exercise the agent). */
 	skipFinalize?: boolean;
+	/**
+	 * Register a handler for the pod's termination signal (warren-01d5). The
+	 * default `runAgentEntrypoint` main wiring installs `SIGTERM`/`SIGINT` on
+	 * the process; tests inject a registrar they can fire directly. Absent
+	 * (unit tests of `runAgent`) ⇒ no signal handling is installed.
+	 */
+	registerCancelSignal?: (handler: (signal: string) => void) => void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -202,6 +141,84 @@ export interface AgentEntrypointDeps {
 export interface AgentRunResult {
 	exitCode: number;
 	phase: "succeeded" | "failed";
+	/**
+	 * warren-01d5: a registered termination signal fired while the agent ran —
+	 * the entrypoint killed the agent child so the caller's post-step (the
+	 * finalize/salvage entrypoint) can still run inside the pod's cancel grace
+	 * window instead of the kubelet SIGKILLing everything with the work unpushed.
+	 */
+	cancelledViaSignal: boolean;
+}
+
+/**
+ * Resolve the final spawn command: wrap the agent argv in the setpriv uid
+ * drop (warren-cb93, preflighted — see `./agent-uid-drop.ts`) so the agent
+ * process runs at a DIFFERENT uid than this entrypoint and cannot forge the
+ * provenance marker at `/proc/1/fd/1`, then arm the stdin hold. `null` when
+ * the uid-drop preflight failed (a legible error event already emitted).
+ */
+async function resolveAgentCommand(
+	baseCommand: AgentSpawnCommand,
+	useStdinHold: boolean,
+	env: AgentEntrypointEnv,
+	io: { spawn: AgentSpawn; out: (line: string) => void; log: (m: string) => void },
+): Promise<AgentSpawnCommand | null> {
+	let command = baseCommand;
+	if (env.agentRunAs !== undefined) {
+		const dropped = await applyAgentUidDrop(baseCommand, env.agentRunAs, {
+			spawn: io.spawn,
+			cwd: env.workspacePath,
+			log: io.log,
+		});
+		if (!dropped.ok) {
+			emitSystem(io.out, "error", { message: uidDropPreflightErrorMessage(dropped.probeExit) });
+			return null;
+		}
+		command = dropped.command;
+	}
+	return useStdinHold ? { ...command, holdStdin: true } : command;
+}
+
+/**
+ * True when a parsed runtime event is a terminal envelope — claude's `result`
+ * or pi's `agent_end` on the `state_change`/`system` carrier. This is the exact
+ * predicate the control plane's `detectRuntimeTerminal`
+ * (src/runs/stream/terminal-detect.ts) applies to the re-parsed stream, kept in
+ * sync by going through the same shared extractor
+ * (`src/core/event-envelope.ts`). (warren-9a4a)
+ */
+export function isTerminalEnvelope(ev: AdapterRuntimeEvent): boolean {
+	const env = extractAgentEventEnvelope(ev);
+	return env !== null && (env.type === "result" || env.type === "agent_end");
+}
+
+/**
+ * warren-9a4a: the agent exited without ever emitting a terminal envelope —
+ * synthesize the missing `agent_end` in-pod (called AFTER every other witness
+ * event, so those reach the log before the terminal signal). Emitted through
+ * `emitSystem`/`formatEventLine`, it carries the warren origin marker and
+ * passes both the provenance gate and `detectRuntimeTerminal` with no
+ * control-plane change; a non-zero exit marks the envelope failed so the run
+ * terminalizes truthfully instead of reading succeeded.
+ */
+function emitSynthesizedTerminalEnvelope(
+	out: (line: string) => void,
+	sawTerminalEnvelope: boolean,
+	exitCode: number,
+): void {
+	if (sawTerminalEnvelope) return;
+	emitSystem(out, "state_change", {
+		type: "agent_end",
+		synthesized: true,
+		reason: "agent_exit_without_terminal_envelope",
+		exitCode,
+		...(exitCode !== 0
+			? {
+					stopReason: "error",
+					errorMessage: `agent exited ${exitCode} without emitting a terminal envelope`,
+				}
+			: {}),
+	});
 }
 
 /**
@@ -214,7 +231,7 @@ export async function runAgent(
 	env: AgentEntrypointEnv,
 	deps: AgentEntrypointDeps = {},
 ): Promise<AgentRunResult> {
-	const registry = deps.registry ?? new AgentRegistry();
+	const registry = deps.registry ?? DEFAULT_ADAPTER_REGISTRY;
 	const spawn = deps.spawn ?? defaultSpawn;
 	const http = deps.http ?? defaultHttp;
 	const out = deps.out ?? ((line: string) => process.stdout.write(`${line}\n`));
@@ -223,30 +240,72 @@ export async function runAgent(
 	const runtime = registry.get(env.runtimeId);
 	if (runtime === undefined) {
 		emitSystem(out, "error", { message: `runtime '${env.runtimeId}' is not registered` });
-		return { exitCode: 1, phase: "failed" };
+		return { exitCode: 1, phase: "failed", cancelledViaSignal: false };
 	}
 
 	const pendingMessages = await drainInbox(env, http, log);
 	const ctx = buildSpawnContext(env, pendingMessages);
 
+	// warren-cb93: under the uid split the agent runs as a DIFFERENT uid than
+	// this entrypoint, sharing the pod gid (fsGroup) — so everything the
+	// entrypoint materializes into the workspace (prepareWorkspace dirs, the
+	// claude TMPDIR, the pi session dir) must be GROUP-writable for the
+	// split-off agent to write there. Unconditional (this entrypoint only ever
+	// runs in the pod); the init container sets the same umask for the clone
+	// itself (workspace-init.ts).
+	process.umask(0o002);
+
 	if (runtime.prepareWorkspace !== undefined) {
 		await runtime.prepareWorkspace({
-			burrow: ctx.burrow,
-			run: ctx.run,
+			runId: env.runId,
 			workspacePath: env.workspacePath,
 		});
 	}
+	if (runtime.buildSpawnCommand === undefined) {
+		emitSystem(out, "error", {
+			message: `runtime '${env.runtimeId}' declares no buildSpawnCommand`,
+		});
+		return { exitCode: 1, phase: "failed", cancelledViaSignal: false };
+	}
 
-	// A runtime that declares `shouldCloseStdinOnEvent` (pi/leveret/healer) exits
-	// the instant stdin closes mid-inference — so it MUST keep stdin open until
-	// its terminal event lands (mirrors burrow `dispatch.ts` `useStdinHold`).
-	// Batch runtimes (claude-code `--print`, sapling) leave the seam undefined and
-	// keep the write-and-close-at-spawn behavior. (warren-7a43)
+	// A runtime that declares `shouldCloseStdinOnEvent` (pi) exits the instant
+	// stdin closes mid-inference — so it MUST keep stdin open until its terminal
+	// event lands (mirrors burrow `dispatch.ts` `useStdinHold`). Batch runtimes
+	// (claude-code `--print`) leave the seam undefined and keep the
+	// write-and-close-at-spawn behavior. (warren-7a43)
 	const useStdinHold = typeof runtime.shouldCloseStdinOnEvent === "function";
 	const baseCommand = runtime.buildSpawnCommand(ctx);
-	const command: SpawnCommand = useStdinHold ? { ...baseCommand, holdStdin: true } : baseCommand;
-	log(`agent-entrypoint: launching '${runtime.id}' in ${env.workspacePath}`);
-	const proc = await spawn(command, { cwd: env.workspacePath });
+
+	const command = await resolveAgentCommand(baseCommand, useStdinHold, env, { spawn, out, log });
+	if (command === null) return { exitCode: 1, phase: "failed", cancelledViaSignal: false };
+	log(`agent-entrypoint: launching '${runtime.runtimeId}' in ${env.workspacePath}`);
+	const spawned = await spawn(command, { cwd: env.workspacePath });
+	// warren-950d: under the uid split the watchdog's kill is a cross-uid
+	// signal the entrypoint's empty effective capability set cannot deliver on
+	// containerd 2.x — route it through setpriv (assume the agent's uid, then
+	// signal uid-matched). No drop env ⇒ pass-through.
+	const proc = withCrossUidKill(spawned, env.agentRunAs, {
+		spawn,
+		cwd: env.workspacePath,
+		log,
+	});
+
+	// warren-01d5: a graceful cancel (a cost-cap trip or an operator cancel
+	// both land on `provider.cancel(handle)` → pod delete → kubelet SIGTERM)
+	// must NOT hard-kill this entrypoint before the finalize/salvage step
+	// runs — the pod is the only place the committed work exists. Latch the
+	// first signal, witness it on the event stream, and stop the agent child
+	// so the spawn loop below returns promptly; control then falls through
+	// `runAgentEntrypoint` into `runFinalizeEntrypoint`, which pushes the
+	// branch / posts the salvage bundle before the process exits.
+	const cancelledViaSignal = { value: false };
+	deps.registerCancelSignal?.((signal) => {
+		if (cancelledViaSignal.value) return;
+		cancelledViaSignal.value = true;
+		log(`agent-entrypoint: ${signal} received; stopping the agent for graceful finalize`);
+		emitSystem(out, "cancel_requested", { signal, stop: "graceful" });
+		proc.kill?.();
+	});
 
 	// All the stdin-hold machinery (close-on-trigger, auto-reply, idle watchdog,
 	// mid-run steering) lives behind this controller; for a batch runtime it is a
@@ -266,8 +325,11 @@ export async function runAgent(
 		for await (const line of readLines(proc.stdout)) {
 			hold.onOutput(); // any output resets the idle watchdog
 			if (line.length === 0) continue;
-			const events = [...runtime.parseEvents(line, { burrow: ctx.burrow, run: ctx.run })];
-			for (const ev of events) out(formatEventLine(ev));
+			const events = [...(runtime.parseEvents?.(line) ?? [])];
+			for (const ev of events) {
+				out(formatEventLine(ev));
+				if (isTerminalEnvelope(ev)) sawTerminalEnvelope = true;
+			}
 			await hold.onEvents(events);
 		}
 	};
@@ -278,6 +340,14 @@ export async function runAgent(
 		}
 	};
 
+	// warren-9a4a: track whether the agent's OWN stream carried a terminal
+	// envelope (`result` / `agent_end` on the state_change/system carrier — the
+	// exact shape `detectRuntimeTerminal` reads). A stdin-held runtime killed by
+	// the idle watchdog (or any crashed agent) exits without one, and the reap
+	// pipeline terminalizes ONLY on that envelope — without a synthesized
+	// fallback the run hangs in `running` while the pod polls finalize-intent
+	// forever.
+	let sawTerminalEnvelope = false;
 	let streamError: unknown;
 	let exitCode: number;
 	try {
@@ -306,9 +376,10 @@ export async function runAgent(
 			message: `event stream failed: ${streamError instanceof Error ? streamError.message : String(streamError)}`,
 		});
 	}
+	emitSynthesizedTerminalEnvelope(out, sawTerminalEnvelope, exitCode);
 	const phase = exitCode === 0 ? "succeeded" : "failed";
-	log(`agent-entrypoint: '${runtime.id}' exited ${exitCode} (${phase})`);
-	return { exitCode, phase };
+	log(`agent-entrypoint: '${runtime.runtimeId}' exited ${exitCode} (${phase})`);
+	return { exitCode, phase, cancelledViaSignal: cancelledViaSignal.value };
 }
 
 /**
@@ -348,7 +419,10 @@ export async function runAgentEntrypoint(
 	let finalizeDelivered = true;
 	if (deps.skipFinalize !== true && canFinalize) {
 		try {
-			finalizeDelivered = await runFinalizeEntrypoint(envSource, deps.finalize);
+			finalizeDelivered = await runFinalizeEntrypoint(
+				buildFinalizeEnvSource(envSource, result),
+				deps.finalize,
+			);
 		} catch (err) {
 			// A thrown finalize error means nothing was delivered — treat it as a
 			// delivery failure for exit-code purposes (warren-4d6a).
@@ -371,8 +445,51 @@ export async function runAgentEntrypoint(
 	return result.exitCode;
 }
 
+/**
+ * Build the env the finalize entrypoint runs with: the pod env overlaid with
+ * the agent's exit code (warren-5202 — reported on every intent poll so a
+ * recovering control plane can classify the outcome from the pod's own
+ * witness, not the (possibly log-rotated) terminal envelope), plus — warren-01d5
+ * — a BOUNDED intent-poll budget under a signal-driven cancel. The pod then has
+ * only the cancel grace window left, so the poll is bounded to a slice of it
+ * (default 25s): if warren's intent arrives in time the branch is pushed from
+ * the pod; if not, the entrypoint still banks the no-intent salvage bundle
+ * before exiting — the same finalize/salvage outcome a natural completion gets.
+ */
+function buildFinalizeEnvSource(envSource: AgentEnvSource, result: AgentRunResult): AgentEnvSource {
+	return {
+		...envSource,
+		WARREN_AGENT_EXIT_CODE: String(result.exitCode),
+		...(result.cancelledViaSignal && envSource.WARREN_FINALIZE_MAX_WAIT_MS === undefined
+			? { WARREN_FINALIZE_MAX_WAIT_MS: cancelFinalizeMaxWaitMs(envSource) }
+			: {}),
+	};
+}
+
+/**
+ * warren-01d5: bounded finalize budget under a signal-driven cancel, as
+ * `WARREN_CANCEL_FINALIZE_MAX_WAIT_MS` (ms). Must fit inside the pod's
+ * cancel grace (`WARREN_K8S_CANCEL_GRACE_SECONDS`) so the entrypoint can
+ * still bank the no-intent salvage bundle and exit before the SIGKILL.
+ */
+const DEFAULT_CANCEL_FINALIZE_MAX_WAIT_MS = "25000";
+
+function cancelFinalizeMaxWaitMs(envSource: AgentEnvSource): string {
+	const raw = envSource.WARREN_CANCEL_FINALIZE_MAX_WAIT_MS?.trim();
+	return raw !== undefined && raw !== "" ? raw : DEFAULT_CANCEL_FINALIZE_MAX_WAIT_MS;
+}
+
 if (import.meta.main) {
-	runAgentEntrypoint(process.env)
+	runAgentEntrypoint(process.env, {
+		// warren-01d5: route the pod's termination signal into the graceful
+		// stop path — K8sProvider.cancel deletes the pod, the kubelet delivers
+		// SIGTERM, and this handler stops the agent so the in-pod
+		// finalize/salvage step still runs inside the cancel grace window.
+		registerCancelSignal: (handler) => {
+			process.on("SIGTERM", () => handler("SIGTERM"));
+			process.on("SIGINT", () => handler("SIGINT"));
+		},
+	})
 		.then((code) => process.exit(code))
 		.catch((err: unknown) => {
 			console.error(err instanceof Error ? err.message : String(err));

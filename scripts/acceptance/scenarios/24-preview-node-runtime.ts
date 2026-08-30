@@ -51,6 +51,10 @@ import {
 } from "../lib/assert.ts";
 import { WarrenHttp } from "../lib/http.ts";
 import { type BootHandle, bootInProc } from "../lib/inproc.ts";
+import {
+	waitForRunPredicate,
+	waitForRunTerminal as waitForRunTerminalRow,
+} from "./lib/poll-helpers.ts";
 
 interface ProjectRow {
 	readonly id: string;
@@ -61,7 +65,7 @@ interface ProjectRow {
 interface RunRow {
 	readonly id: string;
 	readonly state: string;
-	readonly burrowId: string | null;
+	readonly sandboxId: string | null;
 	readonly previewState: "starting" | "live" | "failed" | "torn-down" | null;
 	readonly previewPort: number | null;
 	readonly previewFailureMessage: string | null;
@@ -71,12 +75,10 @@ interface CreateRunResponse {
 	readonly run: RunRow;
 }
 
-const POLL_INTERVAL_MS = 250;
 /** Same generous budget as scenario 20: reap → branch_push → pr_open →
  *  preview_launch can take up to ~60s of readiness probing. */
 const LIVE_PREVIEW_TIMEOUT_MS = 90_000;
 const TERMINAL_TIMEOUT_MS = 30_000;
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
 
 const PREVIEW_HOST = "preview.warren.acceptance";
 const PREVIEW_SANDBOX_PORT = 3000;
@@ -160,7 +162,6 @@ async function runNodePreview(ctx: ScenarioCtx): Promise<void> {
 			canopyRepoUrl: ctx.fixtures.canopyRepoUrl,
 			gitConfigPath: sample.gitConfigPath,
 			extraEnv: {
-				WARREN_STUB_SLEEP_MS: "0",
 				WARREN_PREVIEW_HOST: PREVIEW_HOST,
 				WARREN_PREVIEW_IDLE_TTL: "30m",
 				WARREN_PREVIEW_MAX_LIFETIME: "8h",
@@ -170,7 +171,14 @@ async function runNodePreview(ctx: ScenarioCtx): Promise<void> {
 		ctx.logger.info(`scenario-24: warren ready at ${handle.warrenUrl}`);
 
 		const http = new WarrenHttp({ baseUrl: handle.warrenUrl, token: handle.token });
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// The stub agent was seeded at boot via WARREN_SEED_AGENTS_FILE
+		// (warren-e376); POST /agents/refresh is deleted (pl-3a79). GET it
+		// to prove boot seeding landed before spawning against it.
+		await http.expectStatus(
+			"GET",
+			`/agents/${encodeURIComponent(ctx.fixtures.stubAgentName)}`,
+			200,
+		);
 		const project = await ensureProject(http, sample.gitUrl);
 
 		const created = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {
@@ -325,37 +333,18 @@ async function runGit(cwd: string, args: readonly string[]): Promise<void> {
 /* HTTP + lifecycle helpers                                            */
 /* ------------------------------------------------------------------ */
 
-async function ensureProject(http: WarrenHttp, gitUrl: string): Promise<ProjectRow> {
-	const list = await http.expectJson<{ projects: ProjectRow[] }>("GET", "/projects", 200);
-	const existing = list.projects.find((p) => p.gitUrl === gitUrl);
-	if (existing !== undefined) return existing;
-	return http.expectJson<ProjectRow>("POST", "/projects", 201, { body: { gitUrl } });
-}
-
 async function waitForRunTerminal(
 	http: WarrenHttp,
 	runId: string,
 	logger: ScenarioLogger,
 ): Promise<void> {
-	const deadline = Date.now() + TERMINAL_TIMEOUT_MS;
-	let last = "<unknown>";
-	while (Date.now() < deadline) {
-		const row = await http.expectJson<RunRow>("GET", `/runs/${encodeURIComponent(runId)}`, 200);
-		last = row.state;
-		if (TERMINAL_STATES.has(row.state)) {
-			logger.debug(`scenario-24: run ${runId} terminal in state=${row.state}`);
-			if (row.state !== "succeeded") {
-				throw new AcceptanceError(
-					`expected run ${runId} to succeed (preview launches only on success); got state=${row.state}`,
-				);
-			}
-			return;
-		}
-		await sleep(POLL_INTERVAL_MS);
+	const row = await waitForRunTerminalRow(http, runId, TERMINAL_TIMEOUT_MS);
+	logger.debug(`scenario-24: run ${runId} terminal in state=${row.state}`);
+	if (row.state !== "succeeded") {
+		throw new AcceptanceError(
+			`expected run ${runId} to succeed (preview launches only on success); got state=${row.state}`,
+		);
 	}
-	throw new AcceptanceError(
-		`run ${runId} did not reach terminal within ${TERMINAL_TIMEOUT_MS}ms (last state=${last})`,
-	);
 }
 
 async function waitForPreviewState(
@@ -364,24 +353,30 @@ async function waitForPreviewState(
 	target: RunRow["previewState"],
 	timeoutMs: number,
 ): Promise<RunRow> {
-	const deadline = Date.now() + timeoutMs;
-	let last: RunRow | undefined;
-	while (Date.now() < deadline) {
-		last = await http.expectJson<RunRow>("GET", `/runs/${encodeURIComponent(runId)}`, 200);
-		if (last.previewState === target) return last;
-		if (last.previewState === "failed") {
-			throw new AcceptanceError(
-				`preview transitioned to 'failed' before reaching '${target}' on run ${runId}: ` +
-					`${last.previewFailureMessage ?? "<no message>"}`,
-			);
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new AcceptanceError(
-		`preview did not reach '${target}' within ${timeoutMs}ms on run ${runId} ` +
-			`(last preview_state=${JSON.stringify(last?.previewState ?? null)}, ` +
-			`failure_message=${JSON.stringify(last?.previewFailureMessage ?? null)})`,
+	return waitForRunPredicate(
+		http,
+		runId,
+		(row) => row.previewState === target,
+		timeoutMs,
+		(row) =>
+			`preview_state=${JSON.stringify(row.previewState ?? null)}, ` +
+			`failure_message=${JSON.stringify(row.previewFailureMessage ?? null)}`,
+		(row) => {
+			if (row.previewState === "failed" && target !== "failed") {
+				throw new AcceptanceError(
+					`preview transitioned to 'failed' before reaching '${target}' on run ${runId}: ` +
+						`${row.previewFailureMessage ?? "<no message>"}`,
+				);
+			}
+		},
 	);
+}
+
+async function ensureProject(http: WarrenHttp, gitUrl: string): Promise<ProjectRow> {
+	const list = await http.expectJson<{ projects: ProjectRow[] }>("GET", "/projects", 200);
+	const existing = list.projects.find((p) => p.gitUrl === gitUrl);
+	if (existing !== undefined) return existing;
+	return http.expectJson<ProjectRow>("POST", "/projects", 201, { body: { gitUrl } });
 }
 
 interface ProxyRequestInput {
@@ -478,8 +473,4 @@ async function nodeOnPath(): Promise<boolean> {
 	} catch {
 		return false;
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

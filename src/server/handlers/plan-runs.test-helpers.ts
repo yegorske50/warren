@@ -1,9 +1,10 @@
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeForge } from "../../forge/fake/fake-forge.ts";
 import type { SpawnFn, SpawnOptions, SpawnResult } from "../../projects/clone.ts";
 import { RunEventBroker } from "../../runs/index.ts";
-import { resolveRuntimeProvider } from "../../runtime/registry.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
+import { SeedsTracker } from "../../tracker/seeds-tracker.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import type { BridgeRegistry, Logger, ServeHandle, ServerDeps } from "../types.ts";
 
@@ -69,12 +70,9 @@ export function seedShowResult(id: string, status: "open" | "closed"): SpawnResu
 	};
 }
 
-export async function poolFor(_repos: Repos): Promise<BurrowClient> {
-	const client = new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stubFetch(async () => jsonRes(404, { error: { code: "not_found", message: "stub" } })),
-	});
-	return client;
+/** An inert provider — the plan-run handler tests never reach the runtime seam. */
+export function poolFor(): FakeProvider {
+	return new FakeProvider();
 }
 
 export interface BuildDepsInput {
@@ -92,23 +90,25 @@ export interface BuildDepsInput {
 
 export async function depsFor(input: BuildDepsInput): Promise<ServerDeps> {
 	const broker = new RunEventBroker();
-	const pool = await poolFor(input.repos);
+	const provider = poolFor();
 	return {
 		repos: input.repos,
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => pool }),
+		runtimeProvider: provider,
+		forge: new FakeForge(),
 		broker,
 		bridges:
 			input.bridges ??
 			createBridgeRegistry({
 				repos: input.repos,
 				broker,
-				runtimeProvider: resolveRuntimeProvider({ burrowClient: () => pool }),
+				runtimeProvider: provider,
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
 		logger: input.logger ?? silentLogger,
 		uiDistDir: null,
 		seedsCli: { sdBinary: "sd", spawn: input.sdSpawn },
+		issueTracker: new SeedsTracker({ sdBinary: "sd", spawn: input.sdSpawn }),
 		...(input.spawn !== undefined ? { spawn: input.spawn } : {}),
 		...(input.refreshProjectFn !== undefined ? { refreshProjectFn: input.refreshProjectFn } : {}),
 		...(input.streamLimiter !== undefined ? { streamLimiter: input.streamLimiter } : {}),

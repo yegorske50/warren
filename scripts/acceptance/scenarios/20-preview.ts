@@ -87,7 +87,7 @@ import {
 export interface RunRow {
 	readonly id: string;
 	readonly state: string;
-	readonly burrowId: string | null;
+	readonly sandboxId: string | null;
 	readonly previewState: "starting" | "live" | "failed" | "torn-down" | null;
 	readonly previewPort: number | null;
 	readonly previewFailureMessage: string | null;
@@ -157,7 +157,6 @@ async function runVariantA(ctx: ScenarioCtx): Promise<void> {
 			canopyRepoUrl: ctx.fixtures.canopyRepoUrl,
 			gitConfigPath: sample.gitConfigPath,
 			extraEnv: {
-				WARREN_STUB_SLEEP_MS: "0",
 				// Long enough that the proxy 200/401 assertions don't race
 				// the eviction worker; variant B owns the eviction path.
 				WARREN_PREVIEW_HOST: PREVIEW_HOST,
@@ -288,7 +287,6 @@ async function runVariantB(ctx: ScenarioCtx): Promise<void> {
 			canopyRepoUrl: ctx.fixtures.canopyRepoUrl,
 			gitConfigPath: sample.gitConfigPath,
 			extraEnv: {
-				WARREN_STUB_SLEEP_MS: "0",
 				WARREN_PREVIEW_HOST: PREVIEW_HOST,
 				// 2s idle TTL with a 500ms tick → eviction fires within
 				// ~2.5s of the row reaching live (and no proxy hits land,

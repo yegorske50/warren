@@ -24,6 +24,7 @@
 
 import { sql } from "drizzle-orm";
 import {
+	bigint,
 	boolean,
 	doublePrecision,
 	index,
@@ -42,8 +43,11 @@ import {
 	INBOX_STATES,
 	INDEX_NAMES,
 	PLAN_RUN_CHILD_STATES,
+	PLAN_RUN_SOURCES,
 	PLAN_RUN_STATES,
 	PREVIEW_STATES,
+	PULL_REQUEST_LIFECYCLES,
+	RUN_COST_BASES,
 	RUN_FAILURE_REASONS,
 	RUN_MODES,
 	RUN_STATES,
@@ -91,23 +95,36 @@ export const runs = pgTable(
 		// project removes its runs and (via events.run_id CASCADE) their
 		// event transcripts rather than orphaning them. See sqlite.ts.
 		projectId: text("project_id").references(() => projects.id, { onDelete: "cascade" }),
-		burrowId: text("burrow_id"),
-		burrowRunId: text("burrow_run_id"),
+		sandboxId: text("sandbox_id"),
+		sandboxRunId: text("sandbox_run_id"),
 		workerId: text("worker_id"),
 		seedId: text("seed_id"),
 		renderedAgentJson: jsonb("rendered_agent_json").notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
+		// Mirror of sqlite created_at (warren-0af9 / pl-103e step 1). Epoch ms,
+		// so bigint (pg integer is 32-bit and overflows ~1.7e12). Nullable for
+		// pre-migration rows; see sqlite.ts for the full shape + intent.
+		createdAt: bigint("created_at", { mode: "number" }),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
 		prompt: text("prompt").notNull(),
 		trigger: text("trigger").notNull(),
 		prUrl: text("pr_url"),
 		targetBranch: text("target_branch"),
+		// Composed workspace branch frozen at dispatch (warren-5255); the full
+		// story lives on the `Run.branch` doc comment in src/client/types.ts.
+		branch: text("branch"),
+		// Dispatch-supplied clone ref (warren-afeb); see the sqlite schema comment.
+		ref: text("ref"),
+		// Base-commit pinning (warren-aaf7); see the sqlite schema comment.
+		baseCommit: text("base_commit"),
 		// Salvage-before-destroy (warren-cd3b); see the sqlite schema comment.
 		salvageRef: text("salvage_ref"),
 		salvagePath: text("salvage_path"),
 		costUsd: doublePrecision("cost_usd"),
+		// Cost basis (warren-f3c3) — see the sqlite twin for the full rationale.
+		costBasis: text("cost_basis", { enum: RUN_COST_BASES }).notNull().default("api"),
 		tokensInput: integer("tokens_input"),
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
@@ -126,6 +143,26 @@ export const runs = pgTable(
 		// Mirror of sqlite clone_kind (warren-e96f). Discriminates `continue`
 		// vs `replicate` chain links; see sqlite.ts for the full shape + intent.
 		cloneKind: text("clone_kind", { enum: CLONE_KINDS }),
+		// Mirror of sqlite retry_of (warren-4af7). Infra-lost auto-retry
+		// back-link; see sqlite.ts for the full shape + intent.
+		retryOf: text("retry_of"),
+		// Mirror of sqlite provider/model (warren-2ede / pl-103e). Declared
+		// provider/model frozen at dispatch; see sqlite.ts for the full shape
+		// + intent.
+		provider: text("provider"),
+		model: text("model"),
+		// Mirror of sqlite pr_state/pr_merged_at (warren-3bc6 / pl-103e step 6).
+		// Merge-watcher PR facts; NULL reads as "unknown". See sqlite.ts for
+		// the full shape + intent.
+		prState: text("pr_state", { enum: PULL_REQUEST_LIFECYCLES }),
+		prMergedAt: text("pr_merged_at"),
+		// Mirror of sqlite commits_ahead/files_changed/insertions/deletions
+		// (warren-ab2b / pl-103e). Reap-time measured outcome facts; see
+		// sqlite.ts for the full shape + NULL-semantics intent.
+		commitsAhead: integer("commits_ahead"),
+		filesChanged: integer("files_changed"),
+		insertions: integer("insertions"),
+		deletions: integer("deletions"),
 	},
 	(t) => [
 		index(INDEX_NAMES.runsState).on(t.state),
@@ -147,15 +184,21 @@ export const events = pgTable(
 		runId: text("run_id")
 			.notNull()
 			.references(() => runs.id, { onDelete: "cascade" }),
-		burrowEventSeq: integer("burrow_event_seq").notNull(),
+		sandboxEventSeq: integer("sandbox_event_seq").notNull(),
 		ts: text("ts").notNull(),
 		kind: text("kind").notNull(),
 		stream: text("stream", { enum: EVENT_STREAMS }),
+		// Parse-boundary provenance (warren-5a07) — mirror of sqlite.
+		// Nullable: historical rows read as unknown, never a real bucket.
+		origin: text("origin"),
 		payloadJson: jsonb("payload_json").notNull(),
 	},
 	(t) => [
-		index(INDEX_NAMES.eventsRunSeq).on(t.runId, t.burrowEventSeq),
+		index(INDEX_NAMES.eventsRunSeq).on(t.runId, t.sandboxEventSeq),
 		index(INDEX_NAMES.eventsRunTs).on(t.runId, t.ts),
+		// warren-55cf: healer attempt history filters by kind + payload
+		// fingerprint at the SQL level; this keeps the kind scan bounded.
+		index(INDEX_NAMES.eventsKindTs).on(t.kind, t.ts),
 	],
 );
 
@@ -182,7 +225,9 @@ export const planRuns = pgTable(
 	TABLE_NAMES.planRuns,
 	{
 		id: text("id").primaryKey(),
-		planId: text("plan_id").notNull(),
+		planId: text("plan_id"),
+		// Mirror of sqlite plan_runs.source (warren-de42): 'plan' | 'issues'.
+		source: text("source", { enum: PLAN_RUN_SOURCES }).notNull().default("plan"),
 		projectId: text("project_id")
 			.notNull()
 			.references(() => projects.id, { onDelete: "cascade" }),
@@ -191,6 +236,9 @@ export const planRuns = pgTable(
 		ref: text("ref"),
 		providerOverride: text("provider_override"),
 		modelOverride: text("model_override"),
+		// Mirror of sqlite plan_runs.max_cost_usd (warren-a63d): per-child
+		// spend cap the coordinator forwards on each dispatch.
+		maxCostUsd: doublePrecision("max_cost_usd"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
 		// Mirror of sqlite plan_runs.parent_run_id (warren-d9a2). See
@@ -201,6 +249,9 @@ export const planRuns = pgTable(
 		createdAt: text("created_at").notNull(),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		// Mirror of sqlite plan_runs.resumed_at (warren-1eff). See
+		// sqlite.ts for shape + resume-clock intent.
+		resumedAt: text("resumed_at"),
 	},
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
@@ -228,6 +279,8 @@ export const planRunChildren = pgTable(
 		endedAt: text("ended_at"),
 		prMergedAt: text("pr_merged_at"),
 		failureReason: text("failure_reason"),
+		// warren-6de9: automatic child re-dispatch budget consumed so far.
+		retryCount: integer("retry_count").notNull().default(0),
 	},
 	(t) => [
 		primaryKey({ columns: [t.planRunId, t.seq] }),
@@ -268,9 +321,89 @@ export const runInbox = pgTable(
 	(t) => [index(INDEX_NAMES.runInboxRunState).on(t.runId, t.state)],
 );
 
+/**
+ * Tool-calls rollup (warren-7746) — mirror of sqlite. See sqlite.ts for the
+ * extraction/cascade intent and the nullability semantics.
+ */
+export const toolCalls = pgTable(
+	TABLE_NAMES.toolCalls,
+	{
+		id: serial("id").primaryKey(),
+		runId: text("run_id")
+			.notNull()
+			.references(() => runs.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+		ts: text("ts").notNull(),
+		toolName: text("tool_name"),
+		command: text("command"),
+		filePaths: jsonb("file_paths"),
+		toolUseId: text("tool_use_id"),
+		isError: boolean("is_error").notNull().default(false),
+		resultBytes: integer("result_bytes"),
+		origin: text("origin"),
+	},
+	(t) => [
+		uniqueIndex(INDEX_NAMES.toolCallsRunSeq).on(t.runId, t.seq),
+		index(INDEX_NAMES.toolCallsRunUseId).on(t.runId, t.toolUseId),
+	],
+);
+
+/**
+ * Dispatch-context log (warren-36e7) — mirror of sqlite. See sqlite.ts for
+ * the four column groups, nullability semantics, and cascade intent.
+ */
+export const dispatchContext = pgTable(
+	TABLE_NAMES.dispatchContext,
+	{
+		runId: text("run_id")
+			.primaryKey()
+			.references(() => runs.id, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+
+		agentName: text("agent_name"),
+		provider: text("provider"),
+		model: text("model"),
+		providerSource: text("provider_source"),
+		modelSource: text("model_source"),
+		capSource: text("cap_source"),
+		maxCostUsd: doublePrecision("max_cost_usd"),
+		runtimeId: text("runtime_id"),
+		runtimeBackend: text("runtime_backend"),
+		promptBytes: integer("prompt_bytes"),
+		mode: text("mode"),
+		network: text("network"),
+
+		queueQueuedRuns: integer("queue_queued_runs"),
+		queueRunningRuns: integer("queue_running_runs"),
+		queueProjectNonTerminal: integer("queue_project_non_terminal"),
+		queueSnapshotSource: text("queue_snapshot_source"),
+
+		trigger: text("trigger"),
+		dispatchOrigin: text("dispatch_origin"),
+		dispatcherHandle: text("dispatcher_handle"),
+		triggerId: text("trigger_id"),
+		planRunId: text("plan_run_id"),
+		retryKind: text("retry_kind"),
+		retryOfRunId: text("retry_of_run_id"),
+		parentRunId: text("parent_run_id"),
+		attemptNo: integer("attempt_no"),
+		rootRunId: text("root_run_id"),
+
+		seedId: text("seed_id"),
+		seedStatus: text("seed_status"),
+		seedPriority: integer("seed_priority"),
+		seedSize: text("seed_size"),
+	},
+	(t) => [index(INDEX_NAMES.dispatchContextCreatedAt).on(t.createdAt)],
+);
+
 export type PlanRunRow = typeof planRuns.$inferSelect;
 export type PlanRunInsert = typeof planRuns.$inferInsert;
 export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
 export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
 export type RunInboxRow = typeof runInbox.$inferSelect;
 export type RunInboxInsert = typeof runInbox.$inferInsert;
+export type ToolCallRow = typeof toolCalls.$inferSelect;
+export type ToolCallInsert = typeof toolCalls.$inferInsert;
+export type DispatchContextRow = typeof dispatchContext.$inferSelect;
+export type DispatchContextInsert = typeof dispatchContext.$inferInsert;

@@ -19,6 +19,7 @@ import {
 
 export const WARREN_PREVIEW_HOST_ENV = "WARREN_PREVIEW_HOST" as const;
 export const WARREN_PREVIEW_MODE_ENV = "WARREN_PREVIEW_MODE" as const;
+export const WARREN_PREVIEW_PORT_ENV = "WARREN_PREVIEW_PORT" as const;
 
 export interface PreviewLaunchConfig {
 	/**
@@ -42,6 +43,17 @@ export interface PreviewLaunchConfig {
 	 * (merge precedence enforced by the call site, not here).
 	 */
 	readonly mode: PreviewMode;
+	/**
+	 * TCP port of the dedicated path-mode preview listener (warren-3f8a).
+	 * Path-mode previews are served from their own listener so the browser
+	 * origin differs from the warren UI's — same-origin preview code must
+	 * not be able to read the operator token out of the UI's storage. Null
+	 * when `WARREN_PREVIEW_PORT` is unset or invalid; the boot path then
+	 * derives `<bind port> + 1` (or an ephemeral port when the bind port
+	 * itself is ephemeral). Subdomain mode ignores this — its origin
+	 * boundary comes from the per-run host.
+	 */
+	readonly port: number | null;
 }
 
 export type PreviewLaunchEnvLike = Readonly<Record<string, string | undefined>>;
@@ -62,7 +74,21 @@ export function loadPreviewLaunchConfigFromEnv(
 	const parsedMode = PreviewModeSchema.safeParse(trimmedMode);
 	const mode: PreviewMode = parsedMode.success ? parsedMode.data : DEFAULT_PREVIEW_MODE;
 
-	return { host, mode };
+	// Invalid / empty port degrades to null like the other WARREN_PREVIEW_*
+	// knobs (mx-d3b88f); the boot path substitutes `<bind port> + 1`.
+	const rawPort = env[WARREN_PREVIEW_PORT_ENV];
+	const trimmedPort = rawPort === undefined ? "" : rawPort.trim();
+	const parsedPort = Number.parseInt(trimmedPort, 10);
+	const port =
+		trimmedPort !== "" &&
+		Number.isInteger(parsedPort) &&
+		String(parsedPort) === trimmedPort &&
+		parsedPort >= 1 &&
+		parsedPort <= 65535
+			? parsedPort
+			: null;
+
+	return { host, mode, port };
 }
 
 /**
@@ -73,14 +99,22 @@ export function loadPreviewLaunchConfigFromEnv(
  * - **Subdomain mode** (`https://run-<id>.<host>`): the reviewer-facing
  *   shape from the original docs/design/preview-environments.md. No trailing slash so the URL stays
  *   stable across modes and existing PR annotations.
- * - **Path mode** (`https://<host>/p/<id>/`, warren-c3c4 / docs/design/preview-environments.md
+ * - **Path mode** (`https://<host>:<port>/p/<id>/`, warren-c3c4 / docs/design/preview-environments.md
  *   addendum): trailing slash is load-bearing — without it the browser
  *   resolves the upstream's root-relative HTML (`href="/assets/foo"`)
  *   against `/p/` instead of `/p/<id>/`, defeating the proxy preamble.
+ *   `port` is the dedicated preview listener's port (warren-3f8a); null
+ *   keeps the URL portless for callers that predate the split listener.
  */
-export function formatPreviewUrl(runId: string, host: string, mode: PreviewMode): string {
+export function formatPreviewUrl(
+	runId: string,
+	host: string,
+	mode: PreviewMode,
+	port: number | null = null,
+): string {
 	if (mode === "path") {
-		return `https://${host}/p/${runId}/`;
+		const authority = port === null ? host : `${host}:${port}`;
+		return `https://${authority}/p/${runId}/`;
 	}
 	return `https://run-${runId}.${host}`;
 }

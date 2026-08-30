@@ -1,12 +1,12 @@
 import { dirname, join } from "node:path";
 import type { EventRow } from "../../db/schema.ts";
-import { closeSeed, type SeedsCliDeps } from "../../seeds-cli/index.ts";
+import type { IssueTracker } from "../../tracker/contract.ts";
 import type { ReapFs } from "./types.ts";
 import { splitLines } from "./util.ts";
 
 /* -----------------------------------------------------------------------
  * warren-fbbf: these mirror primitives are PURE string→disk merges. The burrow
- * file-read that used to live here (`burrowClient.http.files.read`) was evicted
+ * file-read that used to live here (`sandboxClient.http.files.read`) was evicted
  * to the LocalProvider (`src/runtime/local/finalize.ts`), which is the ONE place
  * warren still speaks the burrow dialect. finalize reads the workspace tracker
  * body off the live sandbox and hands it in as `workspaceBody`; this module only
@@ -48,7 +48,7 @@ export async function mirrorSeeds(input: MirrorClosedSeedsInput): Promise<Mirror
 	const { workspaceBody, projectPath, fs, emit } = input;
 	if (workspaceBody === null) return { closed: 0, created: 0 };
 	const projectFile = join(projectPath, ".seeds", "issues.jsonl");
-	const burrowBody = workspaceBody;
+	const sandboxBody = workspaceBody;
 
 	const projectBody = (await fs.readFile(projectFile)) ?? "";
 	const projectRows = parseSeeds(projectBody);
@@ -62,7 +62,7 @@ export async function mirrorSeeds(input: MirrorClosedSeedsInput): Promise<Mirror
 	let created = 0;
 	let changed = false;
 
-	for (const incoming of parseSeeds(burrowBody)) {
+	for (const incoming of parseSeeds(sandboxBody)) {
 		const existingIdx = projectIndex.get(incoming.id);
 		if (existingIdx === undefined) {
 			projectRows.push(incoming);
@@ -132,7 +132,7 @@ export async function mirrorPlans(input: MirrorClosedSeedsInput): Promise<number
 	const { workspaceBody, projectPath, fs, emit } = input;
 	if (workspaceBody === null) return 0;
 	const projectFile = join(projectPath, ".seeds", "plans.jsonl");
-	const burrowBody = workspaceBody;
+	const sandboxBody = workspaceBody;
 
 	const projectBody = (await fs.readFile(projectFile)) ?? "";
 	const projectIds = new Set<string>();
@@ -153,7 +153,7 @@ export async function mirrorPlans(input: MirrorClosedSeedsInput): Promise<number
 	}
 
 	let added = 0;
-	for (const line of splitLines(burrowBody)) {
+	for (const line of splitLines(sandboxBody)) {
 		try {
 			const parsed: unknown = JSON.parse(line);
 			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
@@ -186,8 +186,9 @@ export async function mirrorPlans(input: MirrorClosedSeedsInput): Promise<number
 
 export interface CloseRunSeedIdInput {
 	readonly seedId: string;
+	readonly projectId: string;
 	readonly projectPath: string;
-	readonly seedsCli: SeedsCliDeps;
+	readonly issueTracker: IssueTracker;
 	readonly emit: (kind: string, payload: unknown) => Promise<EventRow>;
 }
 
@@ -197,14 +198,17 @@ export interface CloseRunSeedIdInput {
  * the agent performed is already reflected in the project clone.
  *
  * If the seed was already closed (agent closed it + mirrorSeeds picked it
- * up), `sd close` is idempotent and exits 0 — the extra call is harmless.
- * `stageSeedsForCommit` will pick up the updated issues.jsonl and author
- * a `chore(warren): seeds state` commit on the branch so the close appears
- * in git history whether the agent ran `sd close` or not.
+ * up), closing is idempotent (tracker.closeIssue contract) — the extra call
+ * is harmless. `stageSeedsForCommit` will pick up the updated issues.jsonl
+ * and author a `chore(warren): seeds state` commit on the branch so the
+ * close appears in git history whether the agent ran `sd close` or not.
+ *
+ * warren-6234: routed through the IssueTracker seam (`tracker.closeIssue`)
+ * instead of the seeds CLI facade.
  */
 export async function closeRunSeedId(input: CloseRunSeedIdInput): Promise<boolean> {
-	const { seedId, projectPath, seedsCli, emit } = input;
-	await closeSeed(seedsCli, projectPath, seedId);
+	const { seedId, projectId, projectPath, issueTracker, emit } = input;
+	await issueTracker.closeIssue({ projectId, localPath: projectPath }, seedId);
 	await emit("seeds.seed_id_closed", { id: seedId, mode: "host_side" });
 	return true;
 }

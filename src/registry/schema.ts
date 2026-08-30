@@ -25,7 +25,16 @@
  */
 
 import { z } from "zod";
+import { type AcceptedRuntimeId, isKnownRuntimeId, KNOWN_RUNTIME_IDS } from "../core/wire.ts";
+import { AgentNameSchema } from "./agent-name.ts";
 import { AgentSchemaError } from "./errors.ts";
+import { type GatedPromptFragments, validateGatedPrompts } from "./prompt-gating.ts";
+
+// warren-2b75: the shared agent-name grammar lives in agent-name.ts (file-size
+// budget); re-export so existing import sites keep resolving it from here.
+export { AGENT_NAME_PATTERN, AgentNameSchema } from "./agent-name.ts";
+
+import { readSteeringCapability } from "./steering.ts";
 
 export const REQUIRED_AGENT_SECTIONS = ["system"] as const;
 export type RequiredAgentSection = (typeof REQUIRED_AGENT_SECTIONS)[number];
@@ -38,7 +47,7 @@ const SectionSchema = z.object({
 export const RenderResponseSchema = z.object({
 	success: z.literal(true),
 	command: z.literal("render"),
-	name: z.string().min(1),
+	name: AgentNameSchema,
 	version: z.number().int().positive(),
 	sections: z.array(SectionSchema),
 	resolvedFrom: z.array(z.string()).optional(),
@@ -53,6 +62,8 @@ export interface AgentDefinition {
 	readonly sections: Readonly<Record<string, string>>;
 	readonly resolvedFrom: readonly string[];
 	readonly frontmatter: Readonly<Record<string, unknown>>;
+	/** Capability-gated fragments (warren-cb46) — see prompt-gating.ts. */
+	readonly gatedPrompts?: GatedPromptFragments;
 }
 
 /**
@@ -65,12 +76,12 @@ export interface AgentDefinition {
  *              "gpt-4o", "gemini-2.0-pro"). Free-form string; the runtime
  *              decides how to interpret it.
  *   runtime  — burrow runtime id this canopy agent dispatches onto
- *              (e.g. "claude-code", "sapling", "pi"). When unset,
+ *              (e.g. "claude-code", "pi"). When unset,
  *              warren falls back to `DEFAULT_RUNTIME_ID` ("pi") —
  *              the multi-provider runtime is the preferred default
  *              (warren-16f8). claude-code stays available but is now
  *              opt-in: pin it via this field. Built-in agents that
- *              want a non-pi runtime (claude-code / sapling) declare
+ *              want a non-pi runtime (claude-code) declare
  *              it here explicitly; interactive system-prompt-only
  *              agents like `brainstorm` / `planner` (warren-ebca) do
  *              the same so they compose onto a real burrow runtime.
@@ -87,6 +98,10 @@ export interface AgentDefinition {
  *              propagating their system prompt to child runs that
  *              need to write code. Falls back to the parent run's
  *              agentName when unset.
+ *   steering — steering-consumption capability (warren-3305), one of
+ *              STEERING_CAPABILITIES. Read by `readSteeringCapability`;
+ *              `steerRun` 409s a steer the harness cannot consume.
+ *              Absent = legacy fail-open.
  *   tools    — object (warren-8dee). Per-agent tool allowlist/denylist
  *              consumed by the pi runtime: `{ allow?, deny?, noBuiltins?,
  *              noTools? }` → pi's `--tools` / `--exclude-tools` /
@@ -258,17 +273,89 @@ export const DEFAULT_RUNTIME_ID = "pi";
  *   1. `configOverride` — per-project `.warren/config.yaml`
  *      `interactiveAgents.plannerRuntime`
  *   2. `frontmatter.runtime` — declared by built-ins that pin a
- *      specific runtime (claude-code / sapling) or compose a system
+ *      specific runtime (claude-code) or compose a system
  *      prompt onto an existing runtime (planner,
  *      warren-ebca)
  *   3. `DEFAULT_RUNTIME_ID` ("pi") — the preferred default when
  *      nothing pins a runtime; claude-code is opt-in
  */
-export function readRuntimeId(agent: AgentDefinition, configOverride?: string): string {
-	if (typeof configOverride === "string" && configOverride.length > 0) return configOverride;
+export function readRuntimeId(agent: AgentDefinition, configOverride?: string): AcceptedRuntimeId {
+	if (typeof configOverride === "string" && configOverride.length > 0) {
+		return assertKnownRuntimeId(configOverride, agent.name, "config override");
+	}
 	const r = agent.frontmatter.runtime;
-	if (typeof r === "string" && r.length > 0) return r;
+	if (typeof r === "string" && r.length > 0) {
+		return assertKnownRuntimeId(r, agent.name, "frontmatter.runtime");
+	}
 	return DEFAULT_RUNTIME_ID;
+}
+
+/**
+ * Env var an operator sets when their deployment registers runtime ids
+ * beyond warren's canonical ones (warren-c4be). Comma-separated; empty /
+ * unset means the canonical list alone, so validation stays fail-closed by
+ * default. The acceptance harness uses it for its `stub-shell` runtime.
+ *
+ * Scope: agent `frontmatter.runtime` and the dispatch-time override. The
+ * `.warren/config.yaml` `plannerRuntime` enum stays strictly canonical.
+ */
+export const EXTRA_RUNTIME_IDS_ENV = "WARREN_EXTRA_RUNTIME_IDS";
+
+/**
+ * A runtime id that passed validation, declared in the canonical wire home
+ * (`src/core/wire-runtime.ts`) because the dispatch seam now types on it too.
+ * Re-exported here so this module keeps its own vocabulary word.
+ */
+export type { AcceptedRuntimeId };
+
+/** Parse {@link EXTRA_RUNTIME_IDS_ENV} into a deduped, trimmed id list. */
+export function readExtraRuntimeIds(
+	env: Readonly<Record<string, string | undefined>> = process.env,
+): readonly string[] {
+	const raw = env[EXTRA_RUNTIME_IDS_ENV];
+	if (raw === undefined || raw.trim() === "") return [];
+	const ids = raw
+		.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0 && !isKnownRuntimeId(s));
+	return [...new Set(ids)];
+}
+
+/** The full accepted runtime vocabulary: canonical plus operator extras. */
+export function acceptedRuntimeIds(
+	env?: Readonly<Record<string, string | undefined>>,
+): readonly string[] {
+	return [...KNOWN_RUNTIME_IDS, ...readExtraRuntimeIds(env)];
+}
+
+/**
+ * Validate a resolved runtime id against the canonical vocabulary
+ * (warren-c4be). Throws `AgentSchemaError` — which the HTTP layer maps to
+ * 422 — naming the offending id and the accepted list.
+ *
+ * This is the systemic fix behind the warren-ebca incident class: an
+ * unknown runtime id used to travel all the way into burrow, which failed
+ * its own `BUILT_IN_RUNTIMES` lookup and killed the run before agent boot,
+ * long past any 4xx boundary. Called from `validateAgentDefinition`
+ * (registration / refresh / seeding) and again from `readRuntimeId`
+ * (dispatch), so a legacy row that predates the check still fails 4xx
+ * rather than sandbox-side.
+ */
+export function assertKnownRuntimeId(
+	value: string,
+	agentName: string,
+	source = "frontmatter.runtime",
+	env?: Readonly<Record<string, string | undefined>>,
+): AcceptedRuntimeId {
+	if (isKnownRuntimeId(value)) return value;
+	const accepted = acceptedRuntimeIds(env);
+	if (accepted.includes(value)) return value;
+	throw new AgentSchemaError(
+		`agent "${agentName}" ${source} "${value}" is not a known runtime id (known: ${accepted.join(", ")})`,
+		{
+			recoveryHint: `set the runtime to one of: ${accepted.join(", ")}, or declare the id in ${EXTRA_RUNTIME_IDS_ENV}`,
+		},
+	);
 }
 
 /**
@@ -365,6 +452,34 @@ export function validateAgentDefinition(def: AgentDefinition): void {
 	// warren-8dee: reject a malformed tools policy here (parse-time + cross-tier
 	// composer) so an unenforceable read-only declaration surfaces loudly.
 	readToolsFrontmatter(def.frontmatter, def.name);
+	// warren-c4be: an unknown `frontmatter.runtime` fails at registration /
+	// refresh / seeding instead of dying inside the sandbox at dispatch.
+	validateAgentRuntimeId(def);
+	// warren-3305: a malformed steering capability fails just as loudly.
+	readSteeringCapability(def.frontmatter, def.name);
+	// warren-cb46: gated fragments must be strings (see prompt-gating.ts).
+	validateGatedPrompts(def);
+}
+
+/**
+ * Reject an agent whose declared `frontmatter.runtime` is absent-shaped or
+ * outside {@link KNOWN_RUNTIME_IDS} (warren-c4be). An agent that pins no
+ * runtime is fine — `readRuntimeId` falls back to `DEFAULT_RUNTIME_ID`.
+ * Called by `validateAgentDefinition` and by built-in / seed-file seeding,
+ * the two ways an agent row enters the registry.
+ */
+export function validateAgentRuntimeId(def: AgentDefinition): void {
+	const runtime = def.frontmatter.runtime;
+	if (runtime === undefined || runtime === null) return;
+	if (typeof runtime !== "string" || runtime.length === 0) {
+		throw new AgentSchemaError(
+			`agent "${def.name}" frontmatter.runtime must be a non-empty string`,
+			{
+				recoveryHint: `set the runtime to one of: ${acceptedRuntimeIds().join(", ")}`,
+			},
+		);
+	}
+	assertKnownRuntimeId(runtime, def.name);
 }
 
 /**

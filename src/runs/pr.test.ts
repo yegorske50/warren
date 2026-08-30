@@ -1,113 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { jsonResponse, recordingFetch } from "./pr.test-helpers.ts";
-import {
-	buildPrContent,
-	loadAutoOpenPrConfigFromEnv,
-	openPullRequest,
-	type PrFetcher,
-} from "./pr.ts";
-
-const baseInput = {
-	owner: "jayminwest",
-	repo: "warren",
-	head: "agent/refactor-bot/run-1",
-	base: "main",
-	title: "Test PR",
-	body: "body",
-	token: "ghp_xyz",
-};
-
-describe("openPullRequest", () => {
-	test("returns ok with html_url on 201 created", async () => {
-		const { fetch, calls } = recordingFetch([
-			jsonResponse(201, { html_url: "https://github.com/jayminwest/warren/pull/42" }),
-		]);
-		const result = await openPullRequest(baseInput, { fetch });
-		expect(result).toEqual({
-			ok: true,
-			url: "https://github.com/jayminwest/warren/pull/42",
-			mode: "created",
-		});
-		expect(calls).toHaveLength(1);
-		expect(calls[0]?.method).toBe("POST");
-		expect(calls[0]?.url).toBe("https://api.github.com/repos/jayminwest/warren/pulls");
-		expect(calls[0]?.headers.authorization).toBe("Bearer ghp_xyz");
-		expect(calls[0]?.headers.accept).toBe("application/vnd.github+json");
-		const body = JSON.parse(calls[0]?.body as string);
-		expect(body).toEqual({
-			title: "Test PR",
-			body: "body",
-			head: "agent/refactor-bot/run-1",
-			base: "main",
-		});
-	});
-
-	test("treats 422 'already exists' as success and returns the existing PR url", async () => {
-		const { fetch, calls } = recordingFetch([
-			jsonResponse(422, {
-				message: "Validation Failed",
-				errors: [{ message: "A pull request already exists for warren:foo." }],
-			}),
-			jsonResponse(200, [{ html_url: "https://github.com/jayminwest/warren/pull/9" }]),
-		]);
-		const result = await openPullRequest(baseInput, { fetch });
-		expect(result).toEqual({
-			ok: true,
-			url: "https://github.com/jayminwest/warren/pull/9",
-			mode: "exists",
-		});
-		expect(calls).toHaveLength(2);
-		expect(calls[1]?.method).toBe("GET");
-		expect(calls[1]?.url).toContain("head=jayminwest%3Aagent");
-		expect(calls[1]?.url).toContain("base=main");
-	});
-
-	test("returns http_error for unrecognized 422 and embeds errors[] in message (warren-70c6)", async () => {
-		const { fetch, calls } = recordingFetch([
-			jsonResponse(422, {
-				message: "Validation Failed",
-				errors: [{ message: "No commits between main and feature." }],
-			}),
-		]);
-		const result = await openPullRequest(baseInput, { fetch });
-		expect((result as { reason: string }).reason).toBe("http_error");
-		expect((result as { message: string }).message).toContain("errors="); // warren-70c6
-		expect(calls).toHaveLength(1);
-	});
-
-	test("returns missing_token when token is empty", async () => {
-		const { fetch, calls } = recordingFetch([]);
-		const result = await openPullRequest({ ...baseInput, token: "" }, { fetch });
-		expect(result).toEqual({
-			ok: false,
-			reason: "missing_token",
-			message: "GITHUB_TOKEN unset; cannot open pull request",
-		});
-		expect(calls).toHaveLength(0);
-	});
-
-	test("returns network on fetch throw", async () => {
-		const failingFetch: PrFetcher = {
-			fetch: (async () => {
-				throw new Error("ECONNREFUSED");
-			}) as unknown as typeof fetch,
-		};
-		const result = await openPullRequest(baseInput, failingFetch);
-		expect(result.ok).toBe(false);
-		expect((result as { reason: string }).reason).toBe("network");
-		expect((result as { message: string }).message).toContain("ECONNREFUSED");
-	});
-
-	test("returns http_error on a 500 response", async () => {
-		const { fetch } = recordingFetch([
-			new Response("oops", { status: 500, headers: { "content-type": "text/plain" } }),
-		]);
-		const result = await openPullRequest(baseInput, { fetch });
-		expect(result.ok).toBe(false);
-		expect((result as { reason: string }).reason).toBe("http_error");
-		expect((result as { message: string }).message).toContain("500");
-	});
-});
+import { buildPrContent, loadAutoOpenPrConfigFromEnv } from "./pr.ts";
 
 describe("buildPrContent", () => {
 	test("first non-empty prompt line becomes the title", () => {
@@ -311,13 +203,29 @@ describe("buildPrContent", () => {
 		expect(c.body).not.toContain("## Prompt");
 		expect(c.body).toContain("## Summary"); // other defaults survive
 	});
+
+	test("bounds oversized commit lists with a summary line", () => {
+		const commits = Array.from({ length: 2_000 }, (_, index) => ({
+			sha: `${index.toString(16).padStart(7, "0")}abcdef`,
+			subject: `commit ${index} ${"x".repeat(40)}`,
+		}));
+		const c = buildPrContent({
+			prompt: "avoid oversized PR bodies",
+			runId: "run_large",
+			agentName: "pi",
+			commits,
+		});
+		expect(c.body.length).toBeLessThanOrEqual(65_536);
+		expect(c.body).toContain("...and ");
+		expect(c.body).toContain("## Prompt");
+		expect(c.body).toContain("## Commits (2000)");
+	});
 });
 
 describe("loadAutoOpenPrConfigFromEnv", () => {
-	test("defaults to enabled with empty token when env is empty", () => {
+	test("defaults to enabled when env is empty", () => {
 		const cfg = loadAutoOpenPrConfigFromEnv({});
 		expect(cfg.enabled).toBe(true);
-		expect(cfg.token).toBe("");
 		expect(cfg.warrenBaseUrl).toBeNull();
 	});
 
@@ -333,12 +241,10 @@ describe("loadAutoOpenPrConfigFromEnv", () => {
 		}
 	});
 
-	test("forwards GITHUB_TOKEN and WARREN_BASE_URL", () => {
+	test("forwards WARREN_BASE_URL", () => {
 		const cfg = loadAutoOpenPrConfigFromEnv({
-			GITHUB_TOKEN: "ghp_x",
 			WARREN_BASE_URL: "https://warren.example.com",
 		});
-		expect(cfg.token).toBe("ghp_x");
 		expect(cfg.warrenBaseUrl).toBe("https://warren.example.com");
 	});
 });

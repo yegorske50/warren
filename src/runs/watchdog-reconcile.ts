@@ -18,6 +18,14 @@
  * coarse `terminalReason` through to a domain `failure_reason`. Routing through
  * reap (not a bare finalize) also destroys the sandbox — same reclaim philosophy
  * as the heartbeat `forceFail`.
+ *
+ * ## Cancel intent wins over the lost mapping (warren-fe9b / warren-d15c)
+ * A vanished pod (`exists:false`) normally reads as a LOST run — but not when
+ * warren itself deleted the pod: `cancelRun` records a `cancel.requested` event
+ * on the run's log when it forwards the pod delete, and that intent flips the
+ * reconcile target from `failed/sandbox_run_lost` to `cancelled`. Without it,
+ * an operator-requested cancel on K8s surfaced as a failure ~25 min later (the
+ * pod-watcher's NotFound → lost reconciliation overriding the cancel intent).
  */
 
 import type { Repos } from "../db/repos/index.ts";
@@ -25,6 +33,7 @@ import type { RunFailureReason, RunRow, RunTerminalState } from "../db/schema.ts
 import type { RunHandle, RunStatus, RuntimeProvider, TerminalReason } from "../runtime/contract.ts";
 import type { RunEventBroker } from "./events.ts";
 import type { AutoOpenPrConfig } from "./pr.ts";
+import { hasStdinHoldTimeoutWitness } from "./reap/state.ts";
 import { type BridgeLogger, bindBridgeLogger } from "./stream/index.ts";
 import type { WatchdogReap } from "./watchdog.ts";
 
@@ -64,15 +73,30 @@ export interface ReconcileDeps {
  * The terminal state (+ failure reason) to reconcile a stuck `running` run into,
  * projected from the provider's `status()` snapshot — or `null` when the pod is
  * still live (`queued`/`running`), in which case the net leaves the run for a
- * later tick (warren-c433). A vanished pod (`exists:false`) is a lost run; a
+ * later tick (warren-c433). A vanished pod (`exists:false`) is a lost run —
+ * UNLESS `cancelRequested` records that warren deleted the pod itself, in which
+ * case the cancel intent wins and the run reconciles to `cancelled`
+ * (warren-fe9b / warren-d15c); a
  * `failed` pod carries its coarse `terminalReason` through to a domain
  * `failure_reason`; `succeeded`/`cancelled` reconcile to that terminal state so a
  * cleanly-completed pod still finalizes (and its reap re-drives finalize).
+ *
+ * warren-7f0b: a still-LIVE pod is no longer an automatic pass. When the run's
+ * event log carries the entrypoint's `stdin_hold_timeout` kill witness, the
+ * harness is dead but the pod (entrypoint finalize poller) stays Running — the
+ * zombie shape where nothing terminalizes the row and the finalize intent is
+ * never parked. `maybeReconcileTerminal` reaps that run as
+ * `failed(agent_died)` so the in-pod finalize loop picks up the intent and
+ * salvages the workspace before the pod (and its emptyDir) goes away.
  */
 export function reconcileTargetFromStatus(
 	status: RunStatus,
+	cancelRequested = false,
 ): { outcome: RunTerminalState; failureReason?: RunFailureReason } | null {
-	if (!status.exists) return { outcome: "failed", failureReason: "burrow_run_lost" };
+	if (!status.exists) {
+		if (cancelRequested) return { outcome: "cancelled" };
+		return { outcome: "failed", failureReason: "sandbox_run_lost" };
+	}
 	switch (status.phase) {
 		case "succeeded":
 			return { outcome: "succeeded" };
@@ -94,7 +118,7 @@ function failureReasonFromTerminal(reason: TerminalReason | undefined): RunFailu
 		case "evicted":
 			return "evicted";
 		case "lost":
-			return "burrow_run_lost";
+			return "sandbox_run_lost";
 		default:
 			return "crashed";
 	}
@@ -113,11 +137,11 @@ export async function maybeReconcileTerminal(
 	idleMs: number,
 	now: Date,
 ): Promise<RunTerminalState | null> {
-	if (run.burrowId === null || run.burrowRunId === null) return null;
+	if (run.sandboxId === null || run.sandboxRunId === null) return null;
 	const handle: RunHandle = {
 		runId: run.id,
-		sandboxId: run.burrowId,
-		providerRunId: run.burrowRunId,
+		sandboxId: run.sandboxId,
+		providerRunId: run.sandboxRunId,
 	};
 	let status: RunStatus;
 	try {
@@ -127,10 +151,42 @@ export async function maybeReconcileTerminal(
 		// force-finalizing a run it couldn't observe as terminal.
 		return null;
 	}
-	const target = reconcileTargetFromStatus(status);
-	if (target === null) return null;
-	await forceReconcile(deps, run, status, target, idleMs, now);
+	// warren-fe9b / warren-d15c: the lost mapping only applies when the pod
+	// vanished on its own. When warren itself deleted it (a `cancel.requested`
+	// event is on the run's log), the cancel intent wins — probed cheaply and
+	// only on the exists:false branch so a live pod never pays for the query.
+	const cancelRequested = !status.exists && (await hasCancelIntent(deps.repos, run.id));
+	const target = reconcileTargetFromStatus(status, cancelRequested);
+	if (target === null) {
+		// warren-7f0b: the zombie-watchdog shape — the pod still reads Running
+		// (the entrypoint lives on, polling finalize-intent for up to its 40-min
+		// ceiling) but the event log already carries the entrypoint's
+		// `stdin_hold_timeout` kill witness: the harness is dead, the run's
+		// liveness is false, and nothing else will reap it. Reap now so the
+		// finalize intent parks while the pod (and its emptyDir) is still alive —
+		// the in-pod finalize step then collects + salvages the workspace before
+		// the pod terminates. Scope: only the watchdog-kill shape; the general
+		// infra-death salvage case stays warren-6c94.
+		if (await hasStdinHoldTimeoutWitness(deps.repos, run.id)) {
+			const died = { outcome: "failed" as const, failureReason: "agent_died" as const };
+			await forceReconcile(deps, run, status, died, idleMs, now);
+			return died.outcome;
+		}
+		return null;
+	}
+	await forceReconcile(deps, run, status, target, idleMs, now, cancelRequested);
 	return target.outcome;
+}
+
+/**
+ * The cancel-intent probe (warren-fe9b): has the operator asked warren to stop
+ * this run? `cancelRun` appends a `cancel.requested` event when it forwards the
+ * pod delete to the provider, so its presence on the run's log is the durable
+ * record that warren itself deleted the pod. Exported for the watchdog tick's
+ * fast-path grace, which probes status() sooner for cancel-intent runs.
+ */
+export async function hasCancelIntent(repos: Repos, runId: string): Promise<boolean> {
+	return repos.events.hasKind(runId, "cancel.requested");
 }
 
 async function forceReconcile(
@@ -140,12 +196,13 @@ async function forceReconcile(
 	target: { outcome: RunTerminalState; failureReason?: RunFailureReason },
 	idleMs: number,
 	now: Date,
+	cancelRequested = false,
 ): Promise<void> {
 	const log = bindBridgeLogger(deps.logger, {
 		run_id: run.id,
-		...(run.burrowRunId !== null ? { burrow_run_id: run.burrowRunId } : {}),
+		...(run.sandboxRunId !== null ? { sandbox_run_id: run.sandboxRunId } : {}),
 	});
-	await emitReconciledEvent(deps, run, status, target.outcome, idleMs, now);
+	await emitReconciledEvent(deps, run, status, target.outcome, idleMs, now, cancelRequested);
 	await deps.reap({
 		runId: run.id,
 		outcome: target.outcome,
@@ -166,6 +223,7 @@ async function forceReconcile(
 			exists: status.exists,
 			...(target.failureReason !== undefined ? { failureReason: target.failureReason } : {}),
 			...(status.terminalDetail != null ? { terminalDetail: status.terminalDetail } : {}),
+			...(cancelRequested ? { cancelRequested: true } : {}),
 		},
 		"watchdog reconciled terminal-but-stuck run",
 	);
@@ -178,11 +236,12 @@ async function emitReconciledEvent(
 	outcome: RunTerminalState,
 	idleMs: number,
 	now: Date,
+	cancelRequested = false,
 ): Promise<void> {
 	const seq = ((await deps.repos.events.maxSeqForRun(run.id)) ?? 0) + 1;
 	const row = await deps.repos.events.append({
 		runId: run.id,
-		burrowEventSeq: seq,
+		sandboxEventSeq: seq,
 		ts: now.toISOString(),
 		kind: WATCHDOG_TERMINAL_RECONCILED_KIND,
 		stream: "system",
@@ -191,13 +250,17 @@ async function emitReconciledEvent(
 			outcome,
 			providerPhase: status.phase,
 			providerExists: status.exists,
-			burrowRunId: run.burrowRunId,
+			sandboxRunId: run.sandboxRunId,
 			// The provider's free-text terminal detail (warren-4a95) — e.g. the
 			// kubelet's eviction message (`Pod ephemeral local storage usage
 			// exceeds the total limit of containers …`). Persisted onto the run's
 			// event stream so the cause survives the pod's (and its kubectl
 			// events') GC.
 			...(status.terminalDetail != null ? { providerDetail: status.terminalDetail } : {}),
+			// warren-fe9b: the cancel intent that flipped a vanished pod from
+			// failed/sandbox_run_lost to cancelled — recorded so the reconcile is
+			// auditable as an operator stop, not a mysterious loss.
+			...(cancelRequested ? { cancelRequested: true } : {}),
 		},
 	});
 	deps.broker?.publish(run.id, row);

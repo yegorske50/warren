@@ -54,10 +54,11 @@
 # also still ships as a built-in for operators who want it; neither is
 # scheduled on this instance.
 #
-# To re-enable the example, uncomment the block below. Note warren-af3f:
-# cron-triggered patrols succeeded only 32% of the time in production
-# (never_started and dropped_commit are the two dominant failure modes).
-# Fix that before scheduling anything nightly.
+# To run the example, uncomment the block below. One caution from the
+# 2026-07 production sample: cron-triggered patrols succeeded only 32%
+# of the time (never_started and dropped_commit were the two dominant
+# failure modes). No re-enable is planned on this instance — the patrol
+# schedule is retired, and warren-af3f closed with it (2026-08-16).
 #
 # An empty trigger list is valid — warren parses this file and schedules
 # nothing.

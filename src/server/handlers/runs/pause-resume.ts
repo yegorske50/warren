@@ -1,3 +1,4 @@
+import { INBOX_PRIORITIES } from "../../../core/wire.ts";
 import {
 	type CancelReap,
 	cancelRun,
@@ -5,9 +6,10 @@ import {
 	reapRun,
 	steerRun,
 } from "../../../runs/index.ts";
-import type { MessagePriority, RuntimeProvider } from "../../../runtime/contract.ts";
+import type { RuntimeProvider } from "../../../runtime/contract.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
+import { optionalEnum } from "../body-fields.ts";
 import {
 	optionalString,
 	readJsonBody,
@@ -36,6 +38,11 @@ export function cancelRunWiring(deps: ServerDeps): {
 		reap: (reapInput) =>
 			reapRun({
 				...reapInput,
+				// warren-45e6: the inline reap's pr_open runs through the boot-resolved
+				// forge. This single bind covers BOTH cancel call sites the Forge
+				// migration owns — the plan-run cancel handler and the run
+				// cancel/pause-resume handler (warren-b223 inline reap).
+				forge: deps.forge,
 				...(previewSidecars !== undefined ? { previewSidecars } : {}),
 			}),
 	};
@@ -45,15 +52,18 @@ export function steerRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
 		const body = await readJsonBody(ctx);
+		// warren-b27c: membership-checked against the canonical wire vocabulary
+		// before anything persists. An unchecked cast let `{"priority":"CRITICAL"}`
+		// reach the `run_inbox` row (TS-only enum, no SQL CHECK) and make the
+		// delivery comparator non-total.
+		const priority = optionalEnum(body, "priority", INBOX_PRIORITIES);
 		const result = await steerRun({
 			runId: id,
 			body: requireString(body, "body"),
 			repos: deps.repos,
 			runtimeProvider: deps.runtimeProvider,
 			broker: deps.broker,
-			...(optionalString(body, "priority") !== undefined
-				? { priority: optionalString(body, "priority") as MessagePriority }
-				: {}),
+			...(priority !== undefined ? { priority } : {}),
 			...(optionalString(body, "fromActor") !== undefined
 				? { fromActor: optionalString(body, "fromActor") as string }
 				: {}),
@@ -73,9 +83,15 @@ export function steerRunHandler(deps: ServerDeps): RouteHandler {
 export function pollRunInboxHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const id = requireParam(ctx, "id");
+		// warren-3305: `?peek=1` lists the unread queue WITHOUT claiming it.
+		// A bare poll is poll-CONSUME — an operator "just checking" would steal
+		// the message from the pod's steering poll. The pod never peeks.
+		const peek = ctx.url.searchParams.get("peek");
 		const result = await pollRunInbox({
 			runId: id,
 			repos: deps.repos,
+			broker: deps.broker,
+			...(peek === "1" || peek === "true" ? { claim: false } : {}),
 			...(deps.now !== undefined ? { now: deps.now } : {}),
 		});
 		return jsonResponse(200, { messages: result.messages });
@@ -99,7 +115,7 @@ export function cancelRunHandler(deps: ServerDeps): RouteHandler {
 		return jsonResponse(200, {
 			state: result.state,
 			alreadyTerminal: result.alreadyTerminal,
-			burrowRun: result.burrowRun,
+			sandboxRun: result.sandboxRun,
 		});
 	};
 }

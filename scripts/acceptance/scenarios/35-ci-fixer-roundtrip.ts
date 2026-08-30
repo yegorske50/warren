@@ -28,9 +28,12 @@
  * verdicts. There is no faithful local substitute, so this scenario is
  * skip-gated (same convention as scenario 19 / warren-on-postgres) on:
  *
- *   - `GITHUB_TOKEN` — a token with `repo` scope. Used both for the
- *     check-runs fetch (scheduler `githubToken`) and the branch push
- *     (`insteadOf` rewrite); also drives auto-open-PR.
+ *   - `GITHUB_TOKEN` — a token with `repo` scope, owned by the BOOTED
+ *     warren (forge-contract.md §6.14): `bootInProc` passes it through
+ *     (warren-2740) and warren spends it on the check-runs fetch
+ *     (scheduler `githubToken`), the branch push, and auto-open-PR.
+ *     The harness borrows the same token only for best-effort PR/branch
+ *     cleanup in the `finally` below (see `lib/github.ts`).
  *   - `WARREN_ACCEPT_CI_FIXER_REPO` — an `https://github.com/<owner>/<repo>.git`
  *     URL to a repo the operator controls, prepared as a clone of the
  *     harness sample project (so the `stub-shell` agent in `burrow.toml`
@@ -49,6 +52,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { isTerminalRunState } from "../../../src/core/wire.ts";
 import {
 	AcceptanceError,
 	assertEqual,
@@ -56,8 +60,9 @@ import {
 	type Scenario,
 	skipScenario,
 } from "../lib/assert.ts";
+import { closePullRequestAndBranch, parseRepoSlug } from "../lib/github.ts";
 import { WarrenHttp } from "../lib/http.ts";
-import { sleep } from "./lib/poll-helpers.ts";
+import { pollAcceptance } from "../lib/poll.ts";
 
 interface ProjectRow {
 	readonly id: string;
@@ -81,14 +86,12 @@ interface ListRunsResponse {
 	readonly runs: readonly RunRow[];
 }
 
-const GITHUB_API = "https://api.github.com";
 const POLL_INTERVAL_MS = 2_000;
 // Clone + stub run + reap + push + PR-open.
 const OPENER_BUDGET_MS = 180_000;
 // GitHub Actions runner latency + a few scheduler ticks. Generous: this
 // scenario is opt-in and a slow runner queue must not flake it.
 const FIXER_DISPATCH_BUDGET_MS = 600_000;
-const TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
 
 export const scenario: Scenario = {
 	id: "35",
@@ -105,7 +108,14 @@ export const scenario: Scenario = {
 		const slug = parseRepoSlug(repoUrl);
 
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// The stub agent was seeded at boot via WARREN_SEED_AGENTS_FILE
+		// (warren-e376); POST /agents/refresh is deleted (pl-3a79). GET it
+		// to prove boot seeding landed before spawning against it.
+		await http.expectStatus(
+			"GET",
+			`/agents/${encodeURIComponent(ctx.fixtures.stubAgentName)}`,
+			200,
+		);
 		const project = await http.expectJson<ProjectRow>("POST", "/projects", 201, {
 			body: { gitUrl: repoUrl },
 		});
@@ -141,45 +151,34 @@ export const scenario: Scenario = {
 			// branches/PRs across runs. Each step is independently guarded.
 			await cancelRun(http, opener?.id);
 			await cancelLatestFixer(http, project.id);
-			await closeOpenerPr(token, slug, opener?.prUrl ?? null);
+			await closePullRequestAndBranch(token, slug, opener?.prUrl ?? null);
 			await deleteProject(http, project.id);
 		}
 	},
 };
 
-/** Parse `owner/repo` from an `https://github.com/<owner>/<repo>(.git)?` URL. */
-function parseRepoSlug(url: string): { owner: string; repo: string } {
-	const m = /github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url);
-	if (m?.[1] === undefined || m[2] === undefined) {
-		throw new AcceptanceError(`WARREN_ACCEPT_CI_FIXER_REPO is not a GitHub repo url: ${url}`);
-	}
-	return { owner: m[1], repo: m[2] };
-}
-
 async function waitForOpenerPr(http: WarrenHttp, runId: string): Promise<RunRow> {
-	const deadline = Date.now() + OPENER_BUDGET_MS;
-	let last: RunRow | null = null;
-	while (Date.now() < deadline) {
-		last = await http.expectJson<RunRow>("GET", `/runs/${encodeURIComponent(runId)}`, 200);
-		if (last.prUrl !== null && last.prUrl !== "") return last;
-		if (TERMINAL_STATES.has(last.state) && last.prUrl === null) {
-			// Terminal with no PR: give reap a couple ticks, then fail clearly.
-			await sleep(POLL_INTERVAL_MS);
-			const recheck = await http.expectJson<RunRow>(
-				"GET",
-				`/runs/${encodeURIComponent(runId)}`,
-				200,
-			);
-			if (recheck.prUrl !== null) return recheck;
-			throw new AcceptanceError(
-				`opener run ${runId} reached '${last.state}' without opening a PR — check GITHUB_TOKEN push auth + the repo's auto-open-PR config`,
-			);
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new AcceptanceError(
-		`opener run ${runId} did not open a PR within ${OPENER_BUDGET_MS}ms (last state=${last?.state})`,
-	);
+	return pollAcceptance({
+		label: "opener run PR",
+		id: runId,
+		timeoutMs: OPENER_BUDGET_MS,
+		intervalMs: POLL_INTERVAL_MS,
+		fetchRow: async (): Promise<RunRow> => {
+			const row = await http.sdkClient().getRun(runId);
+			if (isTerminalRunState(row.state) && (row.prUrl === null || row.prUrl === "")) {
+				// Terminal with no PR: one immediate recheck in case reap is
+				// mid-write, then fail clearly.
+				const recheck = await http.sdkClient().getRun(runId);
+				if (recheck.prUrl !== null && recheck.prUrl !== "") return recheck;
+				throw new AcceptanceError(
+					`opener run ${runId} reached '${row.state}' without opening a PR — check GITHUB_TOKEN push auth + the repo's auto-open-PR config`,
+				);
+			}
+			return row;
+		},
+		isDone: (row) => row.prUrl !== null && row.prUrl !== "",
+		describe: (row) => `state=${row.state} prUrl=${JSON.stringify(row.prUrl)}`,
+	});
 }
 
 async function waitForCiFixerRun(
@@ -187,20 +186,22 @@ async function waitForCiFixerRun(
 	projectId: string,
 	openerId: string,
 ): Promise<RunRow> {
-	const deadline = Date.now() + FIXER_DISPATCH_BUDGET_MS;
-	while (Date.now() < deadline) {
-		const res = await http.expectJson<ListRunsResponse>(
-			"GET",
-			`/runs?project=${encodeURIComponent(projectId)}`,
-			200,
-		);
-		const fixer = res.runs.find((r) => r.trigger === "ci-fixer" && r.parentRunId === openerId);
-		if (fixer !== undefined) return fixer;
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new AcceptanceError(
-		`scheduler did not dispatch a ci-fixer run for opener ${openerId} within ${FIXER_DISPATCH_BUDGET_MS}ms — check the repo's CI concluded 'failure' and ciFixer.enabled in .warren/config.yaml`,
-	);
+	return pollAcceptance({
+		label: "ci-fixer run",
+		id: openerId,
+		timeoutMs: FIXER_DISPATCH_BUDGET_MS,
+		intervalMs: POLL_INTERVAL_MS,
+		fetchRow: async (): Promise<RunRow | null> => {
+			const res = await http.expectJson<ListRunsResponse>(
+				"GET",
+				`/runs?project=${encodeURIComponent(projectId)}`,
+				200,
+			);
+			return res.runs.find((r) => r.trigger === "ci-fixer" && r.parentRunId === openerId) ?? null;
+		},
+		isDone: (run): run is RunRow => run !== null,
+		describe: (run) => (run === null ? "not dispatched yet" : run.id),
+	});
 }
 
 async function cancelRun(http: WarrenHttp, runId: string | undefined): Promise<void> {
@@ -223,46 +224,6 @@ async function cancelLatestFixer(http: WarrenHttp, projectId: string): Promise<v
 		await cancelRun(http, fixer?.id);
 	} catch {
 		// Best-effort.
-	}
-}
-
-async function closeOpenerPr(
-	token: string,
-	slug: { owner: string; repo: string },
-	prUrl: string | null,
-): Promise<void> {
-	if (prUrl === null) return;
-	const num = /\/pull\/(\d+)/.exec(prUrl)?.[1];
-	if (num === undefined) return;
-	const headers = {
-		accept: "application/vnd.github+json",
-		authorization: `Bearer ${token}`,
-		"user-agent": "warren-ci-fixer-acceptance",
-		"x-github-api-version": "2022-11-28",
-	};
-	try {
-		// Read the head ref before closing so we can delete the branch too.
-		const prRes = await fetch(`${GITHUB_API}/repos/${slug.owner}/${slug.repo}/pulls/${num}`, {
-			headers,
-		});
-		let headRef: string | null = null;
-		if (prRes.ok) {
-			const body = (await prRes.json()) as { head?: { ref?: unknown } };
-			if (typeof body.head?.ref === "string") headRef = body.head.ref;
-		}
-		await fetch(`${GITHUB_API}/repos/${slug.owner}/${slug.repo}/pulls/${num}`, {
-			method: "PATCH",
-			headers: { ...headers, "content-type": "application/json" },
-			body: JSON.stringify({ state: "closed" }),
-		});
-		if (headRef !== null) {
-			await fetch(
-				`${GITHUB_API}/repos/${slug.owner}/${slug.repo}/git/refs/heads/${encodeURIComponent(headRef)}`,
-				{ method: "DELETE", headers },
-			);
-		}
-	} catch {
-		// Best-effort: a leftover PR/branch is the operator's to prune.
 	}
 }
 

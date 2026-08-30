@@ -100,22 +100,30 @@ describe("createPreviewProxyHandler (path mode) — referer routing (warren-63e1
 		expect(await handler(request, url)).toBeNull();
 	});
 
-	test("warren API paths still win on path match (no referer hijack)", async () => {
+	test("API-shaped paths referer-route to the preview upstream (warren-3f8a: no carve-out)", async () => {
 		const handler = createPreviewProxyHandler({
 			repos,
 			previewAuth: auth,
 			config: { mode: "path" },
-			fetch: fetchStub(async () => new Response("nope")),
+			fetch: fetchStub(async () => new Response("upstream")),
 		});
-		// User on a preview clicks a link into warren's /runs/<id>/cancel
-		// route. Referer points at /p/<id>/ but isWarrenApiPath says /runs/...
-		// is real warren — the proxy preamble must return null so the real
-		// handler runs.
-		const { request, url } = buildAssetRequest({
-			path: "/runs/run_unrelated/cancel",
-			referer: `http://warren.example.com/p/${runId}/`,
+		// The path-mode handler runs on the dedicated preview listener now —
+		// there is no warren API on this origin, so a path like
+		// /runs/<id>/cancel with a /p/<id>/ referer belongs to the preview
+		// app. The old isWarrenApiPath carve-out is gone by design: a preview
+		// reaching for the control plane must cross origins explicitly.
+		const cookie = auth.signCookie(runId, new Date());
+		const request = new Request("http://warren.example.com/runs/run_unrelated/cancel", {
+			headers: {
+				host: "warren.example.com",
+				referer: `http://warren.example.com/p/${runId}/`,
+				cookie: `${cookie.name}=${cookie.value}`,
+			},
 		});
-		expect(await handler(request, url)).toBeNull();
+		const response = await handler(request, new URL(request.url));
+		expect(response).not.toBeNull();
+		expect(response?.status).toBe(200);
+		expect(await response?.text()).toBe("upstream");
 	});
 
 	test("subdomain mode does not consult Referer (path-mode-only feature)", async () => {

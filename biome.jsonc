@@ -1,0 +1,156 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.4.14/schema.json",
+	"files": {
+		"includes": [
+			"src/**",
+			"scripts/**",
+			"drizzle.config.ts",
+			"!**/node_modules",
+			"!src/ui/dist",
+			"!**/__golden__",
+			"!.claude",
+			"!extensions"
+		]
+	},
+	"assist": { "actions": { "source": { "organizeImports": "on" } } },
+	"css": { "parser": { "tailwindDirectives": true } },
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"correctness": {
+				"noUnusedVariables": "error",
+				"noUnusedImports": "error",
+				"noUnusedFunctionParameters": "error",
+				"noUnusedPrivateClassMembers": "error"
+			},
+			"suspicious": {
+				"noExplicitAny": "error"
+			},
+			"style": {
+				"noNonNullAssertion": "error",
+				"useConst": "error",
+				"useImportType": "error",
+				"useExportType": "error",
+				"useNodejsImportProtocol": "error",
+				"useTemplate": "error",
+				"useFilenamingConvention": {
+					"level": "error",
+					"options": {
+						"strictCase": true,
+						"requireAscii": true,
+						"filenameCases": ["kebab-case"]
+					}
+				}
+			},
+			"complexity": {
+				"noUselessTypeConstraint": "error",
+				"noExcessiveLinesPerFunction": {
+					"level": "error",
+					"options": { "maxLines": 500 }
+				},
+				"noExcessiveCognitiveComplexity": {
+					"level": "error",
+					"options": { "maxAllowedComplexity": 15 }
+				}
+			}
+		}
+	},
+	"formatter": {
+		"enabled": true,
+		"indentStyle": "tab",
+		"lineWidth": 100
+	},
+	"overrides": [
+		// Existing files above the project-wide cognitive-complexity limit of 15 are grandfathered.
+		// This ratchet only shrinks: refactor an offender below the limit, then remove its line;
+		// never add new exceptions. The UI entries joined the same policy in warren-c8bd.
+		{
+			"includes": [
+				"scripts/acceptance/lib/assert.ts",
+				"scripts/acceptance/lib/http.ts",
+				"scripts/acceptance/run.ts",
+				"scripts/acceptance/scenarios/10-reap-seeds-roundtrip.ts",
+				"scripts/acceptance/scenarios/26-plan-run-roundtrip.ts",
+				"scripts/acceptance/scenarios/27-plan-run-plot-roundtrip.ts",
+				"scripts/acceptance/scenarios/29-plot-detail-roundtrip.ts",
+				"scripts/acceptance/scenarios/31-plot-plan-run-synthesis.ts",
+				"scripts/check-debt-markers.ts",
+				"scripts/check-file-sizes.ts",
+				"scripts/validate-agents-md.ts",
+				"src/burrow-client/client.ts",
+				"src/cli/commands/doctor.ts",
+				"src/cli/commands/run.ts",
+				"src/client/client.ts",
+				"src/db/repos/triggers.ts",
+				"src/plan-runs/coordinator.ts",
+				"src/plots/formalize.ts",
+				"src/plots/needs-attention.ts",
+				"src/plots/summary.ts",
+				"src/plots/sync.ts",
+				"src/preview/cookie.ts",
+				"src/preview/launch/orchestrate.ts",
+				"src/preview/launch/setup.ts",
+				"src/preview/proxy/index.ts",
+				"src/preview/proxy/rewrite.ts",
+				"src/projects/refresh.ts",
+				"src/runs/burrow-config.ts",
+				"src/runs/cancel.ts",
+				"src/runs/cost-analytics.ts",
+				"src/runs/interactive.ts",
+				"src/runs/pause.ts",
+				"src/runs/pr-template.ts",
+				"src/runs/pr.ts",
+				"src/runs/reap/mulch.ts",
+				"src/runs/reap/plot-merge.ts",
+				"src/runs/reap/run.ts",
+				"src/runs/reap/seeds.ts",
+				"src/runs/seed.ts",
+				"src/runs/spawn/dispatch.ts",
+				"src/runs/stream/bridge.ts",
+				"src/runs/usage-aggregate.ts",
+				"src/server-config/workers.ts",
+				"src/server/bridge-reconnect.ts",
+				"src/server/bridges.ts",
+				"src/server/errors.ts",
+				"src/server/handlers/plan-runs.ts",
+				"src/server/handlers/plot-plan-runs.ts",
+				"src/server/handlers/projects.ts",
+				"src/server/handlers/runs.ts",
+				"src/server/integration.multi-worker.test.ts",
+				"src/server/main/index.ts",
+				"src/server/server.ts",
+				"src/ui-tests/plot-detail-run-plan-dialog.test.ts",
+				"src/ui/src/api/client.ts",
+				"src/ui/src/components/dispatch-plan-dialog.tsx",
+				"src/ui/src/components/ui/field.tsx",
+				"src/ui/src/hooks/use-event-stream.ts",
+				"src/ui/src/pages/agents.tsx",
+				"src/ui/src/pages/new-plan-run.tsx",
+				"src/ui/src/pages/new-run.tsx",
+				"src/ui/src/pages/plan-runs.tsx",
+				"src/ui/src/pages/project-detail.tsx",
+				"src/ui/src/pages/projects.tsx",
+				"src/ui/src/pages/run-analytics.tsx",
+				"src/ui/src/pages/run-detail.tsx",
+				"src/ui/src/pages/run-detail-events.tsx",
+				"src/ui/src/pages/runs.tsx",
+				"src/ui/src/pages/plan-run-detail/child-table.tsx",
+				"src/ui/src/pages/run-analytics/token-consumption-chart.tsx"
+			],
+			"linter": {
+				"rules": {
+					"complexity": {
+						"noExcessiveCognitiveComplexity": "off"
+					}
+				}
+			}
+		},
+		{
+			"includes": ["scripts/check-all.ts", "scripts/check-ci-parity.ts"],
+			"formatter": {
+				"enabled": false
+			}
+		}
+	]
+}

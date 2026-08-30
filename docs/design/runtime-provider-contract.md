@@ -1,8 +1,14 @@
 # RuntimeProvider Contract — Design Spike
 
+**Kind:** contract
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-07-09
+**Shipped:** v0.10.0
+**Current truth:** `src/runtime/contract.ts` and `src/runtime/registry.ts`
+
 > **HISTORICAL — shipped in v0.10.0.** This document is a design record, not a plan in flight. The contract below now lives in `src/runtime/contract.ts`, and both backends implement it — see [`docs/RUNBOOK-K8S.md`](../RUNBOOK-K8S.md) §0 for the operator view. Read the code when the two disagree.
 
-**Status:** Design — the seam that unblocked the migration branch
 **Date:** 2026-07-09
 **Companion:** [`k8s-migration.md`](./k8s-migration.md) — the architecture record this seam serves
 **Grounded in:** three codebase ground-truth audits (dispatch/RunSpec, event/status,
@@ -96,7 +102,7 @@ interface RunSpec {
   hostClonePathHint?: string;  // optional burrow worktree optimization; K8s ignores it.
 
   // Agent.
-  runtimeId: string;           // claude-code | pi | codex | sapling — selects image/toolchain
+  runtimeId: string;           // claude-code | pi | codex — selects image/toolchain
   prompt: string;              // system section already prepended by the domain
   metadata?: Record<string, unknown>;   // e.g. { frontmatter } — provider carries to runtime
   mode: "batch" | "conversation";
@@ -218,11 +224,12 @@ interface FinalizeIntent {
   branch: string;
   push: boolean;                    // push HEAD:branch from inside the workspace
   mirror: ("mulch" | "seeds" | "plans" | "plot")[];   // which artifact sets to extract
-  closeSeedId?: string;
 }
 interface FinalizeResult {
   pushed: boolean;
-  commitsAhead: number;
+  commitsAhead: number | null;      // null = not measured (warren-f3bb)
+  commitsAheadBase?: string;        // ref the count ran against; a repair run pins the
+                                    // pre-push origin/<base> SHA (warren-ba08)
   emptyPush: boolean;               // dropped-commit detection
   mirror: {                         // artifact diffs the domain applies to the project clone
     mulch?: MulchDelta; seeds?: SeedsDelta; plans?: PlansDelta; plot?: PlotDelta;
@@ -258,6 +265,18 @@ forms:
 
 1. **Rescue ref** — push `HEAD` to `warren/rescue/<runId>` on origin. Recovery is one `git fetch`. Push protection can refuse this push too.
 2. **Git bundle** — `git bundle create <base>..HEAD` at `<dataDir>/salvage/<runId>.bundle`. The bundle never touches origin, so push protection cannot block it.
+
+Under K8s, salvage first folds a dirty tree into a warren bookkeeping commit
+with `git add -A` and the canonical bot identity (warren-6016). A run that
+died with uncommitted work is exactly the case salvage exists for. A range
+bundle over a dirty tree refuses as empty.
+
+The in-pod rescue push authenticates with the intent-carried `gitToken` when
+one parked, else with the pod-carried `WARREN_GIT_TOKEN` from the same
+`warren-git-token` Secret the init container clones with.
+The harness alone holds that credential.
+The entrypoint spawns the agent child with the token scrubbed, so the agent
+itself never holds a push token.
 
 The runtime split mirrors `finalize` itself.
 

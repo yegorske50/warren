@@ -12,6 +12,7 @@
  * swallowed so a cost-write error never fails the bridge or the run.
  */
 
+import type { RuntimeId } from "../../core/wire.ts";
 import type { Repos } from "../../db/repos/index.ts";
 import type { SessionStatsAccumulator } from "../usage-aggregate.ts";
 import type { BridgeLogger, PiStatsClient, SessionStats } from "./types.ts";
@@ -23,19 +24,19 @@ import type { BridgeLogger, PiStatsClient, SessionStats } from "./types.ts";
  */
 export async function snapshotStats(
 	client: PiStatsClient,
-	burrowRunId: string,
+	sandboxRunId: string,
 	signal: AbortSignal,
 	phase: "baseline" | "terminal",
 	runId: string,
 	logger: BridgeLogger | undefined,
 ): Promise<SessionStats | null> {
 	try {
-		return await client.fetch(burrowRunId, signal);
+		return await client.fetch(sandboxRunId, signal);
 	} catch (err) {
 		logger?.warn?.(
 			{
 				runId,
-				burrowRunId,
+				sandboxRunId,
 				phase,
 				err: err instanceof Error ? err.message : String(err),
 			},
@@ -47,7 +48,7 @@ export async function snapshotStats(
 
 export interface PersistPiStatsInput {
 	readonly piStats: PiStatsClient;
-	readonly burrowRunId: string;
+	readonly sandboxRunId: string;
 	readonly runId: string;
 	readonly repos: Repos;
 	readonly baseline: Promise<SessionStats | null> | undefined;
@@ -67,7 +68,7 @@ export interface PersistPiStatsInput {
 export async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<void> {
 	const terminal = await snapshotStats(
 		input.piStats,
-		input.burrowRunId,
+		input.sandboxRunId,
 		input.signal,
 		"terminal",
 		input.runId,
@@ -94,7 +95,7 @@ export async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<v
 		input.logger?.info?.(
 			{
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				costUsd: delta.costUsd,
 				tokensInput: delta.tokensInput,
 				tokensOutput: delta.tokensOutput,
@@ -105,7 +106,7 @@ export async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<v
 		input.logger?.warn?.(
 			{
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				err: err instanceof Error ? err.message : String(err),
 			},
 			"attachStats threw; cost columns may be inconsistent",
@@ -115,9 +116,9 @@ export async function persistPiStatsDelta(input: PersistPiStatsInput): Promise<v
 
 export interface PersistInStreamUsageInput {
 	readonly usage: SessionStatsAccumulator;
-	readonly runtime: "pi" | "claude";
+	readonly runtime: RuntimeId;
 	readonly runId: string;
-	readonly burrowRunId: string;
+	readonly sandboxRunId: string;
 	readonly repos: Repos;
 	readonly logger?: BridgeLogger;
 }
@@ -128,7 +129,10 @@ export interface PersistInStreamUsageInput {
  * stay null. attachStats throws on storage errors; we log + swallow to
  * match the PiStatsClient path's best-effort posture. The `runtime`
  * tag distinguishes pi (`turn_end` accumulator, warren-17a4) from
- * claude-code (`result` single-shot, warren-87f9) in the log line.
+ * claude-code (`result` single-shot, warren-87f9) in the log line. It is a
+ * {@link RuntimeId}, so the tag reads the same as every other runtime id in
+ * the system: before warren-c80e this field carried the literal "claude",
+ * which is not a runtime id, so filtering logs by runtime missed these rows.
  */
 export async function persistInStreamUsage(input: PersistInStreamUsageInput): Promise<void> {
 	if (!input.usage.seen) return;
@@ -143,7 +147,7 @@ export async function persistInStreamUsage(input: PersistInStreamUsageInput): Pr
 		input.logger?.info?.(
 			{
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				runtime: input.runtime,
 				costUsd: input.usage.costUsd,
 				tokensInput: input.usage.tokensInput,
@@ -155,7 +159,7 @@ export async function persistInStreamUsage(input: PersistInStreamUsageInput): Pr
 		input.logger?.warn?.(
 			{
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				runtime: input.runtime,
 				err: err instanceof Error ? err.message : String(err),
 			},

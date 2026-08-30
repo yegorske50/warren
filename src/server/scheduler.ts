@@ -22,11 +22,12 @@
  */
 
 import type { Repos } from "../db/repos/index.ts";
+import type { Forge } from "../forge/contract.ts";
+import { mintGitCredential } from "../forge/credentials.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import { spawnRun } from "../runs/index.ts";
 import type { RuntimeProvider } from "../runtime/contract.ts";
-import { listScheduledSeeds, updateExtensions } from "../seeds-cli/index.ts";
 import {
 	CronRetryTracker,
 	createProjectCloneHealer,
@@ -43,6 +44,7 @@ import {
 	type TriggerSchedulerConfig,
 } from "../triggers/index.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
+import type { GitSpawnCredential } from "../workspace/git/credential-env.ts";
 import type { BridgeRegistry } from "./types.ts";
 
 export interface BootSchedulerInput {
@@ -69,16 +71,21 @@ export interface BootSchedulerInput {
 	 */
 	readonly runBranchPrefixDefault?: string;
 	/**
-	 * `GITHUB_TOKEN` for the CI-fixer poller's check-runs fetch (warren-0b75).
-	 * Resolved from the same env the reap pr-open path reads. Defaults to the
-	 * empty string; the poller surfaces per-PR `error` results when unset.
-	 * Also forwarded onto every scheduled `spawnRun` as the pre-dispatch
-	 * refresh's git credential (`SpawnRunInput.githubToken`) so cron /
-	 * scheduled-for dispatches can fetch private repos on the K8s control
-	 * plane. The acceptance seam's synthetic `stub-token` is inert there:
-	 * the harness's own `insteadOf` rules are longer-prefix and win.
+	 * Boot-resolved forge (`ServerDeps.forge`, warren-0b49 — required,
+	 * resolved ONCE at boot). Replaces the old captured `githubToken`:
+	 *   - the CI-fixer poller reads check runs / log tails through it, and
+	 *     its capability flags drive the §5 degradations;
+	 *   - the self-heal re-clone and the scheduled-dispatch refresh mint
+	 *     their git credential PER SPAWN via `mintGitCredential`
+	 *     (forge-contract.md §4 — credentials are minted, never held), so a
+	 *     short-lived App credential never has to outlive a tick loop.
 	 */
-	readonly githubToken?: string;
+	readonly forge: Forge;
+	/**
+	 * Boot-resolved IssueTracker (warren-5819), threaded onto every
+	 * scheduled/ci-fixer `spawnRun` call. Tests may omit.
+	 */
+	readonly issueTracker?: import("../tracker/contract.ts").IssueTracker;
 	/** Override the spawnRun seam (tests). Defaults to the live `spawnRun`. */
 	readonly spawnRunFn?: typeof spawnRun;
 	/**
@@ -100,6 +107,10 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 	const spawnRunFn = input.spawnRunFn ?? spawnRun;
 
 	const seedsDeps = { sdBinary: input.config.sdBinary, spawn: input.projectSpawn };
+	// warren-5819: hoisted so the spawn closures below stay under the
+	// cognitive-complexity ceiling.
+	const trackerOption =
+		input.issueTracker !== undefined ? { issueTracker: input.issueTracker } : {};
 
 	// warren-a0a2: one bounded-retry tracker for the scheduler's process
 	// lifetime (in-memory; a restart resets counters — see cron-retry.ts). The
@@ -121,15 +132,28 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 		tracker: projectHealTracker,
 		config: input.projectsConfig,
 		spawn: input.projectSpawn,
-		...(input.githubToken !== undefined ? { token: input.githubToken } : {}),
+		mintCredential: (project) => mintGitCredential(input.forge, project.gitUrl),
 		...(input.logger !== undefined ? { logger: input.logger } : {}),
 		...(input.cloneExists !== undefined ? { exists: input.cloneExists } : {}),
 		...(input.now !== undefined ? { now: input.now } : {}),
 	});
 
+	const mintProjectGitSecret = async (
+		projectId: string,
+	): Promise<GitSpawnCredential | undefined> => {
+		// §4 per-spawn mint: credential is minted immediately before the spawn,
+		// never captured at boot. Unowned URL / `no_credential` → undefined.
+		const project = await input.repos.projects.get(projectId);
+		return project !== null ? await mintGitCredential(input.forge, project.gitUrl) : undefined;
+	};
+
 	const spawnDispatch: DispatchSpawnFn = async (
 		args: DispatchSpawnInput,
 	): Promise<DispatchSpawnResult> => {
+		const gitSecret = await mintProjectGitSecret(args.projectId);
+		// warren-9ce3: origin from the resolved trigger kind; seedId forward
+		// closes the scheduled-seed loss (was only buried in metadata).
+		const dispatchOrigin = args.trigger === "scheduled" ? "scheduled" : "cron";
 		const result = await spawnRunFn({
 			repos: input.repos,
 			runtimeProvider: input.runtimeProvider,
@@ -137,25 +161,25 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 			projectId: args.projectId,
 			prompt: args.prompt,
 			trigger: args.trigger,
+			dispatchOrigin,
+			...(args.seedId !== undefined ? { seedId: args.seedId } : {}),
 			...(args.metadata !== undefined ? { metadata: args.metadata } : {}),
 			...(args.maxCostUsd !== undefined ? { maxCostUsdOverride: args.maxCostUsd } : {}),
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
-			githubToken: input.githubToken,
+			gitCredential: gitSecret,
 			warrenConfigs: input.warrenConfigs,
 			seedsCli: seedsDeps,
-			// warren-a0a2: forward the cron dispatcher's row-id probe so its
-			// bounded-retry GC can reclaim a transient never_started row.
+			...trackerOption,
+			// warren-a0a2: forward the cron dispatcher's row-id probe.
 			...(args.onRowCreated !== undefined ? { onRunRowCreated: args.onRowCreated } : {}),
 			...(input.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
 				: {}),
 			...(input.now !== undefined ? { now: input.now } : {}),
 		});
-		// Same hand-off as POST /runs — bridge the dispatched run so its
-		// events flow into warren.events. Without this the scheduled run
-		// would emit events into burrow that the warren wire never sees.
-		input.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+		// Same hand-off as POST /runs — bridge so events flow into warren.events.
+		input.bridges.start(result.run.id, result.sandboxRun.id, result.sandbox.id);
 		return { runId: result.run.id };
 	};
 
@@ -169,6 +193,7 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 	const ciFixerSpawn: TickCiFixerSpawnFn = async (
 		args: TickCiFixerSpawnInput,
 	): Promise<{ runId: string }> => {
+		const gitSecret = await mintProjectGitSecret(args.projectId);
 		const result = await spawnRunFn({
 			repos: input.repos,
 			runtimeProvider: input.runtimeProvider,
@@ -176,19 +201,23 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 			projectId: args.projectId,
 			prompt: args.prompt,
 			trigger: "ci-fixer",
+			// warren-9ce3: underscore spelling matches the dispatch-origin
+			// vocabulary (distinct from the hyphenated trigger column).
+			dispatchOrigin: "ci_fixer",
 			parentRunId: args.parentRunId,
 			targetBranch: args.targetBranch,
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
-			githubToken: input.githubToken,
+			gitCredential: gitSecret,
 			warrenConfigs: input.warrenConfigs,
 			seedsCli: seedsDeps,
+			...trackerOption,
 			...(input.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
 				: {}),
 			...(input.now !== undefined ? { now: input.now } : {}),
 		});
-		input.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+		input.bridges.start(result.run.id, result.sandboxRun.id, result.sandbox.id);
 		return { runId: result.run.id };
 	};
 
@@ -197,16 +226,16 @@ export function bootScheduler(input: BootSchedulerInput): SchedulerHandle {
 		disabled: input.config.disabled,
 		repos: input.repos,
 		loadWarrenConfig: (projectId, projectPath) => input.warrenConfigs.get(projectId, projectPath),
-		listScheduledSeeds: (projectPath) => listScheduledSeeds(seedsDeps, projectPath),
-		updateExtensions: (projectPath, seedId, extensions) =>
-			updateExtensions(seedsDeps, projectPath, seedId, extensions),
+		// warren-6234: the scheduled-issues pass routes through the tracker
+		// seam (listScheduledIssues + mergeIssueMetadata).
+		...(input.issueTracker !== undefined ? { issueTracker: input.issueTracker } : {}),
 		spawn: spawnDispatch,
 		cronRetryTracker,
 		deleteNeverStartedRun,
 		ensureProjectClone,
 		noticeGate: projectHealTracker,
 		ciFixer: {
-			githubToken: input.githubToken ?? "",
+			forge: input.forge,
 			spawn: ciFixerSpawn,
 			...(input.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }

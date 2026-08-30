@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
-	importSpec,
 	type LayerRule,
 	loadRules,
 	matchesPath,
@@ -93,19 +92,8 @@ describe("resolveSpec", () => {
 	});
 });
 
-describe("importSpec", () => {
-	test("sees import, side-effect import, re-export and multi-line closing forms", () => {
-		expect(importSpec('import { x } from "../server/types.ts";')).toBe("../server/types.ts");
-		expect(importSpec('import "@os-eco/burrow-cli";')).toBe("@os-eco/burrow-cli");
-		expect(importSpec('export { x } from "./types.ts";')).toBe("./types.ts");
-		expect(importSpec('} from "../../seeds-cli/index.ts";')).toBe("../../seeds-cli/index.ts");
-	});
-
-	test("ignores comment lines", () => {
-		expect(importSpec('// import { x } from "../server/types.ts";')).toBeUndefined();
-		expect(importSpec(' * see `from "../server/types.ts"`')).toBeUndefined();
-	});
-});
+// Edge extraction itself (dynamic import, require, export-from, type-only,
+// comment/string blindness) is covered in scripts/layer-graph.test.ts.
 
 describe("scanText", () => {
 	test("reports the 1-based line and the specifier as written", () => {
@@ -158,64 +146,6 @@ describe("scanText", () => {
 	});
 });
 
-describe("scan — the burrow seam warren-f796 used to own alone", () => {
-	test("flags a facade import outside the local-topology allowlist", () => {
-		withFixtureRepo(
-			{ "src/runs/spawn.ts": 'import { c } from "../burrow-client/index.ts";\n' },
-			(dir) => {
-				expect(scan(dir, RULES)).toEqual([
-					{
-						rule: "burrow-facade-is-local-only",
-						file: "src/runs/spawn.ts",
-						line: 1,
-						reason: 'imports "../burrow-client/index.ts"',
-					},
-				]);
-			},
-		);
-	});
-
-	test("allows the facade in the four homes the old guard allowed", () => {
-		withFixtureRepo(
-			{
-				"src/burrow-client/client.ts": 'import { e } from "./errors.ts";\n',
-				"src/runtime/local/provider.ts": 'import { c } from "../../burrow-client/index.ts";\n',
-				"src/supervisor/main.ts": 'import { c } from "../burrow-client/index.ts";\n',
-				"src/runtime/registry.ts": 'import { c } from "../burrow-client/index.ts";\n',
-			},
-			(dir) => {
-				expect(scan(dir, RULES)).toEqual([]);
-			},
-		);
-	});
-
-	test("flags the @os-eco/burrow-cli package outside its allowlist but not in src/runtime/k8s/", () => {
-		withFixtureRepo(
-			{
-				"src/runtime/k8s/agent-entrypoint.ts":
-					'import { AgentRegistry } from "@os-eco/burrow-cli";\n',
-				"src/projects/clone.ts": 'import { HttpClient } from "@os-eco/burrow-cli";\n',
-			},
-			(dir) => {
-				expect(scan(dir, RULES).map((v) => `${v.rule} ${v.file}`)).toEqual([
-					"burrow-package-is-local-only src/projects/clone.ts",
-				]);
-			},
-		);
-	});
-
-	test("the package allowlist stays narrower than the facade's, as warren-f796 had it", () => {
-		// `src/runtime/registry.ts` may hold the `() => BurrowClient` factory seam
-		// but not reach for burrow's own library.
-		withFixtureRepo(
-			{ "src/runtime/registry.ts": 'import { HttpClient } from "@os-eco/burrow-cli";\n' },
-			(dir) => {
-				expect(scan(dir, RULES).map((v) => v.rule)).toEqual(["burrow-package-is-local-only"]);
-			},
-		);
-	});
-});
-
 describe("scan — the seams warren-89a6 added", () => {
 	test("flags the three domain to server imports it had to repair", () => {
 		withFixtureRepo(
@@ -264,18 +194,16 @@ describe("scan — the seams warren-89a6 added", () => {
 	});
 
 	test("flags a handler reaching for a drizzle table", () => {
-		withFixtureRepo(
-			{
-				"src/server/handlers/runs/lifecycle.ts":
-					'import type { RunRow } from "../../../db/schema.ts";\n',
-				"src/server/handlers/agents.ts": 'import { agents } from "../../db/schema/agents.ts";\n',
-			},
-			(dir) => {
-				// `src/db/schema.ts` is the type barrel and stays legal; the rule is
-				// about the drizzle table modules under `src/db/schema/`.
-				expect(scan(dir, RULES).map((v) => v.file)).toEqual(["src/server/handlers/agents.ts"]);
-			},
+		const rule = ruleNamed("handlers-are-a-thin-surface");
+		const rel = "src/server/handlers/x.ts";
+		// warren-02c9: the barrel `src/db/schema.ts` is banned too; row types live at the seams.
+		expect(scanText(rule, rel, 'import { runs } from "../../db/schema/runs.ts";\n')).toHaveLength(
+			1,
 		);
+		expect(scanText(rule, rel, 'import type { RunRow } from "../../db/schema.ts";\n')).toHaveLength(
+			1,
+		);
+		expect(scanText(rule, rel, 'import type { RunRow } from "../../runs/index.ts";\n')).toEqual([]);
 	});
 
 	test("flags a handler assembling a repo from deps.db", () => {
@@ -288,7 +216,14 @@ describe("scan — the seams warren-89a6 added", () => {
 			},
 		);
 	});
-
+	test("the UI seam flags server-only imports, spares the kernel, ndjson reader and itself (warren-f0ae)", () => {
+		const rule = ruleNamed("ui-is-a-browser-consumer");
+		const rel = "src/ui/src/a.ts";
+		expect(scanText(rule, rel, 'import { s } from "../../server/main.ts";\n')).toHaveLength(1);
+		for (const spec of ["../../../core/wire.ts", "../../../client/ndjson.ts", "../lib/f.ts"]) {
+			expect(scanText(rule, rel, `import { x } from "${spec}";\n`)).toEqual([]);
+		}
+	});
 	test("flags any import in the dependency-free kernel", () => {
 		withFixtureRepo(
 			{
@@ -325,11 +260,168 @@ describe("scan — walk scope", () => {
 	});
 });
 
+describe("scan — the widened scripts/ walk (warren-c042)", () => {
+	test("the walk reaches scripts/: a scripts file importing an extension is flagged", () => {
+		// `core-does-not-import-extensions` declares scripts/ in `from` and was
+		// inert before the walk widened. This fixture has no src/ tree at all —
+		// a hit proves the scripts/ walk exists.
+		withFixtureRepo(
+			{
+				"scripts/foo.ts": 'import { z } from "../extensions/audit-log/src/index.ts";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES).map((v) => v.rule)).toEqual(["core-does-not-import-extensions"]);
+			},
+		);
+	});
+
+	test("flags an api.github.com literal in scripts/", () => {
+		withFixtureRepo(
+			{
+				"scripts/acceptance/scenarios/99-foo.ts":
+					'const BASE = "https://api.github.com/repos/o/r";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES).map((v) => v.rule)).toEqual(["github-api-literal-is-forge-only"]);
+			},
+		);
+	});
+
+	test("the forge literal rule spares source-level comments in scripts/", () => {
+		withFixtureRepo(
+			{
+				"scripts/acceptance/scenarios/99-foo.ts":
+					" * hits the `api.github.com` check-runs endpoint\n",
+			},
+			(dir) => {
+				expect(scan(dir, RULES)).toEqual([]);
+			},
+		);
+	});
+
+	test("flags a scripts file importing forge transport, except the acceptance seam helper", () => {
+		withFixtureRepo(
+			{
+				"scripts/acceptance/lib/github.ts":
+					'import { GITHUB_API_BASE } from "../../../src/forge/github/headers.ts";\n',
+				"scripts/fresh-client.ts":
+					'import { request } from "octokit";\nimport { h } from "../src/forge/github/headers.ts";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES).map((v) => `${v.rule} ${v.file} ${v.line}`)).toEqual([
+					"forge-transport-is-forge-only scripts/fresh-client.ts 1",
+					"forge-transport-is-forge-only scripts/fresh-client.ts 2",
+				]);
+			},
+		);
+	});
+});
+
+describe("scan — the extension boundary (warren-0781, plan pl-116e)", () => {
+	test("flags an extension importing warren's src/ or scripts/", () => {
+		withFixtureRepo(
+			{
+				"extensions/audit-log/src/collector.ts": 'import { X } from "../../../src/core/wire.ts";\n',
+				"extensions/audit-log/src/helper.ts":
+					'import { Y } from "../../../scripts/check-layers.ts";\n',
+			},
+			(dir) => {
+				// The filesystem walk order is platform-dependent, so sort the
+				// findings by file the way the warren-89a6 multi-finding tests do.
+				expect(scan(dir, RULES).sort((a, b) => a.file.localeCompare(b.file))).toEqual([
+					{
+						rule: "extensions-are-standalone",
+						file: "extensions/audit-log/src/collector.ts",
+						line: 1,
+						reason: 'imports "../../../src/core/wire.ts"',
+					},
+					{
+						rule: "extensions-are-standalone",
+						file: "extensions/audit-log/src/helper.ts",
+						line: 1,
+						reason: 'imports "../../../scripts/check-layers.ts"',
+					},
+				]);
+			},
+		);
+	});
+
+	test("flags core importing an extension", () => {
+		withFixtureRepo(
+			{
+				"src/server/main/lifecycle-bus-wiring.ts":
+					'import { z } from "../../../extensions/audit-log/src/index.ts";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES).map((v) => v.rule)).toEqual(["core-does-not-import-extensions"]);
+			},
+		);
+	});
+
+	test("both directions stay forbidden for every shipped extension, including campaign-controller (warren-772a)", () => {
+		// The campaign-controller scaffold must not weaken the seam it is born
+		// under: a file inside it importing src/, and a src/ file importing it,
+		// both fire — in one scan, proving the two rules are symmetric.
+		withFixtureRepo(
+			{
+				"extensions/campaign-controller/src/controller.ts":
+					'import { X } from "../../../src/core/wire.ts";\n',
+				"src/server/main/wiring.ts":
+					'import { y } from "../../../extensions/campaign-controller/src/index.ts";\n',
+			},
+			(dir) => {
+				const rules = scan(dir, RULES)
+					.map((v) => `${v.rule} ${v.file}`)
+					.sort();
+				expect(rules).toEqual([
+					"core-does-not-import-extensions src/server/main/wiring.ts",
+					"extensions-are-standalone extensions/campaign-controller/src/controller.ts",
+				]);
+			},
+		);
+	});
+
+	test("leaves an extension's own internal imports alone", () => {
+		withFixtureRepo(
+			{
+				"extensions/audit-log/src/index.ts":
+					'import { c } from "./collector.ts";\nimport { Database } from "bun:sqlite";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES)).toEqual([]);
+			},
+		);
+	});
+
+	test("the reverse-direction rule is not theater: the walk reaches extensions/", () => {
+		// Plan risk 1: if the walk silently never covered extensions/, the
+		// import rule would never fire. This fixture has no src/ tree at all —
+		// a hit proves the extensions/ walk exists.
+		withFixtureRepo(
+			{
+				"extensions/audit-log/src/x.ts": 'import { w } from "../../../src/core/wire.ts";\n',
+			},
+			(dir) => {
+				expect(scan(dir, RULES)).toHaveLength(1);
+			},
+		);
+	});
+});
+
 describe("the shipped manifest", () => {
-	test("still declares both halves of the retired burrow guard", () => {
+	test("the retired burrow guard is gone with its import targets (warren-ea0a)", () => {
+		// Both burrow rules guarded `src/burrow-client/` and `@os-eco/burrow-cli`.
+		// The excision deleted both targets, so the rules guard nothing real and
+		// left with them — this pins the retirement.
 		const names = RULES.map((r) => r.name);
-		expect(names).toContain("burrow-facade-is-local-only");
-		expect(names).toContain("burrow-package-is-local-only");
+		expect(names).not.toContain("burrow-facade-is-local-only");
+		expect(names).not.toContain("burrow-package-is-local-only");
+	});
+
+	test("declares both directions of the extension boundary", () => {
+		const names = RULES.map((r) => r.name);
+		expect(names).toContain("extensions-are-standalone");
+		expect(names).toContain("core-does-not-import-extensions");
 	});
 
 	test("every allow entry carries a reason, because JSON has no comments", () => {

@@ -3,8 +3,8 @@
  * CLI for cloud plan-runs (warren-ec6a, pl-55df step 2).
  *
  * Unlike the DB-backed commands (`warren run`, `warren serve`, …), the `plan`
- * group talks to a remote warren over HTTP via {@link WarrenClient.fromEnv} —
- * it is the first command without `withCliDb`. The flow mirrors `warren run`:
+ * group talks to a remote warren over HTTP via `resolveCommandClient`. It
+ * is the first command without `withCliDb`. The flow mirrors `warren run`:
  * probe the server first (turning a down warren into a friendly error rather
  * than a mid-stream transport throw), POST `/plan-runs`, print the
  * `{planRun, children}` dispatch summary, then tail the union event stream as
@@ -20,27 +20,63 @@
  * pretty` renderer lands separately in warren-ae0a.
  */
 
-import type { WarrenClient } from "../../client/index.ts";
+import type { CreatePlanRunInput, WarrenClient } from "../../client/index.ts";
 import type { PlanRunState } from "../../client/types.ts";
 import type { CliContext } from "../output.ts";
-import { formatError } from "../output.ts";
+import {
+	commandFailure,
+	EXIT_SERVER_UNREACHABLE,
+	EXIT_USAGE,
+	exitCodeForError,
+	formatError,
+} from "../output.ts";
 import { createRenderer, type PlanRunOutput, type PlanRunRenderer } from "../plan-run-renderer.ts";
+import { guardRemotePlanRun, probeOrReport } from "./probe.ts";
+import { type RemoteTailDeps, tailOutcomeExit, tailWithDetach } from "./remote-tail.ts";
 
-/** Exit code emitted when the operator detaches a live tail with SIGINT. */
-const SIGINT_EXIT_CODE = 130;
+// Re-exported for the test seam (warren-97a2: the type moved to remote-tail.ts).
+export type { SigintDisposer } from "./remote-tail.ts";
 
 export interface PlanRunArgs {
-	readonly planId: string;
+	/** Seeds plan id — mutually exclusive with `issues` (warren-de42). */
+	readonly planId?: string;
+	/** warren-de42: ordered issue-id list; drives the walk without a plan-capable tracker. */
+	readonly issues?: string[];
 	readonly project: string;
 	readonly agent: string;
 	readonly promptTemplate?: string;
 	readonly ref?: string;
 	readonly provider?: string;
 	readonly model?: string;
+	/** Per-child USD spend cap (warren-a63d), forwarded to every child dispatch. */
+	readonly maxCostUsd?: number;
 	/** Tail events until terminal (default). `--no-follow` dispatches and exits. */
 	readonly follow: boolean;
 	/** Output mode for the dispatch summary + event stream. Default `ndjson`. */
 	readonly output?: PlanRunOutput;
+}
+
+/**
+ * warren-de42: usage validation for the two mutually exclusive source forms.
+ * Returns the error message, or undefined when the args are usable.
+ */
+function validatePlanRunArgs(args: PlanRunArgs): string | undefined {
+	if (args.project === "" || args.agent === "") {
+		return "--project and --agent are both required";
+	}
+	const hasPlanId = args.planId !== undefined && args.planId !== "";
+	const hasIssues = args.issues !== undefined && args.issues.length > 0;
+	if (hasPlanId === hasIssues) {
+		return "exactly one of <plan-id> or --issues <a,b,c> is required";
+	}
+	return undefined;
+}
+
+/** warren-de42: the plan-id / issues source fields for the create body. */
+function sourceFields(args: PlanRunArgs): Pick<CreatePlanRunInput, "planId" | "issues"> {
+	return args.planId !== undefined && args.planId !== ""
+		? { planId: args.planId }
+		: { issues: args.issues ?? [] };
 }
 
 export interface PlanCancelArgs {
@@ -49,23 +85,7 @@ export interface PlanCancelArgs {
 	readonly output?: PlanRunOutput;
 }
 
-/** Disposer returned by {@link PlanRunDeps.onSigint}. */
-export type SigintDisposer = () => void;
-
-export interface PlanRunDeps {
-	/** Remote warren client. Production wires `WarrenClient.fromEnv(context.env)`. */
-	readonly client: WarrenClient;
-	/**
-	 * SIGINT seam (tests). Registers `handler` and returns a disposer that
-	 * unregisters it. Production wires `process.on("SIGINT", …)`. When omitted
-	 * the command falls back to the live `process` registration.
-	 */
-	readonly onSigint?: (handler: () => void) => SigintDisposer;
-	/** Hard-exit seam (tests). Defaults to `process.exit`. */
-	readonly exit?: (code: number) => never;
-	/** Override the probe timeout (tests). */
-	readonly probeTimeoutMs?: number;
-}
+export interface PlanRunDeps extends RemoteTailDeps {}
 
 export interface PlanCancelDeps {
 	readonly client: WarrenClient;
@@ -83,41 +103,18 @@ export interface PlanCancelResult {
 	readonly planRunId?: string;
 }
 
-/** Default SIGINT registration against the live process (production). */
-function defaultOnSigint(handler: () => void): SigintDisposer {
-	process.on("SIGINT", handler);
-	return () => {
-		process.off("SIGINT", handler);
-	};
-}
-
-/** Probe the remote warren, mapping an unreachable server to a stderr line. */
-async function probeOrReport(
-	context: CliContext,
-	client: WarrenClient,
-	probeTimeoutMs?: number,
-): Promise<boolean> {
-	try {
-		await (probeTimeoutMs !== undefined ? client.probe(probeTimeoutMs) : client.probe());
-		return true;
-	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return false;
-	}
-}
-
 export async function runPlanRun(
 	context: CliContext,
 	deps: PlanRunDeps,
 	args: PlanRunArgs,
 ): Promise<PlanRunResult> {
-	if (args.planId === "" || args.project === "" || args.agent === "") {
-		context.stdio.stderr.write("warren: plan-id, --project, and --agent are all required\n");
-		return { exitCode: 2 };
+	const usage = validatePlanRunArgs(args);
+	if (usage !== undefined) {
+		context.stdio.stderr.write(`warren: ${usage}\n`);
+		return { exitCode: EXIT_USAGE };
 	}
-
 	if (!(await probeOrReport(context, deps.client, deps.probeTimeoutMs))) {
-		return { exitCode: 1 };
+		return { exitCode: EXIT_SERVER_UNREACHABLE };
 	}
 
 	const renderer = createRenderer(args.output ?? "ndjson", context.stdio.stdout);
@@ -125,19 +122,20 @@ export async function runPlanRun(
 	let planRunId: string;
 	try {
 		const created = await deps.client.createPlanRun({
-			planId: args.planId,
+			...sourceFields(args),
 			project: args.project,
 			agent: args.agent,
 			...(args.promptTemplate !== undefined ? { promptTemplate: args.promptTemplate } : {}),
 			...(args.ref !== undefined ? { ref: args.ref } : {}),
 			...(args.provider !== undefined ? { providerOverride: args.provider } : {}),
 			...(args.model !== undefined ? { modelOverride: args.model } : {}),
+			...(args.maxCostUsd !== undefined ? { maxCostUsd: args.maxCostUsd } : {}),
 		});
 		planRunId = created.planRun.id;
 		renderer.dispatched(created.planRun, created.children);
 	} catch (err) {
 		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1 };
+		return { exitCode: exitCodeForError(err) };
 	}
 
 	if (!args.follow) {
@@ -158,45 +156,19 @@ async function tailUntilTerminal(
 	renderer: PlanRunRenderer,
 	planRunId: string,
 ): Promise<PlanRunResult> {
-	const onSigint = deps.onSigint ?? defaultOnSigint;
-	const exit = deps.exit ?? (process.exit as (code: number) => never);
-	const tailAbort = new AbortController();
-	let interrupted = false;
-
-	const dispose = onSigint(() => {
-		if (interrupted) {
-			// Second SIGINT: stop waiting and hand control back to the shell.
-			exit(SIGINT_EXIT_CODE);
-			return;
-		}
-		interrupted = true;
-		context.stdio.stderr.write(
+	const outcome = await tailWithDetach({
+		context,
+		detachHint:
 			`warren: detaching from plan-run ${planRunId} (the remote run keeps going; ` +
-				`'warren plan cancel ${planRunId}' to stop it). Ctrl-C again to exit.\n`,
-		);
-		tailAbort.abort();
+			`'warren plan cancel ${planRunId}' to stop it). Ctrl-C again to exit.\n`,
+		stream: (signal) => deps.client.streamPlanRunEvents(planRunId, { follow: true, signal }),
+		onEvent: (event) => renderer.event(event),
+		onSigint: deps.onSigint,
+		exit: deps.exit,
 	});
 
-	try {
-		for await (const event of deps.client.streamPlanRunEvents(planRunId, {
-			follow: true,
-			signal: tailAbort.signal,
-		})) {
-			renderer.event(event);
-		}
-	} catch (err) {
-		if (!interrupted) {
-			dispose();
-			context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-			return { exitCode: 1, planRunId };
-		}
-		// Interrupted tails surface an AbortError — swallow it.
-	} finally {
-		dispose();
-	}
-
-	if (interrupted) {
-		return { exitCode: SIGINT_EXIT_CODE, planRunId };
+	if (outcome.kind !== "completed") {
+		return { exitCode: tailOutcomeExit(context, outcome), planRunId };
 	}
 
 	return resolveTerminal(context, deps, renderer, planRunId);
@@ -216,7 +188,7 @@ async function resolveTerminal(
 		return { exitCode: state === "succeeded" ? 0 : 1, planRunId, state };
 	} catch (err) {
 		context.stdio.stderr.write(`warren: failed to read plan-run state: ${formatError(err)}\n`);
-		return { exitCode: 1, planRunId };
+		return { exitCode: exitCodeForError(err), planRunId };
 	}
 }
 
@@ -225,14 +197,8 @@ export async function runPlanCancel(
 	deps: PlanCancelDeps,
 	args: PlanCancelArgs,
 ): Promise<PlanCancelResult> {
-	if (args.planRunId === "") {
-		context.stdio.stderr.write("warren: plan-run id is required\n");
-		return { exitCode: 2 };
-	}
-
-	if (!(await probeOrReport(context, deps.client, deps.probeTimeoutMs))) {
-		return { exitCode: 1 };
-	}
+	const guard = await guardRemotePlanRun(context, deps.client, args.planRunId, deps.probeTimeoutMs);
+	if (guard !== null) return guard;
 
 	try {
 		const result = await deps.client.cancelPlanRun(args.planRunId);
@@ -240,7 +206,6 @@ export async function runPlanCancel(
 		renderer.cancelled(result);
 		return { exitCode: 0, planRunId: args.planRunId };
 	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1, planRunId: args.planRunId };
+		return { ...commandFailure(context, err), planRunId: args.planRunId };
 	}
 }

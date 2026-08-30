@@ -2,21 +2,34 @@
  * PlanRun HTTP handlers (warren-f923 / pl-a258 step 6).
  *
  * Extracted from `src/server/handlers/index.ts` (warren-a2b4 /
- * pl-9088 step 2). Shared parsing helpers are re-imported from the index
- * module; the NDJSON streaming plumbing (`bridgeAbort`,
- * `asNdjsonStream`, `eventToNdjson`) is re-imported from `./runs.ts`
- * so the plan-run stream handler stays byte-identical to the
- * pre-split shape.
+ * pl-9088 step 2). As of warren-e240 (pl-882c step 8) the orchestration
+ * lives in the `src/plan-runs/` domain (`createPlanRun`, `cancelPlanRun`,
+ * `tailPlanRunEvents`); these handlers are a thin surface — parse the
+ * request, call the domain function, render the response — matching the
+ * spawnRun / addProject single-implementation pattern. The NDJSON
+ * streaming plumbing (`bridgeAbort`, `asNdjsonStream`, `eventToNdjson`)
+ * is re-imported from `./runs.ts` so the plan-run stream handler stays
+ * byte-identical to the pre-split shape.
  */
 
-import { NotFoundError, ValidationError } from "../../core/errors.ts";
-import { PlanHasNoOpenChildrenError, ProjectLacksSeedsError } from "../../plan-runs/errors.ts";
-import { cancelRun } from "../../runs/index.ts";
-import { showPlan, showSeed } from "../../seeds-cli/index.ts";
+import { ValidationError } from "../../core/errors.ts";
+import {
+	isTerminalPlanRunState,
+	PLAN_RUN_STATE_FILTERS,
+	type PlanRunStateFilter,
+} from "../../core/wire.ts";
+import { mintGitCredential } from "../../forge/credentials.ts";
+import {
+	buildDefaultPlanRunEmit,
+	cancelPlanRun,
+	createPlanRun,
+	resumePlanRun,
+	tailPlanRunEvents,
+} from "../../plan-runs/index.ts";
 import { jsonResponse, ndjsonResponse } from "../response.ts";
 import { reserveEventStreamSlot } from "../stream-limits.ts";
 import type { RouteHandler, ServerDeps } from "../types.ts";
-import { refreshDispatchProject } from "./dispatch-refresh.ts";
+import { optionalPositiveNumber, optionalStringArray } from "./body-fields.ts";
 import {
 	optionalString,
 	parseBoolean,
@@ -24,6 +37,7 @@ import {
 	requireParam,
 	requireString,
 } from "./index.ts";
+import { projectPlanRun, projectPlanRunChild } from "./plan-runs-projection.ts";
 import {
 	asNdjsonStream,
 	bridgeAbort,
@@ -36,21 +50,11 @@ import {
 /* Plan runs (warren-f923 / pl-a258 step 6)                                 */
 /* ----------------------------------------------------------------------- */
 
-const PLAN_RUN_ACCEPTED_PLAN_STATUSES = ["approved", "active", "done"] as const;
-const PLAN_RUN_STATE_FILTER_VALUES = [
-	"queued",
-	"running",
-	"succeeded",
-	"failed",
-	"cancelled",
-] as const;
-type PlanRunStateFilter = (typeof PLAN_RUN_STATE_FILTER_VALUES)[number];
-
 function parsePlanRunStateFilter(raw: string | null): PlanRunStateFilter | undefined {
 	if (raw === null) return undefined;
-	if (!(PLAN_RUN_STATE_FILTER_VALUES as readonly string[]).includes(raw)) {
+	if (!(PLAN_RUN_STATE_FILTERS as readonly string[]).includes(raw)) {
 		throw new ValidationError(
-			`?state must be one of ${PLAN_RUN_STATE_FILTER_VALUES.join(", ")}; got '${raw}'`,
+			`?state must be one of ${PLAN_RUN_STATE_FILTERS.join(", ")}; got '${raw}'`,
 		);
 	}
 	return raw as PlanRunStateFilter;
@@ -58,113 +62,54 @@ function parsePlanRunStateFilter(raw: string | null): PlanRunStateFilter | undef
 
 /**
  * `POST /plan-runs` — kick off a serial plan execution against a seeds plan.
- *
- * Handler order (warren-f923):
- *   (1) load project; 404 if missing.
- *   (2) reject when project.hasSeeds is false (ProjectLacksSeedsError) —
- *       400 envelope with a stable code so HTTP consumers can branch on it.
- *   (3) call showPlan; assert plan.status is in (approved, active, done) and
- *       at least one open child exists (PlanHasNoOpenChildrenError).
- *   (4) resolve agent via repos.agents.get from the global registry.
- *   (5/6) build + persist plan_runs + plan_run_children rows in a single
- *       repo.create call (the repo runs them in a transaction so a half-
- *       inserted PlanRun never appears to listActive).
- *   (7) return 201 with {planRun, children}.
+ * Body parsing only; the orchestration (project gate, plan walk, agent
+ * resolution, transactional persist) is `createPlanRun` in the domain.
+ * Returns 201 with {planRun, children}; the coordinator picks the row up on
+ * its next tick.
  */
 export function createPlanRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const body = await readJsonBody(ctx);
-		const projectId = requireString(body, "project");
-		const planId = requireString(body, "planId");
-		const agentName = requireString(body, "agent");
 		const promptTemplate = optionalString(body, "promptTemplate");
 		const ref = optionalString(body, "ref");
 		const providerOverride = optionalString(body, "providerOverride");
 		const modelOverride = optionalString(body, "modelOverride");
 		const dispatcherHandle = optionalString(body, "dispatcherHandle");
+		// warren-de42: planId | issues are mutually exclusive and exactly one
+		// is required — the domain (createPlanRun) owns that assertion.
+		const planId = optionalString(body, "planId");
+		const issues = optionalStringArray(body, "issues");
+		// warren-a63d: per-child spend cap; each child dispatch carries it as
+		// maxCostUsdOverride. Same boundary validation as POST /runs.
+		const maxCostUsd = optionalPositiveNumber(body, "maxCostUsd");
 
-		// (1) project lookup — NotFoundError → 404.
+		const projectId = requireString(body, "project");
+		// warren-6c4c: mint the pre-dispatch refresh-fetch credential per-spawn
+		// through the boot forge (forge-contract.md §4); no config object
+		// holds a token.
 		const project = await deps.repos.projects.require(projectId);
-
-		// (2) hasSeeds gate.
-		if (!project.hasSeeds) {
-			throw new ProjectLacksSeedsError(
-				`project ${project.id} has no .seeds/ directory; plan-runs are not accepted`,
-				{
-					recoveryHint: "add a .seeds/ directory to the project clone and refresh",
-				},
-			);
-		}
-
-		// warren-6d60: refresh the project host clone before the plan
-		// walk so a plan pushed moments earlier is read off fresh on-disk
-		// state. See `refreshDispatchProject`.
-		const dispatchProject = await refreshDispatchProject(deps, project, ref);
-
-		// (3) read the plan via seeds-cli.
-		if (deps.seedsCli === undefined) {
-			throw new ValidationError(
-				"seeds CLI is not configured on this warren; plan-runs require sd",
-				{ recoveryHint: "set WARREN_SD_BINARY (or install sd on PATH) and restart" },
-			);
-		}
-		const plan = await showPlan(deps.seedsCli, dispatchProject.localPath, planId);
-		if (!(PLAN_RUN_ACCEPTED_PLAN_STATUSES as readonly string[]).includes(plan.status)) {
-			throw new ValidationError(
-				`plan ${planId} is in status '${plan.status}'; plan-runs require one of ${PLAN_RUN_ACCEPTED_PLAN_STATUSES.join(", ")}`,
-				{
-					recoveryHint: "approve or activate the plan in seeds, then retry POST /plan-runs",
-				},
-			);
-		}
-		if (plan.children.length === 0) {
-			throw new PlanHasNoOpenChildrenError(`plan ${planId} has no children; nothing to dispatch`, {
-				recoveryHint: "run `sd plan submit <seed-id>` to populate the plan's children",
-			});
-		}
-		// Probe every child seed's status — if all are already closed there is
-		// nothing to dispatch. Each child is read in parallel since the seeds
-		// CLI is shell-out + filesystem read, not network.
-		const seedsCli = deps.seedsCli;
-		const childStatuses = await Promise.all(
-			plan.children.map((seedId) =>
-				showSeed(seedsCli, dispatchProject.localPath, seedId).then((s) => ({
-					seedId,
-					status: s.status,
-				})),
-			),
-		);
-		const hasOpenChild = childStatuses.some((c) => c.status !== "closed");
-		if (!hasOpenChild) {
-			throw new PlanHasNoOpenChildrenError(
-				`plan ${planId} has no open children; every child seed is closed`,
-				{
-					recoveryHint: "re-open at least one child seed (sd update <id> --status open) and retry",
-				},
-			);
-		}
-
-		// (4) resolve the agent from the global registry.
-		const agent = await deps.repos.agents.get(agentName);
-		if (agent === null) {
-			throw new NotFoundError(`agent not found: ${agentName}`);
-		}
-
-		// (5/6) persist.
-		const result = await deps.repos.planRuns.create({
-			planId,
-			projectId: project.id,
-			agentName: agent.name,
-			children: plan.children.map((seedId, index) => ({ seq: index + 1, seedId })),
+		const gitSecret = await mintGitCredential(deps.forge, project.gitUrl);
+		const result = await createPlanRun({
+			projectId,
+			...(planId !== undefined ? { planId } : {}),
+			...(issues !== undefined ? { issues } : {}),
+			agentName: requireString(body, "agent"),
 			...(promptTemplate !== undefined ? { promptTemplate } : {}),
 			...(ref !== undefined ? { ref } : {}),
 			...(providerOverride !== undefined ? { providerOverride } : {}),
 			...(modelOverride !== undefined ? { modelOverride } : {}),
+			...(maxCostUsd !== undefined ? { maxCostUsd } : {}),
 			...(dispatcherHandle !== undefined ? { dispatcherHandle } : {}),
-			...(deps.now !== undefined ? { now: deps.now() } : {}),
+			repos: deps.repos,
+			issueTracker: deps.issueTracker,
+			projectsConfig: deps.projectsConfig,
+			...(deps.spawn !== undefined ? { spawn: deps.spawn } : {}),
+			...(gitSecret !== undefined ? { gitCredential: gitSecret } : {}),
+			...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
+			...(deps.refreshProjectFn !== undefined ? { refreshProjectFn: deps.refreshProjectFn } : {}),
+			...(deps.now !== undefined ? { now: deps.now } : {}),
 		});
 
-		// (7) wire response — coordinator picks the row up on its next tick.
 		return jsonResponse(201, {
 			planRun: result.planRun,
 			children: result.children,
@@ -184,25 +129,34 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
 		if (projectId !== null) {
 			const rows = await deps.repos.planRuns.listByProjectAndState(
 				projectId,
-				state !== undefined ? state : undefined,
+				state !== undefined && state !== "active" ? state : undefined,
 			);
-			return jsonResponse(200, { planRuns: rows });
+			const scoped =
+				state === "active" ? rows.filter((row) => !isTerminalPlanRunState(row.state)) : rows;
+			return jsonResponse(200, {
+				planRuns: scoped.map((row) => projectPlanRun(row, ctx.actor)),
+			});
 		}
-		// No project filter — return active PlanRuns when no state requested,
-		// or the operator's chosen state across every project.
-		if (state !== undefined) {
-			// listByProjectAndState requires a project; for a state-only view
-			// we walk projects sequentially. Volume is tiny relative to runs
-			// (one plan-run per dispatched plan, not per child).
+		if (state === "active") {
+			const active = await deps.repos.planRuns.listActive();
+			return jsonResponse(200, {
+				planRuns: active.map((row) => projectPlanRun(row, ctx.actor)),
+			});
+		}
+		// listByProjectAndState requires a project, so the unscoped view walks
+		// projects. Volume is tiny relative to runs (one plan-run per
+		// dispatched plan, not per child). `state` undefined means every state.
+		{
 			const projects = await deps.repos.projects.listAll();
 			const all = (
 				await Promise.all(
 					projects.map((p) => deps.repos.planRuns.listByProjectAndState(p.id, state)),
 				)
 			).flat();
-			return jsonResponse(200, { planRuns: all });
+			return jsonResponse(200, {
+				planRuns: all.map((row) => projectPlanRun(row, ctx.actor)),
+			});
 		}
-		return jsonResponse(200, { planRuns: await deps.repos.planRuns.listActive() });
 	};
 }
 
@@ -214,6 +168,10 @@ export function listPlanRunsHandler(deps: ServerDeps): RouteHandler {
  * `runs[]` goes through the SAME `projectRun` the `/runs` routes use
  * (warren-c405): this route is `readPublic`, so serving the rows raw handed
  * a spectator every field `REDACTED_RUN_FIELDS` withholds elsewhere.
+ * `planRun` and `children` go through `projectPlanRun` / `projectPlanRunChild`
+ * (warren-8793): this pair was the last `readPublic` body served with no
+ * field allowlist, leaking `promptTemplate`, the dispatch overrides,
+ * `dispatcherHandle`, and raw internal error strings on `failureReason`.
  */
 export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
@@ -223,8 +181,8 @@ export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 		const runIds = children.map((c) => c.runId).filter((v): v is string => v !== null);
 		const runs = await deps.repos.runs.listByIds(runIds);
 		return jsonResponse(200, {
-			planRun,
-			children,
+			planRun: projectPlanRun(planRun, ctx.actor),
+			children: children.map((child) => projectPlanRunChild(child, ctx.actor)),
 			runs: runs.map((run) => projectRun(run, ctx.actor)),
 		});
 	};
@@ -233,71 +191,46 @@ export function getPlanRunHandler(deps: ServerDeps): RouteHandler {
 /**
  * `POST /plan-runs/:id/cancel` — flip the plan-run to `cancelled` and, if
  * a child run is in-flight (dispatched / running / pr_open), forward a
- * cancel to that child via the existing `cancelRun` seam.
+ * cancel to that child via the existing `cancelRun` seam. The orchestration
+ * is `cancelPlanRun` in the domain; this handler only binds the deps.
  *
  * Idempotent against an already-terminal plan-run: returns the current row
  * without firing a second cancel.
  */
 export function cancelPlanRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
-		const id = requireParam(ctx, "id");
-		const planRun = await deps.repos.planRuns.require(id);
-		if (
-			planRun.state === "cancelled" ||
-			planRun.state === "succeeded" ||
-			planRun.state === "failed"
-		) {
-			return jsonResponse(200, {
-				planRun,
-				cancelledChild: null,
-				alreadyTerminal: true,
-			});
-		}
-
-		const children = await deps.repos.planRuns.listChildren(id);
-		const inFlight = children.find(
-			(c) => c.state === "dispatched" || c.state === "running" || c.state === "pr_open",
-		);
-
-		const endedAt = (deps.now?.() ?? new Date()).toISOString();
-		const cancelled = await deps.repos.planRuns.transitionTo(planRun.id, "cancelled", {
-			endedAt,
+		const result = await cancelPlanRun({
+			planRunId: requireParam(ctx, "id"),
+			repos: deps.repos,
+			broker: deps.broker,
+			...cancelRunWiring(deps), // warren-b223: provider + burrow-bound inline reap
+			...(deps.autoOpenPr !== undefined ? { autoOpenPr: deps.autoOpenPr } : {}),
+			logger: deps.logger,
+			...(deps.now !== undefined ? { now: deps.now } : {}),
 		});
+		return jsonResponse(200, result);
+	};
+}
 
-		let cancelledChild: { childSeq: number; runId: string } | null = null;
-		if (inFlight !== undefined && inFlight.runId !== null) {
-			try {
-				await cancelRun({
-					runId: inFlight.runId,
-					repos: deps.repos,
-					...cancelRunWiring(deps), // warren-b223: provider + burrow-bound inline reap
-					broker: deps.broker,
-					reason: `plan_run_cancelled:${planRun.id}`,
-					...(deps.now !== undefined ? { now: deps.now } : {}),
-					...(deps.autoOpenPr !== undefined ? { autoOpenPr: deps.autoOpenPr } : {}),
-				});
-				cancelledChild = { childSeq: inFlight.seq, runId: inFlight.runId };
-			} catch (err) {
-				// Best-effort cancel — the plan-run itself is already in the
-				// cancelled state, and the child run will land terminally via
-				// the bridge regardless. Surface the failure on the response
-				// so operators can see why the child didn't cancel cleanly.
-				deps.logger.warn(
-					{
-						planRunId: planRun.id,
-						childRunId: inFlight.runId,
-						err: err instanceof Error ? err.message : String(err),
-					},
-					"plan_run.cancel_child_failed",
-				);
-			}
-		}
-
-		return jsonResponse(200, {
-			planRun: cancelled,
-			cancelledChild,
-			alreadyTerminal: false,
+/**
+ * `POST /plan-runs/:id/resume` — re-drive the SAME plan-run row after a
+ * merge-timeout failure (warren-1eff, Option A). Only the two
+ * human-merge-stall failure reasons (`child_pr_merge_timeout`,
+ * `parent_pr_merge_timeout`) are resumable; anything else — including a
+ * non-failed plan-run — gets a typed 409 from StateTransitionError with
+ * no state change. The orchestration is `resumePlanRun` in the domain;
+ * the coordinator picks the row up on its next tick and re-polls the
+ * existing PR against a re-armed merge clock.
+ */
+export function resumePlanRunHandler(deps: ServerDeps): RouteHandler {
+	return async (ctx) => {
+		const result = await resumePlanRun({
+			planRunId: requireParam(ctx, "id"),
+			repos: deps.repos,
+			emit: buildDefaultPlanRunEmit(deps.repos, deps.now),
+			...(deps.now !== undefined ? { now: deps.now } : {}),
 		});
+		return jsonResponse(200, result);
 	};
 }
 
@@ -305,7 +238,8 @@ export function cancelPlanRunHandler(deps: ServerDeps): RouteHandler {
  * `GET /plan-runs/:id/events` — NDJSON tail of the union of every child
  * run's events. Read-only: snapshots `events.listByRunIds(...)` first,
  * then subscribes to the broker for each child run. Live arrivals after
- * the snapshot are deduped by (runId, burrowEventSeq).
+ * the snapshot are deduped by (runId, sandboxEventSeq). The generator is
+ * `tailPlanRunEvents` in the domain.
  *
  * `?follow=1` keeps the stream open until the client disconnects or the
  * plan-run reaches a terminal state. Default (no follow) returns the
@@ -328,7 +262,7 @@ export function streamPlanRunEventsHandler(deps: ServerDeps): RouteHandler {
 		});
 
 		const source = tailPlanRunEvents({
-			planRun,
+			planRunId: planRun.id,
 			repos: deps.repos,
 			broker: deps.broker,
 			follow,
@@ -343,112 +277,4 @@ export function streamPlanRunEventsHandler(deps: ServerDeps): RouteHandler {
 			),
 		);
 	};
-}
-
-interface TailPlanRunEventsInput {
-	readonly planRun: { id: string };
-	readonly repos: ServerDeps["repos"];
-	readonly broker: ServerDeps["broker"];
-	readonly follow: boolean;
-	readonly signal: AbortSignal;
-}
-
-type PlanRunEventRow = {
-	id: number;
-	runId: string;
-	burrowEventSeq: number;
-	ts: string;
-	kind: string;
-	stream: string | null;
-	payloadJson: unknown;
-};
-
-/**
- * Tail the union of every plan-run child's events. History first (via
- * `events.listByRunIds`), then live arrivals from `broker.subscribe(runId)`
- * for each known child runId. Newly-dispatched children are picked up by a
- * polling watcher so a stream opened before child 2 lands still sees its
- * events without a reconnect.
- *
- * Live events are deduped by (runId, burrowEventSeq) against the high-water
- * mark established during history replay, so a row that lands in the gap
- * between snapshot and subscribe isn't either dropped or duplicated.
- */
-async function* tailPlanRunEvents(
-	input: TailPlanRunEventsInput,
-): AsyncGenerator<PlanRunEventRow, void, void> {
-	const seenSeq = new Map<string, number>();
-
-	const initialChildren = await input.repos.planRuns.listChildren(input.planRun.id);
-	const initialRunIds = initialChildren.map((c) => c.runId).filter((v): v is string => v !== null);
-	const history = await input.repos.events.listByRunIds(initialRunIds);
-	for (const row of history) {
-		const prev = seenSeq.get(row.runId) ?? 0;
-		if (row.burrowEventSeq > prev) seenSeq.set(row.runId, row.burrowEventSeq);
-		yield row;
-	}
-
-	if (!input.follow) return;
-
-	// Shared event queue fed by every per-child subscription pump.
-	const queue: PlanRunEventRow[] = [];
-	let waiter: (() => void) | null = null;
-	const wake = (): void => {
-		const fn = waiter;
-		if (fn !== null) {
-			waiter = null;
-			fn();
-		}
-	};
-	input.signal.addEventListener("abort", wake, { once: true });
-
-	const subscribed = new Set<string>();
-	const subscribe = (runId: string): void => {
-		if (subscribed.has(runId)) return;
-		subscribed.add(runId);
-		const sub = input.broker.subscribe(runId, { signal: input.signal });
-		void (async () => {
-			try {
-				for await (const row of sub) {
-					queue.push(row as PlanRunEventRow);
-					wake();
-				}
-			} catch {
-				// broker.subscribe ends via signal abort or close — ignore.
-			}
-		})();
-	};
-	for (const runId of initialRunIds) subscribe(runId);
-
-	const watcherIntervalMs = 2_000;
-	const watcher = setInterval(() => {
-		void (async () => {
-			try {
-				const fresh = await input.repos.planRuns.listChildren(input.planRun.id);
-				for (const child of fresh) {
-					if (child.runId !== null) subscribe(child.runId);
-				}
-			} catch {
-				// Best-effort — a missed reload pings again next tick.
-			}
-		})();
-	}, watcherIntervalMs);
-
-	try {
-		while (!input.signal.aborted) {
-			const row = queue.shift();
-			if (row === undefined) {
-				await new Promise<void>((resolve) => {
-					waiter = resolve;
-				});
-				continue;
-			}
-			const prev = seenSeq.get(row.runId) ?? 0;
-			if (row.burrowEventSeq <= prev) continue;
-			seenSeq.set(row.runId, row.burrowEventSeq);
-			yield row;
-		}
-	} finally {
-		clearInterval(watcher);
-	}
 }

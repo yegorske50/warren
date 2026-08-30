@@ -1,10 +1,16 @@
 # Warren → Kubernetes Migration Design
 
+**Kind:** architecture-decision
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-07-07
+**Shipped:** v0.10.0
+**Current truth:** [`docs/RUNBOOK-K8S.md`](../RUNBOOK-K8S.md) and `src/runtime/k8s/`
+
 > **HISTORICAL — shipped in v0.10.0.** This document is a design record, not a plan in flight. The K8s runtime it argues for now runs in production — see [`docs/RUNBOOK-K8S.md`](../RUNBOOK-K8S.md) for how warren behaves today.
 >
 > **Decisions #2 and #3 below changed during the work (2026-07-09).** Warren keeps burrow rather than archiving it: burrow became one provider (`LocalProvider`) behind the `RuntimeProvider` contract, and K8s became the scale backend. See [`runtime-provider-contract.md`](./runtime-provider-contract.md) for that seam. The rest of this document's architecture reasoning — pod-per-run, init container, pod-log streaming, `run_inbox` — still describes the shipped system.
 
-**Status:** Design record — architecture decisions.
 **Date:** 2026-07-07  
 **Author:** derived from postmortem `notes/2026-07-07-warren-deployed-oom-crash-loop-postmortem.md`  
 **Scope:** Warren control plane + run dispatch
@@ -135,6 +141,22 @@ Alternative (pod stdin) was rejected: it requires a running `exec` session to
 the pod, which is stateful and breaks on pod restart or warren restart. The HTTP
 poll is stateless and naturally handles reconnects.
 
+#### The two-inbox split (warren-3305)
+
+Two steering stores exist. Do not conflate them.
+
+- **The burrow per-burrow inbox** — the LocalProvider path. `steerRun` calls `runtimeProvider.sendMessage`. Under `local` that posts to the burrow `POST /burrows/:id/inbox` over the unix socket. The scope is per-BURROW, not per-run, so the returned message carries `runId: null`. The burrow dispatcher drains it. Warren never sees delivery.
+- **The warren `run_inbox` table** — the K8s path. `K8sProvider.sendMessage` persists the message under the warren run id. The in-pod agent harness (`agent-stdin-hold.ts`) polls `GET /runs/:id/inbox` and drains it.
+
+Operational rules:
+
+- **`GET /runs/:id/inbox` reads only the `run_inbox` store.** Under the local topology it knows nothing of the burrow inbox. `{"messages":[]}` after a steer is not proof of delivery. A non-empty read is not proof the agent acted, either.
+- **A bare poll consumes.** It claims every unread row at once and flips it to `delivered`. Any reader other than the pod, such as an operator curl, steals the message before the pod polls.
+- **Use `?peek=1` to inspect.** `GET /runs/:id/inbox?peek=1` (warren-3305) lists the unread queue without claiming. The pod never peeks, so claiming stays exactly-once.
+- **`steer.sent` vs `steer.delivered`.** `steerRun` emits `steer.sent` when warren accepts the message. The poll emits one `steer.delivered` per claimed message (warren-3305). Delivered means the harness took the message, not that the agent acted on it. A steer with `steer.sent` but no `steer.delivered` is the observable non-delivery signature.
+- **Declare the harness capability, never assume it.** `frontmatter.steering` (see `STEERING_CAPABILITIES` in `src/core/wire.ts`) records what the agent runtime consumes. `"mid-run"` means a live stdin channel. No builtin has one today.
+- **All eight builtins are `"spawn-only"`.** The harness folds the message into the prompt at spawn and never reads mid-run. `"none"` rejects every steer. `POST /runs/:id/steer` returns 409 when the declared harness cannot consume the steer. Agents that predate the flag stay fail-open.
+
 ---
 
 ## 2. Sandbox Model
@@ -189,6 +211,52 @@ matters for short runs. Defer.
 
 This is stricter than the current Fly posture (which didn't need the compose
 flags but also didn't explicitly drop caps).
+
+**Entrypoint/agent uid split (warren-cb93, amendment):** the agent container
+adds back `capabilities: [SETUID, SETGID, KILL]` for warren's in-pod
+entrypoint only (still uid 1000), never for the agent.
+
+The entrypoint wraps the agent argv in `setpriv` with a full privilege
+drop: `--reuid=1001 --regid=1000 --clear-groups --no-new-privs
+--inh-caps=-all --ambient-caps=-all --bounding-set=-all`
+(`src/runtime/k8s/agent-uid-drop.ts`). The agent process then runs under a
+different uid than the process whose stdout IS the pod log.
+
+That closes the warren-6646 residual. A forged write at `/proc/1/fd/1` from
+the agent now fails EACCES (cross-uid), so the agent cannot reproduce the
+in-band provenance marker.
+
+The split-off agent also cannot SIGNAL the entrypoint. The watchdog's own
+cross-uid kill routes through the same setpriv drop (`withCrossUidKill`),
+because the entrypoint's effective capability set is empty on containerd 2.x.
+
+Two prerequisites apply. First, setpriv must be able to gain
+CAP_SETUID/CAP_SETGID (warren-950d amendment). containerd 2.x grants a
+non-root pid 1 its `capabilities.add` in the bounding set only.
+
+So the agent image bakes file caps on setpriv
+(`setcap cap_setuid,cap_setgid+ep`) and the agent container sets
+`allowPrivilegeEscalation: true` while the split is on.
+
+`no_new_privs` off is what lets the file caps take effect for the
+entrypoint. The agent stays sealed by setpriv's own
+`--no-new-privs --bounding-set=-all`.
+
+The entrypoint preflights the drop and the run fails legibly
+(`spawn_failed`) when the caps never arrive. The deploy workflow gates on
+the same probe via `scripts/k8s-uid-drop-canary.ts` (RUNBOOK-K8S.md §4.2).
+
+Second, the workspace stays group-writable (pod `fsGroup` 1000 plus
+`umask 002` in the init container and the entrypoint), so the uid-1001 agent
+can write its uid-1000-owned checkout.
+
+`WARREN_K8S_AGENT_UID_DROP=0` restores the legacy shared-uid shape. The
+DockerProvider spawns the agent argv directly as the container's pid 1, so
+no entrypoint fd exists to protect and no split applies.
+
+The shared agent image now ships a file-caps setpriv, so the docker run
+pins `--security-opt no-new-privileges` to keep those caps (and any setuid
+bit) inert there (warren-950d).
 
 ---
 

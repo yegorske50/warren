@@ -6,7 +6,7 @@
  * plan-run's child-state table with per-child cost + duration pulled from the
  * fanned-out `runs[]` rows, while `list` prints the plan-run index, optionally
  * filtered by `--project` / `--state`. Like the rest of the `plan` group they
- * talk to a remote warren via {@link WarrenClient.fromEnv}, probe first so a
+ * talk to a remote warren via `resolveCommandClient`, probe first so a
  * down server is a friendly stderr line rather than a mid-call throw, and
  * default to NDJSON output (pipeline parity) with an opt-in `--output pretty`
  * human renderer.
@@ -21,8 +21,18 @@ import type {
 	RunRow,
 } from "../../client/types.ts";
 import type { CliContext } from "../output.ts";
-import { formatError, type WriteSink, writeJsonLine } from "../output.ts";
+import {
+	commandFailure,
+	EXIT_SERVER_UNREACHABLE,
+	exitCodeForError,
+	formatError,
+	type WriteSink,
+	writeJsonLine,
+} from "../output.ts";
 import type { PlanRunOutput } from "../plan-run-renderer.ts";
+import { runCost, runDuration } from "../run-renderer.ts";
+import { columnWidths, formatRow, renderTable } from "../table.ts";
+import { guardRemotePlanRun, probeOrReport } from "./probe.ts";
 
 export interface PlanStatusArgs {
 	readonly planRunId: string;
@@ -53,31 +63,13 @@ export interface PlanListResult {
 	readonly count?: number;
 }
 
-/** Probe the remote warren, mapping an unreachable server to a stderr line. */
-async function probeOrReport(deps: PlanStatusDeps, context: CliContext): Promise<boolean> {
-	try {
-		await (deps.probeTimeoutMs !== undefined
-			? deps.client.probe(deps.probeTimeoutMs)
-			: deps.client.probe());
-		return true;
-	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return false;
-	}
-}
-
 export async function runPlanStatus(
 	context: CliContext,
 	deps: PlanStatusDeps,
 	args: PlanStatusArgs,
 ): Promise<PlanStatusResult> {
-	if (args.planRunId === "") {
-		context.stdio.stderr.write("warren: plan-run id is required\n");
-		return { exitCode: 2 };
-	}
-	if (!(await probeOrReport(deps, context))) {
-		return { exitCode: 1 };
-	}
+	const guard = await guardRemotePlanRun(context, deps.client, args.planRunId, deps.probeTimeoutMs);
+	if (guard !== null) return guard;
 	try {
 		const detail = await deps.client.getPlanRun(args.planRunId);
 		if ((args.output ?? "ndjson") === "pretty") {
@@ -87,8 +79,7 @@ export async function runPlanStatus(
 		}
 		return { exitCode: 0, planRunId: detail.planRun.id, state: detail.planRun.state };
 	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1, planRunId: args.planRunId };
+		return { ...commandFailure(context, err), planRunId: args.planRunId };
 	}
 }
 
@@ -97,8 +88,8 @@ export async function runPlanList(
 	deps: PlanListDeps,
 	args: PlanListArgs,
 ): Promise<PlanListResult> {
-	if (!(await probeOrReport(deps, context))) {
-		return { exitCode: 1 };
+	if (!(await probeOrReport(context, deps.client, deps.probeTimeoutMs))) {
+		return { exitCode: EXIT_SERVER_UNREACHABLE };
 	}
 	try {
 		const filter = {
@@ -116,7 +107,7 @@ export async function runPlanList(
 		return { exitCode: 0, count: planRuns.length };
 	} catch (err) {
 		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: 1 };
+		return { exitCode: exitCodeForError(err) };
 	}
 }
 
@@ -150,13 +141,13 @@ const HEADER: readonly string[] = ["#", "seed", "state", "cost", "duration", "ru
 
 /** Build one table row (string cells) for a child + its optional run row. */
 function childRow(child: PlanRunChildRow, runById: Map<string, RunRow>): readonly string[] {
-	const run = child.runId !== null ? runById.get(child.runId) : undefined;
+	const run = child.runId !== null ? (runById.get(child.runId) ?? null) : null;
 	return [
 		`#${child.seq}`,
 		child.seedId,
 		child.state,
-		formatCost(run?.costUsd ?? null),
-		formatDuration(run ?? null),
+		runCost(run?.costUsd ?? null),
+		runDuration(run),
 		child.runId ?? "—",
 	];
 }
@@ -172,47 +163,10 @@ function renderListPretty(sink: WriteSink, planRuns: readonly PlanRunRow[]): voi
 	const rows = planRuns.map((pr) => [
 		pr.id,
 		pr.state,
-		pr.planId,
+		pr.planId ?? "-",
 		pr.projectId,
 		pr.agentName,
 		pr.createdAt,
 	]);
-	const widths = columnWidths([header, ...rows]);
-	line(formatRow(header, widths));
-	for (const row of rows) {
-		line(formatRow(row, widths));
-	}
-}
-
-/** Compute the max width of each column across all rows. */
-function columnWidths(rows: readonly (readonly string[])[]): number[] {
-	const widths: number[] = [];
-	for (const row of rows) {
-		row.forEach((cell, i) => {
-			widths[i] = Math.max(widths[i] ?? 0, cell.length);
-		});
-	}
-	return widths;
-}
-
-/** Left-pad each cell to its column width and join with two spaces. */
-function formatRow(row: readonly string[], widths: readonly number[]): string {
-	return row
-		.map((cell, i) => cell.padEnd(widths[i] ?? cell.length))
-		.join("  ")
-		.trimEnd();
-}
-
-/** Render a cost in USD, or an em-dash when unknown. */
-function formatCost(costUsd: number | null): string {
-	return costUsd === null ? "—" : `$${costUsd.toFixed(4)}`;
-}
-
-/** Render a run's wall-clock duration as `Ns`, or an em-dash when unknown. */
-function formatDuration(run: RunRow | null): string {
-	if (run === null || run.startedAt === null || run.endedAt === null) return "—";
-	const started = Date.parse(run.startedAt);
-	const ended = Date.parse(run.endedAt);
-	if (Number.isNaN(started) || Number.isNaN(ended) || ended < started) return "—";
-	return `${((ended - started) / 1000).toFixed(1)}s`;
+	renderTable(sink, header, rows);
 }

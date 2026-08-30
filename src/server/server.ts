@@ -31,7 +31,7 @@ import { NO_AUTH, policyAllows } from "./auth.ts";
 import { errorLogFields, forbidden, methodNotAllowed, notFound, renderError } from "./errors.ts";
 import { buildApiRoutes, isApiPath, isAuthExempt } from "./handlers/index.ts";
 import { bindRequestIdLogger, extractOrGenerateRequestId, stampRequestId } from "./request-id.ts";
-import { jsonResponse } from "./response.ts";
+import { jsonResponse, withSecurityHeaders } from "./response.ts";
 import { matchRoute, pathExists } from "./router.ts";
 import type {
 	Actor,
@@ -55,14 +55,21 @@ type ServeServer = ReturnType<typeof Bun.serve>;
 const DEFAULT_TRANSPORT: Transport = { kind: "tcp", hostname: "127.0.0.1", port: 0 };
 
 /**
- * Bun.serve's per-request idleTimeout defaults to 10 seconds; that
- * silently kills the long-lived NDJSON stream behind
- * `GET /runs/:id/events?follow=1` whenever the agent has a quiet stretch
- * (warren-b8fc). 0 disables the per-request timeout — every other route
- * here completes in milliseconds, so a server-wide disable is safe and
- * keeps the streaming surface honest.
+ * Per-request idle timeout handed to `Bun.serve`, in seconds.
+ *
+ * This was 0 (warren-b8fc), which disables the timer for the whole server
+ * and left no route with slow-request protection (warren-a676). What the
+ * timer actually watches is socket inactivity while a request is being
+ * read: a client that drips its body a byte at a time is refused once the
+ * gap exceeds this, and with 0 it is served no matter how long it stalls.
+ *
+ * It does NOT watch a handler that takes its time, nor a response body
+ * that stays quiet, so the long-lived NDJSON tails behind
+ * `GET /runs/:id/events?follow=1` are unaffected by a bounded value and
+ * need no per-route exemption. Their own lifetime and concurrency caps
+ * live in `stream-limits.ts`.
  */
-const DEFAULT_IDLE_TIMEOUT_SECONDS = 0;
+export const DEFAULT_IDLE_TIMEOUT_SECONDS = 30;
 
 /**
  * Boot the wire layer for a fully-wired `ServerDeps`. The serving side
@@ -228,7 +235,10 @@ async function handleRequest(
 	if (previewProxy !== undefined) {
 		try {
 			const proxied = await previewProxy(request, url);
-			if (proxied !== null) return proxied;
+			// The preamble builds its own envelopes below the shared
+			// constructors, so stamp the warren-e2a4 security-header
+			// baseline on here (warren-b0bd: scenario 39 asserts it).
+			if (proxied !== null) return withSecurityHeaders(proxied);
 		} catch (err) {
 			const rendered = renderError(err, requestId);
 			logger.error(

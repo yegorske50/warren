@@ -119,9 +119,9 @@ describe("resolveK8sPodConfig", () => {
 		});
 	});
 
-	test("teardown grace periods default to 30s (cancel) / 0s (terminate)", () => {
+	test("teardown grace periods default to 90s (cancel) / 0s (terminate)", () => {
 		const c = resolveK8sPodConfig({});
-		expect(c.cancelGracePeriodSeconds).toBe(30);
+		expect(c.cancelGracePeriodSeconds).toBe(90);
 		expect(c.terminateGracePeriodSeconds).toBe(0);
 	});
 
@@ -137,16 +137,16 @@ describe("resolveK8sPodConfig", () => {
 	test("invalid grace env (negative / non-integer / blank) falls back to the default", () => {
 		expect(
 			resolveK8sPodConfig({ WARREN_K8S_CANCEL_GRACE_SECONDS: "-5" }).cancelGracePeriodSeconds,
-		).toBe(30);
+		).toBe(90);
 		expect(
 			resolveK8sPodConfig({ WARREN_K8S_CANCEL_GRACE_SECONDS: "1.5" }).cancelGracePeriodSeconds,
-		).toBe(30);
+		).toBe(90);
 		expect(
 			resolveK8sPodConfig({ WARREN_K8S_CANCEL_GRACE_SECONDS: "  " }).cancelGracePeriodSeconds,
-		).toBe(30);
+		).toBe(90);
 		expect(
 			resolveK8sPodConfig({ WARREN_K8S_CANCEL_GRACE_SECONDS: "abc" }).cancelGracePeriodSeconds,
-		).toBe(30);
+		).toBe(90);
 	});
 
 	test("callback + git-secret read from env", () => {
@@ -260,6 +260,20 @@ describe("buildRunPod", () => {
 		expect(pod.metadata?.annotations?.["warren.io/branch"]).toBeUndefined();
 	});
 
+	test("agent image precedence: spec.agentImage > env config (warren-fabb)", () => {
+		// config.agentImage here comes from WARREN_K8S_AGENT_IMAGE — the
+		// per-project override must win, and fall back to it when absent.
+		const withEnvImage = resolveK8sPodConfig({ WARREN_K8S_AGENT_IMAGE: "ghcr.io/acme/agent:1.2" });
+		const overridden = buildRunPod(
+			baseSpec({ agentImage: "ghcr.io/acme/agent-py:1.0" }),
+			withEnvImage,
+		);
+		expect(overridden.spec?.containers?.[0]?.image).toBe("ghcr.io/acme/agent-py:1.0");
+
+		const fallback = buildRunPod(baseSpec(), withEnvImage);
+		expect(fallback.spec?.containers?.[0]?.image).toBe("ghcr.io/acme/agent:1.2");
+	});
+
 	test("imagePullPolicy: omitted by default, applied to BOTH containers when set (warren-245d)", () => {
 		const bare = buildRunPod(baseSpec(), config);
 		expect(bare.spec?.initContainers?.[0]?.imagePullPolicy).toBeUndefined();
@@ -280,18 +294,19 @@ describe("buildRunPod", () => {
 		expect(sc?.seccompProfile?.type).toBe("RuntimeDefault");
 	});
 
-	test("every container drops ALL caps, forbids privilege escalation, runs non-root + seccomp", () => {
+	test("every container drops ALL caps, runs non-root + seccomp", () => {
 		const pod = buildRunPod(baseSpec(), config);
 		const containers = [...(pod.spec?.initContainers ?? []), ...(pod.spec?.containers ?? [])];
 		expect(containers.length).toBe(2);
 		for (const c of containers) {
 			const sc = c.securityContext;
-			expect(sc?.allowPrivilegeEscalation).toBe(false);
 			expect(sc?.capabilities?.drop).toEqual(["ALL"]);
 			expect(sc?.runAsNonRoot).toBe(true);
 			expect(sc?.runAsUser).toBe(1000);
 			expect(sc?.seccompProfile?.type).toBe("RuntimeDefault");
 		}
+		// The agent container's uid-split relaxation: pod-spec.uid-drop.test.ts (warren-950d).
+		expect(pod.spec?.initContainers?.[0]?.securityContext?.allowPrivilegeEscalation).toBe(false);
 	});
 
 	test("references a workspace-init init container sharing the /workspace emptyDir", () => {
@@ -385,8 +400,8 @@ describe("buildRunPod", () => {
 		const agent = buildRunPod(baseSpec(), config).spec?.containers?.[0];
 		const anthropic = (agent?.env ?? []).find((e) => e.name === "ANTHROPIC_API_KEY");
 		expect(anthropic?.valueFrom?.secretKeyRef).toEqual({
-			name: config.anthropicSecret.name,
-			key: config.anthropicSecret.key,
+			name: "warren-anthropic-key",
+			key: "api-key",
 			optional: true,
 		});
 	});
@@ -408,8 +423,8 @@ describe("buildRunPod", () => {
 		const agent = buildRunPod(baseSpec(), config).spec?.containers?.[0];
 		const openrouter = (agent?.env ?? []).find((e) => e.name === "OPENROUTER_API_KEY");
 		expect(openrouter?.valueFrom?.secretKeyRef).toEqual({
-			name: config.openrouterSecret.name,
-			key: config.openrouterSecret.key,
+			name: "warren-openrouter-key",
+			key: "api-key",
 			optional: true,
 		});
 	});

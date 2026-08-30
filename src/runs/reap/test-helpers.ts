@@ -1,36 +1,52 @@
-import { type Burrow, NotFoundError } from "@os-eco/burrow-cli";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { RunTerminalState } from "../../db/schema.ts";
+import type { Forge, RepoRef } from "../../forge/contract.ts";
+import { FAKE_FORGE_KIND, FakeForge, type FakeForgeOptions } from "../../forge/fake/fake-forge.ts";
 import type { PreviewSidecarResolver } from "../../preview/launch/index.ts";
 import type { RuntimeProvider } from "../../runtime/contract.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
+import { LocalSidecarRegistry } from "../../runtime/local/preview/registry.ts";
 import { createLocalSidecarsResolver } from "../../runtime/local/preview/sidecars.ts";
-import { LocalProvider } from "../../runtime/local/provider.ts";
+import type { SandboxProfile } from "../../sandbox/types.ts";
 import { RunEventBroker } from "../events.ts";
-import type { OpenPullRequestInput, OpenPullRequestResult } from "../pr.ts";
 import type { ReapExec, ReapFs, ReapRunResult } from "./types.ts";
 
 /**
- * Build the reap runtime seams for tests over a fake burrow client (warren-e24d).
- * Reap no longer takes a burrow client: it drives finalize/terminate/workspace
- * resolution through a `RuntimeProvider` and preview through a neutral sidecar
- * resolver. This helper wraps a `fakeBurrowClient` into the burrow-backed
- * `LocalProvider` (with the test's fake `fs`/`exec` so finalize runs against
- * them) plus the sidecar resolver, so a test spreads `...reapDeps(client, {
- * fs, exec })` where it used to pass `burrowClient`.
+ * Build the reap runtime seams for tests over a fake provider (warren-e24d;
+ * re-based onto `FakeProvider` in warren-ea0a when the burrow facade left).
+ * Reap drives finalize/terminate/workspace resolution through a
+ * `RuntimeProvider` and preview through a neutral sidecar resolver. This
+ * helper threads the test's fake `fs`/`exec` into the provider's finalize
+ * seams plus the sidecar resolver, so a test spreads `...reapDeps(provider,
+ * { fs, exec })`.
  */
 export function reapDeps(
-	client: BurrowClient,
+	provider: FakeProvider,
 	opts: { fs?: ReapFs; exec?: ReapExec } = {},
 ): { runtimeProvider: RuntimeProvider; previewSidecars: PreviewSidecarResolver } {
 	return {
-		runtimeProvider: new LocalProvider({
-			burrowClient: () => client,
-			...(opts.fs !== undefined ? { fs: opts.fs } : {}),
-			...(opts.exec !== undefined ? { exec: opts.exec } : {}),
-		}),
-		previewSidecars: createLocalSidecarsResolver(client),
+		runtimeProvider: provider.withFinalizeSeams(opts.fs, opts.exec),
+		// warren-4bf3: the sidecar resolver is warren-owned now. Reap tests
+		// never spawn sidecars (launch is faked), so a registry over a stub
+		// profile lookup gives the resolver a real-but-empty facade — list
+		// returns [], delete throws NotFoundError the sweeps tolerate.
+		previewSidecars: createLocalSidecarsResolver(
+			new LocalSidecarRegistry({ profileFor: () => stubProfile() }),
+		),
+	};
+}
+
+function stubProfile(): SandboxProfile {
+	return {
+		workspace: "/tmp/ws",
+		home: "/tmp/home",
+		readOnlyMounts: [],
+		network: "none",
+		allowedDomains: [],
+		envPassthrough: [],
+		setEnv: {},
+		toolchainPaths: [],
 	};
 }
 
@@ -68,20 +84,6 @@ export function makeReapRunResult(overrides: Partial<ReapRunResult> = {}): ReapR
 		alreadyTerminal: false,
 		...overrides,
 	};
-}
-
-/**
- * Historical one-worker pool wrapper (warren-c0c9). Placement + the
- * workers/burrows tables were retired (warren-76c5 / warren-3743), so this is
- * now a pass-through kept for call-site stability; the `_repos` param is
- * vestigial.
- */
-export async function makePool(
-	client: BurrowClient,
-	_repos: Repos,
-	_workerName = "local",
-): Promise<BurrowClient> {
-	return client;
 }
 
 export interface FakeFs {
@@ -140,11 +142,28 @@ export interface FakeExecOpts {
 	/** Throw on git rev-list calls (default: succeed). */
 	failRevList?: string;
 	/**
+	 * Stdout for `git rev-parse --verify <ref>` (warren-ba08: the pre-push
+	 * `origin/<branch>` tip finalize pins on a ref-dispatch repair run).
+	 * Default a fixed fake SHA; pass `""` to simulate a missing tracking ref.
+	 */
+	revParse?: string;
+	/**
+	 * Throw on `git cat-file -e <ref>:<path>` (default: succeed) — simulates
+	 * a seed drop absent from the base ref, i.e. untracked in every ref
+	 * (warren-0f18's seed_reset sweep test).
+	 */
+	failCatFile?: boolean;
+	/**
 	 * Stdout for `git rev-list --count <ref>..HEAD`. Default `"1"` so
 	 * existing tests with `branchPushed: true` see commitsAhead=1 (real
 	 * work shipped) rather than the empty-push shape (warren-f3bb).
 	 */
 	revListCount?: string;
+	/**
+	 * Stdout for `git diff --numstat <base>..<head>` (warren-ab2b outcome
+	 * facts). Default `""` (no rows → zeroed totals).
+	 */
+	numstat?: string;
 	/**
 	 * When `true`, `git diff --cached --quiet …` throws (exit non-zero =
 	 * staged changes present). Default `false` — exits zero = no staged
@@ -170,10 +189,24 @@ function isGitSub(cmd: string, args: readonly string[], sub: string): boolean {
 
 type ExecResult = { stdout: string; stderr: string };
 
+function handleCatFile(failCatFile: boolean): ExecResult {
+	if (failCatFile) throw new Error("path does not exist in ref");
+	return { stdout: "", stderr: "" };
+}
+
 function handleRevList(failRevList: string | null, revListCount: string): ExecResult {
 	if (failRevList !== null) throw new Error(failRevList);
 	return { stdout: `${revListCount}\n`, stderr: "" };
 }
+
+/** warren-ba08: `git rev-parse --verify` exits non-zero (throws) when the ref is missing. */
+function handleRevParse(revParse: string): ExecResult {
+	if (revParse === "") throw new Error("fatal: Needed a single revision");
+	return { stdout: `${revParse}\n`, stderr: "" };
+}
+
+/** The pre-run tip `fakeExec` resolves `origin/<branch>` to by default. */
+export const FAKE_REV_PARSE_SHA = "0123456789abcdef0123456789abcdef01234567";
 
 function handleStatus(failGitStatus: string | null, gitStatus: string): ExecResult {
 	if (failGitStatus !== null) throw new Error(failGitStatus);
@@ -195,20 +228,35 @@ export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 	const fail = opts.fail !== undefined ? { reason: opts.fail } : null;
 	const failPush = opts.failPush ?? null;
 	const failRevList = opts.failRevList ?? null;
+	const failCatFile = opts.failCatFile === true;
 	const revListCount = opts.revListCount ?? "1";
+	const revParse = opts.revParse ?? FAKE_REV_PARSE_SHA;
+	const numstat = opts.numstat ?? "";
 	const stagedDelta = opts.stagedDelta === true;
 	const gitStatus = opts.gitStatus ?? "";
 	const failGitStatus = opts.failGitStatus ?? null;
+	// Routed `git <sub>` reads, split out of `run` to keep both under the
+	// cognitive-complexity budget.
+	const route = (cmd: string, args: readonly string[]): ExecResult | null => {
+		if (isGitSub(cmd, args, "cat-file")) return handleCatFile(failCatFile);
+		if (isGitSub(cmd, args, "rev-list")) return handleRevList(failRevList, revListCount);
+		if (isGitSub(cmd, args, "rev-parse")) return handleRevParse(revParse);
+		if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
+			return handleStatus(failGitStatus, gitStatus);
+		}
+		if (isGitSub(cmd, args, "diff") && args.includes("--cached") && args.includes("--quiet")) {
+			return handleDiffCached(stagedDelta);
+		}
+		if (isGitSub(cmd, args, "diff") && args.includes("--numstat")) {
+			return { stdout: numstat, stderr: "" };
+		}
+		return null;
+	};
 	const exec: ReapExec = {
 		run: async (cmd, args, opt) => {
 			calls.push({ cmd, args, cwd: opt.cwd, env: opt.env });
-			if (isGitSub(cmd, args, "rev-list")) return handleRevList(failRevList, revListCount);
-			if (isGitSub(cmd, args, "status") && args.includes("--porcelain")) {
-				return handleStatus(failGitStatus, gitStatus);
-			}
-			if (isGitSub(cmd, args, "diff") && args.includes("--cached") && args.includes("--quiet")) {
-				return handleDiffCached(stagedDelta);
-			}
+			const routed = route(cmd, args);
+			if (routed !== null) return routed;
 			if (failPush !== null && isGitSub(cmd, args, "push")) throw new Error(failPush);
 			if (fail !== null) throw new Error(fail.reason);
 			return { stdout: "", stderr: "" };
@@ -219,67 +267,62 @@ export function fakeExec(opts: FakeExecOpts = {}): FakeExec {
 
 export interface FakeBurrowClientOpts {
 	/**
-	 * Body the workspace-side seeds file (`.seeds/issues.jsonl`) returns
-	 * over `client.http.files.read`. `undefined` (default) makes the read
-	 * throw `NotFoundError` — i.e. the agent never created the file —
-	 * mirroring the no-op path. Pass a string to exercise the mirror code.
+	 * Body the workspace-side seeds file (`.seeds/issues.jsonl`) returns from
+	 * the provider's tracker-read seam. `undefined` (default) reads as absent
+	 * — i.e. the agent never created the file — mirroring the no-op path.
+	 * Pass a string to exercise the mirror code.
 	 */
 	seedsIssuesBody?: string;
 	/**
-	 * Body the workspace-side plans file (`.seeds/plans.jsonl`) returns
-	 * over `client.http.files.read`. `undefined` (default) makes the read
-	 * throw `NotFoundError`. Pass a string to exercise mirrorPlans.
+	 * Body the workspace-side plans file (`.seeds/plans.jsonl`) returns.
+	 * `undefined` (default) reads as absent. Pass a string to exercise
+	 * mirrorPlans.
 	 */
 	seedsPlansBody?: string;
-	/** Override `client.http.files.read` end-to-end (advanced). */
-	filesRead?: (burrowId: string, path: string) => Promise<{ contents: string }>;
+	/** Override the tracker-read seam end-to-end (advanced). */
+	filesRead?: (sandboxId: string, path: string) => Promise<{ contents: string }>;
 }
 
-export function fakeBurrowClient(burrow: Burrow, opts: FakeBurrowClientOpts = {}): BurrowClient {
-	const client = new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: (async () =>
-			new Response("{}", {
-				status: 200,
-				headers: { "content-type": "application/json" },
-			})) as unknown as typeof fetch,
+/**
+ * The sandbox fixture shape `fakeBurrowClient` consumes. Kept under the
+ * historical helper names (warren-ea0a): the record is the workspace slice
+ * the provider's `workspaceInfo` resolves.
+ */
+export interface FakeSandbox {
+	id: string;
+	workspacePath: string | null;
+	branch: string;
+}
+
+export function fakeBurrowClient(
+	sandbox: FakeSandbox,
+	opts: FakeBurrowClientOpts = {},
+): FakeProvider {
+	// A filesRead override propagates its throws verbatim — the finalize
+	// pipeline surfaces them as failed stages (only ABSENCE reads as null).
+	const readTracker =
+		opts.filesRead !== undefined
+			? async (relPath: string) => (await opts.filesRead?.(sandbox.id, relPath))?.contents ?? null
+			: async (relPath: string) => {
+					if (relPath === ".seeds/issues.jsonl") return opts.seedsIssuesBody ?? null;
+					if (relPath === ".seeds/plans.jsonl") return opts.seedsPlansBody ?? null;
+					return null;
+				};
+	return new FakeProvider({
+		sandboxId: sandbox.id,
+		workspacePath: sandbox.workspacePath,
+		branch: sandbox.branch,
+		readTracker,
 	});
-	(client.http.burrows as unknown as { get: (id: string) => Promise<Burrow> }).get = async () =>
-		burrow;
-	const filesRead =
-		opts.filesRead ??
-		(async (_burrowId: string, path: string) => {
-			if (path === ".seeds/issues.jsonl" && opts.seedsIssuesBody !== undefined) {
-				return { contents: opts.seedsIssuesBody };
-			}
-			if (path === ".seeds/plans.jsonl" && opts.seedsPlansBody !== undefined) {
-				return { contents: opts.seedsPlansBody };
-			}
-			throw new NotFoundError(`file not found: ${path}`);
-		});
-	(
-		client.http.files as unknown as {
-			read: (burrowId: string, path: string) => Promise<{ contents: string }>;
-		}
-	).read = filesRead;
-	return client;
 }
 
-export function makeBurrow(overrides: Partial<Burrow> = {}): Burrow {
-	const now = new Date(2026, 4, 8, 12, 0, 0);
+export function makeBurrow(overrides: Partial<FakeSandbox> = {}): FakeSandbox {
 	return {
 		id: "bur_aaaaaaaaaaaa",
-		state: "active",
-		projectRoot: "/data/projects/x/y",
-		workspacePath: "/data/burrow/ws",
+		workspacePath: "/data/sandbox/ws",
 		branch: "agent/refactor-bot/run-1",
-		baseBranch: "main",
-		network: "restricted",
-		createdAt: now,
-		updatedAt: now,
-		destroyedAt: null,
 		...overrides,
-	} as unknown as Burrow;
+	};
 }
 
 export interface Ctx {
@@ -306,8 +349,8 @@ export async function setup(): Promise<Ctx> {
 		prompt: "p",
 		renderedAgentJson: {},
 		trigger: "manual",
-		burrowId: "bur_aaaaaaaaaaaa",
-		burrowRunId: "run_zzzzzzzzzzzz",
+		sandboxId: "bur_aaaaaaaaaaaa",
+		sandboxRunId: "run_zzzzzzzzzzzz",
 	});
 	await repos.runs.markRunning(run.id);
 	return {
@@ -316,25 +359,57 @@ export async function setup(): Promise<Ctx> {
 		broker: new RunEventBroker(),
 		runId: run.id,
 		projectPath: project.localPath,
-		workspacePath: "/data/burrow/ws",
+		workspacePath: "/data/sandbox/ws",
 	};
 }
 
-export function fakeOpenPr(
-	responses: ReadonlyArray<OpenPullRequestResult | (() => OpenPullRequestResult)>,
-): {
-	openPr: (input: OpenPullRequestInput) => Promise<OpenPullRequestResult>;
-	calls: OpenPullRequestInput[];
-} {
-	const calls: OpenPullRequestInput[] = [];
-	let i = 0;
-	const openPr = async (input: OpenPullRequestInput): Promise<OpenPullRequestResult> => {
-		calls.push(input);
-		const r = responses[i++];
-		if (r === undefined) throw new Error("fakeOpenPr: out of responses");
-		return typeof r === "function" ? r() : r;
-	};
-	return { openPr, calls };
+/* ----------------------------------------------------------------------- */
+/* Forge seams (warren-45e6)                                                 */
+/* ----------------------------------------------------------------------- */
+
+/**
+ * The RepoRef the test forges mint for the `setup()` project's clone URL
+ * (`https://github.com/x/y.git`). Keyed `x/y` so FakeForge's store lines up
+ * with the pre-migration `owner/repo` assertions.
+ */
+export const TEST_REPO_REF: RepoRef = { forge: FAKE_FORGE_KIND, key: "x/y" };
+
+/**
+ * A FakeForge that ALSO claims github.com clone URLs (the fake's own grammar
+ * is `fake://` only). Reap tests exercise the semantic seam against this —
+ * never a hand-rolled fetch mock.
+ */
+export function fakeForge(options: FakeForgeOptions = {}): FakeForge {
+	const forge = new FakeForge(options);
+	const inner = forge.parseRepoRef.bind(forge);
+	forge.parseRepoRef = (cloneUrl: string): RepoRef | null =>
+		inner(cloneUrl) ?? (cloneUrl.includes("github.com") ? TEST_REPO_REF : null);
+	return forge;
 }
 
-export { type Burrow, BurrowClient, createRepos, NotFoundError, openDatabase, RunEventBroker };
+/**
+ * A contract-typed Forge stub: every method delegates to a FakeForge, with
+ * per-method overrides for the failure shapes the fake cannot produce (a
+ * `conflict` open, a `no_credential` find, a capability flip). Replaces the
+ * pre-migration `fakeOpenPr` response-queue at the same semantic seam.
+ */
+export function stubForge(overrides: Partial<Forge> = {}): Forge {
+	const inner = fakeForge();
+	return {
+		capabilities: inner.capabilities,
+		parseRepoRef: (cloneUrl) => inner.parseRepoRef(cloneUrl),
+		gitCredential: (ref) => inner.gitCredential(ref),
+		openPullRequest: (ref, req) => inner.openPullRequest(ref, req),
+		findPullRequest: (ref, q) => inner.findPullRequest(ref, q),
+		getPullRequest: (ref, pr) => inner.getPullRequest(ref, pr),
+		setPullRequestBody: (ref, pr, body) => inner.setPullRequestBody(ref, pr, body),
+		listChecks: (ref, commit) => inner.listChecks(ref, commit),
+		fetchJobLogTail: (ref, jobId, maxBytes) => inner.fetchJobLogTail(ref, jobId, maxBytes),
+		deleteBranch: (ref, branch) => inner.deleteBranch(ref, branch),
+		botIdentity: () => inner.botIdentity(),
+		listInstallationRepos: () => inner.listInstallationRepos(),
+		...overrides,
+	};
+}
+
+export { createRepos, openDatabase, RunEventBroker };

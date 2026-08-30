@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import {
@@ -10,7 +10,7 @@ import {
 	type EventStreamLimits,
 } from "../stream-limits.ts";
 import type { Logger, ServeHandle, ServerDeps } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
 
 describe("GET /runs/:id/events — NDJSON tail", () => {
 	let db: WarrenDb;
@@ -35,7 +35,7 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 		});
 		await repos.events.append({
 			runId: run.id,
-			burrowEventSeq: 1,
+			sandboxEventSeq: 1,
 			ts: "2026-05-08T12:00:00Z",
 			kind: "tool_use",
 			stream: "stdout",
@@ -43,7 +43,7 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 		});
 		await repos.events.append({
 			runId: run.id,
-			burrowEventSeq: 2,
+			sandboxEventSeq: 2,
 			ts: "2026-05-08T12:00:01Z",
 			kind: "tool_result",
 			stream: "stdout",
@@ -60,11 +60,8 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 	});
 
 	test("non-follow returns the events as NDJSON", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient);
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -89,12 +86,78 @@ describe("GET /runs/:id/events — NDJSON tail", () => {
 		expect(first.seq).toBe(1);
 	});
 
-	test("404 on unknown run id", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
+	test("?limit=N returns a bounded read and closes (warren-17c1)", async () => {
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
 		});
-		const deps = await depsFor(repos, burrowClient);
+
+		const run = (await repos.runs.listAll())[0];
+		if (!run) throw new Error("run missing");
+		// The run is non-terminal, so without ?limit this request would
+		// follow and hang (warren-7bff). limit implies follow=false.
+		const res = await fetch(`${tcpUrl(handle)}/runs/${run.id}/events?limit=1`);
+		expect(res.status).toBe(200);
+		expect(res.headers.get("content-type")).toContain("application/x-ndjson");
+		const text = await res.text();
+		const lines = text
+			.trim()
+			.split("\n")
+			.filter((l) => l !== "");
+		expect(lines.length).toBe(1);
+		const first = JSON.parse(lines[0] ?? "{}") as { kind: string; seq: number };
+		expect(first.kind).toBe("tool_use");
+		expect(first.seq).toBe(1);
+	});
+
+	test("?limit wins over an explicit ?follow=1 (warren-17c1)", async () => {
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const run = (await repos.runs.listAll())[0];
+		if (!run) throw new Error("run missing");
+		// follow=1 on a non-terminal run would hold the stream open; the
+		// bounded read must still close after at most N events.
+		const res = await fetch(`${tcpUrl(handle)}/runs/${run.id}/events?follow=1&limit=2`);
+		expect(res.status).toBe(200);
+		const text = await res.text();
+		const lines = text
+			.trim()
+			.split("\n")
+			.filter((l) => l !== "");
+		expect(lines.length).toBe(2);
+	});
+
+	test("?limit rejects garbage and zero (warren-17c1)", async () => {
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
+		handle = startServer(deps, {
+			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+			auth: NO_AUTH,
+			logger: silentLogger,
+		});
+
+		const run = (await repos.runs.listAll())[0];
+		if (!run) throw new Error("run missing");
+		for (const raw of ["abc", "0", "-3", "1.5"]) {
+			const res = await fetch(
+				`${tcpUrl(handle)}/runs/${run.id}/events?limit=${encodeURIComponent(raw)}`,
+			);
+			expect(res.status).toBe(400);
+		}
+	});
+
+	test("404 on unknown run id", async () => {
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -136,7 +199,7 @@ describe("GET /runs/:id/events — concurrency caps", () => {
 		});
 		await repos.events.append({
 			runId: run.id,
-			burrowEventSeq: 1,
+			sandboxEventSeq: 1,
 			ts: "2026-05-08T12:00:00Z",
 			kind: "tool_use",
 			stream: "stdout",
@@ -158,11 +221,8 @@ describe("GET /runs/:id/events — concurrency caps", () => {
 	});
 
 	async function serve(limits: EventStreamLimits, logger: Logger = silentLogger): Promise<string> {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient, undefined, {
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient, undefined, {
 			streamLimiter: new EventStreamLimiter(limits),
 		});
 		handle = startServer(deps, {
@@ -198,7 +258,12 @@ describe("GET /runs/:id/events — concurrency caps", () => {
 	}
 
 	test("the N+1th stream for one client is refused while the first N keep delivering", async () => {
-		const url = await serve({ maxGlobal: 0, maxPerClient: 2, maxLifetimeMs: 0 });
+		const url = await serve({
+			maxGlobal: 0,
+			maxPerClient: 2,
+			maxLifetimeMs: 0,
+			trustedProxyHops: 0,
+		});
 
 		const first = await openStream(url);
 		const second = await openStream(url);
@@ -228,7 +293,7 @@ describe("GET /runs/:id/events — concurrency caps", () => {
 				lines.push({ level, obj: obj as Record<string, unknown>, msg });
 			};
 		const url = await serve(
-			{ maxGlobal: 1, maxPerClient: 0, maxLifetimeMs: 0 },
+			{ maxGlobal: 1, maxPerClient: 0, maxLifetimeMs: 0, trustedProxyHops: 0 },
 			{ info: record("info"), warn: record("warn"), error: record("error") },
 		);
 
@@ -244,7 +309,12 @@ describe("GET /runs/:id/events — concurrency caps", () => {
 	});
 
 	test("a stream that ends normally gives its slot back", async () => {
-		const url = await serve({ maxGlobal: 1, maxPerClient: 1, maxLifetimeMs: 0 });
+		const url = await serve({
+			maxGlobal: 1,
+			maxPerClient: 1,
+			maxLifetimeMs: 0,
+			trustedProxyHops: 0,
+		});
 		// Non-follow: the handler replays history and closes, so the slot is
 		// released through `asNdjsonStream`'s end-of-source path.
 		const historyUrl = url.replace("?follow=1", "?follow=0");
@@ -286,7 +356,7 @@ describe("GET /runs/:id/events — follow-by-default on live runs (warren-7bff)"
 		});
 		await repos.events.append({
 			runId: run.id,
-			burrowEventSeq: 1,
+			sandboxEventSeq: 1,
 			ts: "2026-05-08T12:00:00Z",
 			kind: "tool_use",
 			stream: "stdout",
@@ -303,11 +373,8 @@ describe("GET /runs/:id/events — follow-by-default on live runs (warren-7bff)"
 	});
 
 	async function serve(): Promise<{ url: string; runId: string; deps: ServerDeps }> {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient);
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -350,7 +417,7 @@ describe("GET /runs/:id/events — follow-by-default on live runs (warren-7bff)"
 			// the pre-fix behavior closed the stream after the replay.
 			const row = await repos.events.append({
 				runId,
-				burrowEventSeq: 2,
+				sandboxEventSeq: 2,
 				ts: "2026-05-08T12:00:01Z",
 				kind: "tool_result",
 				stream: "stdout",

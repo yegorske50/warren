@@ -33,10 +33,21 @@ export function previewError(status: number, code: string, message: string): Res
 export function previewUnauthorized(runId: string, config: PreviewProxyConfig, url: URL): Response {
 	const loginPath = `${LOGIN_PATH_PREFIX}${runId}/preview/login`;
 	const authHeader = "-H 'Authorization: Bearer <WARREN_API_TOKEN>'";
+	// warren-3f8a: in path mode the proxy runs on the dedicated preview
+	// listener, but the login handshake lives on the warren API listener —
+	// point the hint at `apiPort` when the wiring provided it.
+	const apiOrigin = (): string => {
+		if (config.mode !== "subdomain" && config.apiPort !== undefined && config.apiPort !== null) {
+			const origin = new URL(url.origin);
+			origin.port = String(config.apiPort);
+			return origin.origin;
+		}
+		return url.origin;
+	};
 	const hint =
 		config.mode === "subdomain"
 			? `POST https://${config.host}${loginPath} ${authHeader} -d '{"redirect":"https://run-${runId}.${config.host}/"}'`
-			: `POST ${url.origin}${loginPath} ${authHeader} -d '{"redirect":"${url.origin}/p/${runId}/"}'`;
+			: `POST ${apiOrigin()}${loginPath} ${authHeader} -d '{"redirect":"${url.origin}/p/${runId}/"}'`;
 	const body = {
 		error: {
 			code: "preview_unauthorized",

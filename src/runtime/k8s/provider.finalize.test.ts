@@ -70,6 +70,25 @@ describe("K8sProvider.finalize — wiring", () => {
 		await expect(p).resolves.toMatchObject({ pushed: true, commitsAhead: 5 });
 	});
 
+	test("an intent-carried minted credential wins over the env-derived token (warren-4e1c)", async () => {
+		const coordinator = new FinalizeCoordinator();
+		const provider = new K8sProvider({
+			coreApi: () => fakeApi([{ metadata: { name: handle.sandboxId } }]),
+			serverEnv: { WARREN_GIT_TOKEN: "ghp_envtoken" },
+			finalizeCoordinator: coordinator,
+			finalizeSetTimer: inertTimer,
+		});
+		const p = provider.finalize(handle, {
+			...intent(),
+			gitCredential: { username: "x-access-token", secret: "minted_per_spawn", host: "github.com" },
+		});
+		await Promise.resolve();
+		const parked = coordinator.peekIntent(handle.runId);
+		expect(parked?.gitToken).toBe("minted_per_spawn");
+		coordinator.submit(handle.runId, parked?.attemptId ?? "", podResult());
+		await expect(p).resolves.toMatchObject({ pushed: true });
+	});
+
 	test("falls back to GITHUB_TOKEN, and omits the token when neither is set", async () => {
 		const coordinator = new FinalizeCoordinator();
 		const provider = new K8sProvider({
@@ -101,6 +120,43 @@ describe("K8sProvider.finalize — wiring", () => {
 		expect(parked2 && "gitToken" in parked2).toBe(false);
 		coord2.submit(handle.runId, parked2?.attemptId ?? "", podResult());
 		await p2;
+	});
+
+	test("App mode (allowStaticPushTokenFallback: false) never serves the static env token (warren-c9ac)", async () => {
+		const coordinator = new FinalizeCoordinator();
+		const provider = new K8sProvider({
+			coreApi: () => fakeApi([{ metadata: { name: handle.sandboxId } }]),
+			serverEnv: { WARREN_GIT_TOKEN: "ghp_static", GITHUB_TOKEN: "ghp_fallback" },
+			allowStaticPushTokenFallback: false,
+			finalizeCoordinator: coordinator,
+			finalizeSetTimer: inertTimer,
+		});
+		const p = provider.finalize(handle, intent());
+		await Promise.resolve();
+		const parked = coordinator.peekIntent(handle.runId);
+		expect(parked && "gitToken" in parked).toBe(false);
+		coordinator.submit(handle.runId, parked?.attemptId ?? "", podResult());
+		await p;
+	});
+
+	test("App mode still serves the minted intent token when the gate is off", async () => {
+		const coordinator = new FinalizeCoordinator();
+		const provider = new K8sProvider({
+			coreApi: () => fakeApi([{ metadata: { name: handle.sandboxId } }]),
+			serverEnv: { WARREN_GIT_TOKEN: "ghp_static" },
+			allowStaticPushTokenFallback: false,
+			finalizeCoordinator: coordinator,
+			finalizeSetTimer: inertTimer,
+		});
+		const p = provider.finalize(handle, {
+			...intent(),
+			gitCredential: { username: "x-access-token", secret: "ghs_minted", host: "github.com" },
+		});
+		await Promise.resolve();
+		const parked = coordinator.peekIntent(handle.runId);
+		expect(parked?.gitToken).toBe("ghs_minted");
+		coordinator.submit(handle.runId, parked?.attemptId ?? "", podResult());
+		await p;
 	});
 
 	test("reads WARREN_K8S_FINALIZE_TIMEOUT_MS from env as the timeout budget", async () => {

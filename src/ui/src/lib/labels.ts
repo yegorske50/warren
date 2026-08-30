@@ -16,12 +16,12 @@
  *     leaking underscores, so a reason added server-side before this UI
  *     ships still reads as prose.
  *
- * Status-PILL labels are deliberately NOT here: `components/StatusIndicator.tsx`
+ * Status-PILL labels are deliberately NOT here: `components/status-indicator.tsx`
  * is already the single registry for `{label, variant, icon, pulse}`, and a
  * second copy of those labels is exactly the drift this file exists to
  * prevent. It imports `humanizeWireValue` for its unknown-status fallback.
  */
-import type { PlanRunChildState, RunFailureReason } from "@/api/types.ts";
+import type { PlanRunChildState, PullRequestLifecycle, RunFailureReason } from "@/api/types.ts";
 
 /**
  * Snake-case words that read wrong when merely capitalised. Kept tiny on
@@ -47,7 +47,7 @@ export function humanizeWireValue(raw: string): string {
  * compiler still fails the build when `src/core/wire.ts` grows a reason
  * this map does not carry.
  *
- * `burrow_run_lost` / `burrow_unreachable` say "sandbox", not "burrow":
+ * `sandbox_run_lost` / `sandbox_unreachable` say "sandbox", not "burrow":
  * burrow is the LocalProvider's substrate, an implementation detail a
  * visitor has no name for. The raw value stays in the tooltip.
  */
@@ -55,12 +55,16 @@ const RUN_FAILURE_REASON_LABELS: Readonly<Record<string, string>> = {
 	never_started: "Never started",
 	no_model_response: "No model response",
 	sandbox_failed: "Sandbox failed",
+	spawn_failed: "Spawn failed",
 	crashed: "Crashed",
+	agent_died: "Agent died",
 	timed_out: "Timed out",
-	burrow_run_lost: "Sandbox run lost",
-	burrow_unreachable: "Sandbox unreachable",
+	sandbox_run_lost: "Sandbox run lost",
+	sandbox_unreachable: "Sandbox unreachable",
 	dropped_commit: "Dropped commit",
+	no_changes: "No changes",
 	finalize_failed: "Finalize failed",
+	push_rejected_policy: "Push blocked by repository policy",
 	finalize_unposted: "Finalize not posted",
 	provider_error: "Provider error",
 	oom_killed: "Out of memory",
@@ -70,6 +74,22 @@ const RUN_FAILURE_REASON_LABELS: Readonly<Record<string, string>> = {
 /** Prose for a run's `failureReason`. */
 export function formatRunFailureReason(reason: string): string {
 	return RUN_FAILURE_REASON_LABELS[reason] ?? humanizeWireValue(reason);
+}
+
+/**
+ * `PullRequestLifecycle` → prose (warren-0993). Same shape as the
+ * failure-reason map: `satisfies` so the compiler fails the build when
+ * `PULL_REQUEST_LIFECYCLES` grows a value this map does not carry.
+ */
+const PULL_REQUEST_LIFECYCLE_LABELS: Readonly<Record<string, string>> = {
+	open: "Open",
+	merged: "Merged",
+	closed_unmerged: "Closed without merging",
+} satisfies Record<PullRequestLifecycle, string>;
+
+/** Prose for a pull request's `lifecycle`. */
+export function formatPullRequestLifecycle(lifecycle: string): string {
+	return PULL_REQUEST_LIFECYCLE_LABELS[lifecycle] ?? humanizeWireValue(lifecycle);
 }
 
 /**

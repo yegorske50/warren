@@ -324,21 +324,43 @@ describe("formatPreviewUrl", () => {
 	test("path mode prefers the configured host over the browser origin", async () => {
 		const { formatPreviewUrl } = await import("./client.ts");
 		expect(
-			formatPreviewUrl("run_abc", { mode: "path", host: "warren.example.com" }, "http://local"),
+			formatPreviewUrl(
+				"run_abc",
+				{ mode: "path", host: "warren.example.com", port: null },
+				"http://local",
+			),
 		).toBe("https://warren.example.com/p/run_abc/");
 	});
 
 	test("path mode falls back to the current origin when no host is configured", async () => {
 		const { formatPreviewUrl } = await import("./client.ts");
-		expect(formatPreviewUrl("run_abc", { mode: "path", host: null }, "http://local:7777")).toBe(
-			"http://local:7777/p/run_abc/",
-		);
+		expect(
+			formatPreviewUrl("run_abc", { mode: "path", host: null, port: null }, "http://local:7777"),
+		).toBe("http://local:7777/p/run_abc/");
+	});
+
+	test("path mode swaps in the dedicated preview listener port (warren-3f8a)", async () => {
+		const { formatPreviewUrl } = await import("./client.ts");
+		expect(
+			formatPreviewUrl("run_abc", { mode: "path", host: null, port: 8081 }, "http://local:8080"),
+		).toBe("http://local:8081/p/run_abc/");
+		expect(
+			formatPreviewUrl(
+				"run_abc",
+				{ mode: "path", host: "warren.example.com", port: 8081 },
+				"http://x",
+			),
+		).toBe("https://warren.example.com:8081/p/run_abc/");
 	});
 
 	test("subdomain mode keys off the configured host", async () => {
 		const { formatPreviewUrl } = await import("./client.ts");
 		expect(
-			formatPreviewUrl("run_abc", { mode: "subdomain", host: "preview.example.com" }, "http://x"),
+			formatPreviewUrl(
+				"run_abc",
+				{ mode: "subdomain", host: "preview.example.com", port: null },
+				"http://x",
+			),
 		).toBe("https://run-run_abc.preview.example.com/");
 	});
 });

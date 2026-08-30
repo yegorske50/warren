@@ -41,6 +41,15 @@ export interface PreviewProxyConfigPath extends PreviewProxyConfigBase {
 	 *  hint URL). Path mode derives the preview origin from the
 	 *  request's own `Host` header, so this is allowed to be null. */
 	readonly host?: string | null;
+	/**
+	 * The warren API listener's port (warren-3f8a). The path-mode proxy
+	 * runs on the dedicated preview listener, so the login handshake in
+	 * a 401 hint lives on a DIFFERENT port than the inbound request —
+	 * this is that port. Null/omitted keeps the hint on the inbound
+	 * origin (legacy unix-transport mounting, or tests that bind
+	 * ephemeral ports).
+	 */
+	readonly apiPort?: number | null;
 }
 
 export type PreviewProxyConfig = PreviewProxyConfigSubdomain | PreviewProxyConfigPath;

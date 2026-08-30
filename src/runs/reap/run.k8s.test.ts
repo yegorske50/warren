@@ -12,7 +12,7 @@ import type {
 } from "../../runtime/contract.ts";
 import type { ServerPreviewConfig } from "../../warren-config/index.ts";
 import { reapRun } from "./index.ts";
-import { type Ctx, fakeExec, fakeFs, fakeOpenPr, setup } from "./test-helpers.ts";
+import { type Ctx, fakeExec, fakeForge, fakeFs, setup } from "./test-helpers.ts";
 
 /**
  * Leg 1 (warren-e9e1): a succeeded run under a K8s-style provider (no host
@@ -144,6 +144,50 @@ describe("reapRun under a K8s-style RuntimeProvider", () => {
 		expect(result.errors).toEqual([]);
 	});
 
+	test("the finalize intent carries a per-spawn credential minted from the forge (warren-4e1c)", async () => {
+		const branch = "warren/run-1";
+		const fake = fakeK8sProvider({ branch, finalizeResult: finalizeResultWithDeltas(branch) });
+		const e = fakeExec({ stagedDelta: true });
+
+		const result = await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			runtimeProvider: fake.provider,
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+			forge: fakeForge(),
+		});
+
+		expect(result.state).toBe("succeeded");
+		// Minted from the forge (FakeForge's static secret) immediately before
+		// the finalize call — never read off a config object.
+		expect(fake.calls.lastIntent?.gitCredential).toEqual({
+			username: "fake",
+			secret: "fake-credential",
+			host: "github.com",
+		});
+	});
+
+	test("no forge on the reap input leaves the finalize intent credential-free", async () => {
+		const branch = "warren/run-1";
+		const fake = fakeK8sProvider({ branch, finalizeResult: finalizeResultWithDeltas(branch) });
+		const e = fakeExec({ stagedDelta: true });
+
+		await reapRun({
+			runId: ctx.runId,
+			outcome: "succeeded",
+			repos: ctx.repos,
+			runtimeProvider: fake.provider,
+			broker: ctx.broker,
+			fs: fakeFs().fs,
+			exec: e.exec,
+		});
+
+		expect(fake.calls.lastIntent && "gitCredential" in fake.calls.lastIntent).toBe(false);
+	});
+
 	test("applies finalize mirror deltas to the project clone (leg 2)", async () => {
 		const branch = "warren/run-1";
 		const fake = fakeK8sProvider({ branch, finalizeResult: finalizeResultWithDeltas(branch) });
@@ -246,7 +290,7 @@ describe("reapRun under a K8s-style RuntimeProvider", () => {
 		const branch = "warren/run-1";
 		const fake = fakeK8sProvider({ branch, finalizeResult: finalizeResultWithDeltas(branch) });
 		const e = fakeExec({ stagedDelta: true });
-		const pr = fakeOpenPr([{ ok: true, url: "https://github.com/x/y/pull/9", mode: "created" }]);
+		const forge = fakeForge();
 
 		const result = await reapRun({
 			runId: ctx.runId,
@@ -256,11 +300,11 @@ describe("reapRun under a K8s-style RuntimeProvider", () => {
 			broker: ctx.broker,
 			fs: fakeFs().fs,
 			exec: e.exec,
-			autoOpenPr: { enabled: true, token: "ghp_xyz", warrenBaseUrl: null },
-			openPr: pr.openPr,
+			autoOpenPr: { enabled: true, warrenBaseUrl: null },
+			forge,
 		});
 
-		expect(result.prUrl).toBe("https://github.com/x/y/pull/9");
+		expect(result.prUrl).toBe("fake://x/y/pulls/1");
 		// The context-gathering fetched the pushed run branch into the project
 		// clone under a namespaced temp ref (never a local branch), cwd = the clone.
 		const fetchCall = e.calls.find(
@@ -271,6 +315,9 @@ describe("reapRun under a K8s-style RuntimeProvider", () => {
 		);
 		expect(fetchCall).toBeDefined();
 		expect(fetchCall?.cwd).toBe(ctx.projectPath);
+		// warren-45e6: the fetch credential is minted from the forge
+		// (gitCredential → FakeForge's static secret), not read off autoOpen.token.
+		expect(fetchCall?.args.some((a) => a.includes("fake-credential"))).toBe(true);
 		// The temp ref is torn down after the reads.
 		const cleanup = e.calls.find(
 			(c) => c.cmd === "git" && c.args[0] === "update-ref" && c.args.includes("-d"),
@@ -297,8 +344,8 @@ describe("reapRun under a K8s-style RuntimeProvider", () => {
 			prBranch: null,
 			stages: [
 				{ stage: "mulch_merge", status: "failed", error: message },
-				{ stage: "seeds_mirror", status: "failed", error: message },
-				{ stage: "plans_mirror", status: "failed", error: message },
+				{ stage: "seeds_merge", status: "failed", error: message },
+				{ stage: "plans_merge", status: "failed", error: message },
 				{ stage: "branch_push", status: "failed", error: message },
 			],
 		};

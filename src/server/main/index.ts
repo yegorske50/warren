@@ -1,29 +1,14 @@
 /**
  * Boot entry for `warren serve` (docs/design/runtime-and-supervisor.md).
  *
- * Wires together every layer the server depends on:
- *   - load env-driven config (server bind, data dir, UI dist),
- *   - open the SQLite db (creates + migrates if missing),
- *   - construct the BurrowClient + RunEventBroker,
- *   - boot the BridgeRegistry (resumes any in-flight runs from the
- *     events-table cursor — docs/design/runtime-and-supervisor.md restart-recovery contract),
- *   - load the canopy + projects sub-configs,
- *   - resolve the AuthProvider,
- *   - call `startServer`.
+ * Wires together every layer the server depends on (env config, db,
+ * BurrowClient + RunEventBroker, BridgeRegistry, projects, auth) and calls
+ * `startServer`. Returns a `WarrenServerHandle` whose `stop()` tears
+ * everything down in reverse order; the supervisor owns SIGTERM/SIGINT
+ * plumbing. `bootServer` is async.
  *
- * Returns a `WarrenServerHandle` whose `stop()` tears everything down
- * in the reverse order: aborts the wire, drains the bridges, closes
- * the db, closes the burrow client. The supervisor (Phase 12) will
- * own the SIGTERM/SIGINT plumbing — this entry just exposes the stop
- * function so an integration test or the CLI can call it directly.
- *
- * `bootServer` is async because the startup burrow probe is async.
- *
- * Split into a `main/` subdirectory (warren-8d3d / pl-9088 step 10):
- * - `./utils.ts`         — env/process/db helpers (incl. `defaultSpawn`,
- *                          `resolvePgPoolMax`)
- * - `./logging.ts`       — pino → narrow logger adapters
- * - `./preview-wiring.ts` — preview signed-cookie + proxy assembly
+ * Split into a `main/` subdirectory (warren-8d3d / pl-9088 step 10) — one
+ * `*-wiring.ts` module per boot concern; this file is the composition root.
  */
 
 import { join } from "node:path";
@@ -43,45 +28,49 @@ import {
 	assertRegisteredProjectsAllowlisted,
 	resolvePublicAllowlist,
 } from "../../projects/public-allowlist.ts";
-import { seedBuiltinAgents } from "../../registry/builtins/index.ts";
-import { seedAgentsFromEnvFile } from "../../registry/builtins/seed-file.ts";
 import {
 	loadAutoOpenPrConfigFromEnv,
 	loadRunBranchPrefixFromEnv,
 	RunEventBroker,
-	reapRun,
 } from "../../runs/index.ts";
-import { loadWorkspaceGcConfigFromEnv, startWorkspaceGcWorker } from "../../runs/reap/gc.ts";
+import { loadWorkspaceGcConfigFromEnv } from "../../runs/reap/gc.ts";
 import { resolveLocalBootBackend } from "../../runtime/local/boot-backend.ts";
 import { resolveRuntimeKind } from "../../runtime/registry.ts";
 import { loadWarrenServerConfigFromFile } from "../../server-config/index.ts";
+import { SeedsTracker } from "../../tracker/seeds-tracker.ts";
 import { loadTriggerSchedulerConfigFromEnv } from "../../triggers/index.ts";
 import { createWarrenConfigCache } from "../../warren-config/index.ts";
 import { NO_AUTH, resolveAuth, resolveAuthKind } from "../auth.ts";
-import { bootBridges } from "../bridges.ts";
 import { type EnvLike, loadServerConfigFromEnv } from "../config.ts";
+import { bootGitHubAppRegistrationGate } from "../github-app-gate.ts";
 import { bootScheduler } from "../scheduler.ts";
 import { startServer } from "../server.ts";
+import { armSetupHandoffFromBoot, setupRedemptionUrl } from "../setup-handoff.ts";
 import { loadEventStreamLimitsFromEnv } from "../stream-limits.ts";
 import type { AuthProvider, RunActivityCheck, ServeHandle } from "../types.ts";
+import { seedAgentsAtBoot } from "./agent-seeding.ts";
+import { bindReapWithBootDeps, bootBridgesAndProviderRetry } from "./bridges-wiring.ts";
 import { buildServerDeps } from "./deps.ts";
 import { bootBackgroundDetectors } from "./detector-wiring.ts";
+import { bootGitHubAppActivation } from "./github-app-activation-wiring.ts";
+import { makePodWarningRunEventSink } from "./k8s-pod-warning-sink.ts";
 import { bootLifecycleBus } from "./lifecycle-bus-wiring.ts";
 import {
 	bridgeLoggerFromPino,
 	previewEvictionLoggerFromPino,
 	schedulerLoggerFromPino,
-	workspaceGcLoggerFromPino,
 } from "./logging.ts";
 import { bootObservability, captureBootFailure } from "./observability-wiring.ts";
 import { bootPlanRunCoordinatorWiring } from "./plan-run-wiring.ts";
-import { createPreviewAuthAndProxy } from "./preview-wiring.ts";
+import { bootPreviewSurface } from "./preview-wiring.ts";
+import { wireInfraLostRetry } from "./retry-wiring.ts";
 import { bootK8sRuntime, resolveBootRuntimeProvider } from "./runtime-wiring.ts";
+import { bootstrapOperatorToken } from "./token-bootstrap.ts";
+import { bootToolCallsBackfill } from "./tool-calls-backfill-wiring.ts";
 import { closeDatabase, defaultSpawn, redactDbUrl, resolvePgPoolMax } from "./utils.ts";
+import { bootWorkspaceGc } from "./workspace-gc-wiring.ts";
 
-// Re-export `resolvePgPoolMax` so the strict round-trip check stays
-// accessible from `main.test.ts` (and any other importer that grew
-// before the split).
+// Re-exported so `main.test.ts` keeps its strict round-trip check.
 export { resolvePgPoolMax } from "./utils.ts";
 
 export interface BootServerOptions {
@@ -91,33 +80,45 @@ export interface BootServerOptions {
 	readonly defaultUiDistDir?: string;
 	/** Override `Date.now()` for deterministic tests. */
 	readonly now?: () => Date;
+	readonly setupHandoff?: boolean; // warren-48f8: arm the one-time setup handoff (warren up only).
+	/** warren-53ea: boot-wired IssueTracker override; pass it ALREADY-CONNECTED. */
+	readonly issueTracker?: import("../../tracker/contract.ts").IssueTracker;
 }
 
 export interface WarrenServerHandle extends ServeHandle {
 	stop(): Promise<void>;
+	/** Token from the mint-or-persist path (not env); `warren up` writes the client config. */
+	readonly operatorToken?: string;
+	readonly setupUrl?: string; // warren-48f8: one-time /setup URL, only when the handoff armed.
 }
 
 export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenServerHandle> {
 	const env = opts.env ?? process.env;
 	const { logger, metricsRegistry } = await bootObservability(env);
 
-	const serverConfig = loadServerConfigFromEnv({
+	// warren-ef6e fresh-install token bootstrap (see ./token-bootstrap.ts).
+	const { tokenBoot, bootEnv } = bootstrapOperatorToken({
 		env,
+		logger,
+		...(opts.noAuth !== undefined ? { noAuth: opts.noAuth } : {}),
+	});
+
+	const serverConfig = loadServerConfigFromEnv({
+		env: bootEnv,
 		...(opts.noAuth !== undefined ? { noAuth: opts.noAuth } : {}),
 		...(opts.defaultUiDistDir !== undefined ? { defaultUiDistDir: opts.defaultUiDistDir } : {}),
 	});
 	const projectsConfig = loadProjectsConfigFromEnv(env);
 
 	// Resolve the auth backend's IDENTITY here (warren-851b), before the db
-	// opens: an unrecognized `WARREN_AUTH` throws out of `bootServer` rather
-	// than degrading to a provider nobody asked for. The provider itself is
-	// built further down, once `serverConfig.token` has been consulted.
-	//
-	// warren-ce9b: `public` also demands a non-empty org allowlist, parsed
-	// here so a public instance with no allowlist refuses the boot before it
-	// touches anything. `undefined` in every other mode ⇒ no org restriction.
+	// opens: an unrecognized `WARREN_AUTH` throws rather than degrading to a
+	// provider nobody asked for. warren-ce9b: `public` also demands a non-empty
+	// org allowlist; `undefined` in every other mode ⇒ no org restriction.
 	const authKind = resolveAuthKind(env);
 	const publicAllowlist = resolvePublicAllowlist(authKind === "public", env);
+
+	// warren-48f8: one-time setup handoff (warren up only; never public/no-auth).
+	const setupHandoffBoot = armSetupHandoffFromBoot(opts, tokenBoot, env, authKind, logger);
 
 	if (serverConfig.dbUrlConflict !== null) {
 		logger.warn(
@@ -132,20 +133,12 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	});
 	const repos = createRepos(db);
 
-	// warren-ce9b: hold every ALREADY-registered project to the allowlist too.
-	// A public instance serving one private repo is the worst outcome this
-	// posture can produce, so a violation refuses the boot (naming every
-	// offender) instead of being served anonymously until someone notices.
+	// warren-ce9b: registered projects must satisfy the allowlist or boot refuses.
 	assertRegisteredProjectsAllowlisted(publicAllowlist, await listProjects(repos.projects));
-
 	// Load the operator-facing TOML config (pl-9ba1 step 7 / warren-3909).
 	const fileConfig = await loadWarrenServerConfigFromFile({ env });
-	// warren-288f: multi-worker pooling is retired with the K8s migration — the
-	// self-host backend is a single local burrow built from WARREN_BURROW_* env
-	// vars. The `[workers]` TOML block, the /workers + /burrows surfaces, and the
-	// worker-probe loop are all gone; the workers table itself is dropped in
-	// step 24 (warren-3743). warren-f796: the burrow client no longer lives here —
-	// the `LocalBootBackend` builds + owns it under `local` (none under `k8s`).
+	// warren-f796: the LocalBootBackend owns the local-topology seams; warren-9a26
+	// dropped the burrow client from it (the daemon is gone).
 	const broker = new RunEventBroker();
 
 	logger.info(
@@ -160,74 +153,55 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		logger.info({ path: fileConfig.path }, "loaded warren.toml");
 	}
 
-	// Seed built-in agents (warren-d3e9); idempotent — existing rows are preserved.
-	const seedResult = await seedBuiltinAgents(repos.agents, undefined, opts.now);
-	if (seedResult.seeded.length > 0) {
-		logger.info({ agents: seedResult.seeded }, "seeded built-in agents");
-	}
-
-	const extra = await seedAgentsFromEnvFile(repos.agents, env, opts.now);
-	if (extra !== null && extra.seeded.length > 0)
-		logger.info({ agents: extra.seeded, path: extra.path }, "seeded seed-file agents");
+	// Boot-time agent seeding (warren-c4be): idempotent; a refused definition warns.
+	await seedAgentsAtBoot({
+		repo: repos.agents,
+		env,
+		logger,
+		...(opts.now ? { now: opts.now } : {}),
+	});
 
 	const autoOpenPr = loadAutoOpenPrConfigFromEnv(env);
-	if (autoOpenPr.enabled && autoOpenPr.token === "") {
-		logger.warn(
-			{},
-			"WARREN_AUTO_OPEN_PR is enabled but GITHUB_TOKEN is unset; reap pr_open will skip with reap_failed events",
-		);
-	}
-
+	// warren-6c4c: resolve the forge ONCE; warren-b504: opt-in store wraps it in a HotForge.
+	const appCredBoot = { env, dataDir: serverConfig.dataDir, logger };
+	const { forge, activation: gitHubAppActivation } = bootGitHubAppActivation(appCredBoot);
+	const gitHubAppRegistration = bootGitHubAppRegistrationGate(env, logger);
 	const warrenConfigs = createWarrenConfigCache();
 	const runBranchPrefixDefault = loadRunBranchPrefixFromEnv(env);
 	const previewPortRange = loadPreviewPortRangeFromEnv(env);
 	// Dialect-polymorphic allocator (warren-adfb): sqlite uses BEGIN/COMMIT
-	// + per-instance mutex; postgres adds `pg_advisory_xact_lock` for cross-
-	// process serialization. Constructed unconditionally for both dialects.
+	// + mutex; postgres adds `pg_advisory_xact_lock` for cross-process
+	// serialization. Constructed unconditionally for both dialects.
 	const adapter = DrizzleAdapter.for(db);
 	const portAllocator = new PreviewPortAllocator(adapter, previewPortRange);
 	const previewLaunchConfig = loadPreviewLaunchConfigFromEnv(env);
 	const previewEvictionConfig = loadPreviewEvictionConfigFromEnv(env);
 	const workspaceGcConfig = loadWorkspaceGcConfigFromEnv(env);
 
-	// Seeds-CLI seam shared by the bridge reap path (warren-41d5 auto_plan_run
-	// child-seed validation) and the plan-run coordinator below.
+	// Seeds-CLI seam shared by the bridge reap path (warren-41d5) and the plan-run coordinator.
 	const schedulerConfig = loadTriggerSchedulerConfigFromEnv(env);
 	const seedsCli = { sdBinary: schedulerConfig.sdBinary, spawn: defaultSpawn };
+	// warren-5819 (pl-a37b Track B step 7): ONE SeedsTracker threaded through
+	// every seedsCli fan-out site below and onto ServerDeps. Contract port:
+	// warren-2d98/47b0/6234; override seam: warren-53ea (BootServerOptions).
+	const issueTracker = opts.issueTracker ?? new SeedsTracker(seedsCli);
 
-	// Tier-1 observation event bus (warren-bb60) + its first-party consumers
-	// (warren-4e74 healer, warren-df3e seed-close). Installed as the process
-	// singleton BEFORE the bridges resume in-flight runs (which may reap and emit
-	// `post_reap`), so no lifecycle emit is dropped on the floor at boot. Wired
-	// here (after `repos`/`broker`/`seedsCli`) so the seed-close subscriber can
-	// resolve run/project rows + drive `sd close`. See lifecycle-bus-wiring.ts.
-	const lifecycleBusHandle = bootLifecycleBus({ logger, repos, seedsCli, broker });
+	// Tier-1 observation bus (warren-bb60) + first-party consumers (warren-4e74 healer,
+	// warren-df3e seed-close). Installed BEFORE bridges resume in-flight runs so no emit
+	// is dropped (see lifecycle-bus-wiring.ts). warren-3bc6: `forge` is the boot-resolved instance.
+	const lifecycleBusHandle = bootLifecycleBus({ logger, repos, issueTracker, broker, forge });
 
-	// K8s runtime background loops (pl-829f step 25 / warren-7c30). Under
-	// `WARREN_RUNTIME=k8s` this constructs + starts the pod-watcher informer and
-	// the pod-GC loop, feeding both the shared `metricsRegistry` as their counter
-	// sink. Returns `undefined` for the default `local` backend, so the self-host
-	// boot path constructs nothing new. The started watcher is the provider's
-	// status cache + admission source and the `/metrics` gauge source; the shared
-	// core-API factory keeps the provider on one client.
-	//
-	// warren-c531: booted HERE (before `bootBridges`) so the runtime provider can
-	// be resolved once and threaded into the bridge registry, the run-state
-	// poller, and the watchdog — all of which run before `buildServerDeps`. Until
-	// this move, the provider was resolved late (in `buildServerDeps`) and those
-	// background paths defaulted to the burrow-backed `LocalProvider`, so under
-	// `WARREN_RUNTIME=k8s` the bridge/poller spoke burrow directly and never
-	// streamed pod-log events / reconciled terminal pod status.
-	const k8sRuntime = bootK8sRuntime({ env, metrics: metricsRegistry, logger });
+	// K8s runtime background loops (pl-829f step 25 / warren-7c30); undefined under the
+	// default `local` backend. warren-c531: booted HERE (before `bootBridges`).
+	// warren-32f8: onPodWarning surfaces pod-level stalls (FailedAttachVolume & co.) onto the run's event stream.
+	const onPodWarning = makePodWarningRunEventSink({ repos, broker, logger });
+	const k8sRuntime = bootK8sRuntime({ env, metrics: metricsRegistry, logger, onPodWarning });
 	if (k8sRuntime !== undefined) {
 		logger.info({}, "k8s runtime: pod-watcher + pod-GC started");
 	}
 
-	// Resolve the runtime provider ONCE (warren-c531) — the SAME instance flows
-	// into the bridge registry, poller, watchdog, and `ServerDeps`. warren-f796:
-	// under `local` the `LocalBootBackend` owns the burrow client + the
-	// capability-gated preview/GC seams + burrow probe; under `k8s` there is no
-	// burrow, so we resolve the `K8sProvider` directly and those seams stay dark.
+	// Resolve the runtime provider ONCE (warren-c531) — the SAME instance flows into the
+	// bridge registry, poller, watchdog, and `ServerDeps` (warren-f796: local vs k8s seams).
 	const localBackend =
 		resolveRuntimeKind(env) === "local" ? resolveLocalBootBackend(env) : undefined;
 	const runtimeProvider =
@@ -238,56 +212,74 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 			logger,
 			...(metricsRegistry !== undefined ? { admissionMetrics: metricsRegistry } : {}),
 			...(k8sRuntime !== undefined ? { k8sRuntime } : {}),
+			forge,
 		});
+	// warren-3f8a/820e: path mode boots a dedicated preview listener; previewPorts gates it.
+	const previewSurface = bootPreviewSurface({
+		token: serverConfig.token,
+		previewLaunchConfig,
+		repos,
+		logger,
+		transport: serverConfig.transport,
+		previewPorts: runtimeProvider.capabilities.previewPorts,
+		...(opts.now !== undefined ? { now: opts.now } : {}),
+	});
 	const previewSidecars = localBackend?.previewSidecars;
 	const workspaceDestroyer = localBackend?.workspaceDestroyer;
-	// warren-cd3b: the local salvage step writes its bundle capture to the same
-	// durable dir the salvage intake handler serves.
+	// warren-cd3b: the salvage bundle capture lands beside the salvage intake dir.
+	// warren-45e6: the boot-resolved forge drives reap's PR sub-steps.
 	const salvageDir = join(serverConfig.dataDir, "salvage");
-	const bindReap = (i: Parameters<typeof reapRun>[0]) =>
-		reapRun({
-			...i,
-			...(previewSidecars !== undefined ? { previewSidecars } : {}),
-			salvageDir,
-		});
-
-	const bridgesBoot = await bootBridges({
+	// warren-4af7: infra-lost auto-retry — see retry-wiring.ts.
+	const { onInfraLostRun, onRegistryCreated } = wireInfraLostRetry({
 		repos,
-		broker,
 		runtimeProvider,
-		// warren-e24d: reap seam pre-bound with the provider-derived preview seam.
-		reap: bindReap,
-		logger: bridgeLoggerFromPino(logger),
-		autoOpenPr,
+		broker,
+		projectsConfig,
 		warrenConfigs,
-		portAllocator,
-		previewLaunchConfig,
 		seedsCli,
+		issueTracker,
+		forge,
+		env,
+		logger,
+		projectSpawn: defaultSpawn,
+		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
+		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
-	if (bridgesBoot.resumed.length > 0) {
-		logger.info(
-			{ count: bridgesBoot.resumed.length },
-			"resumed run-stream bridges from active runs",
-		);
-	}
-	if (bridgesBoot.skipped.length > 0) {
-		logger.warn(
-			{ count: bridgesBoot.skipped.length, runs: bridgesBoot.skipped },
-			"skipped runs without burrow_run_id",
-		);
-	}
+	const bindReap = bindReapWithBootDeps({ forge, previewSidecars, salvageDir, onInfraLostRun });
 
-	// Startup burrow probe — local backend only; k8s has no socket (warren-c128).
-	if (localBackend !== undefined) {
-		localBackend.probeBurrow().then((result) => {
-			if (!result.ok) {
-				logger.warn(
-					{ err: result.message ?? "unknown" },
-					"burrow probe failed at boot — /readyz will reflect this",
-				);
-			}
-		});
-	}
+	// warren-339d: bridge boot + provider-retry registration (see bridges-wiring.ts).
+	const { bridgesBoot, providerRetryRegistration } = await bootBridgesAndProviderRetry({
+		bridges: {
+			repos,
+			broker,
+			runtimeProvider,
+			// warren-e24d: reap seam pre-bound with the provider-derived preview seam.
+			reap: bindReap,
+			logger: bridgeLoggerFromPino(logger),
+			autoOpenPr,
+			warrenConfigs,
+			portAllocator,
+			previewLaunchConfig: previewSurface.launchConfig,
+			seedsCli,
+			issueTracker,
+			// warren-4af7: infra-lost ghost-reconcile + registry late-binding.
+			onInfraLostRun,
+			onRegistryCreated,
+		},
+		logger,
+		bus: lifecycleBusHandle.bus,
+		repos,
+		runtimeProvider,
+		projectsConfig,
+		projectSpawn: defaultSpawn,
+		forge,
+		warrenConfigs,
+		seedsCli,
+		issueTracker,
+		broker,
+		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
+		...(opts.now !== undefined ? { now: opts.now } : {}),
+	});
 
 	const scheduler = bootScheduler({
 		repos,
@@ -297,9 +289,11 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		projectsConfig,
 		projectSpawn: defaultSpawn,
 		config: schedulerConfig,
+		issueTracker,
 		logger: schedulerLoggerFromPino(logger),
-		// warren-0b75: CI-fixer poller reuses the reap pr-open GITHUB_TOKEN.
-		githubToken: autoOpenPr.token,
+		// warren-0b49: the boot-resolved forge drives the CI-fixer poller and
+		// the per-spawn credential mints (§4) — no captured githubToken.
+		forge,
 		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
@@ -317,20 +311,22 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		env,
 		repos,
 		runtimeProvider,
+		forge,
 		bridges: bridgesBoot.registry,
 		warrenConfigs,
 		projectsConfig,
 		autoOpenPr,
 		seedsCli,
+		issueTracker,
 		projectSpawn: defaultSpawn,
 		logger,
 		...(runBranchPrefixDefault !== undefined ? { runBranchPrefixDefault } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
 
-	// Background detectors: run heartbeat watchdog (warren-285d) plus the
-	// periodic ops-stats worker. See detector-wiring.ts.
-	const { watchdog, opsStatsWorker } = bootBackgroundDetectors({
+	// Background detectors: run heartbeat watchdog (warren-285d), periodic
+	// ops-stats worker, forge credential heartbeat (warren-1295). See detector-wiring.ts.
+	const { watchdog, opsStatsWorker, forgeHeartbeat, finalizeRecovery } = bootBackgroundDetectors({
 		env,
 		adapter,
 		repos,
@@ -340,6 +336,8 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		warrenConfigs,
 		autoOpenPr,
 		runtimeProvider,
+		forge,
+		metricsRegistry,
 		logger,
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
@@ -360,40 +358,30 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		logger.info({ ...previewEvictionConfig }, "preview eviction worker running");
 	}
 
-	// Fallback GC for stranded workspaces (warren-0a9a): reclaims workspaces
-	// stranded by a mid-reap crash / out-of-band force-kill. warren-e24d: runs
-	// only when the runtime advertises `workspaceGc` (dark under K8s).
-	const resolvedWorkspaceGcConfig =
-		workspaceDestroyer !== undefined ? workspaceGcConfig : { ...workspaceGcConfig, disabled: true };
-	const workspaceGcWorker = startWorkspaceGcWorker({
+	// Fallback GC for stranded workspaces (warren-0a9a). See workspace-gc-wiring.ts.
+	const workspaceGcWorker = bootWorkspaceGc({
 		repos,
-		destroyWorkspace: workspaceDestroyer ?? (async () => ({ status: "already-gone" as const })),
-		config: resolvedWorkspaceGcConfig,
-		logger: workspaceGcLoggerFromPino(logger),
-		...(opts.now !== undefined ? { now: opts.now } : {}),
-	});
-	logger.info(
-		{ ...resolvedWorkspaceGcConfig },
-		resolvedWorkspaceGcConfig.disabled
-			? "workspace GC disabled (WARREN_WORKSPACE_GC_DISABLED or runtime lacks workspaceGc capability)"
-			: "workspace GC worker running",
-	);
-
-	const { previewAuth, previewProxy } = createPreviewAuthAndProxy({
-		token: serverConfig.token,
-		previewLaunchConfig,
-		repos,
+		workspaceDestroyer,
+		config: workspaceGcConfig,
 		logger,
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
+
+	// Tool-calls rollup backfill (warren-7746). Fire-and-forget; see the wiring module.
+	bootToolCallsBackfill({ repos, logger });
+
 	const deps = buildServerDeps({
 		repos,
 		db,
-		// warren-c531: the provider resolved once above; deps re-uses it.
+		// warren-c531 / warren-6c4c: provider + forge resolved once above; deps re-uses them.
 		runtimeProvider,
-		// warren-f796: local-topology `/readyz` burrow probe (absent under k8s).
-		...(localBackend !== undefined ? { burrowProbe: localBackend.probeBurrow } : {}),
+		forge,
+		gitHubAppRegistration,
+		...(setupHandoffBoot !== undefined ? { setupHandoff: setupHandoffBoot.store } : {}),
+		...(gitHubAppActivation !== undefined ? { gitHubAppActivation } : {}),
 		broker,
+		// warren-f566: the global lifecycle stream broker the bus wiring owns.
+		lifecycleStream: lifecycleBusHandle.lifecycleStream,
 		bridges: bridgesBoot.registry,
 		projectsConfig,
 		logger,
@@ -402,30 +390,28 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		warrenConfigs,
 		runBranchPrefixDefault,
 		previewPortRange,
-		previewLaunchConfig,
+		previewLaunchConfig: previewSurface.launchConfig,
 		previewEvictionConfig,
 		workspaceGcTtlMs: workspaceGcConfig.ttlMs,
-		// Event-stream concurrency caps (warren-25f6). Parsed here so a bad
-		// knob refuses the boot instead of surfacing on someone's first stream.
+		// Event-stream concurrency caps (warren-25f6); a bad knob refuses the boot.
 		eventStreamLimits: loadEventStreamLimitsFromEnv(),
 		// warren-ce9b: only set under `WARREN_AUTH=public`; gates POST /projects.
 		publicAllowlist,
-		previewAuth,
+		previewAuth: previewSurface.previewAuth,
 		...(previewSidecars !== undefined ? { previewSidecars } : {}),
 		sdBinary: schedulerConfig.sdBinary,
+		issueTracker,
 		metricsRegistry,
-		// warren-cd3b: durable salvage-bundle intake dir (pod-posted git bundles
-		// land here; the data dir is the persistent volume in both runtimes).
+		// warren-cd3b: durable salvage-bundle intake dir (the persistent volume).
 		salvageDir,
-		// `/metrics` pod-phase gauges read live from the same pod-watcher at scrape
-		// (warren-7c30); absent under LocalProvider.
+		// `/metrics` pod-phase gauges read from the pod-watcher at scrape (warren-7c30).
 		...(k8sRuntime !== undefined ? { k8sPodWatcher: k8sRuntime.podWatcher } : {}),
+		...(finalizeRecovery !== undefined ? { finalizeRecovery } : {}),
 		...(opts.now !== undefined ? { now: opts.now } : {}),
 	});
 
 	// Build the provider from the backend resolved at the top of the boot
-	// (warren-851b), before the listener exists. `--no-auth` (token null)
-	// still wins — it is the loopback dev hatch and predates the selector.
+	// (warren-851b). `--no-auth` (token null) wins: the loopback dev hatch.
 	const auth: AuthProvider =
 		serverConfig.token !== null
 			? resolveAuth({ token: serverConfig.token, kind: authKind })
@@ -437,20 +423,19 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 		);
 	}
 
-	// warren-57fd: bound each run-scoped callback token's lifetime to its run.
-	// The auth layer verifies the token's signature and run binding; this probe
-	// is what makes the token invalid once the run reaches a terminal state.
+	// warren-57fd: this probe makes a run-scoped callback token invalid once terminal.
 	const runActivityCheck: RunActivityCheck = async (runId) => {
 		const row = await deps.repos.runs.get(runId);
 		return row !== null && !isTerminalRunState(row.state);
 	};
 
+	const mainPreamble = previewSurface.mainPreamble;
 	const handle = startServer(deps, {
 		transport: serverConfig.transport,
 		auth,
 		logger,
 		runActivityCheck,
-		...(previewProxy !== undefined ? { previewProxy } : {}),
+		...(mainPreamble !== undefined ? { previewProxy: mainPreamble } : {}),
 	});
 
 	logger.info({ url: handle.url }, "warren server listening");
@@ -458,23 +443,28 @@ export async function bootServer(opts: BootServerOptions = {}): Promise<WarrenSe
 	return {
 		transport: handle.transport,
 		url: handle.url,
+		...(tokenBoot !== null && tokenBoot.source !== "env" ? { operatorToken: tokenBoot.token } : {}),
+		...(setupHandoffBoot !== undefined
+			? { setupUrl: setupRedemptionUrl(handle.url, setupHandoffBoot.code) }
+			: {}),
 		stop: async () => {
 			logger.info({}, "warren server stopping");
-			// Stop the HTTP listener first so no new POSTs land mid-teardown,
-			// then drain the scheduler so any in-flight tick finishes calling
-			// spawnRun before bridges/burrow/db disappear under it.
+			// Stop the HTTP listener first, then drain the scheduler so any in-flight
+			// tick finishes calling spawnRun before bridges/burrow/db disappear.
 			await handle.stop();
+			await previewSurface.previewListener?.stop();
 			await planRunCoordinator.stop();
 			await watchdog.stop();
 			await scheduler.stop();
 			await previewEvictionWorker.stop();
 			await workspaceGcWorker.stop();
 			await opsStatsWorker.stop();
-			// K8s runtime loops (no-op / undefined under the local backend).
+			forgeHeartbeat?.stop();
 			await k8sRuntime?.stop();
 			await bridgesBoot.registry.stopAll();
 			// Detach the lifecycle-bus consumers + uninstall the singleton so a
 			// teardown leaves no global emit target behind (warren-4e74).
+			providerRetryRegistration.unregister();
 			lifecycleBusHandle.stop();
 			// warren-f796: close the local backend's burrow client (undefined under k8s).
 			await localBackend?.close();

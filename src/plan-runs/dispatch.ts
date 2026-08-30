@@ -22,12 +22,15 @@
  */
 
 import type { Repos } from "../db/repos/index.ts";
+import type { Forge } from "../forge/contract.ts";
+import { mintGitCredential } from "../forge/credentials.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import type { ProjectsConfig } from "../projects/config.ts";
 import { spawnRun } from "../runs/index.ts";
 import type { BridgeRegistry } from "../runs/stream/types.ts";
 import type { RuntimeProvider } from "../runtime/contract.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
+import type { IssueTracker } from "../tracker/contract.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import type { CoordinatorSpawnFn } from "./coordinator.ts";
 
@@ -44,9 +47,15 @@ export interface CreatePlanRunSpawnInput {
 	readonly warrenConfigs: WarrenConfigCache;
 	readonly projectsConfig: ProjectsConfig;
 	readonly projectSpawn: SpawnFn;
-	/** Raw `GITHUB_TOKEN` for the pre-dispatch refresh fetch — see `SpawnRunInput.githubToken`. */
-	readonly githubToken?: string;
+	/**
+	 * Boot-resolved forge. The pre-dispatch refresh fetch mints its credential
+	 * HERE, per dispatch (forge-contract.md §4), instead of the boot-captured
+	 * `GITHUB_TOKEN` this used to hold across the coordinator's whole lifetime.
+	 */
+	readonly forge?: Forge;
 	readonly seedsCli: SeedsCliDeps;
+	/** Boot-resolved IssueTracker (warren-5819) — threading seam for the child spawn. */
+	readonly issueTracker?: IssueTracker;
 	readonly runBranchPrefixDefault?: string;
 	readonly now?: () => Date;
 	/** Test seam — defaults to the live `spawnRun`. */
@@ -58,6 +67,8 @@ export function createPlanRunSpawn(input: CreatePlanRunSpawnInput): CoordinatorS
 	return async ({ planRun, child, prompt }) => {
 		const project = await input.repos.projects.require(planRun.projectId);
 		const ref = planRun.ref ?? project.defaultBranch;
+		const gitCredential =
+			input.forge === undefined ? undefined : await mintGitCredential(input.forge, project.gitUrl);
 		const result = await spawnRunFn({
 			repos: input.repos,
 			runtimeProvider: input.runtimeProvider,
@@ -65,9 +76,15 @@ export function createPlanRunSpawn(input: CreatePlanRunSpawnInput): CoordinatorS
 			projectId: planRun.projectId,
 			prompt,
 			trigger: "plan-run",
+			// warren-9ce3: underscore spelling matches the dispatch-origin
+			// vocabulary (distinct from the hyphenated trigger column).
+			dispatchOrigin: "plan_run",
 			seedId: child.seedId,
 			...(planRun.providerOverride !== null ? { providerOverride: planRun.providerOverride } : {}),
 			...(planRun.modelOverride !== null ? { modelOverride: planRun.modelOverride } : {}),
+			// warren-a63d: the plan-run's spend cap applies to EACH child dispatch
+			// on the override tier, same slot a POST /runs body cap rides.
+			...(planRun.maxCostUsd !== null ? { maxCostUsdOverride: planRun.maxCostUsd } : {}),
 			ref,
 			metadata: {
 				planRunId: planRun.id,
@@ -76,16 +93,17 @@ export function createPlanRunSpawn(input: CreatePlanRunSpawnInput): CoordinatorS
 			},
 			projectsConfig: input.projectsConfig,
 			projectSpawn: input.projectSpawn,
-			githubToken: input.githubToken,
+			gitCredential,
 			warrenConfigs: input.warrenConfigs,
 			seedsCli: input.seedsCli,
+			...(input.issueTracker !== undefined ? { issueTracker: input.issueTracker } : {}),
 			dispatcherHandle: planRun.dispatcherHandle,
 			...(input.runBranchPrefixDefault !== undefined
 				? { runBranchPrefixDefault: input.runBranchPrefixDefault }
 				: {}),
 			...(input.now !== undefined ? { now: input.now } : {}),
 		});
-		input.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+		input.bridges.start(result.run.id, result.sandboxRun.id, result.sandbox.id);
 		return { runId: result.run.id };
 	};
 }

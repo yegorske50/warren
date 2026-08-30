@@ -1,10 +1,12 @@
 /**
  * In-process boot for the acceptance harness.
  *
- * Boots a real `burrow serve` and a real `bun run src/server/main/index.ts`
- * as siblings on a temp dir. No docker, no compose. Used as the default
- * mode for fast/cheap acceptance runs; the `--container` flag flips to
- * compose-based booting (see `compose.ts`).
+ * Boots a real `bun run src/server/main/index.ts` on a temp dir. No
+ * docker, no compose, and — since the burrow absorption (warren-9a26 /
+ * warren-ea0a) — no co-tenanted daemon: the local runtime is warren's
+ * own in-process engine, so warren is the ONLY child process. Used as
+ * the default mode for fast/cheap acceptance runs; the `--container`
+ * flag flips to compose-based booting (see `compose.ts`).
  *
  * Layout this creates under `${tmpRoot}`:
  *
@@ -12,24 +14,22 @@
  *   │   ├── warren.db          ← created by warren on first connect
  *   │   ├── canopy-repo/        ← cloned by warren on POST /agents/refresh
  *   │   └── projects/           ← cloned by warren on POST /projects
- *   ├── burrow/                 ← burrow's own data dir
- *   ├── git-config              ← GIT_CONFIG_GLOBAL with insteadOf rewrites
- *   └── sock/burrow.sock        ← unix socket between warren and burrow
+ *   └── git-config              ← GIT_CONFIG_GLOBAL with insteadOf rewrites
  *
- * Returns a `BootHandle` whose `stop()` SIGTERMs both processes and
- * cleans up the temp dir. The harness owns lifecycle; scenarios just
- * read the `warrenUrl` and `token` fields off the handle.
+ * Returns a `BootHandle` whose `stop()` SIGTERMs the process and cleans
+ * up the temp dir. The harness owns lifecycle; scenarios just read the
+ * `warrenUrl` and `token` fields off the handle.
  *
- * Why we don't reuse warren's own `bootServer()` directly: the docs/design/runtime-and-supervisor.md
- * supervisor is the deploy entrypoint, and the acceptance harness is
- * the closest in-process approximation we have to "what docker compose
- * up does." Boot here mirrors the supervisor's contract: spawn burrow
- * → wait for socket → spawn warren.
+ * Why we don't reuse warren's own `bootServer()` directly: the
+ * docs/design/runtime-and-supervisor.md supervisor is the deploy
+ * entrypoint, and the acceptance harness is the closest in-process
+ * approximation we have to "what docker compose up does."
  */
 
-import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+
+import { waitForHealthz } from "./poll.ts";
 
 export interface InProcBootOptions {
 	readonly tmpRoot: string;
@@ -38,7 +38,7 @@ export interface InProcBootOptions {
 	/** Path to a GIT_CONFIG_GLOBAL file (typically built by `buildFixtures`). */
 	readonly gitConfigPath?: string;
 	readonly bind?: { host: string; port: number };
-	/** Additional env vars to pass through to warren / burrow. */
+	/** Additional env vars to pass through to warren. */
 	readonly extraEnv?: Record<string, string>;
 	/** Override the warren server entry; default `src/server/main/index.ts`. */
 	readonly serverEntry?: string;
@@ -57,34 +57,29 @@ export interface BootHandle {
 	readonly warrenUrl: string;
 	readonly token: string;
 	readonly tmpRoot: string;
-	readonly socketPath: string;
 	readonly dataDir: string;
 	readonly env: Record<string, string>;
 	stop(): Promise<void>;
-	/** Force-stop only the warren process (leaves burrow up). For restart-recovery. */
+	/** Force-stop only the warren process. For restart-recovery. */
 	killWarren(): Promise<void>;
-	/** Restart warren after a `killWarren()`. Burrow stays up across the restart. */
+	/** Restart warren after a `killWarren()`. */
 	restartWarren(): Promise<void>;
-	/** Force-stop only burrow (for supervisor-restart-budget scenario). */
-	killBurrow(): Promise<void>;
 }
 
-const SOCKET_WAIT_TIMEOUT_MS = 5_000;
-const HEALTHZ_WAIT_TIMEOUT_MS = 10_000;
-const POLL_INTERVAL_MS = 100;
+// 30s (warren-f074): 10s flaked on loaded CI runners booting the seeded
+// second (public-mode) instance. waitForHealthz polls with backoff, so
+// the happy path still resolves in the first few hundred ms locally.
+const HEALTHZ_WAIT_TIMEOUT_MS = 30_000;
 
 export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 	const tmpRoot = opts.tmpRoot;
 	const dataDir = join(tmpRoot, "data");
-	const burrowDir = join(tmpRoot, "burrow");
-	const sockDir = join(tmpRoot, "sock");
-	const socketPath = join(sockDir, "burrow.sock");
 	const canopyDir = join(dataDir, "canopy-repo");
 	const projectsDir = join(dataDir, "projects");
 	const dbPath = join(dataDir, "warren.db");
 	const gitConfigPath = opts.gitConfigPath ?? join(tmpRoot, "git-config");
 
-	for (const d of [dataDir, burrowDir, sockDir, projectsDir]) {
+	for (const d of [dataDir, projectsDir]) {
 		await mkdir(d, { recursive: true });
 	}
 
@@ -105,11 +100,9 @@ export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 		WARREN_DATA_DIR: dataDir,
 		WARREN_CANOPY_DIR: canopyDir,
 		WARREN_PROJECTS_DIR: projectsDir,
-		WARREN_BURROW_SOCKET: socketPath,
 		WARREN_DISABLE_UI: "1",
 		WARREN_LOG_LEVEL: process.env.WARREN_ACCEPTANCE_LOG_LEVEL ?? "warn",
 		CANOPY_REPO_URL: opts.canopyRepoUrl,
-		BURROW_DATA_DIR: burrowDir,
 		GIT_CONFIG_GLOBAL: gitConfigPath,
 		// Empty per-process git identity so commits don't fail in CI.
 		GIT_AUTHOR_NAME: "Warren Acceptance",
@@ -128,13 +121,9 @@ export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 	}
 
 	const state: ProcState = {
-		burrow: spawnBurrow(socketPath, env, burrowDir),
 		warren: undefined,
 		warrenStartCmd: () => spawnWarren(opts.serverEntry ?? "src/server/main/index.ts", env),
-		warrenStopped: undefined,
 	};
-
-	await waitForSocket(socketPath, SOCKET_WAIT_TIMEOUT_MS);
 
 	state.warren = state.warrenStartCmd();
 	await waitForHealthz(warrenUrl, HEALTHZ_WAIT_TIMEOUT_MS);
@@ -143,14 +132,11 @@ export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 		warrenUrl,
 		token: opts.token,
 		tmpRoot,
-		socketPath,
 		dataDir,
 		env,
 		stop: async () => {
 			await stopChild(state.warren);
 			state.warren = undefined;
-			await stopChild(state.burrow);
-			state.burrow = undefined;
 			try {
 				await rm(tmpRoot, { recursive: true, force: true });
 			} catch {
@@ -166,10 +152,6 @@ export async function bootInProc(opts: InProcBootOptions): Promise<BootHandle> {
 			state.warren = state.warrenStartCmd();
 			await waitForHealthz(warrenUrl, HEALTHZ_WAIT_TIMEOUT_MS);
 		},
-		killBurrow: async () => {
-			await stopChild(state.burrow);
-			state.burrow = undefined;
-		},
 	};
 }
 
@@ -179,31 +161,8 @@ interface SpawnedProc {
 }
 
 interface ProcState {
-	burrow: SpawnedProc | undefined;
 	warren: SpawnedProc | undefined;
 	warrenStartCmd: () => SpawnedProc;
-	warrenStopped: Promise<void> | undefined;
-}
-
-function spawnBurrow(
-	socketPath: string,
-	env: Record<string, string>,
-	burrowDataDir: string,
-): SpawnedProc {
-	// Acceptance burrow needs the declarative `stub-shell` agent registered
-	// in its runtime registry — `burrow serve` doesn't auto-register agents
-	// from a project's burrow.toml, so we launch a tiny wrapper that does
-	// it programmatically before delegating to runServeCommand. Production
-	// warren talks to plain `burrow serve` (the supervisor in src/supervisor/main.ts).
-	const wrapperEntry = new URL("./burrow-with-stub.ts", import.meta.url).pathname;
-	const proc = Bun.spawn({
-		cmd: ["bun", "run", wrapperEntry, "--socket", socketPath, "--no-auth"],
-		env: { ...env, BURROW_DATA_DIR: burrowDataDir },
-		stdin: "ignore",
-		stdout: process.env.WARREN_ACCEPTANCE_BURROW_STDOUT === "1" ? "inherit" : "ignore",
-		stderr: process.env.WARREN_ACCEPTANCE_BURROW_STDERR === "1" ? "inherit" : "ignore",
-	});
-	return { proc, exited: proc.exited.then((c) => c ?? 0) };
 }
 
 function spawnWarren(serverEntry: string, env: Record<string, string>): SpawnedProc {
@@ -238,49 +197,46 @@ async function stopChild(child: SpawnedProc | undefined): Promise<void> {
 	}
 }
 
-async function waitForSocket(path: string, timeoutMs: number): Promise<void> {
-	const start = Date.now();
-	while (Date.now() - start < timeoutMs) {
-		if (existsSync(path)) return;
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new Error(`burrow socket did not appear at ${path} within ${timeoutMs}ms`);
-}
-
-async function waitForHealthz(baseUrl: string, timeoutMs: number): Promise<void> {
-	const start = Date.now();
-	let lastErr: string | undefined;
-	while (Date.now() - start < timeoutMs) {
-		try {
-			const res = await fetch(`${baseUrl}/healthz`, { method: "GET" });
-			if (res.status === 200) return;
-			lastErr = `status ${res.status}`;
-		} catch (err) {
-			lastErr = err instanceof Error ? err.message : String(err);
-		}
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new Error(
-		`warren /healthz did not respond 200 within ${timeoutMs}ms: ${lastErr ?? "unknown"}`,
-	);
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function pickPort(): number {
 	// 32_000–60_000 ephemeral range, randomized so parallel runs don't
 	// trample. Real conflicts surface as boot timeouts, not silent fails.
 	return 32_000 + Math.floor(Math.random() * 28_000);
 }
 
+// Credential ownership (forge-contract.md §6.14, warren-2740): the harness
+// itself owns no GitHub credential. `GITHUB_TOKEN`, when the operator exports
+// it, is passed through and owned by the BOOTED warren — it funds warren's
+// auto-open-PR config, the CI-fixer poller's check-runs fetch, and push auth.
+// Per scenario:
+//   - 35 (ci-fixer-roundtrip): the booted warren owns the token end-to-end;
+//     the harness borrows it only for best-effort PR/branch cleanup
+//     (lib/github.ts). Without it (and WARREN_ACCEPT_CI_FIXER_REPO) the
+//     scenario records `skipped`, never a failure.
+//   - 26 / 36 (plan-run scenarios): no real credential; they boot with
+//     WARREN_FORGE=fake and drive merge transitions through the fake's
+//     state file (lib/fake-forge.ts, warren-2600).
+//   - 12 (supervisor-restart-budget): explicitly blanks GITHUB_TOKEN via
+//     extraEnv to keep the dev-only insteadOf rewrite out of the assertion.
+//   - everything else: auto-open-PR defaults on, but reap pr_open is
+//     best-effort against the fake local-git fixtures (reap_failed is
+//     tolerated), so an operator-exported token changes nothing observable.
 const PASSTHROUGH_ENV_KEYS = new Set([
+	// The booted warren owns the operator's GitHub credential (see the
+	// credential-ownership note above). Without this entry an exported
+	// GITHUB_TOKEN never reached the child env, so warren booted with an
+	// empty auto-open-PR config and scenario 35's opener assertion could
+	// not pass in in-proc mode (warren-2740).
+	"GITHUB_TOKEN",
 	// Seeds the stub-shell agent into every warren this harness boots
 	// (warren-e376). run.ts points it at the fixture-built JSON file;
 	// scenario-owned boots (20, 20-path, 26, 36) inherit it from
 	// process.env so their private warren pairs register the stub too.
 	"WARREN_SEED_AGENTS_FILE",
+	// The stub-shell runtime id sits outside warren's canonical
+	// KNOWN_RUNTIME_IDS, so the harness declares it as an operator
+	// extension (warren-c4be). Without it, boot-time seeding refuses
+	// the stub agent and every dispatch onto it fails 422.
+	"WARREN_EXTRA_RUNTIME_IDS",
 	"PATH",
 	"HOME",
 	"USER",

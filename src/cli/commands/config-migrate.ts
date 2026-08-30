@@ -24,10 +24,10 @@
 
 import { existsSync } from "node:fs";
 import { readFile, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { join } from "node:path";
 import { dump } from "js-yaml";
-import { NotFoundError, ValidationError } from "../../core/errors.ts";
-import type { ProjectsRepo } from "../../db/repos/projects.ts";
+import type { WarrenClient } from "../../client/index.ts";
+import { ValidationError } from "../../core/errors.ts";
 import {
 	WARREN_CONFIG_DIR,
 	WARREN_CONFIG_FILES,
@@ -39,14 +39,19 @@ import {
 	parseDefaultsConfig,
 } from "../../warren-config/schema.ts";
 import type { CliContext } from "../output.ts";
-import { formatError, writeJsonLine } from "../output.ts";
+import { commandFailure, formatError, writeResult } from "../output.ts";
+import { resolveTargetDir } from "./target-dir.ts";
 
 export type ConfigMigrateArgs =
 	| { readonly mode: "cwd"; readonly cwd: string }
 	| { readonly mode: "project"; readonly projectId: string };
 
 export interface ConfigMigrateDeps {
-	readonly projects: ProjectsRepo;
+	/**
+	 * Remote warren client (warren-97a2). `--project` resolves the clone
+	 * path via `GET /projects/:id`; the CLI no longer opens the server's DB.
+	 */
+	readonly client: WarrenClient;
 }
 
 export interface ConfigMigrateResult {
@@ -72,7 +77,7 @@ export async function runConfigMigrate(
 	args: ConfigMigrateArgs,
 ): Promise<ConfigMigrateResult> {
 	try {
-		const targetDir = await resolveTargetDir(deps, args);
+		const targetDir = await resolveTargetDir(deps.client, args);
 		const warrenDir = join(targetDir, WARREN_CONFIG_DIR);
 		const legacyAbs = join(warrenDir, WARREN_CONFIG_FILES.defaults);
 		const configAbs = join(warrenDir, WARREN_CONFIG_FILES.config);
@@ -150,44 +155,23 @@ export async function runConfigMigrate(
 
 		await rm(legacyAbs, { force: true });
 
-		writeJsonLine(context.stdio.stdout, {
-			ok: true,
-			migrated: {
-				root: targetDir,
-				removed: warrenConfigRelativePath("defaults"),
-				written: writtenFiles,
-				previewHoisted: previewBlock !== null,
+		writeResult(
+			context,
+			{
+				ok: true,
+				migrated: {
+					root: targetDir,
+					removed: warrenConfigRelativePath("defaults"),
+					written: writtenFiles,
+					previewHoisted: previewBlock !== null,
+				},
 			},
-		});
+			`✔ migrated .warren/defaults.json in ${targetDir} — wrote ${writtenFiles.join(", ")}`,
+		);
 		return { exitCode: 0 };
 	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: err instanceof ValidationError ? 2 : 1 };
+		return commandFailure(context, err);
 	}
-}
-
-async function resolveTargetDir(deps: ConfigMigrateDeps, args: ConfigMigrateArgs): Promise<string> {
-	if (args.mode === "cwd") {
-		const cwd = args.cwd;
-		if (cwd === "") {
-			throw new ValidationError("--cwd path is empty");
-		}
-		const abs = isAbsolute(cwd) ? cwd : resolve(cwd);
-		if (!existsSync(abs)) {
-			throw new ValidationError(`target directory does not exist: ${abs}`);
-		}
-		return abs;
-	}
-	const row = await deps.projects.get(args.projectId);
-	if (row === null) {
-		throw new NotFoundError(`project not found: ${args.projectId}`);
-	}
-	if (!existsSync(row.localPath)) {
-		throw new ValidationError(`project clone missing on disk: ${row.localPath}`, {
-			recoveryHint: "POST /projects/:id/refresh or re-add the project",
-		});
-	}
-	return row.localPath;
 }
 
 function splitPreview(defaults: DefaultsConfig): {

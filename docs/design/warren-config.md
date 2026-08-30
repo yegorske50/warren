@@ -1,5 +1,12 @@
 # `.warren/` Directory Convention + Config-Loader Contract
 
+**Kind:** contract
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-08-01
+**Shipped:** v0.1.5; YAML reorganization followed in v0.3.2
+**Current truth:** `src/warren-config/`
+
 > **Salvage provenance:** lifted from the retired top-level spec §11.H (`.warren/`
 > directory convention, 2026-05-10, reorg 2026-05-14) as part of the
 > SPEC retirement plan `pl-1717` (step `warren-3bec`). The wording
@@ -59,12 +66,45 @@ event). A malformed / non-positive value fails OPEN (no cap) so a budget
 typo never silently cancels every run. `config.yaml` and legacy
 `defaults.json` share the same
 schema — `{ defaultRole?, defaultBranch?, defaultPrompt?, defaultProvider?,
-defaultModel?, runBranchPrefix?, preview? }` — all optional, all strict.
+defaultModel?, runBranchPrefix?, agentImage?, preview?, maxCostUsd? }` — all optional,
+all strict. `maxCostUsd` on `config.yaml` is the project-wide default
+spend cap, the weakest source in the warren-a63d chain: an explicit
+dispatch override (a `POST /runs` `maxCostUsd` body field / `warren run
+--max-cost-usd`, or a trigger entry's cap) > the agent's own
+`frontmatter.maxCostUsd` > this project default. The default applies only
+when the agent declares no cap at all — a malformed / non-positive agent
+value keeps the fail-open rule above (no cap, and the unreadable value
+stays visible on the frozen `rendered_agent_json`) rather than being
+silently replaced by the project default. `resolveCapOverride` in
+`src/runs/cost-cap.ts` is the one implementation of this chain.
+Cap semantics for subscription-authenticated runs (warren-f3c3):
+`costUsd` is always priced at API rates, so `maxCostUsd` always enforces
+against that estimated number — it is a runaway brake on estimated usage,
+not a bill. A run whose anthropic credential is `CLAUDE_CODE_OAUTH_TOKEN`
+(no `ANTHROPIC_API_KEY`) is stamped `costBasis: subscription_estimate` at
+dispatch, and the UI renders its cost as an estimate; the cap is unchanged.
 `runBranchPrefix` (warren-9993) overrides the prefix warren composes the
 burrow branch from (`${prefix}/${run.id}`); precedence project default >
-`WARREN_RUN_BRANCH_PREFIX` env > built-in `"burrow"`. `preview.yaml` (when
+`WARREN_RUN_BRANCH_PREFIX` env > built-in `"warren"` (warren-2de0; the
+legacy default was `"burrow"`). `agentImage`
+(warren-fabb) pins the agent image for the container runtimes — a Python
+mirror runs its agent in a stack-specific image without redeploying warren.
+Precedence: project `agentImage` > `WARREN_DOCKER_AGENT_IMAGE` /
+`WARREN_K8S_AGENT_IMAGE` env > built-in `warren-agent:latest`; the
+LocalProvider ignores it (host toolchain). `preview.yaml` (when
 present) carries the preview block at the top level and wins over any
 nested `preview:` field — see `PreviewConfigSchema` in §11.L.
+
+**`repoContext` (warren-540f).** A free-text onboarding block (capped at
+8192 characters) injected by `composeDispatchPrompt`
+(`src/runs/spawn/dispatch.ts`) between the agent's `system` section and
+the user's prompt, delimited by horizontal rules. Its bytes count into
+the dispatch-context `prompt_bytes` (`src/runs/spawn/dispatch-context.ts`).
+This is the blessed way to onboard a **mirror of a repo you do not
+control**: the host clone's untracked `.warren/config.yaml` survives
+every clone refresh, and `repoContext` rides the composed prompt so it
+reaches docker and k8s runs too. The end-to-end recipe lives in
+[`docs/onboarding-external-repos.md`](../onboarding-external-repos.md).
 
 **Loader contract** (`src/warren-config/load.ts`):
 
@@ -88,6 +128,32 @@ nested `preview:` field — see `PreviewConfigSchema` in §11.L.
 - Per-project cache (`src/warren-config/cache.ts`) is invalidated inside
   `refreshProject` and `deleteProject` (`mx-61c0e6`) so the next request
   reparses; this avoids the stale-config race called out in pl-5d74 risk #4.
+
+**Fail-closed dispatch (warren-02aa).** The loader contract above is
+read-only: it never throws and never guesses a partial value. Consumers
+that merely RENDER config (doctor, `/readyz`, the UI) keep reading
+`defaults: null` plus `errors[]`. Consumers that ACT on guardrails must
+not. `DefaultsConfigSchema` is `.strict()`, so one unknown key (e.g.
+`admission.maxConcurrentRun`, missing the `s`) rejects the whole document
+— and every guardrail it carried (admission cap, quality gate, resource
+limits, cost caps) used to disappear at once while the dispatch went
+through uncapped.
+
+`readProjectDefaults` (`src/runs/spawn/agent-cache.ts`) now calls
+`assertGuardrailConfigUsable` and throws `WarrenConfigInvalidError`
+(HTTP 422) when an `errors[]` entry names a guardrail-bearing file —
+`.warren/config.yaml` or the legacy `.warren/defaults.json`. The refusal
+lands before the run row is created, so a broken policy file produces no
+orphan run. `triggers.yaml` and `pr-template.md` are deliberately outside
+that set: neither constrains what a dispatched run may do, so they keep
+degrading gracefully. A project with NO config file at all is unchanged —
+no errors, built-in defaults, dispatch proceeds.
+
+Whole-document strictness is kept rather than salvaging section by
+section. Per-section validation would still drop precisely the knob the
+operator fat-fingered, which is the same bug with a smaller blast radius.
+Strict parse plus a dispatch-blocking failure is the only shape where a
+typo cannot widen a guardrail.
 
 **HTTP surface.** `GET /projects/:id/warren-config` returns the
 `LoadedWarrenConfig` envelope verbatim (`mx-adf588`); 404 if the project

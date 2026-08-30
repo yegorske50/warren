@@ -7,7 +7,7 @@
  * cancel / refresh / delete affordance is rendered anywhere. The warren UI
  * package ships without a React test harness (no jsdom, no
  * @testing-library, mx-a86ce6), so — same convention as
- * `plot-surface-removed.test.ts` and `ready-plans-tab.test.ts` — the
+ * `plot-surface-removed.test.ts` and `walk-inventory.test.ts` — the
  * invariants are pinned at the source level:
  *
  *   1. every mutating `useMutation` lives in a file that imports the ONE
@@ -25,7 +25,6 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const UI_SRC = join(import.meta.dir, "..", "ui", "src");
-
 function walk(dir: string): string[] {
 	const out: string[] = [];
 	for (const entry of readdirSync(dir)) {
@@ -62,15 +61,17 @@ describe("useCapabilities (warren-f53e)", () => {
 	});
 
 	test("both token-mutating sites clear the cache so the answer is re-asked", () => {
-		expect(read("components", "Layout.tsx")).toMatch(
+		// warren-4ed7: the logout site moved from the legacy layout.tsx
+		// into the console sidebar footer.
+		expect(read("components", "console", "console-sidebar.tsx")).toMatch(
 			/setApiToken\(null\);[\s\S]{0,400}qc\.clear\(\)/,
 		);
-		expect(read("pages", "Login.tsx")).toMatch(/qc\.clear\(\)/);
+		expect(read("pages", "login.tsx")).toMatch(/qc\.clear\(\)/);
 	});
 });
 
 describe("AuthGate lets an anonymous visitor through (warren-f53e)", () => {
-	const gate = read("components", "AuthGate.tsx");
+	const gate = read("components", "auth-gate.tsx");
 
 	test("decides from the capability layer, not from a stored token", () => {
 		expect(gate).toMatch(/useCapabilities/);
@@ -90,49 +91,50 @@ describe("AuthGate lets an anonymous visitor through (warren-f53e)", () => {
 });
 
 describe("route guards and nav filtering (warren-f53e)", () => {
-	const app = read("App.tsx");
-	const layout = read("components", "Layout.tsx");
+	const app = read("app.tsx");
+	const sidebar = read("components", "console", "console-sidebar.tsx");
+	const nav = read("components", "console", "console-nav.ts");
 
 	test("both dispatch forms are wrapped in OperatorRoute", () => {
-		for (const page of ["NewRunPage", "NewPlanRunPage"]) {
+		for (const page of ["DispatchPage", "DispatchPlanPage"]) {
 			expect(app).toMatch(new RegExp(`<OperatorRoute>\\s*<${page} />\\s*</OperatorRoute>`));
 		}
 	});
 
 	test("OperatorRoute bounces to a surface every caller can read", () => {
-		const guard = read("components", "OperatorOnly.tsx");
+		const guard = read("components", "operator-only.tsx");
 		expect(guard).toMatch(/<Navigate to="\/runs" replace \/>/);
 		// Waits for the answer rather than bouncing an operator mid-load.
 		expect(guard).toMatch(/status === "loading"\) return null/);
 	});
 
-	test("the cost analytics page and its nav entry are gated together", () => {
-		expect(app).toMatch(/<OperatorRoute capability="readOperator">/);
-		expect(layout).toMatch(/to: "\/cost-analytics"[^\n]*capability: "readOperator"/);
+	test("the cost analytics surface and its route gate travel together", () => {
+		// warren-4ed7: the legacy /cost-analytics route folded into the
+		// Telemetry Economics tab, which keeps the same readOperator guard
+		// GET /analytics/cost carries in ROUTE_TABLE (warren-cf63).
+		expect(app).toMatch(/<OperatorRoute capability="readOperator">\s*<TelemetryEconomicsTab \/>/);
+		expect(app).toMatch(/Navigate to="\/telemetry\/economics"/);
+		expect(nav).not.toMatch(/to: "\/cost-analytics"/);
 	});
 
-	test("nav links are filtered by capability and the dispatch CTA is gated", () => {
-		expect(layout).toMatch(
-			/NAV_ITEMS\.filter\(\s*\(\{ capability \}\) => capability === undefined \|\| caps\.can\(capability\)/,
-		);
-		expect(layout).toMatch(/<OperatorOnly>\s*<NavLink\s*to="\/runs\/new"/);
+	test("console nav entries declare capability and the sidebar filters on it", () => {
+		// An entry whose destination is readOperator never shows to a caller
+		// who would only ever see a 403 there. No Direction C entry carries a
+		// capability today — this holds the seam for the page issues that
+		// land gated destinations.
+		expect(nav).toMatch(/readonly capability\?: CapabilityName/);
+		expect(sidebar).toMatch(/item\.capability === undefined \|\| caps\.can\(item\.capability\)/);
 	});
 });
 
-/**
- * Every file that mutates must import the gate. This is the criterion that
- * actually scales: it fails the moment someone adds a mutation to a page
- * that has no notion of capabilities, without this test needing to know
- * which button the mutation is behind.
- *
- * `mutationFn` is the marker — a `useMutation` is the only way the UI
- * writes. The exemptions are NAMED, not pattern-matched, and each is
- * asserted separately below: `RefreshProjectsCTA.tsx` is a leaf gated by
- * its caller, and `NewRun.tsx` is a whole page guarded at the route (its
- * only reason to exist is the dispatch it submits).
- */
 describe("every mutation site sits behind the one gate (warren-f53e)", () => {
-	const GATED_ELSEWHERE = new Set(["RefreshProjectsCTA.tsx", "NewRun.tsx"]);
+	// warren-bbe8 / warren-02bb: the dispatch mutations live in the
+	// Direction C page state hooks, route-gated like the legacy forms were.
+	const GATED_ELSEWHERE = new Set([
+		"refresh-projects-cta.tsx",
+		"use-dispatch-state.ts",
+		"walk-state.ts",
+	]);
 
 	test("no file calls useMutation without importing OperatorOnly", () => {
 		const offenders: string[] = [];
@@ -148,15 +150,17 @@ describe("every mutation site sits behind the one gate (warren-f53e)", () => {
 	});
 
 	test("the caller-gated leaf is gated by every one of its callers", () => {
-		const projects = read("pages", "Projects.tsx");
+		const projects = read("pages", "projects.tsx");
 		expect(projects).toMatch(
 			/<OperatorOnly capability="admin">\s*<RefreshProjectsCTA \/>\s*<\/OperatorOnly>/,
 		);
 	});
 
-	test("the plan-dispatch dialog is gated at its entry point", () => {
-		const dialog = read("components", "dispatch-plan-dialog.tsx");
-		expect(dialog).toMatch(/<OperatorOnly>\s*<Button type="button" size="sm"/);
+	test("the plan-runs dispatch control is gated at its entry point", () => {
+		// warren-23b2: the Direction C walk inventory's Dispatch plan link is
+		// the page's only operator affordance, wrapped in the one gate.
+		const page = read("pages", "plan-runs.tsx");
+		expect(page).toMatch(/<OperatorOnly>\s*<Link\s+to="\/dispatch\/plan"/);
 	});
 
 	test("project + registry mutation is gated on admin, not dispatch", () => {
@@ -164,23 +168,25 @@ describe("every mutation site sits behind the one gate (warren-f53e)", () => {
 		// ROUTE_TABLE (warren-b875). The canopy `/agents/refresh` routes were
 		// removed in the deletion pass (warren-6fcd), so the Agents page no
 		// longer carries an admin mutation control.
-		expect(read("pages", "Projects.tsx")).toMatch(
-			/<OperatorOnly capability="admin">\s*<AddProjectForm/,
+		expect(read("pages", "projects.tsx")).toMatch(
+			/<OperatorOnly capability="admin">\s*<Button size="sm" onClick=\{\(\) => setAddOpen\(true\)\}>/,
 		);
-		expect(read("pages", "NewPlanRun.tsx")).toMatch(/<OperatorOnly capability="admin">/);
+		expect(read("pages", "dispatch-plan.tsx")).toMatch(/<OperatorOnly capability="admin">/);
 	});
 });
 
 describe("redacted wire fields render on presence (warren-f53e)", () => {
 	const types = read("api", "types.ts");
-	const client = read("api", "client.ts");
-	const runDetail = read("pages", "RunDetail.tsx");
+	// warren-8c85: the legacy run detail page split into the Direction C
+	// run-detail/ directory; the runtime facts panel owns the sandbox
+	// handle rendering now.
+	const runDetail = read("pages", "run-detail", "side-panels.tsx");
 
 	test("the fields the public projection drops are optional in the row types", () => {
 		// `undefined !== null` is TRUE — the exact shape that blanked every
 		// run detail page in warren-1f12. Optional forces a presence test.
-		expect(types).toMatch(/burrowId\?: string \| null/);
-		expect(types).toMatch(/burrowRunId\?: string \| null/);
+		expect(types).toMatch(/sandboxId\?: string \| null/);
+		expect(types).toMatch(/sandboxRunId\?: string \| null/);
 		expect(types).toMatch(/previewFailureMessage\?: string \| null/);
 		expect(types).toMatch(/localPath\?: string/);
 		// `AgentRow` is canonical in `src/core/wire.ts` (warren-4253) and
@@ -193,26 +199,30 @@ describe("redacted wire fields render on presence (warren-f53e)", () => {
 		expect(types).toMatch(/costTotalUsd\?: number/);
 	});
 
-	test("the burrow meta cards don't render as two empty '—' cards", () => {
-		expect(runDetail).toMatch(/\{r\.burrowId \? \(/);
-		expect(runDetail).toMatch(/\{r\.burrowRunId \? \(/);
-		expect(runDetail).not.toMatch(/burrowId \?\? "—"/);
-		expect(runDetail).not.toMatch(/burrowRunId \?\? "—"/);
+	test("the burrow meta facts don't render as empty '—' rows", () => {
+		// The Direction C Runtime panel (warren-8c85) presence-tests the
+		// runtime handle before rendering it.
+		expect(runDetail).toMatch(/handle !== null && handle\.length > 0/);
+		expect(runDetail).not.toMatch(/sandboxId \?\? "—"/);
+		expect(runDetail).not.toMatch(/sandboxRunId \?\? "—"/);
 	});
 
 	test("the runs list renders its all-time cost tile on presence", () => {
-		const runs = read("pages", "Runs.tsx");
+		const runs = read("pages", "runs.tsx");
 		expect(runs).toMatch(/total: runs\.data\?\.costTotalUsd,/);
 		expect(runs).toMatch(/costTotals\.total !== undefined/);
 	});
 
-	test("the agents panel reads the flat metadata that survives projection", () => {
-		const agents = read("pages", "Agents.tsx");
+	test("the agents registry reads the flat metadata that survives projection", () => {
+		const agents = read("pages", "agents.tsx");
 		expect(agents).toMatch(/agent\.provider \?\?/);
 		expect(agents).toMatch(/agent\.model \?\?/);
-		// The rendered envelope (system prompt, canopy paths) is dropped for
-		// a spectator, so its half of the panel is operator-only.
-		expect(agents).toMatch(/<OperatorOnly capability="readOperator">\s*<AgentDefinitionInternals/);
+		// The rendered envelope (system prompt, cost cap) is dropped for a
+		// spectator, so the Direction C registry (warren-db84) reads the
+		// cost cap out of `renderedJson` only under a strict narrowing
+		// guard — a spectator's cell degrades to "—", never a guess.
+		expect(agents).toMatch(/readCostCap/);
+		expect(agents).toMatch(/typeof cap === "number" && Number\.isFinite/);
 	});
 
 	// warren-e274: `REDACTED_RUN_TOTALS_FIELDS` drops `totals.cost` and
@@ -221,23 +231,29 @@ describe("redacted wire fields render on presence (warren-f53e)", () => {
 	// the three consumers must render on presence. Before this fix the whole
 	// /run-analytics page threw for an anonymous visitor.
 	test("run-analytics cost fields are optional in the wire types", () => {
-		expect(client).toMatch(/cost\?: \{ total: number; avg: number \| null; priced: number \}/);
-		expect(client).toMatch(/costUsd\?: number;\s*priced\?: number;/);
+		// warren-be04: the run-analytics mirror types moved out of client.ts
+		// (file-size budget) into ./run-analytics-types.ts, re-exported from
+		// client.ts, so the assertion reads the new home.
+		const analyticsTypes = read("api", "run-analytics-types.ts");
+		expect(analyticsTypes).toMatch(
+			/cost\?: \{ total: number; avg: number \| null; priced: number \}/,
+		);
+		expect(analyticsTypes).toMatch(/costUsd\?: number;\s*priced\?: number;/);
+		// The outcome rollup's USD figures are redacted the same way.
+		expect(analyticsTypes).toMatch(/costPerMergedPrUsd\?: number \| null/);
 	});
 
-	test("the run-analytics consumers guard the redacted cost fields", () => {
-		const kpi = read("pages", "run-analytics", "KpiCards.tsx");
-		const tables = read("pages", "run-analytics", "Tables.tsx");
-		const tokenStats = read("pages", "run-analytics", "TokenStats.tsx");
-		// KpiCards: the `Total cost` card renders only when `cost` is present.
-		expect(kpi).toMatch(/cost !== undefined \?/);
-		expect(kpi).not.toMatch(/totals\.cost\.total/);
-		// Tables: the `Cost` column is omitted when no bucket carries costUsd.
-		expect(tables).toMatch(/buckets\.some\(\(b\) => b\.costUsd !== undefined\)/);
-		expect(tables).toMatch(/b\.costUsd === undefined \? "—" : formatCostUsd/);
-		// TokenStats: same treatment for the `$/1M` column.
-		expect(tokenStats).toMatch(/buckets\.some\(\(b\) => b\.costUsd !== undefined\)/);
-		expect(tokenStats).toMatch(/b\.costUsd === undefined \? "—" : costPer1M/);
+	test("the telemetry consumers guard the redacted cost fields", () => {
+		// warren-7197: the legacy run-analytics chunks are deleted; the
+		// Direction C Telemetry tabs are the consumers now. The metric
+		// strip renders cost/merged PR on presence, and the economics tab
+		// coalesces the redacted bucket figure to "—" rather than NaN.
+		const metrics = read("pages", "telemetry", "telemetry-metrics.tsx");
+		const economics = read("pages", "telemetry", "economics-tab.tsx");
+		expect(metrics).toMatch(/costPerMergedPr === null \|\| costPerMergedPr === undefined/);
+		expect(economics).toMatch(
+			/row\.costPerMergedPrUsd === null \|\| row\.costPerMergedPrUsd === undefined/,
+		);
 	});
 });
 
@@ -253,7 +269,7 @@ describe("redacted wire fields render on presence (warren-f53e)", () => {
  */
 describe("empty states don't point a spectator at a hidden control (warren-b67b)", () => {
 	test("the hint hook yields the copy only for a caller holding the capability", () => {
-		const guard = read("components", "OperatorOnly.tsx");
+		const guard = read("components", "operator-only.tsx");
 		expect(guard).toMatch(/export function useOperatorHint\(/);
 		expect(guard).toMatch(/return caps\.can\(capability\) \? hint : undefined;/);
 	});
@@ -265,43 +281,41 @@ describe("empty states don't point a spectator at a hidden control (warren-b67b)
 		expect(read("components", "ui", "empty-state.tsx")).toMatch(/\{description \? \(/);
 	});
 
-	test("the two dispatch lists gate their instruction on `dispatch`", () => {
-		for (const page of ["Runs.tsx", "PlanRuns.tsx"]) {
-			const src = read("pages", page);
-			expect(src).toMatch(/useOperatorHint\("Dispatch one above\."\)/);
-			expect(src).toMatch(/description=\{emptyHint\}/);
-		}
+	test("the dispatch lists gate their instruction on `dispatch`", () => {
+		// runs.tsx keeps the legacy EmptyState slot; the Direction C walk
+		// inventory (warren-23b2) carries its quiet placeholder inline but
+		// the hint is still the copy-level gate.
+		const runs = read("pages", "runs.tsx");
+		expect(runs).toMatch(/useOperatorHint\("Dispatch one above\."\)/);
+		expect(runs).toMatch(/description=\{emptyHint\}/);
+		const planRuns = read("pages", "plan-runs.tsx");
+		expect(planRuns).toMatch(/useOperatorHint\(/);
 	});
 
-	test("the projects list gates its instruction on `admin`, like AddProjectForm", () => {
+	test("the projects list gates its instruction on `admin`, like the add-project control", () => {
 		// `POST /projects` is `admin`, not `dispatch` (warren-b875) — gating
 		// the copy on `dispatch` would print it for a caller who still can't
-		// see the form.
-		const projects = read("pages", "Projects.tsx");
-		expect(projects).toMatch(/useOperatorHint\("Add one with a GitHub URL above\.", "admin"\)/);
+		// see the control.
+		const projects = read("pages", "projects.tsx");
+		expect(projects).toMatch(
+			/useOperatorHint\("An operator can add one with a GitHub URL\.", "admin"\)/,
+		);
 		expect(projects).toMatch(/description=\{emptyHint\}/);
 	});
 
 	/**
 	 * The scaling half: gated copy travels as `useOperatorHint("…")` and
 	 * reaches the slot as an expression, so a description STRING LITERAL that
-	 * points at an on-page control ("… above") is by construction ungated.
+	 * points at an on-page control (“… above”) is by construction ungated.
 	 * That catches a fourth page without this test naming it.
-	 *
-	 * One named exemption, in the style of `GATED_ELSEWHERE` above:
-	 * `ready-plans.tsx` lives inside a `readOperator` tab that `PlanRuns.tsx`
-	 * drops for a spectator, so its "choose one above" never reaches one.
 	 *
 	 * Expression descriptions are outside the guard by design — the Agents
 	 * page's copy is a JSX fragment and its spectator issues are tracked
 	 * separately.
 	 */
 	test("no ungated empty-state literal points at an on-page control", () => {
-		const GATED_ELSEWHERE = new Set(["ready-plans.tsx"]);
 		const offenders: string[] = [];
 		for (const file of UI_FILES) {
-			const name = file.slice(file.lastIndexOf("/") + 1);
-			if (GATED_ELSEWHERE.has(name)) continue;
 			const literals = readFileSync(file, "utf8").match(/description="[^"]*"/g) ?? [];
 			if (literals.some((literal) => / above/.test(literal))) {
 				offenders.push(file.slice(UI_SRC.length + 1));
@@ -312,22 +326,29 @@ describe("empty states don't point a spectator at a hidden control (warren-b67b)
 });
 
 describe("demo polish (warren-f53e)", () => {
-	test("the steer form sits above the 480px event tail", () => {
-		const runDetail = read("pages", "RunDetail.tsx");
+	test("the steer form is reachable beside the event tail, not below it", () => {
+		// warren-f53e's original fix stacked SteerForm above the 480px
+		// tail because steering meant scrolling past the whole log.
+		// The Direction C workload inspector (warren-8c85) solves the same
+		// problem by layout: the tail is the main column and the steer
+		// inbox sits in the always-visible side column.
+		const runDetail = read("pages", "run-detail", "index.tsx");
+		const aside = runDetail.indexOf("<aside");
 		const steer = runDetail.indexOf("<SteerForm");
 		const tail = runDetail.indexOf("<EventTail");
 		expect(steer).toBeGreaterThan(-1);
 		expect(tail).toBeGreaterThan(-1);
-		expect(steer).toBeLessThan(tail);
+		expect(aside).toBeGreaterThan(-1);
+		expect(steer).toBeGreaterThan(aside);
 	});
 
 	test("the plot-era residue is gone from the two files that carried it", () => {
-		const cta = read("components", "RefreshProjectsCTA.tsx");
+		const cta = read("components", "refresh-projects-cta.tsx");
 		// Dead cache invalidations for surfaces deleted in pl-3a79.
 		expect(cta).not.toMatch(/\["plots"\]/);
 		expect(cta).not.toMatch(/\["plot"\]/);
 		expect(cta).not.toMatch(/discover new Plots/);
-		const status = read("components", "StatusIndicator.tsx");
+		const status = read("components", "status-indicator.tsx");
 		expect(status).not.toMatch(/PLOT_STATUS/);
 		expect(status).not.toMatch(/^\tplot: /m);
 	});

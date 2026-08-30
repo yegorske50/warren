@@ -21,6 +21,11 @@ import { formatError } from "../output.ts";
 
 export interface ServeArgs {
 	readonly noAuth?: boolean;
+	/**
+	 * warren-48f8: arm the one-time browser auth handoff (mints a single-use
+	 * /setup code). Set only by `warren up`; plain `warren serve` never arms it.
+	 */
+	readonly setupHandoff?: boolean;
 }
 
 export interface ServeDeps {
@@ -32,6 +37,13 @@ export interface ServeDeps {
 	 * resolve it immediately to exercise the cleanup path.
 	 */
 	readonly waitForShutdown?: () => Promise<void>;
+	/**
+	 * Post-boot hook (warren-c18a): called once the server is listening,
+	 * before the shutdown wait. `warren up` uses it to persist the client
+	 * config from the boot result while the process stays in the
+	 * foreground. A throw stops the server and fails the command.
+	 */
+	readonly onBooted?: (handle: WarrenServerHandle) => Promise<void>;
 }
 
 export interface ServeResult {
@@ -52,6 +64,7 @@ export async function runServe(
 		const opts: BootServerOptions = {
 			env: context.env,
 			...(args.noAuth === true ? { noAuth: true } : {}),
+			...(args.setupHandoff === true ? { setupHandoff: true } : {}),
 			...(context.now !== undefined ? { now: context.now } : {}),
 		};
 		handle = await boot(opts);
@@ -61,6 +74,20 @@ export async function runServe(
 	}
 
 	context.stdio.stdout.write(`warren listening at ${handle.url}\n`);
+
+	if (deps.onBooted !== undefined) {
+		try {
+			await deps.onBooted(handle);
+		} catch (err) {
+			context.stdio.stderr.write(`warren: post-boot step failed: ${formatError(err)}\n`);
+			try {
+				await handle.stop();
+			} catch (stopErr) {
+				context.stdio.stderr.write(`warren: shutdown error: ${formatError(stopErr)}\n`);
+			}
+			return { exitCode: 1, url: handle.url };
+		}
+	}
 
 	try {
 		await waitForShutdown();

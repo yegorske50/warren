@@ -42,7 +42,10 @@ import {
 	warrenCommitIdentityArgs,
 	warrenCommitIdentityEnv,
 } from "../../bot-identity.ts";
+import { mintGitCredential } from "../../forge/credentials.ts";
 import type { FinalizeResult } from "../../runtime/contract.ts";
+import { gitCredentialGitEnv } from "../../workspace/git/credential-env.ts";
+import { isCommitSha } from "../base-commit.ts";
 import { hasAutoPlanRunFrontmatter } from "./auto-plan-run.ts";
 import type { ReapPipelineContext, ReapPipelineState } from "./pipeline.ts";
 
@@ -187,11 +190,32 @@ export async function pushCloneDeltasToOrigin(
 	ctx: ReapPipelineContext,
 	ref: string,
 ): Promise<boolean> {
+	// warren-aaf7: a 40-hex ref is a commit SHA, not a push target — `git
+	// push origin HEAD:<sha>` is rejected by the remote. Legacy rows dispatched
+	// with a SHA `ref` (pre-split) can still reach here, so skip the push with
+	// a logged reason rather than burning a `clone_apply_push` failure. The
+	// caller suppresses auto-dispatch (return false): a SHA-pinned run must not
+	// spawn a plan-run against host-only state either.
+	if (isCommitSha(ref)) {
+		await ctx.emit("reap.clone_deltas_push_skipped", {
+			ref,
+			reason: "ref is a commit sha; nothing to push to",
+		});
+		return false;
+	}
 	try {
+		// warren-4e1c: per-spawn minted credential (forge-contract.md §4 —
+		// minted HERE, immediately before the push spawn, never held). A mint
+		// failure throws inside this try and degrades to `clone_apply_push` +
+		// suppressed auto-dispatch, exactly like a rejected push.
+		const secret =
+			ctx.input.forge !== undefined
+				? await mintGitCredential(ctx.input.forge, ctx.project.gitUrl)
+				: undefined;
 		await ctx.exec.run("git", ["push", "origin", `HEAD:${ref}`], {
 			cwd: ctx.project.localPath,
 			timeoutMs: PUSH_TIMEOUT_MS,
-			env: gitRepoContextScrubEnv(),
+			env: { ...gitRepoContextScrubEnv(), ...gitCredentialGitEnv(secret) },
 		});
 		await ctx.emit("reap.clone_deltas_pushed", { ref });
 		return true;

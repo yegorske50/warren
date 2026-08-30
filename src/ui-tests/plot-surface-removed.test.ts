@@ -44,7 +44,7 @@ describe("plot surface is gone from the UI (warren-1f12)", () => {
 			const src = readFileSync(file, "utf8");
 			// ErrorBoundary.tsx documents the incident in prose — it is the
 			// one place the word is allowed, and it ships no plot code.
-			if (file.endsWith("ErrorBoundary.tsx")) continue;
+			if (file.endsWith("error-boundary.tsx")) continue;
 			if (/plotId|plotsApi|hasPlot|\/plots\b|PlotStatus|PlotSummary/.test(src)) {
 				offenders.push(file.slice(UI_SRC.length + 1));
 			}
@@ -53,8 +53,8 @@ describe("plot surface is gone from the UI (warren-1f12)", () => {
 	});
 
 	test("RunDetail and PlanRunDetail render no Plot MetaCard", () => {
-		const runDetail = readFileSync(join(UI_SRC, "pages", "RunDetail.tsx"), "utf8");
-		const planRunDetail = readFileSync(join(UI_SRC, "pages", "PlanRunDetail.tsx"), "utf8");
+		const runDetail = readFileSync(join(UI_SRC, "pages", "run-detail", "index.tsx"), "utf8");
+		const planRunDetail = readFileSync(join(UI_SRC, "pages", "plan-run-detail.tsx"), "utf8");
 		for (const src of [runDetail, planRunDetail]) {
 			expect(src).not.toMatch(/PlotMetaCardContent/);
 			expect(src).not.toMatch(/label="Plot"/);
@@ -71,8 +71,10 @@ describe("plot surface is gone from the UI (warren-1f12)", () => {
 });
 
 describe("route-level error boundary (warren-1f12)", () => {
-	const boundary = readFileSync(join(UI_SRC, "components", "ErrorBoundary.tsx"), "utf8");
-	const layout = readFileSync(join(UI_SRC, "components", "Layout.tsx"), "utf8");
+	const boundary = readFileSync(join(UI_SRC, "components", "error-boundary.tsx"), "utf8");
+	// warren-4ed7: the routed Outlet moved from the legacy Layout into the
+	// Direction C console shell.
+	const layout = readFileSync(join(UI_SRC, "components", "console", "console-shell.tsx"), "utf8");
 
 	test("implements the React error-boundary contract", () => {
 		// Both halves are required: getDerivedStateFromError swaps in the

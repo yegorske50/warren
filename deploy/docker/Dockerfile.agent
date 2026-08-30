@@ -12,9 +12,9 @@
 # Unlike the control-plane Dockerfile this image has NO supervisor, NO
 # `burrow serve`, and NO bubblewrap/uidmap — the pod boundary replaces all of
 # that (design k8s-migration.md §2.2). It bakes the agent toolchain (design §4.3):
-# bun, real Node, the coding-agent CLIs (claude-code, pi, sapling), and the
-# os-eco data-plane CLIs (canopy/seeds/mulch/plot) the agent shells out to during
-# a run.
+# bun, real Node, python3+uv (warren-fabb), the coding-agent CLIs (claude-code,
+# pi, sapling), and the os-eco data-plane CLIs (canopy/seeds/mulch/plot) the
+# agent shells out to during a run.
 #
 # Build context is the repo root:
 #   docker build -f deploy/docker/Dockerfile.agent -t warren-agent:latest .
@@ -24,21 +24,54 @@ FROM oven/bun:1.2
 # git + https CA roots for clone/push; real Node (NodeSource LTS) for agent
 # tooling whose shims are `#!/usr/bin/env node` (parity with the control-plane
 # image, warren-a82b). No bubblewrap/uidmap/netcat — the pod is the sandbox.
+# warren-fabb (pl-a37b step 17): python3 + pip + venv + uv so a Python
+# mirror's agent can run the project's own tests (pytest/uv). Deliberately
+# minimal — no go/rust/jdk this pass; a stack needing more pins its own
+# agentImage via `.warren/config.yaml`.
+# util-linux ships `setpriv`, the warren-cb93 entrypoint/agent uid-split
+# primitive: the in-pod entrypoint (uid 1000) setpriv-drops the AGENT process
+# to uid 1001 so a forged write at the entrypoint's stdout fd (/proc/1/fd/1)
+# fails EACCES (see src/runtime/k8s/agent-uid-drop.ts). K8s-only: the
+# DockerProvider spawns the agent argv directly as the container's pid 1, so
+# there is no entrypoint fd to protect and no split applies.
+#
+# warren-950d: containerd 2.x grants the pod spec's SETUID/SETGID
+# `capabilities.add` to a non-root pid 1 in the BOUNDING set only, never
+# effectively — so setpriv must carry file capabilities
+# (`cap_setuid,cap_setgid+ep`, via libcap2-bin's setcap) to privilege the
+# drop itself. File caps take effect only while no_new_privs is off (the
+# agent container sets `allowPrivilegeEscalation: true` for the entrypoint);
+# the split-off AGENT runs under `--no-new-privs` with an emptied bounding
+# set, so it cannot use this same binary to climb back (verified live on GKE
+# Autopilot / containerd 2.1.7). DockerProvider runs pin
+# `--security-opt no-new-privileges` so the caps stay inert there too.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
         curl \
         gnupg \
+        python3 \
+        python3-pip \
+        python3-venv \
+        util-linux \
+        libcap2-bin \
+    && setcap cap_setuid,cap_setgid+ep "$(command -v setpriv)" \
+    && getcap "$(command -v setpriv)" \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf https://astral.sh/uv/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin UV_UNMANAGED_INSTALL=1 sh \
+    && uv --version
 
 # Trust the `/workspace` emptyDir regardless of owner uid (warren-fd08 live
 # validation): the pod runs as uid 1000 but the emptyDir mountpoint is
 # root-owned, so git >= 2.35.2 refuses the agent's commits + finalize's push with
 # "detected dubious ownership". A system-wide safe.directory is the canonical
-# container fix (single-tenant pod ⇒ no added trust surface).
+# container fix (single-tenant pod ⇒ no added trust surface). warren-cb93:
+# this fix is uid-AGNOSTIC, so it also covers the uid-1001 agent the
+# entrypoint/agent uid split spawns inside a uid-1000-owned checkout.
 RUN git config --system --add safe.directory '*'
 
 # Baked coding-agent runtimes + os-eco data-plane CLIs. Versions track the
@@ -53,7 +86,7 @@ RUN bun install -g \
     @os-eco/sapling-cli@0.3.2 \
     @os-eco/plot-cli@0.4.0 \
     @anthropic-ai/claude-code@2.1.150 \
-    @earendil-works/pi-coding-agent@0.83.0
+    @earendil-works/pi-coding-agent@0.84.2
 
 # claude-code's postinstall (download the platform-native `claude` binary) is
 # skipped by `bun install -g`; run it explicitly so /usr/local/bin/claude exists
@@ -76,9 +109,21 @@ COPY . /app
 
 # Route Bun's install cache outside the workspace so `git add .` never sweeps it
 # (mirrors the domain's BUN_INSTALL_CACHE_DIR). The agent runs unprivileged
-# (uid 1000, set by the pod securityContext); give it a writable HOME on /tmp.
+# (uid 1000 — K8s pod securityContext, docker `--user`, see warren-3f32); give
+# it a writable HOME on /tmp so tooling that ignores the bind-mounted run home
+# still has somewhere to write.
 ENV BUN_INSTALL_CACHE_DIR=/tmp/bun-install-cache
 ENV HOME=/tmp
+
+# oven/bun ships a non-root `bun` user at uid/gid 1000. Drop root in the image
+# as defense in depth (warren-3f32): claude-code refuses
+# `--dangerously-skip-permissions` when getuid()==0. DockerProvider also passes
+# `--user 1000:1000` (or the host uid when warren is non-root) so an image
+# rebuilt without this USER still runs non-root; K8s overrides via
+# securityContext the same way. Hand /app to bun so a standalone smoke run of
+# this image can still read the baked source.
+RUN chown -R bun:bun /app
+USER bun
 
 # pod-spec.ts sets the container `command` explicitly (K8S_AGENT_COMMAND); this
 # CMD is the same entry so the image is runnable standalone for smoke tests.

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { type AnyWarrenDb, openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeForge } from "../../forge/fake/fake-forge.ts";
 import { createPreviewAuth, type PreviewAuth } from "../../preview/cookie.ts";
 import { RunEventBroker } from "../../runs/index.ts";
-import { resolveRuntimeProvider } from "../../runtime/registry.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { bearerAuth } from "../auth.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import { startServer } from "../server.ts";
@@ -20,11 +20,8 @@ const silentLogger = {
 	debug() {},
 };
 
-function makeBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: (async () => new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch,
-	});
+function makeSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 async function depsFor(
@@ -33,12 +30,12 @@ async function depsFor(
 	db?: AnyWarrenDb,
 	previewMode: "subdomain" | "path" = "subdomain",
 ): Promise<{ deps: ServerDeps; bridges: BridgeRegistry }> {
-	const burrowClient = makeBurrowClient();
+	const sandboxClient = makeSandboxClient();
 	const broker = new RunEventBroker();
 	const bridges = createBridgeRegistry({
 		repos,
 		broker,
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+		runtimeProvider: sandboxClient,
 		bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 	});
 	const previewExtras =
@@ -49,7 +46,8 @@ async function depsFor(
 				: { previewAuth, previewMode: "subdomain" as const, previewHost: HOST };
 	const deps: ServerDeps = {
 		repos,
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+		runtimeProvider: sandboxClient,
+		forge: new FakeForge(),
 		broker,
 		bridges,
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
@@ -118,9 +116,31 @@ describe("GET /preview/config (warren-016d)", () => {
 			headers: { authorization: `Bearer ${TOKEN}` },
 		});
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { mode: string; host: string | null };
+		const body = (await res.json()) as { mode: string; host: string | null; port: number | null };
 		expect(body.mode).toBe("path");
 		expect(body.host).toBeNull();
+		// No dedicated preview listener wired in this fixture → null (the UI
+		// then keeps the portless URL shape).
+		expect(body.port).toBeNull();
+	});
+
+	test("returns the dedicated preview listener port in path mode (warren-3f8a)", async () => {
+		const previewAuth = createPreviewAuth(TOKEN, { scope: { mode: "path" }, secure: false });
+		const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+		handle = startServer(
+			{ ...deps, previewPort: 8081 },
+			{
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: bearerAuth(TOKEN),
+				logger: silentLogger,
+			},
+		);
+		const res = await fetch(`${tcpUrl(handle)}/preview/config`, {
+			headers: { authorization: `Bearer ${TOKEN}` },
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { mode: string; port: number | null };
+		expect(body.port).toBe(8081);
 	});
 
 	test("401 without a bearer token (gated like every non-login preview surface)", async () => {

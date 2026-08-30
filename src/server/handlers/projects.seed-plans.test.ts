@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
+import { SeedsTracker } from "../../tracker/seeds-tracker.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle, ServerDeps } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./projects.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./projects.test-helpers.ts";
 
 interface PlanSummaryWire {
 	id: string;
@@ -54,27 +55,24 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 	});
 
 	function depsWithSdSpawn(
-		burrowClient: BurrowClient,
+		provider: FakeProvider,
 		sdSpawn: (
 			cmd: readonly string[],
 		) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
 	): Promise<ServerDeps> {
 		return (async () => {
-			const base = await depsFor(repos, burrowClient);
-			return { ...base, seedsCli: { sdBinary: "sd", spawn: sdSpawn } };
+			const base = await depsFor(repos, provider);
+			return { ...base, issueTracker: new SeedsTracker({ sdBinary: "sd", spawn: sdSpawn }) };
 		})();
 	}
 
-	function silentBurrow(): BurrowClient {
-		return new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
+	function silentSandbox(): FakeProvider {
+		return new FakeProvider();
 	}
 
 	test("returns lean plan summaries and shells out to `sd plan list --json`", async () => {
 		const calls: (readonly string[])[] = [];
-		const deps = await depsWithSdSpawn(silentBurrow(), async (cmd) => {
+		const deps = await depsWithSdSpawn(silentSandbox(), async (cmd) => {
 			calls.push(cmd);
 			return {
 				stdout: JSON.stringify({
@@ -126,7 +124,7 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 	});
 
 	test("returns an empty array for a project with no plans", async () => {
-		const deps = await depsWithSdSpawn(silentBurrow(), async () => ({
+		const deps = await depsWithSdSpawn(silentSandbox(), async () => ({
 			stdout: JSON.stringify({ success: true, plans: [] }),
 			stderr: "",
 			exitCode: 0,
@@ -144,7 +142,7 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 	});
 
 	test("404 for unknown project id", async () => {
-		const deps = await depsWithSdSpawn(silentBurrow(), async () => ({
+		const deps = await depsWithSdSpawn(silentSandbox(), async () => ({
 			stdout: "",
 			stderr: "",
 			exitCode: 0,
@@ -160,7 +158,7 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 	});
 
 	test("400 ProjectLacksSeedsError when project has no .seeds/", async () => {
-		const deps = await depsWithSdSpawn(silentBurrow(), async () => ({
+		const deps = await depsWithSdSpawn(silentSandbox(), async () => ({
 			stdout: "",
 			stderr: "",
 			exitCode: 0,
@@ -177,8 +175,8 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 		expect(body.error.code).toBe("project_lacks_seeds");
 	});
 
-	test("400 ValidationError when seeds CLI is not configured on warren", async () => {
-		const deps = await depsFor(repos, silentBurrow());
+	test("400 ValidationError when no issue tracker is configured on warren", async () => {
+		const deps = await depsFor(repos, silentSandbox());
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -193,7 +191,7 @@ describe("GET /projects/:id/seeds/plans — list a project's seeds plans (warren
 
 	test("`plans` is not swallowed by the :seedId param route", async () => {
 		const calls: (readonly string[])[] = [];
-		const deps = await depsWithSdSpawn(silentBurrow(), async (cmd) => {
+		const deps = await depsWithSdSpawn(silentSandbox(), async (cmd) => {
 			calls.push(cmd);
 			return { stdout: JSON.stringify({ success: true, plans: [] }), stderr: "", exitCode: 0 };
 		});

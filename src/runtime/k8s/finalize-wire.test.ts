@@ -47,6 +47,15 @@ describe("validateFinalizeResult", () => {
 		expect(validateFinalizeResult(JSON.parse(JSON.stringify(r)))).toEqual(r);
 	});
 
+	test("carries an optional commitsAheadBase and keeps it off the shape when absent (warren-ba08)", () => {
+		expect(validateFinalizeResult(fullResult())).not.toHaveProperty("commitsAheadBase");
+		const withBase = { ...fullResult(), commitsAheadBase: "0123abcd" };
+		expect(validateFinalizeResult(withBase).commitsAheadBase).toBe("0123abcd");
+		expect(() =>
+			validateFinalizeResult({ ...fullResult(), commitsAheadBase: 7 } as unknown),
+		).toThrow(ValidationError);
+	});
+
 	test("accepts commitsAhead: null (the widened shape)", () => {
 		const r = { ...fullResult(), commitsAhead: null };
 		expect(validateFinalizeResult(r).commitsAhead).toBeNull();
@@ -61,6 +70,29 @@ describe("validateFinalizeResult", () => {
 	test("rejects an unknown stage name", () => {
 		const bad = { ...fullResult(), stages: [{ stage: "not_a_stage", status: "ok" }] };
 		expect(() => validateFinalizeResult(bad)).toThrow(/not a known finalize stage/);
+	});
+
+	test("accepts an empty mergedBody — a pruned tracker file is legal workspace truth (warren-8e05)", () => {
+		const r = fullResult();
+		const artifacts = {
+			...r.artifacts,
+			mulch: {
+				...r.artifacts.mulch,
+				files: [{ path: ".mulch/expertise/sandbox.jsonl", mergedBody: "" }],
+				counts: { updated: 0, skipped: 0, appended: 0 },
+			},
+		};
+		const out = validateFinalizeResult({ ...r, artifacts });
+		expect(out.artifacts.mulch?.files[0]?.mergedBody).toBe("");
+	});
+
+	test("still rejects an empty path on a delta file entry", () => {
+		const r = fullResult();
+		const artifacts = {
+			...r.artifacts,
+			mulch: { ...r.artifacts.mulch, files: [{ path: "", mergedBody: "x\n" }] },
+		};
+		expect(() => validateFinalizeResult({ ...r, artifacts })).toThrow(/path must be a non-empty/);
 	});
 
 	test("rejects a malformed artifact delta file entry", () => {

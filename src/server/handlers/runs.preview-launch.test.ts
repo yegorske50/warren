@@ -300,6 +300,54 @@ describe("POST /runs/:id/preview/login", () => {
 			expect(res.status).toBe(400);
 		});
 
+		test("resolves the redirect against the dedicated preview origin (warren-3f8a)", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(
+				{ ...deps, previewPort: 8081 },
+				{
+					transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+					auth: bearerAuth(TOKEN),
+					logger: silentLogger,
+				},
+			);
+			const res = await login(handle, runId);
+			expect(res.status).toBe(200);
+			const body = (await res.json()) as { url: string };
+			expect(body.url).toBe(`http://127.0.0.1:8081/p/${runId}/`);
+		});
+
+		test("accepts an absolute redirect on the preview origin and rejects the warren origin (warren-3f8a)", async () => {
+			const previewAuth = createPreviewAuth(TOKEN, {
+				scope: { mode: "path" },
+				secure: false,
+			});
+			const { deps } = await depsFor(repos, previewAuth, undefined, "path");
+			handle = startServer(
+				{ ...deps, previewPort: 8081 },
+				{
+					transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+					auth: bearerAuth(TOKEN),
+					logger: silentLogger,
+				},
+			);
+			const onPreviewOrigin = await login(handle, runId, {
+				redirect: `http://127.0.0.1:8081/p/${runId}/inner`,
+			});
+			expect(onPreviewOrigin.status).toBe(200);
+			const body = (await onPreviewOrigin.json()) as { url: string };
+			expect(body.url).toBe(`http://127.0.0.1:8081/p/${runId}/inner`);
+			// The warren origin no longer serves previews — an absolute
+			// redirect pointing at it must be refused.
+			const onWarrenOrigin = await login(handle, runId, {
+				redirect: `${tcpUrl(handle)}/p/${runId}/inner`,
+			});
+			expect(onWarrenOrigin.status).toBe(400);
+		});
+
 		test("path mode works without WARREN_PREVIEW_HOST", async () => {
 			const previewAuth = createPreviewAuth(TOKEN, {
 				scope: { mode: "path" },

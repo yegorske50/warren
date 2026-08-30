@@ -70,11 +70,19 @@ export function whoamiHandler(): RouteHandler {
  * `host` is null when path mode is configured without `WARREN_PREVIEW_HOST`;
  * in that case the UI derives the URL from `window.location.origin`. In
  * subdomain mode `host` is always set (boot rejects subdomain-without-host).
+ *
+ * `port` (warren-3f8a) is the dedicated path-mode preview listener's
+ * public port — path-mode previews live on their own origin (same
+ * hostname, this port) so agent-authored preview code cannot read the
+ * operator token out of the UI origin's storage. Null in subdomain mode
+ * and on the unix transport's legacy same-origin mounting; the UI then
+ * keeps the portless URL shape.
  */
 export function previewConfigHandler(deps: ServerDeps): RouteHandler {
 	return () =>
 		jsonResponse(200, {
 			mode: deps.previewMode ?? DEFAULT_PREVIEW_MODE,
 			host: deps.previewHost ?? null,
+			port: deps.previewPort ?? null,
 		});
 }

@@ -21,6 +21,13 @@
  *   - `model-cost-outlier`: a model whose average per-run cost is a multiple of
  *     its peers' median
  *   - `steering-anomaly`: a high share of runs needing mid-run human steering
+ *   - `steering-outcome-delta` (warren-be04): steered versus unsteered
+ *     merged-PR rates, denominators + confidence attached
+ *   - `cost-per-merged-pr` (warren-be04): total priced cost over merged-PR
+ *     count, overall with the priciest bucket named
+ *   - `context-waste-proxy` (warren-6d41): the tool whose tool_result byte
+ *     share of run context tokens dominates — a byte-size proxy, not
+ *     per-turn usage deltas, and the payload says so
  *
  * NOTE: the `steering-anomaly` callout fires only when a caller passes the
  * optional {@link SteeringSignals} bundle. The `GET /analytics/behavior`
@@ -40,8 +47,18 @@
  * of which categories fired.
  */
 
+import type { InsightConfidence } from "../../core/wire.ts";
 import type { CommandMining, CommandStat } from "./command-mining.ts";
+import type { ContextWasteProxy } from "./context-waste.ts";
+import type { DirectoryDifficulty } from "./directory-difficulty.ts";
+import { contextWasteProxy } from "./insights-context-waste.ts";
+import { hardestDirectory } from "./insights-directory.ts";
+import type { RunOutcomes } from "./outcome-analytics.ts";
 import type { RunGroupBucket, RunMetrics } from "./run-metrics.ts";
+
+// The confidence vocabulary is canonical in the wire kernel (warren-be04);
+// re-exported here so insight consumers keep one import site.
+export type { InsightConfidence } from "../../core/wire.ts";
 
 export type InsightSeverity = "info" | "warning" | "critical";
 
@@ -51,7 +68,11 @@ export type InsightKind =
 	| "most-failed-command"
 	| "most-retried-command"
 	| "model-cost-outlier"
-	| "steering-anomaly";
+	| "steering-anomaly"
+	| "steering-outcome-delta"
+	| "cost-per-merged-pr"
+	| "context-waste-proxy"
+	| "hardest-directory";
 
 export interface Insight {
 	readonly kind: InsightKind;
@@ -64,6 +85,18 @@ export interface Insight {
 	readonly value: number;
 	/** the subject (seedId / agent / command / model), or null when global. */
 	readonly subject: string | null;
+	/**
+	 * The count `value` was divided by (warren-be04). Outcome-joined
+	 * callouts ship every rate/ratio with its denominator so the UI can
+	 * render "12 of 34" next to "35%". Absent on count-shaped callouts.
+	 */
+	readonly denominator?: number;
+	/**
+	 * Confidence qualifier for outcome-joined callouts (warren-be04),
+	 * derived from the sample behind `denominator`. Absent on callouts
+	 * whose number is a raw count rather than a rate or ratio.
+	 */
+	readonly confidence?: InsightConfidence;
 }
 
 /**
@@ -84,6 +117,26 @@ export interface InsightsInput {
 	readonly metrics: RunMetrics;
 	readonly mining: CommandMining;
 	readonly steering?: SteeringSignals;
+	/**
+	 * Outcome-joined rollup (warren-be04) — steered/unsteered cohort
+	 * outcomes plus cost-per-merged-PR. When supplied, `buildInsights`
+	 * also derives the `steering-outcome-delta` and `cost-per-merged-pr`
+	 * callouts.
+	 */
+	readonly outcomes?: RunOutcomes;
+	/**
+	 * Context-waste proxy rollup (warren-6d41) — tool_result byte shares
+	 * against run context tokens from the `tool_calls` rollup. When
+	 * supplied, `buildInsights` also derives the `context-waste-proxy`
+	 * callout. The `GET /analytics/behavior` handler supplies it.
+	 */
+	readonly contextWaste?: ContextWasteProxy;
+	/**
+	 * Per-directory difficulty rollup (warren-8f1b). Optional like
+	 * `steering`: when omitted the `hardest-directory` callout is
+	 * skipped. Directories carry their own denominators + confidence.
+	 */
+	readonly directories?: DirectoryDifficulty;
 }
 
 /** Minimum terminal runs before an agent's success rate is worth flagging. */
@@ -104,13 +157,18 @@ const MIN_MODELS_FOR_OUTLIER = 2;
 /** Share-of-runs thresholds for the steering anomaly. */
 const STEERING_CRITICAL_SHARE = 0.5;
 const STEERING_WARNING_SHARE = 0.25;
-
+/** Minimum resolved-PR rows per cohort before a delta is worth reporting. */
+const MIN_OUTCOME_COHORT_KNOWN = 3;
 const KIND_ORDER: readonly InsightKind[] = [
 	"worst-success-agent",
 	"most-retried-command",
 	"most-failed-command",
 	"model-cost-outlier",
+	"cost-per-merged-pr",
+	"steering-outcome-delta",
 	"steering-anomaly",
+	"context-waste-proxy",
+	"hardest-directory",
 	"highest-context-seed",
 ];
 
@@ -242,6 +300,85 @@ function steeringAnomaly(s: SteeringSignals): Insight | null {
 	};
 }
 
+/**
+ * Steered-versus-unsteered merged-PR rate delta (warren-be04). Fires only
+ * when BOTH cohorts have at least {@link MIN_OUTCOME_COHORT_KNOWN} runs with
+ * a resolved `prState` — below that the delta is noise. A negative delta
+ * (steered runs land LESS often) is a warning; a non-negative one is info.
+ * NULL `prState` rows sit in neither denominator.
+ */
+function steeringOutcomeDelta(outcomes: RunOutcomes): Insight | null {
+	const { steered, unsteered, mergedPrRateDelta, confidence } = outcomes.steering;
+	if (mergedPrRateDelta === null) return null;
+	if (
+		steered.prStateKnown < MIN_OUTCOME_COHORT_KNOWN ||
+		unsteered.prStateKnown < MIN_OUTCOME_COHORT_KNOWN
+	) {
+		return null;
+	}
+	const steeredRate = steered.mergedPrRate;
+	const unsteeredRate = unsteered.mergedPrRate;
+	if (steeredRate === null || unsteeredRate === null) return null;
+	const signed = `${mergedPrRateDelta >= 0 ? "+" : ""}${Math.round(mergedPrRateDelta * 100)}pts`;
+	return {
+		kind: "steering-outcome-delta",
+		severity: mergedPrRateDelta < 0 ? "warning" : "info",
+		title: "Steering-outcome delta",
+		detail:
+			`Steered runs merged ${steered.prsMerged} of ${steered.prStateKnown} resolved PR(s) ` +
+			`(${pct(steeredRate)}); unsteered runs merged ${unsteered.prsMerged} of ` +
+			`${unsteered.prStateKnown} (${pct(unsteeredRate)}) — a ${signed} delta.`,
+		value: mergedPrRateDelta,
+		subject: null,
+		denominator: steered.prStateKnown + unsteered.prStateKnown,
+		confidence,
+	};
+}
+
+/**
+ * Overall cost per merged PR (warren-be04): total priced cost over merged-PR
+ * count, with the priciest agent/model/provider bucket named as the subject.
+ * Fires only when at least one PR merged AND at least one run carried a
+ * price — a zero-merged window has no ratio, and an unpriced window has no
+ * cost numerator. Buckets with zero merged PRs never win the "priciest"
+ * slot: their ratio is undefined, not infinite.
+ */
+function costPerMergedPr(outcomes: RunOutcomes): Insight | null {
+	const c = outcomes.costPerMergedPr;
+	if (c.overall.costPerMergedPrUsd === null || c.overall.priced === 0) return null;
+	let worst: { dimension: string; key: string; ratio: number } | null = null;
+	const dimensions = [
+		["agent", c.byAgent],
+		["model", c.byModel],
+		["provider", c.byProvider],
+	] as const;
+	for (const [dimension, buckets] of dimensions) {
+		for (const b of buckets) {
+			if (b.costPerMergedPrUsd === null) continue;
+			if (worst === null || b.costPerMergedPrUsd > worst.ratio) {
+				worst = { dimension, key: b.key, ratio: b.costPerMergedPrUsd };
+			}
+		}
+	}
+	const ratio = c.overall.costPerMergedPrUsd;
+	return {
+		kind: "cost-per-merged-pr",
+		severity: "info",
+		title: "Cost per merged PR",
+		detail:
+			`$${ratio.toFixed(2)} of priced run cost per merged PR ` +
+			`($${c.overall.costUsd.toFixed(2)} across ${c.overall.priced} priced run(s) over ` +
+			`${c.overall.prsMerged} merged PR(s) of ${c.overall.prStateKnown} resolved)` +
+			(worst === null
+				? "."
+				: ` — priciest ${worst.dimension}: "${worst.key}" at $${worst.ratio.toFixed(2)}/merged PR.`),
+		value: ratio,
+		subject: worst?.key ?? null,
+		denominator: c.overall.prsMerged,
+		confidence: c.confidence,
+	};
+}
+
 function compareInsights(a: Insight, b: Insight): number {
 	const sev = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
 	if (sev !== 0) return sev;
@@ -296,13 +433,27 @@ export function buildSteeringSignals(
 }
 
 /**
+ * Per-run steering-message counts (warren-8f1b): the same `steer.sent`
+ * scan as {@link buildSteeringSignals}, keyed by run id, for aggregators
+ * that join steering to a per-run subject (the directory difficulty map).
+ */
+export function countSteeringByRun(rows: readonly SteeringEventRow[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const row of rows) {
+		if (row.kind !== STEER_SENT_KIND) continue;
+		counts.set(row.runId, (counts.get(row.runId) ?? 0) + 1);
+	}
+	return counts;
+}
+
+/**
  * Distill the run-metrics + command-mining rollups (and optional steering
  * signals) into a ranked list of severity-coded callouts. Returns `[]` for a
  * healthy, low-signal window. O(groups + commands) — a handful of single
  * passes over the already-aggregated breakdowns.
  */
 export function buildInsights(input: InsightsInput): Insight[] {
-	const { metrics, mining, steering } = input;
+	const { metrics, mining, steering, directories, outcomes } = input;
 	const candidates: (Insight | null)[] = [
 		highestContextSeed(metrics),
 		worstSuccessAgent(metrics),
@@ -312,6 +463,16 @@ export function buildInsights(input: InsightsInput): Insight[] {
 	];
 	if (steering !== undefined) {
 		candidates.push(steeringAnomaly(steering));
+	}
+	if (outcomes !== undefined) {
+		candidates.push(steeringOutcomeDelta(outcomes));
+		candidates.push(costPerMergedPr(outcomes));
+	}
+	if (directories !== undefined) {
+		candidates.push(hardestDirectory(directories));
+	}
+	if (input.contextWaste !== undefined) {
+		candidates.push(contextWasteProxy(input.contextWaste));
 	}
 	const insights = candidates.filter((i): i is Insight => i !== null);
 	insights.sort(compareInsights);

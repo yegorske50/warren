@@ -1,12 +1,20 @@
 import type { EventRow, RunFailureReason, RunTerminalState } from "../../db/schema.ts";
+import { mintGitCredential } from "../../forge/credentials.ts";
 import type { RunHandle, RuntimeProvider, WorkspaceInfo } from "../../runtime/contract.ts";
+import type { GitSpawnCredential } from "../../workspace/git/credential-env.ts";
 import { lifecycleBus } from "../lifecycle-bus.ts";
+import { isInfraLostRunFailure } from "../retry/infra-lost-retry.ts";
 import { bindBridgeLogger } from "../stream/index.ts";
 import { runWorkspaceDestroy } from "./destroy.ts";
 import { createPipelineState, runReapPipeline } from "./pipeline.ts";
-import { detectTerminalProviderError } from "./provider-error.ts";
+import { detectTerminalProviderError, providerErrorEventPayload } from "./provider-error.ts";
 import { salvageWorkspace, type WorkspaceSalvageOutcome } from "./salvage.ts";
-import { inferFailureReason, isTerminal, transitionToTerminal } from "./state.ts";
+import {
+	detectSpawnExecFailure,
+	inferFailureReason,
+	isTerminal,
+	transitionToTerminal,
+} from "./state.ts";
 import type { ReapRunInput, ReapRunResult, ReapStep, ReapStepError } from "./types.ts";
 import { buildAlreadyTerminalResult, createSeqAllocator, defaultExec, defaultFs } from "./util.ts";
 
@@ -14,11 +22,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	const fs = input.fs ?? defaultFs;
 	const exec = input.exec ?? defaultExec;
 	const now = input.now ?? (() => new Date());
-	// Runtime-provider seam (warren-1f56). The workspace-dependent half of reap
-	// (finalize) + the sandbox teardown (terminate) + workspace resolution route
-	// through this. REQUIRED since warren-e24d: reap no longer builds a fallback
-	// burrow-backed provider, so it holds no burrow client of its own — the boot
-	// wiring (and tests) construct the provider and thread it in.
+	// RuntimeProvider seam (warren-1f56/e24d): finalize + terminate + workspace.
 	const provider: RuntimeProvider = input.runtimeProvider;
 
 	const run = await input.repos.runs.require(input.runId);
@@ -41,7 +45,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// `turn_end` envelope slips through. This reap-time scan of the
 	// persisted event log is the safety net; the provider message is
 	// surfaced on the `reap.provider_error` event.
-	const providerError = await detectTerminalProviderError(input.repos, run.id);
+	// warren-4001: the run row's declared provider/model (warren-2ede) ride
+	// as the fallback so an opaque harness message still names the pair.
+	const providerError = await detectTerminalProviderError(input.repos, run.id, {
+		fallbackProvider: run.provider,
+		fallbackModel: run.model,
+	});
 	const providerErrorMessage = providerError?.message ?? null;
 	const failedFromProviderError = providerError !== null && input.outcome !== "cancelled";
 	// The success pipeline gates PR-open / seed-close / preview / auto-dispatch
@@ -64,7 +73,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	const emit = async (kind: string, payload: unknown): Promise<EventRow> => {
 		const row = await input.repos.events.append({
 			runId: run.id,
-			burrowEventSeq: seq.next(),
+			sandboxEventSeq: seq.next(),
 			ts: now().toISOString(),
 			kind,
 			stream: "system",
@@ -102,14 +111,14 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// staying null means resolution FAILED (a live burrow 404 / API error); the
 	// pipeline is skipped and `workspace_lookup` is recorded, exactly as before.
 	let resolved: WorkspaceInfo | null = null;
-	if (run.burrowId === null) {
-		await fail("workspace_lookup", new Error("run has no burrow_id; nothing to reap from"));
+	if (run.sandboxId === null) {
+		await fail("workspace_lookup", new Error("run has no sandbox_id; nothing to reap from"));
 	} else {
 		try {
 			resolved = await provider.workspaceInfo({
 				runId: run.id,
-				sandboxId: run.burrowId,
-				providerRunId: run.burrowRunId ?? "",
+				sandboxId: run.sandboxId,
+				providerRunId: run.sandboxRunId ?? "",
 			});
 			workspacePath = resolved.workspacePath;
 			branch = resolved.branch;
@@ -117,11 +126,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			await fail("workspace_lookup", err);
 		}
 	}
-	// Base branch for the empty-push count comes from the project row, not
-	// burrow (which doesn't expose baseBranch at the top level). For V1 the
-	// primary flow always carves the workspace branch off
-	// `project.defaultBranch`, the correct ref for `rev-list --count`.
-	const baseBranch: string | null = project?.defaultBranch ?? null;
+	// Base branch for the empty-push count comes from the run's frozen clone
+	// ref (warren-8cbf: the workspace was cut from it, so it is the correct
+	// ref for `rev-list --count` and the downstream PR base), falling back to
+	// the project row (burrow doesn't expose baseBranch at the top level). A
+	// run dispatched without a ref behaves exactly as before: defaultBranch.
+	const baseBranch: string | null = run.ref ?? project?.defaultBranch ?? null;
 
 	// warren-4e74: observe-only `pre_reap` — reap is about to touch the
 	// workspace. A no-op unless a bus is installed with a subscriber; fired
@@ -133,8 +143,20 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		outcome: pipelineInput.outcome,
 	});
 
+	// warren-4e2a: a spawn-exec failure produced zero agent work — skip the
+	// seeds commit + branch push (same posture as never_started; the push
+	// would pollute the repo). `inferFailureReason` classifies it below.
+	const spawnExecFailed =
+		stateOnEntry !== "queued" &&
+		input.outcome === "failed" &&
+		(await detectSpawnExecFailure(input.repos, run.id));
+
 	if (stateOnEntry === "queued" && resolved !== null && project !== null) {
 		await emit("reap.never_started_skip", { message: "agent never ran; skipping pipeline" });
+	} else if (spawnExecFailed && resolved !== null && project !== null) {
+		await emit("reap.spawn_failed_skip", {
+			message: "agent process could not be spawned; skipping seeds commit and branch push",
+		});
 	} else if (stateOnEntry !== "queued" && resolved !== null && project !== null) {
 		await runReapPipeline(
 			{
@@ -163,26 +185,30 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		});
 	}
 
-	// warren-72b9: `droppedCommit` flips an otherwise-succeeded run to
-	// `failed`/`dropped_commit` so it can't masquerade as success.
-	// warren-edc3: a terminal provider error does the same — and blocks the
-	// bookkeeping-only PR / seed close / plan-run advance that would
-	// otherwise ship a no-code PR and discard the agent's uncommitted edits.
-	// warren-495d: a finalize that timed out / failed before the branch push
-	// completed leaves the agent's commits unpushed — flip an otherwise-
-	// succeeded run to `failed`/`finalize_failed` so it can't report success
-	// while its work sits only on the (soon-to-be-destroyed) workspace.
+	// Flip succeeded→failed: dropped_commit (72b9), ref-dispatch no_changes (ba08;
+	// fresh-branch no-ops stay succeeded/89b0), provider_error (edc3), finalize_failed (495d).
 	const finalizeFailed = state.finalizeFailed && input.outcome === "succeeded";
+	const noChangesFailure =
+		state.noChanges &&
+		(run.ref !== null || run.targetBranch !== null) &&
+		input.outcome === "succeeded";
 	const effectiveOutcome: RunTerminalState =
-		state.droppedCommit || failedFromProviderError || finalizeFailed ? "failed" : input.outcome;
+		state.droppedCommit || noChangesFailure || failedFromProviderError || finalizeFailed
+			? "failed"
+			: input.outcome;
 
-	if (failedFromProviderError) {
-		await emit("reap.provider_error", { message: providerErrorMessage });
+	if (failedFromProviderError && providerError !== null) {
+		// warren-4001: structured provider-error surface — the payload names
+		// provider/model/status so a degraded upstream pool is diagnosable
+		// from the event stream alone.
+		await emit("reap.provider_error", providerErrorEventPayload(providerError));
 	}
 
 	let failureReason: RunFailureReason | null = null;
 	if (state.droppedCommit) {
 		failureReason = "dropped_commit";
+	} else if (noChangesFailure) {
+		failureReason = "no_changes";
 	} else if (failedFromProviderError) {
 		failureReason = "provider_error";
 	} else if (finalizeFailed) {
@@ -192,7 +218,16 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		// reached a terminal phase / vanished / timed out without posting
 		// anything, so the workspace died with it and salvage is the only
 		// recovery path.
-		failureReason = state.finalizeUnposted !== null ? "finalize_unposted" : "finalize_failed";
+		// warren-b68d: a pod-computed result whose push the REMOTE refused on
+		// policy grounds narrows one step further. `finalize_unposted` still wins
+		// the tie: no push was ever attempted, so a rejection cannot be live. The
+		// remediation itself already reached the operator — finalize appended
+		// `reap.push_rejected` and the pipeline replayed it.
+		if (state.finalizeUnposted !== null) {
+			failureReason = "finalize_unposted";
+		} else {
+			failureReason = state.pushRejectedByPolicy ? "push_rejected_policy" : "finalize_failed";
+		}
 	} else if (effectiveOutcome === "failed") {
 		failureReason =
 			input.failureReason ?? (await inferFailureReason(input.repos, run.id, stateOnEntry));
@@ -207,7 +242,12 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// capture also lifts the destroy skip below: the work is safe, so the
 	// workspace no longer needs preserving.
 	let salvage: WorkspaceSalvageOutcome | null = null;
-	if (state.finalizeFailed && workspacePath === null) {
+	// warren-985e: the pod-side surfacing arm also covers a provider_error
+	// failure — that run's finalize SUCCEEDED (it pushed the zero-commit
+	// branch), so `finalizeFailed` never fires, but the pod's
+	// `empty_push_dirty` salvage window may still have captured the
+	// uncommitted work and stamped the row before posting its result.
+	if ((state.finalizeFailed || failedFromProviderError) && workspacePath === null) {
 		// warren-5ea1 (k8s): the control plane cannot reach the pod's emptyDir,
 		// so reap cannot capture anything itself — but the pod may have POSTed a
 		// self-salvage (`/runs/:id/salvage` intake stamps the run row) before
@@ -227,17 +267,32 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		} else {
 			await emit("reap.workspace_salvage_failed", {
 				errors: [
-					"pod reached a terminal phase without posting a finalize result or a salvage bundle; committed work is unrecoverable",
+					failedFromProviderError && !state.finalizeFailed
+						? "run failed with provider_error and the pod posted no salvage bundle; any uncommitted work is unrecoverable"
+						: "pod reached a terminal phase without posting a finalize result or a salvage bundle; committed work is unrecoverable",
 				],
 			});
 		}
 	}
 	if (state.finalizeFailed && workspacePath !== null) {
+		// warren-4e1c: mint the rescue-push credential immediately before the
+		// salvage spawn (forge-contract.md §4 — minted, never held). A mint
+		// failure is recorded and degrades to an anonymous push (which fails
+		// closed on a private repo) rather than skipping the salvage.
+		let gitCredential: GitSpawnCredential | undefined;
+		if (input.forge !== undefined && project !== null) {
+			try {
+				gitCredential = await mintGitCredential(input.forge, project.gitUrl);
+			} catch (err) {
+				await fail("branch_push", err);
+			}
+		}
 		salvage = await salvageWorkspace({
 			runId: run.id,
 			workspacePath,
 			baseBranch,
 			...(input.salvageDir !== undefined ? { salvageDir: input.salvageDir } : {}),
+			...(gitCredential !== undefined ? { gitCredential } : {}),
 			exec,
 			fs,
 		});
@@ -300,8 +355,7 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			rescueRef: salvage?.rescueRef ?? null,
 			bundlePath: salvage?.bundlePath ?? null,
 		},
-		// warren-89b0: distinguish a deliberate no-op (succeeded, non-alarming)
-		// from a dropped commit (failed) for operators reading the terminal event.
+		// warren-89b0/ba08: noChanges flag (run state may still be failed on ref-dispatch).
 		noChanges: state.noChanges,
 		prUrl: state.prUrl,
 		previewState: state.previewLaunchState,
@@ -324,8 +378,8 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 	// `terminate` closure is null when the run has no burrow or reap never
 	// resolved the worker — the same skip the old `workerClient === null` gate had.
 	const workspaceHandle: RunHandle | null =
-		run.burrowId !== null
-			? { runId: run.id, sandboxId: run.burrowId, providerRunId: run.burrowRunId ?? "" }
+		run.sandboxId !== null
+			? { runId: run.id, sandboxId: run.sandboxId, providerRunId: run.sandboxRunId ?? "" }
 			: null;
 	const terminate = workspaceHandle !== null ? () => provider.terminate(workspaceHandle) : null;
 	const workspaceDestroyed = await runWorkspaceDestroy({
@@ -340,6 +394,21 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 		emit,
 		fail: (step, err) => fail(step, err),
 	});
+
+	// warren-9b77: persist the destruction warren-side so the fallback GC
+	// sweep and the `/readyz` stale-workspace diagnostic never re-strand
+	// this workspace. Best-effort like the destroy itself — a bookkeeping
+	// failure surfaces as an event and the GC simply reclaims it later.
+	if (workspaceDestroyed && run.sandboxId !== null) {
+		try {
+			await input.repos.runs.clearBurrowIdForWorkspace(run.sandboxId);
+		} catch (err) {
+			await emit("reap.workspace_destroy_record_failed", {
+				sandboxId: run.sandboxId,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
 
 	// warren-4e74: observe-only lifecycle emits, after the terminal
 	// transition and workspace teardown. `branch_pushed` fires only when
@@ -364,6 +433,25 @@ export async function reapRun(input: ReapRunInput): Promise<ReapRunResult> {
 			commitsAhead: state.commitsAhead,
 			prUrl: state.prUrl,
 		});
+	}
+
+	// warren-4af7: an infra-lost terminalization earns ONE automatic retry —
+	// a fresh run linked via `runs.retry_of`, dispatched by the boot-wired
+	// hook after the workspace is torn down. Plan-run children stand down
+	// inside the hook (the coordinator's child retry owns them). Fire-and-log:
+	// a hook failure lands as `run.retry_failed` and never fails the reap.
+	if (
+		finalState === "failed" &&
+		isInfraLostRunFailure(failureReason) &&
+		input.onInfraLostRun !== undefined
+	) {
+		try {
+			await input.onInfraLostRun(run.id);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			await emit("run.retry_failed", { error: message });
+			log.error({ event: "run.retry_failed", err: message }, "infra-lost run retry failed");
+		}
 	}
 
 	if (input.broker !== undefined) input.broker.close(run.id);

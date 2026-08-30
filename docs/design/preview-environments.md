@@ -1,5 +1,12 @@
 # Per-Run Preview Environments + PR-Body Template
 
+**Kind:** contract
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-08-01
+**Shipped:** v0.3.2
+**Current truth:** `src/runs/reap/preview.ts`, `src/server/main/preview-wiring.ts`, and `.warren/preview.yaml`
+
 > **Salvage provenance:** lifted verbatim from the retired top-level spec §11.L (per-run
 > preview environments, design lock for R-19) and §11.M (PR-body
 > template) as part of the SPEC retirement plan `pl-1717` (step
@@ -27,8 +34,8 @@ RunDetail UI surface, and acceptance scenario `20-preview.ts`
 (happy-path + idle-TTL eviction; macOS skipped per `mx-1d31f0`)
 followed. Operator setup (wildcard CNAME, Caddy DNS-01 snippet, the
 full `WARREN_PREVIEW_*` knob table) is documented in
-[README](README.md#per-run-previews--operator-setup) and
-[`.env.example`](.env.example). Static-site previews
+[README](../../README.md#operator-setup) and
+[`.env.example`](../../.env.example). Static-site previews
 (`type: static`), PR-template configurability, the `.warren/` YAML
 reorg, and a PR-close webhook → preview-teardown hook stay as
 sibling follow-ups under `pl-2c59`. The PR-close webhook teardown
@@ -392,6 +399,45 @@ that boots warren with `WARREN_PREVIEW_MODE=path`, exercises the
 `Location:` rewrite on a redirect), and verifies that the
 wildcard-host doctor warning does **not** fire when
 `WARREN_PREVIEW_HOST` is unset. macOS still skips per mx-1d31f0.
+
+**Dedicated preview origin — path mode (warren-3f8a, 2026-08-03).**
+The original path-mode addendum served previews from warren's own
+listener, which put agent-authored preview code on the same browser
+origin as the warren UI. The UI keeps the operator bearer token in
+`localStorage`, and any same-origin script can read it — a
+prompt-injected agent plus one operator click on "Open preview" equals
+operator-token theft. Documented for a while as a V1 limitation; closed
+by moving path-mode previews onto a **dedicated listener**:
+
+- `WARREN_PREVIEW_PORT` (default: bind port + 1) binds a second
+  `Bun.serve` on the same hostname (`src/server/preview-server.ts`)
+  that serves nothing but the preview proxy. Same URL contract
+  (`/p/<run-id>/...`), same cookie handshake, same rewrites — only the
+  origin changes. `bootPreviewSurface`
+  (`src/server/main/preview-wiring.ts`) is the topology decision point.
+- The browser treats `host:8080` and `host:8081` as different origins,
+  so the preview cannot touch the UI's storage. They stay the same
+  *site*, so the host-scoped `SameSite=Lax` preview cookie set by the
+  login handshake on the warren origin still flows to the preview
+  origin — no cookie-attribute change was needed.
+- The warren origin answers `/p/<run-id>/...` with a **308** to the
+  preview origin (`createPreviewPathRedirect`), keeping pre-split
+  bookmarks and PR annotations working. 308 because it is cacheable and
+  method-preserving.
+- The old `isWarrenApiPath` carve-out in referer-based asset routing is
+  deleted: the preview listener has no warren API to protect, and a
+  preview reaching for the control plane must now cross origins
+  explicitly — which is the point.
+- The login handshake resolves `redirect` targets against the preview
+  origin (`deps.previewPort`), and `GET /preview/config` discloses the
+  port so the UI renders the canonical URL.
+- The unix-socket transport has no TCP port to bind; it keeps the
+  legacy same-origin mounting and warns at boot naming warren-3f8a.
+  Subdomain mode is unchanged — its origin boundary is the per-run
+  host.
+- Operator impact: publish the preview port next to the API port.
+  docker-compose maps `"${WARREN_HOST_PREVIEW_PORT:-8081}:8081"`; a
+  reverse proxy forwards a second port on the same hostname.
 
 ## PR-body template (warren-bd49, 2026-05-14)
 

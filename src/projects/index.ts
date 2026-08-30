@@ -4,6 +4,9 @@
  * rippling out to call sites.
  */
 
+// Row type re-export at the domain seam (warren-02c9): the drizzle schema
+// stays the source of the inferred type; handlers import `ProjectRow` here.
+export type { ProjectRow } from "../db/schema.ts";
 export {
 	detectProjectFeatures,
 	PROJECT_FEATURE_DIRS,
@@ -20,6 +23,7 @@ export {
 } from "./clone.ts";
 export {
 	DEFAULT_PROJECTS_DIR,
+	defaultProjectsRoot,
 	type EnvLike,
 	loadProjectsConfigFromEnv,
 	type ProjectsConfig,
@@ -30,6 +34,7 @@ export {
 	addProject,
 	type DeleteProjectInput,
 	deleteProject,
+	getProject,
 	listProjects,
 	type RefreshProjectInput,
 	type RefreshProjectResult,

@@ -22,8 +22,10 @@
 
 import { ValidationError } from "../../core/errors.ts";
 import type { EventsRepo } from "../../db/repos/events.ts";
+import { mintGitCredential } from "../../forge/credentials.ts";
 import {
 	buildHealPrompt,
+	checkHealerRole,
 	decideHealDispatch,
 	HEAL_DISPATCHED_EVENT,
 	HEALER_TRIGGER,
@@ -63,6 +65,11 @@ export function healAlertHandler(deps: ServerDeps): RouteHandler {
 
 		const settings = resolved.candidate.settings;
 		if (settings === undefined) return skipped("disabled", alert);
+
+		// warren-50a7: fail loudly on a misconfigured `healer.role` here, at
+		// intake, instead of letting it surface as a bare `agent not found`
+		// from deep inside spawnRun after the run row already exists.
+		await assertHealerRole(deps, resolved.candidate);
 
 		const history = await computeHealHistory(deps.repos.events, alert.fingerprint);
 		const decision = decideHealDispatch({
@@ -123,6 +130,21 @@ async function gatherCandidates(deps: ServerDeps): Promise<HealProjectCandidate[
 	return candidates;
 }
 
+/**
+ * Validate the matched project's `healer.role` against the registered
+ * agents. Throws a `ValidationError` (400) naming the project, the bad
+ * role, and the known agents, so a config typo reads as a config error.
+ */
+async function assertHealerRole(deps: ServerDeps, candidate: HealProjectCandidate): Promise<void> {
+	const agents = await deps.repos.agents.listAll();
+	const check = checkHealerRole({
+		role: candidate.role,
+		projectId: candidate.projectId,
+		knownRoles: agents.map((a) => a.name),
+	});
+	if (check.kind === "unknown_role") throw new ValidationError(check.message);
+}
+
 async function loadProjectConfig(
 	deps: ServerDeps,
 	projectId: string,
@@ -134,24 +156,23 @@ async function loadProjectConfig(
 
 /**
  * Reconstruct the prior heal-attempt history for a fingerprint from the
- * durable `heal.dispatched` events. The payload is opaque JSON, so the
- * fingerprint filter runs in JS over the most-recent rows.
+ * durable `heal.dispatched` events. warren-55cf: the fingerprint filter and
+ * the aggregation both run in SQL, so the max-retries and cooldown gates see
+ * every prior attempt for this fingerprint regardless of how many unrelated
+ * heal dispatches landed since. The previous shape scanned the 500 most
+ * recent rows globally and filtered in JS, which silently reset the cooldown
+ * once a busy fleet pushed the fingerprint out of that window.
  */
 async function computeHealHistory(
 	events: EventsRepo,
 	fingerprint: string,
 ): Promise<HealAttemptHistory> {
-	const rows = await events.listByKind(HEAL_DISPATCHED_EVENT);
-	let attempts = 0;
-	let lastAttemptAt: string | null = null;
-	for (const row of rows) {
-		const payload = row.payloadJson as { fingerprint?: unknown } | null;
-		if (payload?.fingerprint !== fingerprint) continue;
-		attempts += 1;
-		// Rows arrive newest-first, so the first match is the latest.
-		if (lastAttemptAt === null) lastAttemptAt = row.ts;
-	}
-	return { attempts, lastAttemptAt };
+	const { count, lastTs } = await events.payloadKeyHistory(
+		HEAL_DISPATCHED_EVENT,
+		"fingerprint",
+		fingerprint,
+	);
+	return { attempts: count, lastAttemptAt: lastTs };
 }
 
 /**
@@ -164,6 +185,10 @@ async function dispatchHealer(
 	candidate: HealProjectCandidate,
 	alert: HealAlert,
 ): Promise<string> {
+	// warren-6c4c: mint the spawn's clone-refresh credential per-spawn through
+	// the boot forge (forge-contract.md §4); no config object holds a token.
+	const project = await deps.repos.projects.require(candidate.projectId);
+	const gitSecret = await mintGitCredential(deps.forge, project.gitUrl);
 	const result = await spawnRun({
 		repos: deps.repos,
 		// warren-245d: dispatch through the resolved runtime provider so the
@@ -173,20 +198,23 @@ async function dispatchHealer(
 		projectId: candidate.projectId,
 		prompt: buildHealPrompt(alert),
 		trigger: HEALER_TRIGGER,
+		// warren-9ce3: explicit provenance for the dispatch-context log.
+		dispatchOrigin: "healer",
 		mode: "batch",
 		metadata: { healFingerprint: alert.fingerprint, alertSource: alert.source },
 		projectsConfig: deps.projectsConfig,
 		projectSpawn: deps.spawn ?? defaultSpawn,
-		githubToken: deps.autoOpenPr?.gitToken,
+		...(gitSecret !== undefined ? { gitCredential: gitSecret } : {}),
 		...(deps.warrenConfigs !== undefined ? { warrenConfigs: deps.warrenConfigs } : {}),
 		...(deps.runBranchPrefixDefault !== undefined
 			? { runBranchPrefixDefault: deps.runBranchPrefixDefault }
 			: {}),
 		...(deps.seedsCli !== undefined ? { seedsCli: deps.seedsCli } : {}),
+		...(deps.issueTracker !== undefined ? { issueTracker: deps.issueTracker } : {}),
 		...(deps.now !== undefined ? { now: deps.now } : {}),
 		logger: deps.logger,
 	});
-	deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+	deps.bridges.start(result.run.id, result.sandboxRun.id, result.sandbox.id);
 	await stampDispatchedEvent(deps, result.run.id, alert);
 	return result.run.id;
 }

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { isPostgresTestEnabled, withDb } from "../testing.ts";
 import { AgentsRepo } from "./agents.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
-import { DEFAULT_TOOL_EVENT_CAP, EventsRepo } from "./events.ts";
+import { EventsRepo } from "./events.ts";
 import { ProjectsRepo } from "./projects.ts";
 import { RunsRepo } from "./runs.ts";
 
@@ -40,7 +40,7 @@ function suite(dialect: "sqlite" | "postgres"): void {
 		) {
 			return events.append({
 				runId,
-				burrowEventSeq: seq,
+				sandboxEventSeq: seq,
 				ts: new Date(2026, 4, 8, 12, 0, seq).toISOString(),
 				kind,
 				stream,
@@ -54,20 +54,20 @@ function suite(dialect: "sqlite" | "postgres"): void {
 				const row = await append(events, runId, 1);
 				expect(row.id).toBeGreaterThan(0);
 				expect(row.runId).toBe(runId);
-				expect(row.burrowEventSeq).toBe(1);
+				expect(row.sandboxEventSeq).toBe(1);
 				expect(row.payloadJson).toEqual({ seq: 1 });
 			} finally {
 				await handle.close();
 			}
 		});
 
-		test("listByRun returns events ordered by burrow_event_seq", async () => {
+		test("listByRun returns events ordered by sandbox_event_seq", async () => {
 			const { handle, events, runId } = await open();
 			try {
 				await append(events, runId, 3);
 				await append(events, runId, 1);
 				await append(events, runId, 2);
-				const got = (await events.listByRun(runId)).map((e) => e.burrowEventSeq);
+				const got = (await events.listByRun(runId)).map((e) => e.sandboxEventSeq);
 				expect(got).toEqual([1, 2, 3]);
 			} finally {
 				await handle.close();
@@ -80,7 +80,7 @@ function suite(dialect: "sqlite" | "postgres"): void {
 				await append(events, runId, 1);
 				await append(events, runId, 2);
 				await append(events, runId, 3);
-				const got = (await events.listByRun(runId, { sinceSeq: 1 })).map((e) => e.burrowEventSeq);
+				const got = (await events.listByRun(runId, { sinceSeq: 1 })).map((e) => e.sandboxEventSeq);
 				expect(got).toEqual([2, 3]);
 			} finally {
 				await handle.close();
@@ -91,9 +91,9 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			const { handle, events, runId } = await open();
 			try {
 				for (let i = 1; i <= 10; i++) await append(events, runId, i);
-				expect((await events.listByRun(runId, { limit: 3 })).map((e) => e.burrowEventSeq)).toEqual([
-					1, 2, 3,
-				]);
+				expect((await events.listByRun(runId, { limit: 3 })).map((e) => e.sandboxEventSeq)).toEqual(
+					[1, 2, 3],
+				);
 			} finally {
 				await handle.close();
 			}
@@ -103,7 +103,7 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			const { handle, events, runId } = await open();
 			try {
 				for (let i = 1; i <= 5; i++) await append(events, runId, i);
-				expect((await events.listTail(runId, 2)).map((e) => e.burrowEventSeq)).toEqual([4, 5]);
+				expect((await events.listTail(runId, 2)).map((e) => e.sandboxEventSeq)).toEqual([4, 5]);
 			} finally {
 				await handle.close();
 			}
@@ -145,15 +145,15 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			}
 		});
 
-		test("listToolEventsForRuns returns only tool_use/tool_result rows ordered by (runId, seq)", async () => {
+		test("listToolEventsForRun returns only tool_use/tool_result rows ordered by seq", async () => {
 			const { handle, events, runId } = await open();
 			try {
 				await append(events, runId, 1, "text");
 				await append(events, runId, 4, "tool_result");
 				await append(events, runId, 2, "tool_use");
 				await append(events, runId, 3, "thinking");
-				const rows = await events.listToolEventsForRuns([runId]);
-				expect(rows.map((r) => [r.kind, r.burrowEventSeq])).toEqual([
+				const rows = await events.listToolEventsForRun(runId);
+				expect(rows.map((r) => [r.kind, r.sandboxEventSeq])).toEqual([
 					["tool_use", 2],
 					["tool_result", 4],
 				]);
@@ -162,24 +162,81 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			}
 		});
 
-		test("listToolEventsForRuns returns [] for empty runIds without a DB hit", async () => {
-			const { handle, events } = await open();
-			try {
-				expect(await events.listToolEventsForRuns([])).toEqual([]);
-			} finally {
-				await handle.close();
-			}
-		});
-
-		test("listToolEventsForRuns caps the row count at the limit", async () => {
+		test("listToolEventsForRun is scoped to one run and uncapped (backfill source)", async () => {
 			const { handle, events, runId } = await open();
 			try {
 				for (let seq = 1; seq <= 5; seq++) {
 					await append(events, runId, seq, "tool_use");
 				}
-				const rows = await events.listToolEventsForRuns([runId], { limit: 3 });
-				expect(rows.map((r) => r.burrowEventSeq)).toEqual([1, 2, 3]);
-				expect(DEFAULT_TOOL_EVENT_CAP).toBeGreaterThan(0);
+				const rows = await events.listToolEventsForRun(runId);
+				expect(rows.map((r) => r.sandboxEventSeq)).toEqual([1, 2, 3, 4, 5]);
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("payloadKeyHistory counts every matching row past the listByKind window", async () => {
+			const { handle, events, runId } = await open();
+			try {
+				const append1 = (seq: number, fingerprint: string, ts: string) =>
+					events.append({
+						runId,
+						sandboxEventSeq: seq,
+						ts,
+						kind: "heal.dispatched",
+						payload: { fingerprint },
+					});
+				// Two attempts for the fingerprint under test, oldest first.
+				await append1(1, "fp-target", "2026-05-01T00:00:00.000Z");
+				await append1(2, "fp-target", "2026-05-01T01:00:00.000Z");
+				// 600 unrelated dispatches scroll the target rows out of the 500-row
+				// newest-first window listByKind returns (warren-55cf).
+				for (let i = 0; i < 600; i++) {
+					await append1(
+						100 + i,
+						`fp-noise-${i}`,
+						`2026-06-01T00:00:00.${String(i).padStart(3, "0")}Z`,
+					);
+				}
+
+				const windowed = await events.listByKind("heal.dispatched");
+				expect(windowed.length).toBe(500);
+				expect(
+					windowed.some(
+						(r) => (r.payloadJson as { fingerprint?: string }).fingerprint === "fp-target",
+					),
+				).toBe(false);
+
+				const history = await events.payloadKeyHistory(
+					"heal.dispatched",
+					"fingerprint",
+					"fp-target",
+				);
+				expect(history.count).toBe(2);
+				expect(history.lastTs).toBe("2026-05-01T01:00:00.000Z");
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("payloadKeyHistory ignores other kinds and unknown fingerprints", async () => {
+			const { handle, events, runId } = await open();
+			try {
+				await events.append({
+					runId,
+					sandboxEventSeq: 1,
+					ts: "2026-05-01T00:00:00.000Z",
+					kind: "other.kind",
+					payload: { fingerprint: "fp-a" },
+				});
+				expect(await events.payloadKeyHistory("heal.dispatched", "fingerprint", "fp-a")).toEqual({
+					count: 0,
+					lastTs: null,
+				});
+				expect(await events.payloadKeyHistory("other.kind", "fingerprint", "fp-a")).toEqual({
+					count: 1,
+					lastTs: "2026-05-01T00:00:00.000Z",
+				});
 			} finally {
 				await handle.close();
 			}
@@ -190,12 +247,37 @@ function suite(dialect: "sqlite" | "postgres"): void {
 			try {
 				const row = await events.append({
 					runId,
-					burrowEventSeq: 1,
+					sandboxEventSeq: 1,
 					ts: "2026-05-08T12:00:00.000Z",
 					kind: "system",
 					payload: {},
 				});
 				expect(row.stream).toBeNull();
+			} finally {
+				await handle.close();
+			}
+		});
+
+		test("origin round-trips and defaults to null (warren-5a07)", async () => {
+			const { handle, events, runId } = await open();
+			try {
+				const withOrigin = await events.append({
+					runId,
+					sandboxEventSeq: 1,
+					ts: "2026-05-08T12:00:00.000Z",
+					kind: "text",
+					origin: "agent",
+					payload: {},
+				});
+				const withoutOrigin = await events.append({
+					runId,
+					sandboxEventSeq: 2,
+					ts: "2026-05-08T12:00:01.000Z",
+					kind: "text",
+					payload: {},
+				});
+				expect(withOrigin.origin).toBe("agent");
+				expect(withoutOrigin.origin).toBeNull();
 			} finally {
 				await handle.close();
 			}

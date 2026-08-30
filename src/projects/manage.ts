@@ -1,8 +1,9 @@
 /**
- * High-level project management: add (clone + persist), list, delete
+ * High-level project management: add (clone + persist), get, list, delete
  * (rm-rf + db). These are the operations behind `POST /projects`,
- * `GET /projects`, and `DELETE /projects/:id` (docs/http-api.md) — the HTTP
- * server is a thin envelope around these calls.
+ * `GET /projects`, `GET /projects/:id`, and `DELETE /projects/:id`
+ * (docs/http-api.md) — the HTTP server is a thin envelope around these
+ * calls.
  *
  * Atomicity contract:
  *   - addProject leaves the system in either "row + dir on disk" or
@@ -34,8 +35,11 @@ import { resolve, sep } from "node:path";
 import { formatError, ValidationError } from "../core/errors.ts";
 import type { ProjectsRepo } from "../db/repos/projects.ts";
 import type { ProjectRow } from "../db/schema.ts";
+import type { Forge } from "../forge/contract.ts";
 import type { BridgeLogger } from "../runs/stream/index.ts";
+import { assertSandboxGit, type SandboxGitPreflightResult } from "../sandbox/git-preflight.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
+import type { GitSpawnCredential } from "../workspace/git/credential-env.ts";
 import {
 	type CloneProjectResult,
 	cloneProjectRepo,
@@ -50,7 +54,26 @@ import {
 	type RefreshProjectCloneResult,
 	refreshProjectClone,
 } from "./refresh.ts";
-import { parseGitHubUrl } from "./url.ts";
+import type { ParsedGitHubUrl } from "./url.ts";
+import { parseForgeOwnedUrl, parseGitHubUrl } from "./url.ts";
+
+/**
+ * Registration URL resolution (warren-2600): github.com grammars parse as
+ * today; a URL the boot forge OWNS but `parseGitHubUrl` rejects falls back
+ * to the forge-owned layout derivation. A URL neither owns surfaces the
+ * ORIGINAL `parseGitHubUrl` validation error verbatim.
+ */
+function parseProjectUrl(gitUrl: string, forge: Forge | undefined): ParsedGitHubUrl {
+	try {
+		return parseGitHubUrl(gitUrl);
+	} catch (err) {
+		if (forge !== undefined) {
+			const owned = parseForgeOwnedUrl(gitUrl, forge);
+			if (owned !== null) return owned;
+		}
+		throw err;
+	}
+}
 
 export interface AddProjectInput {
 	readonly repo: ProjectsRepo;
@@ -62,7 +85,7 @@ export interface AddProjectInput {
 	 * `cloneProjectRepo` — see `CloneProjectInput.token`. Absent/empty →
 	 * anonymous clone.
 	 */
-	readonly token?: string;
+	readonly gitCredential?: GitSpawnCredential;
 	readonly spawn: SpawnFn;
 	readonly timeoutMs?: number;
 	readonly now?: () => Date;
@@ -81,6 +104,24 @@ export interface AddProjectInput {
 	 * the on-disk clone can stay empty.
 	 */
 	readonly detectFeatures?: typeof detectProjectFeatures;
+	/**
+	 * Boot-resolved forge (warren-2600): decides which clone URLs warren can
+	 * host. A URL `parseGitHubUrl` rejects but the forge OWNS
+	 * (`parseRepoRef` non-null, e.g. FakeForge's `fake://<owner>/<name>`)
+	 * still registers, deriving its on-disk path segments via
+	 * `parseForgeOwnedUrl`. Omit ⇒ the legacy github.com-only posture.
+	 */
+	readonly forge?: Forge;
+	/**
+	 * Sandbox git preflight (warren-1219): when provided (LocalProvider
+	 * topology only), the resolved git binary is proven to EXECUTE inside
+	 * the composed sandbox profile BEFORE anything is cloned — a broken
+	 * git (e.g. macOS nix git with dylibs outside the seatbelt-readable
+	 * paths) fails registration with a typed error naming the binary,
+	 * instead of surfacing post-hoc as a dropped_commit run failure.
+	 * Boot-cached by the caller (`sandboxGitPreflightCached`).
+	 */
+	readonly sandboxGitPreflight?: () => Promise<SandboxGitPreflightResult>;
 }
 
 export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
@@ -89,13 +130,20 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 	// ever be registered — refused here, BEFORE anything is cloned, from
 	// the single enforcement site every surface shares.
 	assertGitUrlAllowlisted(input.publicAllowlist, gitUrl);
-	const parsed = parseGitHubUrl(gitUrl);
+	const parsed = parseProjectUrl(gitUrl, input.forge);
 
 	const existing = await repo.findByGitUrl(gitUrl);
 	if (existing) {
 		throw new ValidationError(`project already exists: ${existing.id}`, {
 			recoveryHint: "DELETE /projects/:id first if you want to re-clone",
 		});
+	}
+
+	// warren-1219: prove the sandbox git executes BEFORE cloning, so a
+	// host with a broken sandbox toolchain leaves "neither" (no row, no
+	// disk clone) — the same atomicity contract as a clone failure.
+	if (input.sandboxGitPreflight !== undefined) {
+		assertSandboxGit(await input.sandboxGitPreflight());
 	}
 
 	const cloneFn = input.clone ?? cloneProjectRepo;
@@ -105,9 +153,9 @@ export async function addProject(input: AddProjectInput): Promise<ProjectRow> {
 		owner: parsed.owner,
 		name: parsed.name,
 		defaultBranch: input.defaultBranch,
-		token: input.token,
+		gitCredential: input.gitCredential,
 		spawn: input.spawn,
-		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
+		timeoutMs: input.timeoutMs ?? config.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 	});
 
 	const detect = input.detectFeatures ?? detectProjectFeatures;
@@ -129,10 +177,18 @@ export interface RefreshProjectInput {
 	/** Branch, tag, or SHA. Defaults to the project row's tracked default_branch. */
 	readonly ref?: string;
 	/**
+	 * Detached-HEAD-safe fetch-only mode (warren-232d): fetch this 40-hex
+	 * commit from origin without moving the host clone's HEAD. Forwarded to
+	 * `refreshProjectClone` — see `RefreshProjectCloneInput.fetchCommit`.
+	 * Takes precedence over `ref` for the clone operation; the echo `ref` in
+	 * the result is the fetched SHA.
+	 */
+	readonly fetchCommit?: string;
+	/**
 	 * GitHub token for private-repo fetches (`GITHUB_TOKEN`), forwarded to
 	 * `refreshProjectClone` — see `RefreshProjectCloneInput.token`.
 	 */
-	readonly token?: string;
+	readonly gitCredential?: GitSpawnCredential;
 	readonly spawn: SpawnFn;
 	readonly timeoutMs?: number;
 	readonly now?: () => Date;
@@ -192,9 +248,10 @@ export async function refreshProject(input: RefreshProjectInput): Promise<Refres
 		config,
 		localPath: row.localPath,
 		ref,
-		token: input.token,
+		...(input.fetchCommit !== undefined ? { fetchCommit: input.fetchCommit } : {}),
+		gitCredential: input.gitCredential,
 		spawn: input.spawn,
-		timeoutMs: input.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
+		timeoutMs: input.timeoutMs ?? config.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 		armHooks,
 	});
 
@@ -269,6 +326,15 @@ export async function deleteProject(input: DeleteProjectInput): Promise<ProjectR
 
 export async function listProjects(repo: ProjectsRepo): Promise<ProjectRow[]> {
 	return repo.listAll();
+}
+
+/**
+ * Single-project read behind `GET /projects/:id` (warren-2a89). `require`
+ * throws NotFoundError for an unknown id, which the handler layer renders
+ * as the canonical 404 envelope.
+ */
+export async function getProject(repo: ProjectsRepo, id: string): Promise<ProjectRow> {
+	return repo.require(id);
 }
 
 function assertPathUnderRoot(localPath: string, root: string): void {

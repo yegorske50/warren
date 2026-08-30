@@ -17,7 +17,7 @@
  *      same order — proving the events-first/broker-after ordering and
  *      the table's durability across the bridge handoff.
  *   3. `?since=<seq>` drops every row at-or-below that seq. This is the
- *      "MAX(events.burrow_event_seq)+1" recovery primitive scenario 06
+ *      "MAX(events.sandbox_event_seq)+1" recovery primitive scenario 06
  *      depends on.
  *
  * Why not assert specific event counts: the stub agent emits ~3 setup
@@ -36,6 +36,7 @@ import {
 	type ScenarioCtx,
 } from "../lib/assert.ts";
 import { WarrenHttp } from "../lib/http.ts";
+import { pollAcceptance } from "../lib/poll.ts";
 
 interface ProjectRow {
 	readonly id: string;
@@ -43,7 +44,7 @@ interface ProjectRow {
 
 interface CreateRunResponse {
 	readonly run: { readonly id: string; readonly state: string };
-	readonly burrow: { readonly id: string };
+	readonly sandbox: { readonly id: string };
 }
 
 interface EventEnvelope {
@@ -64,12 +65,19 @@ export const scenario: Scenario = {
 	id: "05",
 	title: "GET /runs/:id/events follows NDJSON; events durable in events table",
 	// Events stream requires a spawned run, which needs the host-side
-	// sample project + canopy fixture. In-proc only.
+	// sample project + boot-seeded stub agent. In-proc only.
 	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
 
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// The stub agent was seeded at boot via WARREN_SEED_AGENTS_FILE
+		// (warren-e376); POST /agents/refresh is deleted (pl-3a79). GET it
+		// to prove boot seeding landed before spawning against it.
+		await http.expectStatus(
+			"GET",
+			`/agents/${encodeURIComponent(ctx.fixtures.stubAgentName)}`,
+			200,
+		);
 		const project = await ensureProject(http, ctx.fixtures.sampleProjectGitUrl);
 
 		const created = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {
@@ -205,17 +213,17 @@ async function waitForReplayAtLeast(
 	targetSeq: number,
 	timeoutMs: number,
 ): Promise<readonly EventEnvelope[]> {
-	const deadline = Date.now() + timeoutMs;
-	let last: EventEnvelope[] = [];
-	while (Date.now() < deadline) {
-		last = await collectAll(http, `/runs/${encodeURIComponent(runId)}/events`);
-		const max = last.reduce((m, e) => (e.seq > m ? e.seq : m), 0);
-		if (max >= targetSeq) return last;
-		await sleep(100);
-	}
-	throw new AcceptanceError(
-		`non-follow replay never reached seq ${targetSeq} within ${timeoutMs}ms (got ${last.length} events, max seq ${last.reduce((m, e) => (e.seq > m ? e.seq : m), 0)})`,
-	);
+	const maxSeq = (events: readonly EventEnvelope[]) =>
+		events.reduce((m, e) => (e.seq > m ? e.seq : m), 0);
+	return pollAcceptance({
+		label: "non-follow replay",
+		id: runId,
+		timeoutMs,
+		intervalMs: 100,
+		fetchRow: () => collectAll(http, `/runs/${encodeURIComponent(runId)}/events`),
+		isDone: (events) => maxSeq(events) >= targetSeq,
+		describe: (events) => `${events.length} events, max seq ${maxSeq(events)}`,
+	});
 }
 
 async function collectAll(http: WarrenHttp, path: string): Promise<EventEnvelope[]> {
@@ -248,8 +256,4 @@ async function safelyCancel(http: WarrenHttp, runId: string, ctx: ScenarioCtx): 
 			`scenario-05: cancel failed (${err instanceof Error ? err.message : String(err)}) — best-effort, continuing`,
 		);
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

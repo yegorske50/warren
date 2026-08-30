@@ -19,8 +19,8 @@
  *     tag.
  *
  * Why this is a thin wrapper, not a re-implementation of inproc.ts:
- *   - The supervisor inside the container owns burrow lifecycle. We do
- *     not get killWarren/restartWarren/killBurrow for free — those would
+ *   - The supervisor inside the container owns process lifecycle. We do
+ *     not get killWarren/restartWarren for free — those would
  *     fight the supervisor's restart policy and aren't a useful test of
  *     production behaviour anyway. Scenarios that need lifecycle declare
  *     `modes: ["in-proc"]` and stay in-proc-only.
@@ -51,6 +51,8 @@
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { waitForHealthz } from "./poll.ts";
+
 export interface ComposeBootOptions {
 	readonly tmpRoot: string;
 	readonly token: string;
@@ -66,15 +68,12 @@ export interface ComposeBootHandle {
 	readonly warrenUrl: string;
 	readonly token: string;
 	readonly tmpRoot: string;
-	/** Burrow socket path *inside* the container; not reachable from the host. */
-	readonly socketPath: string;
 	readonly projectName: string;
 	readonly hostPort: number;
 	stop(): Promise<void>;
 }
 
 const HEALTHZ_WAIT_TIMEOUT_MS = 120_000; // first-run image build + boot can be slow
-const HEALTHZ_POLL_INTERVAL_MS = 500;
 
 export async function bootCompose(opts: ComposeBootOptions): Promise<ComposeBootHandle> {
 	await assertDockerAvailable();
@@ -127,9 +126,6 @@ export async function bootCompose(opts: ComposeBootOptions): Promise<ComposeBoot
 		warrenUrl,
 		token: opts.token,
 		tmpRoot: opts.tmpRoot,
-		// docs/design/runtime-and-supervisor.md + Dockerfile ENV: container's burrow socket lives here.
-		// Surfaced for parity with InProc; not reachable from the host.
-		socketPath: "/var/run/burrow.sock",
 		projectName,
 		hostPort,
 		stop: async () => {
@@ -287,28 +283,6 @@ async function runCompose(
 		proc.exited,
 	]);
 	return { stdout, stderr, exitCode: exitCode ?? 0 };
-}
-
-async function waitForHealthz(baseUrl: string, timeoutMs: number): Promise<void> {
-	const start = Date.now();
-	let lastErr: string | undefined;
-	while (Date.now() - start < timeoutMs) {
-		try {
-			const res = await fetch(`${baseUrl}/healthz`, { method: "GET" });
-			if (res.status === 200) return;
-			lastErr = `status ${res.status}`;
-		} catch (err) {
-			lastErr = err instanceof Error ? err.message : String(err);
-		}
-		await sleep(HEALTHZ_POLL_INTERVAL_MS);
-	}
-	throw new Error(
-		`warren /healthz did not respond 200 within ${timeoutMs}ms: ${lastErr ?? "unknown"}`,
-	);
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function pickPort(): number {

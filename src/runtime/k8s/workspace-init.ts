@@ -65,7 +65,7 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import { WorkspaceMaterializationError } from "../../workspace/errors.ts";
-import { authenticatedCloneUrl } from "../../workspace/git/clone-url.ts";
+import { authenticatedCloneUrl, bareTokenCredential } from "../../workspace/git/clone-url.ts";
 import { runGit } from "../../workspace/git/exec.ts";
 import { parseSeedManifest } from "./seed-configmap.ts";
 
@@ -189,6 +189,14 @@ async function mirrorIsUsable(git: InitGitRunner, mirrorPath: string): Promise<b
  * sight. Credential hygiene: `clone --mirror` embeds the auth URL in `origin`,
  * so we immediately reset it to the clean URL; subsequent `fetch` passes the
  * auth URL positionally and never persists it.
+ *
+ * warren-232d (accepted limit): the update refspec fetches ONLY
+ * `refs/heads/*` + `refs/tags/*`, so a `baseCommit` SHA that is not reachable
+ * from any branch or tag is absent from the mirror — `cloneBaseAndCarve`'s
+ * `git checkout <sha>` then fails inside `materializeViaCache`, which catches
+ * it and falls back to a DIRECT network clone (where the full object store
+ * carries the SHA). That fallback is the documented behavior: correctness is
+ * preserved at the cost of one uncached clone for unreachable-SHA replays.
  */
 async function ensureMirror(
 	git: InitGitRunner,
@@ -254,7 +262,7 @@ async function materializeViaCache(
 ): Promise<boolean> {
 	if (cfg.repoCacheDir === undefined) return false;
 	const mirrorPath = mirrorPathFor(cfg.repoCacheDir, cfg.repoUrl);
-	const authUrl = authenticatedCloneUrl(cfg.repoUrl, cfg.token);
+	const authUrl = authenticatedCloneUrl(cfg.repoUrl, bareTokenCredential(cfg.token));
 	try {
 		await ensureMirror(git, fs, cfg, mirrorPath, authUrl, log);
 		// Local clone from the mirror path — no network, no credentials.
@@ -282,7 +290,7 @@ async function directClone(
 	cfg: InitEnv,
 	log: (m: string) => void,
 ): Promise<void> {
-	const cloneUrl = authenticatedCloneUrl(cfg.repoUrl, cfg.token);
+	const cloneUrl = authenticatedCloneUrl(cfg.repoUrl, bareTokenCredential(cfg.token));
 	log(`workspace-init: cloning ${cfg.repoUrl} (${cfg.baseBranch}) into ${cfg.workspacePath}`);
 	await cloneBaseAndCarve(git, cfg, cloneUrl);
 	// Strip the embedded token so it never persists in the workspace .git/config.
@@ -340,6 +348,13 @@ export async function runWorkspaceInit(
 	const fs = deps.fs ?? defaultFs;
 	const log = deps.log ?? ((m: string) => console.log(m));
 	const cfg = parseInitEnv(env);
+
+	// warren-cb93: the agent process runs as a DIFFERENT uid than the entrypoint
+	// (the entrypoint/agent uid split) and shares only the pod gid (fsGroup), so
+	// the clone this init container materializes must be GROUP-writable —
+	// otherwise the split-off agent cannot write its own workspace. Committed
+	// modes are unaffected (git tracks only the exec bit).
+	process.umask(0o002);
 
 	const usedCache = await materializeViaCache(git, fs, cfg, log);
 	if (!usedCache) await directClone(git, cfg, log);

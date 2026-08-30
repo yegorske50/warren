@@ -3,6 +3,14 @@
 // login screen accepts it. A 401 clears the cached token so the
 // router can redirect back to login on the next render pass.
 
+import { readNdjsonStream } from "../../../client/ndjson.ts";
+import type { InstanceFactsResponse } from "./instance-types.ts";
+import type { OpsOverviewResponse } from "./ops-types.ts";
+import type {
+	RunAnalyticsFilter,
+	RunAnalyticsResponse,
+	RunBehaviorResponse,
+} from "./run-analytics-types.ts";
 import type {
 	AgentRow,
 	ApiErrorEnvelope,
@@ -11,10 +19,12 @@ import type {
 	CreatePlanRunInput,
 	CreatePlanRunResponse,
 	CreateRunInput,
+	EventStream,
+	LifecycleStreamNotification,
 	ListRunsResponse,
 	PlanRunDetailResponse,
 	PlanRunRow,
-	PlanRunState,
+	PlanRunStateFilter,
 	PreviewConfigResponse,
 	PreviewLoginResponse,
 	PreviewTeardownResponse,
@@ -22,7 +32,6 @@ import type {
 	ReadyPlansResponse,
 	ReadyzResponse,
 	RefreshProjectResponse,
-	RunAnalyticsTokensSection,
 	RunEvent,
 	RunRow,
 	RunTriggerResponse,
@@ -30,7 +39,6 @@ import type {
 	SeedStatusResponse,
 	SpawnRunResponse,
 	SteerRunResponse,
-	TokenBreakdown,
 	TriggersResponse,
 	WarrenConfigResponse,
 	WhoamiResponse,
@@ -163,6 +171,11 @@ export const agentsApi = {
 export const projectsApi = {
 	list: (signal?: AbortSignal) =>
 		request<{ projects: ProjectRow[] }>("/projects", { ...(signal ? { signal } : {}) }),
+	/** Bare-row envelope, matching the SDK's `getProject()` (warren-435b). */
+	get: (id: string, signal?: AbortSignal) =>
+		request<ProjectRow>(`/projects/${encodeURIComponent(id)}`, {
+			...(signal ? { signal } : {}),
+		}),
 	create: (input: { gitUrl: string; defaultBranch?: string }) =>
 		request<ProjectRow>("/projects", { method: "POST", body: input }),
 	delete: (id: string) =>
@@ -216,6 +229,65 @@ export const projectsApi = {
 };
 
 /* ----------------------------------------------------------------------- */
+/* Event explorer (`GET /events`, pl-7e38 step 15 / warren-5eec)          */
+/* ----------------------------------------------------------------------- */
+
+/** One event row on the global query — the same eight-key wire shape the per-run NDJSON stream emits, as JSON. */
+export interface EventExplorerRow {
+	id: number;
+	runId: string;
+	seq: number;
+	ts: string;
+	kind: string;
+	stream: string | null;
+	origin: string | null;
+	payload: unknown;
+}
+
+/** Response envelope of `GET /events` — one bounded page plus the filtered total. */
+export interface EventsListResponse {
+	events: EventExplorerRow[];
+	total: number;
+	limit: number;
+	offset: number;
+}
+
+export interface EventsQueryFilterUI {
+	/** Run id — rides `events_run_seq_idx`. */
+	runId?: string;
+	/** Project id — inner join through `runs`. */
+	projectId?: string;
+	/** Exact event kind (open string: the harness vocabulary). */
+	kind?: string;
+	/** One of the canonical `EVENT_STREAMS` (server-validated). */
+	stream?: EventStream;
+	/** Inclusive lower bound on `ts` (ISO8601). */
+	since?: string;
+	/** Inclusive upper bound on `ts` (ISO8601). */
+	until?: string;
+	limit?: number;
+	offset?: number;
+}
+
+export const eventsApi = {
+	list: (filter: EventsQueryFilterUI = {}, signal?: AbortSignal) => {
+		const params = new URLSearchParams();
+		if (filter.runId) params.set("run", filter.runId);
+		if (filter.projectId) params.set("project", filter.projectId);
+		if (filter.kind) params.set("kind", filter.kind);
+		if (filter.stream) params.set("stream", filter.stream);
+		if (filter.since) params.set("since", filter.since);
+		if (filter.until) params.set("until", filter.until);
+		if (filter.limit !== undefined) params.set("limit", String(filter.limit));
+		if (filter.offset !== undefined) params.set("offset", String(filter.offset));
+		const qs = params.toString();
+		return request<EventsListResponse>(`/events${qs.length > 0 ? `?${qs}` : ""}`, {
+			...(signal ? { signal } : {}),
+		});
+	},
+};
+
+/* ----------------------------------------------------------------------- */
 /* Runs                                                                     */
 /* ----------------------------------------------------------------------- */
 
@@ -242,8 +314,14 @@ export const runsApi = {
 			...(signal ? { signal } : {}),
 		});
 	},
-	get: (id: string, signal?: AbortSignal) =>
-		request<RunRow>(`/runs/${encodeURIComponent(id)}`, { ...(signal ? { signal } : {}) }),
+	// warren-7d84: `GET /runs/:id` wraps the row in `{run}` like every
+	// other detail envelope; the UI client unwraps it for callers.
+	get: async (id: string, signal?: AbortSignal) =>
+		(
+			await request<{ run: RunRow }>(`/runs/${encodeURIComponent(id)}`, {
+				...(signal ? { signal } : {}),
+			})
+		).run,
 	create: (input: CreateRunInput) =>
 		request<SpawnRunResponse>("/runs", { method: "POST", body: input }),
 	steer: (id: string, input: { body: string }) =>
@@ -295,9 +373,10 @@ export const previewApi = {
  * `formatPreviewUrl` (`src/preview/launch/index.ts`) so the displayed URL
  * matches where the login handshake actually redirects:
  *
- *   - path mode      → `<origin>/p/<runId>/` (origin from `config.host`
- *                       when set, otherwise the current `window.location.origin`
- *                       — previews ride on the warren host itself).
+ *   - path mode      → `<preview-origin>/p/<runId>/`: `config.host` (or the
+ *                       current `window.location.origin`) with `config.port`
+ *                       swapped in — the dedicated preview listener's own
+ *                       origin (warren-3f8a).
  *   - subdomain mode → `https://run-<runId>.<host>/` (host always set in
  *                       this mode; boot rejects subdomain without host).
  */
@@ -307,8 +386,9 @@ export function formatPreviewUrl(
 	origin: string,
 ): string {
 	if (config.mode === "path") {
-		const base = config.host !== null ? `https://${config.host}` : origin;
-		return `${base}/p/${encodeURIComponent(runId)}/`;
+		const base = new URL(config.host !== null ? `https://${config.host}` : origin);
+		if (config.port !== null) base.port = String(config.port);
+		return `${base.origin}/p/${encodeURIComponent(runId)}/`;
 	}
 	const host = config.host ?? "";
 	return `https://run-${encodeURIComponent(runId)}.${host}/`;
@@ -320,7 +400,8 @@ export function formatPreviewUrl(
 
 export interface ListPlanRunsFilter {
 	project?: string;
-	state?: PlanRunState;
+	/** Omit for every state; `active` is the live view (warren-302a). */
+	state?: PlanRunStateFilter;
 }
 
 export const planRunsApi = {
@@ -383,15 +464,34 @@ export async function* streamRunEvents(
 }
 
 /**
+ * Async iterator over the global lifecycle notification stream
+ * (`GET /events/stream`, warren-f566). One connection per tab feeds the
+ * list pages' debounce-invalidation in place of their old 5s polls.
+ * The server holds no replay — the reader invalidates its queries on
+ * each line, so nothing is lost across a reconnect. Operator-gated: a
+ * 403/401 surfaces as a permanent stop so the caller stays on its
+ * fallback poll.
+ */
+export async function* streamLifecycleEvents(
+	opts: StreamRunEventsOptions = {},
+): AsyncGenerator<LifecycleStreamNotification, void, void> {
+	yield* streamNdjsonEvents("/events/stream", { ...opts, follow: opts.follow ?? true });
+}
+
+/**
  * Shared NDJSON consumer for run + plan-run event streams. The server
  * uses the same `eventToNdjson` serializer for both, so the wire shape
  * matches and the only thing that varies is the URL prefix + `runId`
  * discriminator in each envelope.
+ *
+ * The line parser is the SDK's `readNdjsonStream` (warren-53a7) with the
+ * UI's error factory injected, so this wrapper only owns URL/header
+ * assembly and the 401 token-clearing side effect.
  */
-async function* streamNdjsonEvents(
+async function* streamNdjsonEvents<T = RunEvent>(
 	basePath: string,
 	opts: StreamRunEventsOptions,
-): AsyncGenerator<RunEvent, void, void> {
+): AsyncGenerator<T, void, void> {
 	const params = new URLSearchParams();
 	if (opts.follow) params.set("follow", "1");
 	if (opts.sinceSeq !== undefined) params.set("since", String(opts.sinceSeq));
@@ -405,69 +505,88 @@ async function* streamNdjsonEvents(
 	const init: RequestInit = { headers };
 	if (opts.signal) init.signal = opts.signal;
 
-	const res = await fetch(url, init);
+	yield* readNdjsonStream<T>(() => fetch(url, init), {
+		errorFactory: streamErrorFromResponse,
+	});
+}
+
+/**
+ * Map a non-OK NDJSON response to the UI's error vocabulary. A 401 clears
+ * the cached token so the router redirects back to login; anything else
+ * becomes an {@link ApiError} carrying the server's error envelope.
+ */
+async function streamErrorFromResponse(res: Response): Promise<Error> {
 	if (res.status === 401) {
 		setApiToken(null);
-		throw new UnauthorizedError("API token rejected; please re-authenticate");
+		return new UnauthorizedError("API token rejected; please re-authenticate");
 	}
-	if (!res.ok) {
-		const text = await res.text();
-		let envelope: ApiErrorEnvelope | null = null;
-		try {
-			envelope = text.length > 0 ? (JSON.parse(text) as ApiErrorEnvelope) : null;
-		} catch {
-			envelope = null;
-		}
-		throw new ApiError(
-			res.status,
-			envelope?.error ?? { code: `http_${res.status}`, message: text || res.statusText },
-		);
-	}
-	if (res.body === null) return;
-
-	const reader = res.body.getReader();
-	const decoder = new TextDecoder();
-	let buf = "";
+	const text = await res.text();
+	let envelope: ApiErrorEnvelope | null = null;
 	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			buf += decoder.decode(value, { stream: true });
-			let nl = buf.indexOf("\n");
-			while (nl !== -1) {
-				const line = buf.slice(0, nl);
-				buf = buf.slice(nl + 1);
-				if (line.length > 0) {
-					try {
-						yield JSON.parse(line) as RunEvent;
-					} catch {
-						// drop malformed line; keep streaming
-					}
-				}
-				nl = buf.indexOf("\n");
-			}
-		}
-		// flush trailing line if the server closed without a newline
-		const tail = buf.trim();
-		if (tail.length > 0) {
-			try {
-				yield JSON.parse(tail) as RunEvent;
-			} catch {
-				// drop
-			}
-		}
-	} finally {
-		try {
-			reader.releaseLock();
-		} catch {
-			// ignore — releaseLock can throw if we already errored out
-		}
+		envelope = text.length > 0 ? (JSON.parse(text) as ApiErrorEnvelope) : null;
+	} catch {
+		envelope = null;
 	}
+	return new ApiError(
+		res.status,
+		envelope?.error ?? { code: `http_${res.status}`, message: text || res.statusText },
+	);
 }
 
 /* ----------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------- */
+/* Ops overview (pl-7e38 step 12 / warren-d850)                            */
+/* ----------------------------------------------------------------------- */
+
+/** One repository the App installation can see (warren-2601). */
+export interface ForgeRepoRow {
+	owner: string;
+	name: string;
+	cloneUrl: string;
+	defaultBranch: string;
+	private: boolean;
+}
+
+/** The `GET /forge/repos` envelope; `supported` is the picker's discriminant. */
+export interface ForgeReposResponse {
+	supported: boolean;
+	repos: ForgeRepoRow[];
+	/** Present when the listing failed — the forge's redacted detail. */
+	error?: string;
+}
+
+export const forgeApi = {
+	/**
+	 * `GET /forge/repos` — the Add Project repo picker's data source
+	 * (warren-2601). `supported: false` (PAT / no forge / listing failure)
+	 * means the dialog keeps the URL-paste path only.
+	 */
+	repos: (signal?: AbortSignal) =>
+		request<ForgeReposResponse>("/forge/repos", { ...(signal ? { signal } : {}) }),
+};
+
+export const opsApi = {
+	/**
+	 * One-poll control-plane snapshot behind the Operations page
+	 * (pl-7e38 step 13). Spectators get the reduced projection — the
+	 * envelope's operator sections arrive undefined, never zero.
+	 */
+	overview: (signal?: AbortSignal) =>
+		request<OpsOverviewResponse>("/ops/overview", { ...(signal ? { signal } : {}) }),
+};
+
 /* Meta                                                                     */
 /* ----------------------------------------------------------------------- */
+
+export const instanceApi = {
+	/**
+	 * `GET /instance` — boot-resolved instance facts (warren-2eec). The
+	 * body is an allowlist; spectators get the reduced projection. The
+	 * Dispatch page reads the runtime kind and admission caps off it.
+	 */
+	facts: (signal?: AbortSignal) =>
+		request<InstanceFactsResponse>("/instance", { ...(signal ? { signal } : {}) }),
+};
 
 export const metaApi = {
 	healthz: () => request<{ ok: boolean }>("/healthz"),
@@ -484,6 +603,14 @@ export const metaApi = {
 	 */
 	whoami: (signal?: AbortSignal) =>
 		request<WhoamiResponse>("/whoami", { ...(signal ? { signal } : {}) }),
+	/**
+	 * Boot-resolved instance facts (warren-2eec), for the Instance and
+	 * Login pages. Read-only by construction; the body shrinks under the
+	 * public spectator projection, and the pages placeholder the absent
+	 * fields.
+	 */
+	instance: (signal?: AbortSignal) =>
+		request<InstanceFactsResponse>("/instance", { ...(signal ? { signal } : {}) }),
 };
 
 /* ----------------------------------------------------------------------- */
@@ -527,180 +654,12 @@ export const analyticsApi = {
 };
 
 /* ----------------------------------------------------------------------- */
-/* Run analytics (warren-df6e / pl-ad0f step 4)                            */
+/* Run + behavior analytics wire types live in ./run-analytics-types.ts    */
+/* (file-size budget, warren-be04); re-exported so import sites are        */
+/* unchanged. The sentinel constants ride along.                           */
 /* ----------------------------------------------------------------------- */
 
-/** Sentinel key for a null group (no startedAt, model, provider, etc.). */
-export const RUN_ANALYTICS_NONE_KEY = "__none__";
-/** Sentinel key for the folded remainder in per-dimension token series (≥6 keys). */
-export const RUN_ANALYTICS_OTHER_KEY = "__other__";
-
-/** avg/median/p95 over the non-null sample, all-null when empty. */
-export interface RunStatSummary {
-	avg: number | null;
-	median: number | null;
-	p95: number | null;
-	count: number;
-}
-
-export interface RunAnalyticsTotals {
-	runs: number;
-	succeeded: number;
-	failed: number;
-	cancelled: number;
-	active: number;
-	successRate: number | null;
-	durationMs: RunStatSummary;
-	contextTokens: RunStatSummary;
-	/**
-	 * OPTIONAL on the wire: the windowed USD rollup is redacted for a
-	 * `readPublic`-only caller (`REDACTED_RUN_TOTALS_FIELDS` in
-	 * `src/server/handlers/runs/analytics.ts`), so a spectator's envelope has
-	 * no such key. Callers must render on presence — dereferencing without a
-	 * guard crashed `/run-analytics` for anonymous visitors (warren-e274).
-	 */
-	cost?: { total: number; avg: number | null; priced: number };
-}
-
-export interface RunDayBucket {
-	key: string;
-	runs: number;
-	succeeded: number;
-	failed: number;
-	cancelled: number;
-	active: number;
-	contextTokensTotal: number;
-}
-
-export interface RunGroupBucket {
-	key: string;
-	runs: number;
-	succeeded: number;
-	failed: number;
-	successRate: number | null;
-	contextTokensTotal: number;
-	avgContextTokens: number | null;
-	tokens: TokenBreakdown;
-	/**
-	 * OPTIONAL on the wire: per-group USD spend is redacted for a
-	 * `readPublic`-only caller (`REDACTED_RUN_GROUP_FIELDS` in
-	 * `src/server/handlers/runs/analytics.ts`); summing per-group cost would
-	 * reconstruct the aggregate the totals projection just dropped. Callers
-	 * must render on presence (warren-e274).
-	 */
-	costUsd?: number;
-	priced?: number;
-	avgDurationMs: number | null;
-}
-
-export interface RunFailureBucket {
-	key: string;
-	runs: number;
-}
-
-export interface SeedContextBucket {
-	seedId: string;
-	runs: number;
-	contextTokensTotal: number;
-	avgContextTokens: number | null;
-}
-
-export interface RunAnalyticsResponse {
-	filter: { projectId: string | null; from: string | null; to: string | null };
-	totals: RunAnalyticsTotals;
-	timeSeries: RunDayBucket[];
-	byAgent: RunGroupBucket[];
-	byModel: RunGroupBucket[];
-	byProvider: RunGroupBucket[];
-	byFailureReason: RunFailureBucket[];
-	topSeedsByContext: SeedContextBucket[];
-	/** Token analytics section added by warren-1244 / pl-d1a2 step 2. */
-	tokens: RunAnalyticsTokensSection;
-}
-
-export interface RunAnalyticsFilter {
-	projectId?: string;
-	from?: string;
-	to?: string;
-}
-
-/* ----------------------------------------------------------------------- */
-/* Run behavior analytics — command mining + insights (warren-436a /       */
-/* pl-ad0f step 10). Mirrors the server shapes in                          */
-/* src/runs/analytics/command-mining.ts + insights.ts.                     */
-/* ----------------------------------------------------------------------- */
-
-/** Generalized command category — `os-eco` rows are highlighted in the UI. */
-export type CommandCategory =
-	| "os-eco"
-	| "vcs"
-	| "package"
-	| "build"
-	| "test"
-	| "filesystem"
-	| "network"
-	| "other";
-
-export interface CommandStat {
-	command: string;
-	category: CommandCategory;
-	osEco: boolean;
-	runs: number;
-	invocations: number;
-	failures: number;
-	failureRate: number | null;
-	retries: number;
-	stuckScore: number;
-}
-
-export interface CommandCategoryBucket {
-	category: CommandCategory;
-	invocations: number;
-	failures: number;
-	commands: number;
-}
-
-export interface CommandMiningTotals {
-	toolUses: number;
-	commands: number;
-	distinctCommands: number;
-	failures: number;
-	retries: number;
-}
-
-export interface CommandMining {
-	totals: CommandMiningTotals;
-	byFrequency: CommandStat[];
-	byFailures: CommandStat[];
-	byStuckScore: CommandStat[];
-	osEcoCommands: CommandStat[];
-	byCategory: CommandCategoryBucket[];
-}
-
-export type InsightSeverity = "info" | "warning" | "critical";
-
-export type InsightKind =
-	| "highest-context-seed"
-	| "worst-success-agent"
-	| "most-failed-command"
-	| "most-retried-command"
-	| "model-cost-outlier"
-	| "steering-anomaly";
-
-export interface Insight {
-	kind: InsightKind;
-	severity: InsightSeverity;
-	title: string;
-	detail: string;
-	value: number;
-	subject: string | null;
-}
-
-export interface RunBehaviorResponse {
-	filter: { projectId: string | null; from: string | null; to: string | null };
-	mining: CommandMining;
-	insights: Insight[];
-}
+export * from "./run-analytics-types.ts";
 
 export const runAnalyticsApi = {
 	runs: (filter: RunAnalyticsFilter = {}, signal?: AbortSignal) => {

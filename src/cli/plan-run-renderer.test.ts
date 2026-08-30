@@ -20,12 +20,14 @@ function planRunRow(overrides: Partial<PlanRunRow> = {}): PlanRunRow {
 	return {
 		id: "pr-1",
 		planId: "pl-abc",
+		source: "plan",
 		projectId: "prj_1",
 		agentName: "claude-code",
 		promptTemplate: "",
 		ref: null,
 		providerOverride: null,
 		modelOverride: null,
+		maxCostUsd: null,
 		dispatcherHandle: "cli",
 		trigger: "cli",
 		state: "running",
@@ -50,6 +52,7 @@ function child(seq: number, state: PlanRunChildRow["state"]): PlanRunChildRow {
 		endedAt: null,
 		prMergedAt: null,
 		failureReason: null,
+		retryCount: 0,
 	};
 }
 
@@ -153,7 +156,7 @@ describe("createPrettyRenderer", () => {
 		createPrettyRenderer(sink).event(
 			event("result", { subtype: "success", total_cost_usd: 0.1234, duration_ms: 4200 }),
 		);
-		expect(lines()[0]).toBe("[08:09:10] result: success cost=$0.1234 duration=4200ms");
+		expect(lines()[0]).toBe("[08:09:10] result: success cost=$0.1234 duration=4.2s");
 	});
 
 	test("truncates-long-values", () => {

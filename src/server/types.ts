@@ -9,9 +9,11 @@
  * `db/repos/` — this file just declares the seams the wiring rides on.
  */
 
+import type { ActorCapabilities, ActorKind, CapabilityName } from "../core/wire.ts";
 import type { AnyWarrenDb } from "../db/client.ts";
 import type { DrizzleAdapter } from "../db/repos/drizzle-adapter.ts";
 import type { Repos } from "../db/repos/index.ts";
+import type { Forge } from "../forge/contract.ts";
 import type { PreviewAuth } from "../preview/cookie.ts";
 import type { RunPreviewsRepo } from "../preview/eviction/types.ts";
 import type { PreviewProxyHandler } from "../preview/proxy/types.ts";
@@ -27,18 +29,12 @@ import type { PreviewMode, WarrenConfigCache } from "../warren-config/index.ts";
 import type { IdempotencyStore } from "./idempotency.ts";
 
 /**
- * Error envelope rendered for every non-2xx response. Mirrors burrow's
- * `ErrorEnvelope` so an HTTP consumer hitting both surfaces uses one
- * decoder. `code` is the stable machine identifier; `message` is human;
- * `hint` is the optional recovery cue from `WarrenError.recoveryHint`.
+ * Error envelope rendered for every non-2xx response. Defined once in
+ * `src/core/wire.ts` (warren-42f1) and re-exported here so the server's
+ * import surface is unchanged. Never redeclare it — `check:wire-types`
+ * fails the build if you do.
  */
-export interface ErrorEnvelope {
-	error: {
-		code: string;
-		message: string;
-		hint?: string;
-	};
-}
+export type { ErrorEnvelope } from "../core/wire.ts";
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
@@ -169,14 +165,46 @@ export interface ServerDeps {
 	 * `WARREN_RUNTIME`). REQUIRED (warren-f796) — handlers route through it, no
 	 * burrow-client fallback (`local` ⇒ LocalProvider, `k8s` ⇒ K8sProvider). */
 	readonly runtimeProvider: RuntimeProvider;
-	/** Local-topology `/readyz` burrow probe (warren-f796), boot-wired by the `LocalBootBackend`; absent under `k8s`. */
-	readonly burrowProbe?: () => Promise<import("../diagnostics/checks.ts").DiagnosticCheck>;
+	/**
+	 * Boot-resolved forge (`resolveForge` in `src/forge/registry.ts`, honoring
+	 * `WARREN_FORGE`), resolved ONCE in `bootServer` (warren-6c4c) and threaded
+	 * here exactly like `runtimeProvider`. REQUIRED. Handlers mint per-spawn git
+	 * credentials through it (`mintGitCredential`); the handle must never
+	 * appear in a public projection.
+	 */
+	readonly forge: Forge;
+	/**
+	 * Boot-resolved existence gate for the `/github-app/*` registration
+	 * surface (warren-e320, `resolveGitHubAppRegistrationGate`). Gated-off
+	 * routes answer 404. OPTIONAL: a test that omits it keeps the historical
+	 * always-on behavior; `bootServer` always wires the resolved verdict.
+	 */
+	readonly gitHubAppRegistration?: import("./github-app-gate.ts").GitHubAppRegistrationGate;
+	/**
+	 * Opt-in GitHub App credential store + hot forge activation seam
+	 * (warren-b504, `WARREN_APP_CRED_STORE=data-dir`). Absent (the
+	 * default) keeps the historical render-once registration flow.
+	 */
+	readonly gitHubAppActivation?: import("../forge/hot-forge.ts").GitHubAppActivation;
+	/** warren-48f8: armed setup-handoff store; absent ⇒ GET /setup answers 404. */
+	readonly setupHandoff?: import("./setup-handoff.ts").SetupHandoffStore;
+	/** K8s-topology `/readyz` sync seam (warren-39e1), boot-wired from the started
+	 * pod-watcher under `WARREN_RUNTIME=k8s`; absent under `local`. */
+	readonly k8sPodSync?: import("../runtime/k8s/pod-watcher.ts").PodSyncSource;
 	/** Preview sidecar resolver (warren-e24d), gated on `previewPorts`. The local
 	 * backend's combined facade resolver satisfies both preview consumer seams. */
 	readonly previewSidecars?: import("../runtime/local/preview/sidecars.ts").LocalSidecarsResolver;
 	/** K8s in-pod finalize correlation registry (warren-0d35); defaults to the
 	 * shared singleton, so prod needs no wiring — tests inject a private instance. */
 	readonly finalizeCoordinator?: import("../runtime/k8s/finalize-coordinator.ts").FinalizeCoordinator;
+	/**
+	 * K8s finalize-intent recovery hook (warren-5202). Fired by
+	 * `GET /runs/:id/finalize-intent` on an intent MISS so a post-restart
+	 * control plane re-drives reap for a pod still awaiting its intent.
+	 * Boot-wired only under `WARREN_RUNTIME=k8s`; absent under `local` (no pod
+	 * ever polls the route there) and in tests that don't opt in.
+	 */
+	readonly finalizeRecovery?: import("../runs/finalize-recovery.ts").FinalizeRecoveryHook;
 	/**
 	 * Durable salvage-bundle directory (warren-cd3b). The `POST /runs/:id/salvage`
 	 * intake writes pod-captured git bundles here (`<runId>.bundle`); boot wires
@@ -185,6 +213,14 @@ export interface ServerDeps {
 	 */
 	readonly salvageDir?: string;
 	readonly broker: RunEventBroker;
+	/**
+	 * Global lifecycle notification broker (warren-f566), built ONCE at boot
+	 * and fed by a Tier-1 bus extension registered in the same
+	 * `bootLifecycleBus` batch as the healer / seed-close consumers. Serves
+	 * `GET /events/stream`. Optional: a test omitting it gets a 501 instead
+	 * of a dangling open connection.
+	 */
+	readonly lifecycleStream?: import("../runs/lifecycle-stream.ts").LifecycleStreamBroker;
 	readonly bridges: BridgeRegistry;
 	readonly projectsConfig: ProjectsConfig;
 	readonly logger: Logger;
@@ -210,6 +246,16 @@ export interface ServerDeps {
 	 * `defaultSpawn`; tests can omit (extension write is a no-op).
 	 */
 	readonly seedsCli?: SeedsCliDeps;
+	/**
+	 * The boot-resolved IssueTracker (warren-5819, plan pl-a37b Track B
+	 * step 7). Constructed once at boot — a `SeedsTracker` wrapping the
+	 * same `WARREN_SD_BINARY` + `defaultSpawn` pair `seedsCli` uses — and
+	 * threaded through the same pass-through seams. Call sites still read
+	 * the facade (`deps.seedsCli`); the port to the tracker contract lands
+	 * in warren-2d98 / warren-47b0 / warren-6234, which delete `seedsCli`
+	 * once no consumer remains. Tests may omit.
+	 */
+	readonly issueTracker?: import("../tracker/contract.ts").IssueTracker;
 	/** Provided so tests can override `Date.now()`. */
 	readonly now?: () => Date;
 	/**
@@ -230,7 +276,7 @@ export interface ServerDeps {
 	 * Deployment-wide run-branch prefix fallback (warren-9993). Resolved
 	 * from `WARREN_RUN_BRANCH_PREFIX` at boot and threaded into every
 	 * `spawnRun` call so a per-project default in `.warren/defaults.json`
-	 * still wins. Unset → spawnRun falls back to "burrow".
+	 * still wins. Unset → spawnRun falls back to the built-in default ("warren").
 	 */
 	readonly runBranchPrefixDefault?: string;
 	/**
@@ -250,7 +296,7 @@ export interface ServerDeps {
 	readonly previewMaxLive?: number;
 	/**
 	 * Fallback workspace-GC TTL in ms (warren-0a9a). Resolved from
-	 * `WARREN_WORKSPACE_GC_TTL` at boot so `/readyz`'s `stale_burrow_workspaces`
+	 * `WARREN_WORKSPACE_GC_TTL` at boot so `/readyz`'s `stale_sandbox_workspaces`
 	 * probe ages burrows on the GC sweeper's threshold. Tests may omit; the probe
 	 * is skipped when absent.
 	 */
@@ -273,6 +319,17 @@ export interface ServerDeps {
 	 */
 	readonly previewMode?: PreviewMode;
 	/**
+	 * Public port of the dedicated path-mode preview listener
+	 * (warren-3f8a). Path-mode previews live on their own origin — same
+	 * hostname as warren, this port — so the login handshake resolves
+	 * redirects against it and `/preview/config` discloses it to the UI.
+	 * Undefined in subdomain mode, on the unix transport's legacy
+	 * same-origin mounting, and in tests that never boot the listener
+	 * (redirects then resolve against the inbound origin, the pre-split
+	 * behaviour).
+	 */
+	readonly previewPort?: number;
+	/**
 	 * Signed-cookie auth for the preview proxy (R-19 / docs/design/preview-environments.md,
 	 * warren-8a10). Bound at boot from `WARREN_API_TOKEN` (the same
 	 * bearer the rest of warren uses). Undefined when the operator
@@ -282,7 +339,7 @@ export interface ServerDeps {
 	readonly previewAuth?: PreviewAuth;
 	/**
 	 * Project host-clone refresher (warren-6d60). Used by the plan-run
-	 * dispatch handlers (`refreshDispatchProject`) so the seeds plan is
+	 * creation orchestration (`createPlanRun`, warren-e240) so the seeds plan is
 	 * read off a freshly fetched + reset clone, mirroring the single-run
 	 * path's `spawnRun` refresh. Production omits this (falls back to the
 	 * live `refreshProject` when `spawn` is wired); tests substitute a
@@ -341,10 +398,11 @@ export interface ServeOptions {
 	routes?: readonly Route[];
 	logger?: Logger;
 	/**
-	 * Per-request idle timeout in seconds passed to `Bun.serve`. Defaults
-	 * to 0 (disabled) so long-lived NDJSON streams aren't killed at the
-	 * Bun runtime default of 10s (warren-b8fc). Tests override to assert
-	 * the wire is plumbed.
+	 * Per-request idle timeout in seconds passed to `Bun.serve`. Defaults to
+	 * `DEFAULT_IDLE_TIMEOUT_SECONDS`. The timer watches socket inactivity
+	 * while a request is being read, so it bounds a stalled client without
+	 * touching a long-lived NDJSON tail (warren-b8fc, warren-a676). 0
+	 * disables it for the whole listener.
 	 */
 	idleTimeout?: number;
 	/**
@@ -384,33 +442,15 @@ export interface ServeHandle {
 }
 
 /**
- * What a caller is permitted to do — the gate branches on these, it does
- * not re-derive them from who the caller is (warren-1ff0). Named for the
- * permission, not the holder, mirroring `RuntimeCapabilities`
- * (`src/runtime/contract.ts`): a flag says what the surface allows, so a
- * later provider can grant an arbitrary subset without anyone teaching
- * handlers a new identity vocabulary.
+ * The actor vocabulary crosses the wire on `GET /whoami`, so it is declared
+ * once in `src/core/wire.ts` (warren-3754) and re-exported here. Never
+ * redeclare these — `check:wire-types` fails the build if you do.
+ *
+ * `ActorCapabilities` is named for the permission rather than the holder,
+ * the way `RuntimeCapabilities` (`src/runtime/contract.ts`) is. That one
+ * describes a sandbox and is a separate vocabulary.
  */
-export interface ActorCapabilities {
-	/** Read the public projection of runs / projects / agents. */
-	readonly readPublic: boolean;
-	/**
-	 * Read operator-only surfaces — diagnostics, the run inbox, cost
-	 * rollups, raw agent transcripts, per-project warren-config.
-	 */
-	readonly readOperator: boolean;
-	/** Dispatch runs / plan-runs and steer, pause, cancel them. */
-	readonly dispatch: boolean;
-	/** Mutate instance-level state — register projects, triggers, config. */
-	readonly admin: boolean;
-}
-
-/**
- * One capability name. Derived from `ActorCapabilities` rather than
- * re-listed, so a capability added there is automatically a legal route
- * policy and the two vocabularies can't drift.
- */
-export type CapabilityName = keyof ActorCapabilities;
+export type { ActorCapabilities, ActorKind, CapabilityName } from "../core/wire.ts";
 
 /**
  * What a route demands of its caller (warren-b875). Every `ROUTE_TABLE`
@@ -427,17 +467,6 @@ export type CapabilityName = keyof ActorCapabilities;
  * gate refuses with 403 when it doesn't.
  */
 export type RoutePolicy = "anonymous" | CapabilityName;
-
-/**
- * Identity discriminant. `operator` is the single-user V1 caller
- * (SECURITY.md) the token provider authorizes; `anonymous` is the
- * credential-less spectator the `WARREN_AUTH=public` provider mints
- * (warren-851b) — it holds `readPublic` and nothing else. `run` is a
- * sandbox calling back with its per-run scoped token (warren-57fd): it is
- * pinned to a single run's callback surface by the request gate, not by
- * its capability set. Further kinds land with the providers that mint them.
- */
-export type ActorKind = "operator" | "anonymous" | "run";
 
 /**
  * Who is making the request and what they may do. Produced by an

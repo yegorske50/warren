@@ -66,7 +66,7 @@ describe("WarrenClient", () => {
 			observedUrl = String(input);
 			observedMethod = init?.method;
 			observedBody = init?.body as string;
-			return jsonResponse(201, { run: { id: "r1" }, burrow: { id: "b1" } });
+			return jsonResponse(201, { run: { id: "r1" }, sandbox: { id: "b1" } });
 		});
 
 		const client = new WarrenClient({
@@ -88,6 +88,97 @@ describe("WarrenClient", () => {
 			project: "p1",
 			prompt: "hello",
 		});
+	});
+
+	test("rejects a non-finite maxCostUsd before serialization (warren-a63d)", async () => {
+		// JSON.stringify turns NaN/Infinity into null, which the server reads
+		// as "no cap" — the SDK must fail loudly instead of dispatching uncapped.
+		let fetched = false;
+		const stubFetch = stub(async () => {
+			fetched = true;
+			return jsonResponse(201, { run: { id: "r1" }, sandbox: { id: "b1" } });
+		});
+		const client = new WarrenClient({
+			config: { baseUrl: "https://warren.local" },
+			fetch: stubFetch,
+		});
+		const base = { agent: "claude-code", project: "p1", prompt: "hello" };
+		for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+			expect(client.createRun({ ...base, maxCostUsd: bad })).rejects.toThrow(
+				/maxCostUsd must be a positive finite number/,
+			);
+			expect(client.createPlanRun({ ...base, planId: "pl-x", maxCostUsd: bad })).rejects.toThrow(
+				/maxCostUsd must be a positive finite number/,
+			);
+		}
+		expect(fetched).toBe(false);
+	});
+
+	test("performs cancelRun request with reason", async () => {
+		let observedUrl: string | undefined;
+		let observedMethod: string | undefined;
+		let observedBody: string | undefined;
+
+		const stubFetch = stub(async (input, init) => {
+			observedUrl = String(input);
+			observedMethod = init?.method;
+			observedBody = init?.body as string;
+			return jsonResponse(200, {
+				state: "cancelled",
+				alreadyTerminal: false,
+				sandboxRun: { id: "b1", state: "cancelled" },
+			});
+		});
+
+		const client = new WarrenClient({
+			config: { baseUrl: "https://warren.local" },
+			fetch: stubFetch,
+		});
+
+		const res = await client.cancelRun("r1", { reason: "no longer needed" });
+		expect(observedUrl).toBe("https://warren.local/runs/r1/cancel");
+		expect(observedMethod).toBe("POST");
+		expect(JSON.parse(observedBody || "{}")).toEqual({ reason: "no longer needed" });
+		expect(res.state).toBe("cancelled");
+		expect(res.alreadyTerminal).toBe(false);
+		expect(res.sandboxRun).toEqual({ id: "b1", state: "cancelled" });
+	});
+
+	test("cancelRun omits reason when not given and reports alreadyTerminal", async () => {
+		let observedBody: string | undefined;
+
+		const stubFetch = stub(async (_input, init) => {
+			observedBody = init?.body as string;
+			return jsonResponse(200, { state: "succeeded", alreadyTerminal: true, sandboxRun: null });
+		});
+
+		const client = new WarrenClient({
+			config: { baseUrl: "https://warren.local" },
+			fetch: stubFetch,
+		});
+
+		const res = await client.cancelRun("r2");
+		expect(JSON.parse(observedBody || "{}")).toEqual({});
+		expect(res.alreadyTerminal).toBe(true);
+		expect(res.sandboxRun).toBeNull();
+	});
+
+	test("performs version request", async () => {
+		let observedUrl: string | undefined;
+
+		const stubFetch = stub(async (input) => {
+			observedUrl = String(input);
+			return jsonResponse(200, { version: "1.2.3" });
+		});
+
+		const client = new WarrenClient({
+			config: { baseUrl: "https://warren.local" },
+			fetch: stubFetch,
+		});
+
+		const res = await client.version();
+		expect(observedUrl).toBe("https://warren.local/version");
+		expect(res.version).toBe("1.2.3");
 	});
 
 	test("rehydrates error response as WarrenClientError", async () => {

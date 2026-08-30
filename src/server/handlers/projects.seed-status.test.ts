@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
+import { SeedsTracker } from "../../tracker/seeds-tracker.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle, ServerDeps } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./projects.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./projects.test-helpers.ts";
 
 describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-4015)", () => {
 	let db: WarrenDb;
@@ -42,26 +43,23 @@ describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-40
 	});
 
 	function depsWithSdSpawn(
-		burrowClient: BurrowClient,
+		provider: FakeProvider,
 		sdSpawn: (
 			cmd: readonly string[],
 		) => Promise<{ stdout: string; stderr: string; exitCode: number }>,
 	): Promise<ServerDeps> {
 		return (async () => {
-			const base = await depsFor(repos, burrowClient);
+			const base = await depsFor(repos, provider);
 			return {
 				...base,
-				seedsCli: { sdBinary: "sd", spawn: sdSpawn },
+				issueTracker: new SeedsTracker({ sdBinary: "sd", spawn: sdSpawn }),
 			};
 		})();
 	}
 
 	test("returns {id, status, blockedBy} for an open seed", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsWithSdSpawn(burrowClient, async () => ({
+		const sandboxClient = new FakeProvider();
+		const deps = await depsWithSdSpawn(sandboxClient, async () => ({
 			stdout: JSON.stringify({
 				success: true,
 				issue: { id: "warren-abcd", status: "open", blockedBy: [] },
@@ -84,11 +82,8 @@ describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-40
 	});
 
 	test("returns status='closed' so the UI can drop the seed from BatchDispatch", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsWithSdSpawn(burrowClient, async () => ({
+		const sandboxClient = new FakeProvider();
+		const deps = await depsWithSdSpawn(sandboxClient, async () => ({
 			stdout: JSON.stringify({
 				success: true,
 				issue: { id: "warren-zzzz", status: "closed" },
@@ -110,11 +105,8 @@ describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-40
 	});
 
 	test("404 for unknown project id", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsWithSdSpawn(burrowClient, async () => ({
+		const sandboxClient = new FakeProvider();
+		const deps = await depsWithSdSpawn(sandboxClient, async () => ({
 			stdout: "",
 			stderr: "",
 			exitCode: 0,
@@ -130,11 +122,8 @@ describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-40
 	});
 
 	test("400 ProjectLacksSeedsError when project has no .seeds/", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsWithSdSpawn(burrowClient, async () => ({
+		const sandboxClient = new FakeProvider();
+		const deps = await depsWithSdSpawn(sandboxClient, async () => ({
 			stdout: "",
 			stderr: "",
 			exitCode: 0,
@@ -151,14 +140,10 @@ describe("GET /projects/:id/seeds/:seedId — single-seed status read (warren-40
 		expect(body.error.code).toBe("project_lacks_seeds");
 	});
 
-	test("400 ValidationError when seeds CLI is not configured on warren", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		// `depsFor` does NOT set seedsCli, so this exercises the
-		// "warren has no sd configured" path.
-		const deps = await depsFor(repos, burrowClient);
+	test("400 ValidationError when no issue tracker is configured on warren", async () => {
+		// `depsFor` does NOT set issueTracker, so this exercises the
+		// "warren has no tracker configured" path.
+		const deps = await depsFor(repos, new FakeProvider());
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,

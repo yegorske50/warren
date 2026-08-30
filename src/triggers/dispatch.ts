@@ -28,8 +28,8 @@
  */
 
 import { formatError, NotFoundError } from "../core/errors.ts";
+import type { ScheduledIssue } from "../core/wire.ts";
 import type { Repos } from "../db/repos/index.ts";
-import type { ScheduledSeed } from "../seeds-cli/index.ts";
 import type { CronTrigger, DefaultsConfig } from "../warren-config/index.ts";
 import { parseCron } from "./cron.ts";
 import {
@@ -43,6 +43,14 @@ export interface DispatchSpawnInput {
 	readonly projectId: string;
 	readonly prompt: string;
 	readonly trigger: string;
+	/**
+	 * Seeds issue id this dispatch is against (warren-9ce3). Forwarded onto
+	 * `spawnRun`'s `seedId` so `runs.seed_id` is populated for scheduled-seed
+	 * (and, when a cron entry points at a seed, cron) dispatches. Without
+	 * this field the scheduler closure only saw the id buried in `metadata`,
+	 * leaving `runs.seed_id` NULL for every cron/scheduled fire.
+	 */
+	readonly seedId?: string;
 	readonly metadata?: unknown;
 	/**
 	 * Per-trigger spend cap (warren-a63d). Forwarded to the spawn flow as
@@ -205,6 +213,9 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 			projectId: input.projectId,
 			prompt,
 			trigger: "cron",
+			// warren-9ce3: surface the trigger's seed pointer on the seam so
+			// the scheduler can forward it onto runs.seed_id.
+			...(input.trigger.seed !== undefined ? { seedId: input.trigger.seed } : {}),
 			metadata: {
 				triggerId: input.trigger.id,
 				cron: input.trigger.cron,
@@ -243,7 +254,8 @@ export async function dispatchCronTrigger(input: DispatchCronInput): Promise<Dis
 
 export interface DispatchScheduledInput {
 	readonly projectId: string;
-	readonly seed: ScheduledSeed;
+	/** warren-6234: neutral tracker DTO (was the seeds-cli ScheduledSeed). */
+	readonly seed: ScheduledIssue;
 	readonly defaults?: DefaultsConfig | null;
 	readonly now: Date;
 	readonly spawn: DispatchSpawnFn;
@@ -267,7 +279,8 @@ export type DispatchScheduledResult =
 	| { readonly kind: "error"; readonly seedId: string; readonly reason: string };
 
 /**
- * Decide-and-spawn for a single scheduled seed. Returns `{kind: 'fired',
+ * Decide-and-spawn for a single scheduled issue (warren-6234: neutral
+ * tracker DTO). Returns `{kind: 'fired',
  * runId, role}` so the caller can merge the full warren-namespaced
  * extension payload (role + trigger + lastRunId + lastRunAt + scheduledFor
  * clear + lastScheduledRun pointer) into the seed in a single sd update,
@@ -296,6 +309,10 @@ export async function dispatchScheduledSeed(
 			projectId: input.projectId,
 			prompt,
 			trigger: "scheduled",
+			// warren-9ce3: first-class seedId so runs.seed_id is populated
+			// (was previously only buried in metadata and dropped by the
+			// scheduler's spawnDispatch closure).
+			seedId: input.seed.id,
 			metadata: { seedId: input.seed.id, scheduledFor: input.seed.scheduledFor.toISOString() },
 		});
 		return { kind: "fired", runId: spawned.runId, seedId: input.seed.id, role };
@@ -333,7 +350,7 @@ export function resolveCronPrompt(
 }
 
 function resolveScheduledPrompt(
-	seed: ScheduledSeed,
+	seed: ScheduledIssue,
 	defaults: DefaultsConfig | null | undefined,
 ): string {
 	if (defaults?.defaultPrompt !== undefined && defaults.defaultPrompt.trim() !== "") {

@@ -2,7 +2,7 @@
  * The stdin-hold subsystem for the in-pod agent entrypoint (warren-7a43, design
  * k8s-migration.md §5.1). Mirrors burrow's dispatcher (`src/runner/dispatch.ts`)
  * for runtimes whose CLI exits the instant stdin closes mid-inference (pi, and
- * anything else that declares `AgentRuntime.shouldCloseStdinOnEvent`):
+ * anything else that declares `AgentRuntimeAdapter.shouldCloseStdinOnEvent`):
  *
  *   • keep stdin open past the prompt and close it only when the runtime's
  *     terminal event lands (pi's `agent_end`) — the old unconditional
@@ -14,12 +14,17 @@
  *   • guard against a hung run with an idle watchdog that drops stdin and
  *     force-kills so a stalled inference can't pin the pod forever.
  *
- * A batch runtime (claude-code `--print`, sapling) declares none of these seams,
+ * A batch runtime (claude-code `--print`) declares none of these seams,
  * so `createStdinHoldController({ active: false, … })` returns a no-op and the
  * entrypoint keeps its write-and-close-at-spawn behavior unchanged.
  */
 
-import type { AgentRuntime, Message as BurrowMessage, RuntimeEvent } from "@os-eco/burrow-cli";
+import type { AcceptedRuntimeId } from "../../core/wire.ts";
+import type {
+	AdapterRuntimeEvent,
+	AgentRuntimeAdapter,
+	SteeringMessage,
+} from "../adapters/index.ts";
 import type { AgentEntrypointEnv } from "./agent-entrypoint.ts";
 import {
 	type AgentInboxHttp,
@@ -28,9 +33,6 @@ import {
 	emitSystem,
 	sleepUntil,
 } from "./agent-io.ts";
-
-/** Grace after the watchdog closes stdin before it hard-kills the child. */
-const STDIN_HOLD_KILL_GRACE_MS = 15_000;
 
 /**
  * The stdin lifecycle a stdin-held runtime needs on top of the plain pump loop.
@@ -42,7 +44,7 @@ export interface StdinHoldController {
 	/** Reset the idle watchdog — call on every stdout line. */
 	onOutput(): void;
 	/** Auto-reply + close-on-terminal-event for a batch of parsed events. */
-	onEvents(events: RuntimeEvent[]): Promise<void>;
+	onEvents(events: AdapterRuntimeEvent[]): Promise<void>;
 	/** Tear down: stop timers + steering, then defensively close stdin. */
 	stop(): Promise<void>;
 }
@@ -50,7 +52,7 @@ export interface StdinHoldController {
 export interface StdinHoldControllerArgs {
 	active: boolean;
 	env: AgentEntrypointEnv;
-	runtime: AgentRuntime;
+	runtime: AgentRuntimeAdapter;
 	proc: AgentProc;
 	http: AgentInboxHttp;
 	out: (line: string) => void;
@@ -86,13 +88,18 @@ export function createStdinHoldController(args: StdinHoldControllerArgs): StdinH
 
 	const watchdog = createIdleWatchdog({
 		timeoutMs: env.stdinHoldIdleTimeoutMs,
-		runtimeId: runtime.id,
+		runtimeId: runtime.runtimeId,
 		out,
 		log,
 		isStdinClosed,
 		kill: proc.kill,
+		killGraceMs: env.stdinHoldKillGraceMs,
 		onTimeout: () => {
-			void closeStdinOnce();
+			// warren-9a4a: swallow a rejection here — closing the stdin of an
+			// already-dead child throws EPIPE, and an unhandled rejection inside
+			// the watchdog timer is fatal to the pod process (the sibling call in
+			// `stop()` already catches).
+			void closeStdinOnce().catch(() => {});
 		},
 	});
 
@@ -137,8 +144,8 @@ export function createStdinHoldController(args: StdinHoldControllerArgs): StdinH
 
 /** True when any event satisfies the runtime's stdin-close predicate. */
 function firstEventMatches(
-	predicate: ((event: RuntimeEvent) => boolean) | undefined,
-	events: RuntimeEvent[],
+	predicate: ((event: AdapterRuntimeEvent) => boolean) | undefined,
+	events: AdapterRuntimeEvent[],
 ): boolean {
 	return predicate !== undefined && events.some((ev) => predicate(ev));
 }
@@ -149,9 +156,9 @@ function firstEventMatches(
  * A closed sink or an absent hook/writer short-circuits. Best-effort.
  */
 async function autoRespondToEvents(
-	runtime: AgentRuntime,
+	runtime: AgentRuntimeAdapter,
 	proc: AgentProc,
-	events: RuntimeEvent[],
+	events: AdapterRuntimeEvent[],
 	isStdinClosed: () => boolean,
 ): Promise<void> {
 	const autoRespond = runtime.autoRespondToEvent;
@@ -176,7 +183,9 @@ interface IdleWatchdog {
 
 interface IdleWatchdogArgs {
 	timeoutMs: number;
-	runtimeId: string;
+	/** Grace between the stdin close and the hard kill (warren-9a4a env knob). */
+	killGraceMs: number;
+	runtimeId: AcceptedRuntimeId;
 	out: (line: string) => void;
 	log: (m: string) => void;
 	isStdinClosed: () => boolean;
@@ -191,7 +200,7 @@ interface IdleWatchdogArgs {
  * so a hung inference can't pin the pod. `timeoutMs <= 0` disables it. (warren-7a43)
  */
 function createIdleWatchdog(args: IdleWatchdogArgs): IdleWatchdog {
-	const { timeoutMs, runtimeId, out, log, isStdinClosed, kill, onTimeout } = args;
+	const { timeoutMs, killGraceMs, runtimeId, out, log, isStdinClosed, kill, onTimeout } = args;
 	let idleTimer: ReturnType<typeof setTimeout> | undefined;
 	let killTimer: ReturnType<typeof setTimeout> | undefined;
 	const clear = (): void => {
@@ -210,7 +219,7 @@ function createIdleWatchdog(args: IdleWatchdogArgs): IdleWatchdog {
 			);
 			// Arm the hard-kill synchronously (so `clear()` can always cancel it) —
 			// it fires only if closing stdin doesn't produce a clean exit in time.
-			killTimer = setTimeout(() => kill?.(), STDIN_HOLD_KILL_GRACE_MS);
+			killTimer = setTimeout(() => kill?.(), killGraceMs);
 			onTimeout();
 		}, timeoutMs);
 	};
@@ -220,7 +229,7 @@ function createIdleWatchdog(args: IdleWatchdogArgs): IdleWatchdog {
 interface MidRunSteeringLoopArgs {
 	env: AgentEntrypointEnv;
 	http: AgentInboxHttp;
-	runtime: AgentRuntime;
+	runtime: AgentRuntimeAdapter;
 	log: (m: string) => void;
 	writeStdin: (chunk: string) => Promise<void>;
 	isStdinClosed: () => boolean;
@@ -252,8 +261,8 @@ async function runMidRunSteeringLoop(args: MidRunSteeringLoopArgs): Promise<void
 }
 
 interface DeliverSteeringBatchArgs {
-	messages: BurrowMessage[];
-	encode: (message: BurrowMessage) => { stdin: string } | undefined;
+	messages: SteeringMessage[];
+	encode: (message: SteeringMessage) => { stdin: string } | undefined;
 	writeStdin: (chunk: string) => Promise<void>;
 	onWrite: () => void;
 	stopped: () => boolean;

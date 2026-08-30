@@ -36,6 +36,7 @@ import { PREVIEW_FRAGMENT_END, PREVIEW_FRAGMENT_START, type PrCommit, type PrSee
 export const PR_FRAGMENT_NAMES = [
 	"title",
 	"summary",
+	"agent_notes",
 	"run",
 	"seeds",
 	"preview_url_or_placeholder",
@@ -54,6 +55,20 @@ export type PrFragmentName = (typeof PR_FRAGMENT_NAMES)[number];
 export const PR_BODY_FRAGMENT_NAMES: readonly PrFragmentName[] = PR_FRAGMENT_NAMES.filter(
 	(n): n is PrFragmentName => n !== "title",
 );
+
+/** GitHub rejects pull-request bodies at or above this API limit. */
+export const MAX_PR_BODY_LENGTH = 65_536;
+
+/**
+ * The one PR-body clamp. `composeBody` applies it as the final fallback,
+ * and `annotatePrPreview` (src/runs/pr-annotate.ts) re-clamps through it
+ * before its PATCH so a near-limit body plus a failure tail never 422s.
+ * The clamp lives here in the domain by decision (forge-contract.md §3,
+ * PR #805, mx-026320) — never in a provider or in transport.
+ */
+export function clampPrBodyLength(body: string): string {
+	return body.length <= MAX_PR_BODY_LENGTH ? body : `${body.slice(0, MAX_PR_BODY_LENGTH - 1)}…`;
+}
 
 const PR_FRAGMENT_NAME_SET: ReadonlySet<string> = new Set<string>(PR_FRAGMENT_NAMES);
 
@@ -90,6 +105,12 @@ export interface PrFragmentContext {
 	readonly tokensOutput?: number;
 	readonly tokensCacheRead?: number;
 	readonly previewOptedIn?: boolean;
+	/**
+	 * Body (not the subject) of the run's final commit, lifted at reap time
+	 * into an `## Agent notes` section under Summary (warren-5e86). Empty /
+	 * whitespace-only / undefined → the fragment is omitted entirely.
+	 */
+	readonly agentNotes?: string;
 }
 
 /**
@@ -184,13 +205,37 @@ export function parsePrTemplate(content: string): ParsedPrTemplate {
  * section-merging semantics (mx-1c92f3 in canopy).
  */
 export function composeBody(ctx: PrFragmentContext, overrides: PrTemplateOverrides = {}): string {
-	const out: string[] = [];
+	const out: Array<{ name: PrFragmentName; rendered: string }> = [];
 	for (const name of PR_BODY_FRAGMENT_NAMES) {
 		const rendered = renderFragment(name, ctx, overrides);
 		if (rendered === null) continue;
-		out.push(rendered);
+		out.push({ name, rendered });
 	}
-	return out.join("\n\n");
+	let body = out.map((fragment) => fragment.rendered).join("\n\n");
+	if (body.length <= MAX_PR_BODY_LENGTH) return body;
+
+	const commitsIndex = out.findIndex((fragment) => fragment.name === "commits");
+	if (commitsIndex >= 0 && overrides.commits === undefined && ctx.commits !== undefined) {
+		const prefix = out
+			.slice(0, commitsIndex)
+			.map((fragment) => fragment.rendered)
+			.join("\n\n");
+		const suffix = out
+			.slice(commitsIndex + 1)
+			.map((fragment) => fragment.rendered)
+			.join("\n\n");
+		const separators = (prefix === "" ? 0 : 2) + (suffix === "" ? 0 : 2);
+		const budget = MAX_PR_BODY_LENGTH - prefix.length - suffix.length - separators;
+		out[commitsIndex] = {
+			name: "commits",
+			rendered: boundedCommits(ctx.commits, budget),
+		};
+		body = out.map((fragment) => fragment.rendered).join("\n\n");
+	}
+
+	// Custom templates can still be larger than GitHub's limit. Keep the
+	// request safe even when there is no default commit fragment to shorten.
+	return clampPrBodyLength(body);
 }
 
 /**
@@ -235,6 +280,8 @@ function defaultRender(name: PrFragmentName, ctx: PrFragmentContext): string | n
 			return null; // handled by composeTitle
 		case "summary":
 			return defaultSummary(ctx);
+		case "agent_notes":
+			return ctx.agentNotes !== undefined ? defaultAgentNotes(ctx.agentNotes) : null;
 		case "run":
 			return defaultRun(ctx);
 		case "seeds":
@@ -266,6 +313,25 @@ function defaultSummary(ctx: PrFragmentContext): string {
 	return `## Summary\n\nAgent \`${ctx.agentName}\` ran ${tail}`;
 }
 
+/**
+ * `## Agent notes` from the final commit's body (warren-5e86). Sanitized:
+ * trailing whitespace stripped per line and the whole body trimmed; an empty
+ * result omits the section (returns null). A body containing markdown
+ * headers is fenced wholesale so it cannot break the PR body's own `##`
+ * section structure.
+ */
+function defaultAgentNotes(rawBody: string): string | null {
+	const body = rawBody
+		.split("\n")
+		.map((line) => line.trimEnd())
+		.join("\n")
+		.trim();
+	if (body === "") return null;
+	const hasHeaders = body.split("\n").some((line) => line.startsWith("#"));
+	const rendered = hasHeaders ? `\`\`\`markdown\n${body}\n\`\`\`` : body;
+	return `## Agent notes\n\n${rendered}`;
+}
+
 function defaultRun(ctx: PrFragmentContext): string {
 	const lines = ["## Run", ""];
 	const link =
@@ -295,6 +361,28 @@ function defaultCommits(commits: readonly PrCommit[]): string {
 		lines.push(`- ${shortSha(c.sha)} ${c.subject}`);
 	}
 	return lines.join("\n");
+}
+
+function boundedCommits(commits: readonly PrCommit[], budget: number): string {
+	const header = `## Commits (${commits.length})\n\n`;
+	if (budget <= header.length) return header.slice(0, Math.max(0, budget));
+	const lines = [header];
+	let remaining = budget - header.length;
+	for (let index = 0; index < commits.length; index += 1) {
+		const commit = commits[index];
+		if (commit === undefined) continue;
+		const line = `- ${shortSha(commit.sha)} ${commit.subject}\n`;
+		const left = commits.length - index - 1;
+		const summary = left > 0 ? `- ...and ${left} more` : "";
+		if (line.length + (summary === "" ? 0 : summary.length) <= remaining) {
+			lines.push(line);
+			remaining -= line.length;
+			continue;
+		}
+		if (left > 0 && summary.length <= remaining) lines.push(summary);
+		break;
+	}
+	return lines.join("").trimEnd();
 }
 
 function defaultFilesChanged(diffStat: string): string {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { CommandMining, CommandStat } from "./command-mining.ts";
+import type { DirectoryDifficulty, DirectoryStat } from "./directory-difficulty.ts";
 import {
 	buildInsights,
 	buildSteeringSignals,
@@ -21,7 +22,11 @@ function emptyMetrics(): RunMetrics {
 			cancelled: 0,
 			active: 0,
 			successRate: null,
+			prStateKnown: 0,
+			prsMerged: 0,
+			mergedPrRate: null,
 			durationMs: { avg: null, median: null, p95: null, count: 0 },
+			queueWaitMs: { avg: null, median: null, p95: null, count: 0 },
 			contextTokens: { avg: null, median: null, p95: null, count: 0 },
 			tokens: ZERO_TOKENS,
 			cost: { total: 0, avg: null, priced: 0 },
@@ -40,7 +45,14 @@ function emptyMetrics(): RunMetrics {
 
 function emptyMining(): CommandMining {
 	return {
-		totals: { toolUses: 0, commands: 0, distinctCommands: 0, failures: 0, retries: 0 },
+		totals: {
+			toolUses: 0,
+			commands: 0,
+			distinctCommands: 0,
+			failures: 0,
+			retries: 0,
+			byRuntime: [],
+		},
 		byFrequency: [],
 		byFailures: [],
 		byStuckScore: [],
@@ -67,6 +79,9 @@ function agent(key: string, succeeded: number, failed: number, cancelled = 0): R
 		failed,
 		cancelled,
 		successRate: terminal === 0 ? null : succeeded / terminal,
+		prStateKnown: 0,
+		prsMerged: 0,
+		mergedPrRate: null,
 		contextTokensTotal: 0,
 		avgContextTokens: null,
 		tokens: ZERO_TOKENS,
@@ -84,6 +99,9 @@ function model(key: string, costUsd: number, priced: number): RunGroupBucket {
 		failed: 0,
 		cancelled: 0,
 		successRate: priced === 0 ? null : 1,
+		prStateKnown: 0,
+		prsMerged: 0,
+		mergedPrRate: null,
 		contextTokensTotal: 0,
 		avgContextTokens: null,
 		tokens: ZERO_TOKENS,
@@ -282,6 +300,80 @@ describe("buildInsights", () => {
 	test("skips the steering insight entirely when signals are absent", () => {
 		const insights = buildInsights({ metrics: emptyMetrics(), mining: emptyMining() });
 		expect(kinds(insights)).not.toContain("steering-anomaly");
+	});
+});
+
+describe("hardest-directory insight (warren-8f1b)", () => {
+	function stat(over: Partial<DirectoryStat>): DirectoryStat {
+		return {
+			directory: "src/server",
+			runsTouching: 5,
+			runsFailed: 0,
+			failureShare: 0,
+			fileTouches: 10,
+			errorTouches: 0,
+			retries: 0,
+			steeringMessages: 0,
+			difficultyScore: 0,
+			confidence: "medium",
+			...over,
+		};
+	}
+
+	function rollup(
+		directories: readonly DirectoryStat[],
+		totals: Partial<DirectoryDifficulty["totals"]> = {},
+	): DirectoryDifficulty {
+		return {
+			directories,
+			totals: {
+				runsInWindow: 5,
+				runsWithFilePaths: 5,
+				fileTouches: 10,
+				directoriesRanked: directories.length,
+				directoriesBelowMinN: 0,
+				...totals,
+			},
+		};
+	}
+
+	test("flags the highest-scoring directory with denominators and confidence", () => {
+		const directories = rollup([
+			stat({ directory: "src/server", runsFailed: 2, failureShare: 0.4, difficultyScore: 0.6 }),
+			stat({ directory: "src/ui", runsFailed: 1, failureShare: 0.2, difficultyScore: 0.55 }),
+		]);
+		const i = find(
+			buildInsights({ metrics: emptyMetrics(), mining: emptyMining(), directories }),
+			"hardest-directory",
+		);
+		expect(i.subject).toBe("src/server");
+		expect(i.severity).toBe("warning");
+		expect(i.value).toBe(0.6);
+		expect(i.detail).toContain("2 of 5 run(s)");
+		expect(i.detail).toContain("confidence: medium");
+		expect(i.detail).toContain("5 of 5 run(s) in window have file data");
+	});
+
+	test("escalates to critical at a 50% failure share", () => {
+		const directories = rollup([stat({ runsFailed: 3, failureShare: 0.6, difficultyScore: 0.7 })]);
+		const i = find(
+			buildInsights({ metrics: emptyMetrics(), mining: emptyMining(), directories }),
+			"hardest-directory",
+		);
+		expect(i.severity).toBe("critical");
+	});
+
+	test("skips directories with no struggle evidence and low scores", () => {
+		const directories = rollup([stat({ difficultyScore: 0.3 })]);
+		expect(
+			kinds(buildInsights({ metrics: emptyMetrics(), mining: emptyMining(), directories })),
+		).not.toContain("hardest-directory");
+	});
+
+	test("skips the insight entirely when the rollup is absent", () => {
+		expect(kinds(buildInsights({ metrics: emptyMetrics(), mining: emptyMining() }))).not.toContain(
+			"hardest-directory",
+		);
 	});
 });
 

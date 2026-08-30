@@ -31,9 +31,11 @@
  * is the sole poller of its own run — it never races a real agent for the row.
  */
 
+import { createHmacRunTokenMinter } from "../../../src/runs/spawn/run-token.ts";
 import { AcceptanceError, assertEqual, assertTrue, type Scenario } from "../lib/assert.ts";
 import type { WarrenHttp } from "../lib/http.ts";
-import { resolveK8sTarget, sleep } from "../lib/k8s-target.ts";
+import { resolveK8sTarget } from "../lib/k8s-target.ts";
+import { pollAcceptance } from "../lib/poll.ts";
 
 interface RunRow {
 	readonly id: string;
@@ -100,6 +102,35 @@ export const scenario: Scenario = {
 		);
 
 		try {
+			// 0. (warren-5a5c) The K8s App-mode credential remint rides the
+			//    run-scoped callback token: mint one for this run (same HMAC the
+			//    server verifies, keyed off the operator token) and POST
+			//    /runs/:id/git-credential with it — the exact request
+			//    finalize-entrypoint.ts makes from inside the pod. Before
+			//    warren-5a5c this was 403'd by the run-scope gate, so App-mode
+			//    remint could never work. The target's forge may be PAT-mode and
+			//    mint `null`; the pin here is the auth path (200 + well-formed
+			//    body), which is forge-independent.
+			const runScoped = createHmacRunTokenMinter(target.token).mint(runId);
+			const mintRes = await fetch(
+				target.http.url(`/runs/${encodeURIComponent(runId)}/git-credential`),
+				{
+					method: "POST",
+					headers: { authorization: `Bearer ${runScoped}` },
+				},
+			);
+			if (mintRes.status !== 200) {
+				throw new AcceptanceError(
+					`run-scoped POST git-credential returned HTTP ${mintRes.status} (expected 200 — warren-5a5c callback allowlist): ${await mintRes.text()}`,
+				);
+			}
+			const mintBody = (await mintRes.json()) as { gitToken: string | null };
+			assertTrue(
+				typeof mintBody?.gitToken === "string" || mintBody?.gitToken === null,
+				`git-credential body malformed: ${JSON.stringify(mintBody)}`,
+			);
+			ctx.logger.info("scenario-38: run-scoped git-credential remint accepted (warren-5a5c)");
+
 			// 1. Steer promptly (the run is queued/running — non-terminal — so steer
 			//    is accepted). The 200 body is the enqueued run_inbox row.
 			const steerBody = "scenario-38: fold in the network-policy note on your next turn";
@@ -160,20 +191,22 @@ async function pollInboxFor(
 	messageId: string,
 	timeoutMs: number,
 ): Promise<InboxMessage> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const res = await http.expectJson<InboxResponse>(
-			"GET",
-			`/runs/${encodeURIComponent(runId)}/inbox`,
-			200,
-		);
-		const hit = res.messages.find((m) => m.id === messageId);
-		if (hit !== undefined) return hit;
-		await sleep(POLL_INTERVAL_MS);
-	}
-	throw new AcceptanceError(
-		`steer message ${messageId} was not drainable over GET /runs/${runId}/inbox within ${timeoutMs}ms`,
-	);
+	return pollAcceptance({
+		label: "steer inbox message",
+		id: messageId,
+		timeoutMs,
+		intervalMs: POLL_INTERVAL_MS,
+		fetchRow: async (): Promise<InboxMessage | null> => {
+			const res = await http.expectJson<InboxResponse>(
+				"GET",
+				`/runs/${encodeURIComponent(runId)}/inbox`,
+				200,
+			);
+			return res.messages.find((m) => m.id === messageId) ?? null;
+		},
+		isDone: (msg): msg is InboxMessage => msg !== null,
+		describe: (msg) => (msg === null ? "not drainable yet" : msg.id),
+	});
 }
 
 async function fetchEvents(http: WarrenHttp, runId: string): Promise<EventRow[]> {

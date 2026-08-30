@@ -24,8 +24,9 @@
  * operator-visible instead of silent.
  */
 
-import { join } from "node:path";
-import { rescueBranchFor, salvageBundleFileName } from "../../runtime/salvage.ts";
+import { rescueBranchFor, salvageBundlePath } from "../../runtime/salvage.ts";
+import type { GitSpawnCredential } from "../../workspace/git/credential-env.ts";
+import { gitCredentialGitEnv } from "../../workspace/git/credential-env.ts";
 import type { ReapExec, ReapFs } from "./types.ts";
 
 export interface WorkspaceSalvageInput {
@@ -35,6 +36,14 @@ export interface WorkspaceSalvageInput {
 	readonly baseBranch: string | null;
 	/** Durable dir for the bundle capture; absent ⇒ only the rescue ref is tried. */
 	readonly salvageDir?: string;
+	/**
+	 * Per-spawn minted git credential for the rescue-ref push (warren-4e1c,
+	 * forge-contract.md §4 — minted by the caller immediately before this
+	 * call via `mintGitCredential`, never held on a config object).
+	 * Undefined ⇒ anonymous push, the pre-forge behavior for a forge that owns
+	 * no credential for the URL.
+	 */
+	readonly gitCredential?: GitSpawnCredential;
 	readonly exec: ReapExec;
 	readonly fs: ReapFs;
 }
@@ -70,6 +79,7 @@ export async function salvageWorkspace(
 		await input.exec.run("git", ["push", "origin", `HEAD:refs/heads/${branch}`], {
 			cwd: input.workspacePath,
 			timeoutMs: 60_000,
+			env: gitCredentialGitEnv(input.gitCredential),
 		});
 		rescueRef = branch;
 	} catch (err) {
@@ -79,8 +89,12 @@ export async function salvageWorkspace(
 	if (rescueRef === null && input.salvageDir !== undefined) {
 		const range =
 			input.baseBranch !== null && input.baseBranch !== "" ? `${input.baseBranch}..HEAD` : "HEAD";
-		const target = join(input.salvageDir, salvageBundleFileName(input.runId));
 		try {
+			// Shared resolver, not a bare join (warren-7c1e): this run id comes
+			// off a db row rather than a route param, but the containment check
+			// belongs to the sink so every salvage writer inherits it. Inside the
+			// try because this function reports through `errors` and never throws.
+			const target = salvageBundlePath(input.salvageDir, input.runId);
 			await input.fs.mkdirp(input.salvageDir);
 			await input.exec.run("git", ["bundle", "create", target, range], {
 				cwd: input.workspacePath,

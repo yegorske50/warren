@@ -2,17 +2,16 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BurrowClient } from "../burrow-client/index.ts";
 import { ValidationError } from "../core/errors.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
+import { FakeForge } from "../forge/fake/fake-forge.ts";
 import type { SpawnFn } from "../projects/clone.ts";
 import { RunEventBroker } from "../runs/index.ts";
-import { checkBurrowPoolReachable } from "../runtime/local/diagnostics/burrow.ts";
-import { resolveRuntimeProvider } from "../runtime/registry.ts";
+import { FakeProvider } from "../runtime/fake/fake-provider.ts";
 import { bearerAuth, NO_AUTH } from "./auth.ts";
 import { createBridgeRegistry } from "./bridges.ts";
-import { startServer } from "./server.ts";
+import { DEFAULT_IDLE_TIMEOUT_SECONDS, startServer } from "./server.ts";
 import type { BridgeRegistry, Route, ServeHandle, ServeOptions, ServerDeps } from "./types.ts";
 
 const silentLogger = {
@@ -22,17 +21,8 @@ const silentLogger = {
 	debug() {},
 };
 
-function stub(
-	impl: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>,
-): typeof fetch {
-	return impl as unknown as typeof fetch;
-}
-
-function makeBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(async () => new Response(JSON.stringify({ ok: true }), { status: 200 })),
-	});
+function makeSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 /**
@@ -60,21 +50,20 @@ async function depsFor(
 		platform?: NodeJS.Platform;
 	} = {},
 ): Promise<ServerDeps> {
-	const burrowClient = makeBurrowClient();
+	const sandboxClient = makeSandboxClient();
 	const broker = new RunEventBroker();
 	return {
 		repos,
 		...(overrides.db !== undefined ? { db: overrides.db } : {}),
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
-		// warren-f796: the readyz burrow probe is a boot-wired thunk (LocalBootBackend).
-		burrowProbe: () => checkBurrowPoolReachable(burrowClient),
+		runtimeProvider: sandboxClient,
+		forge: new FakeForge(),
 		broker,
 		bridges:
 			bridges ??
 			createBridgeRegistry({
 				repos,
 				broker,
-				runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+				runtimeProvider: sandboxClient,
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
@@ -275,36 +264,18 @@ describe("startServer — lifecycle", () => {
 		expect(res.status).toBe(500);
 	});
 
-	test("default idleTimeout=0 keeps a >10s-quiet streaming response alive (warren-b8fc)", async () => {
-		// Bun.serve's default idleTimeout is 10s; without our override the
-		// per-request timer would close this connection mid-stream and the
-		// second chunk would never arrive. We pause 11s between chunks so
-		// the fix being plumbed (idleTimeout: 0 default) is what makes the
-		// assertion pass.
-		const routes: Route[] = [
-			{
-				method: "GET",
-				pattern: "/slow",
-				policy: "readPublic",
-				handler: () =>
-					new Response(
-						new ReadableStream({
-							async start(controller) {
-								controller.enqueue(new TextEncoder().encode("a\n"));
-								await new Promise((r) => setTimeout(r, 11_000));
-								controller.enqueue(new TextEncoder().encode("b\n"));
-								controller.close();
-							},
-						}),
-						{ headers: { "content-type": "application/x-ndjson" } },
-					),
-			},
-		];
-		handle = startServer(await depsFor(repos), tcpOpts({ routes }));
-		const res = await fetch(`${tcpUrl(handle)}/slow`);
-		const body = await res.text();
-		expect(body).toBe("a\nb\n");
-	}, 15_000);
+	test("the default idle timeout is bounded (warren-a676)", () => {
+		// The regression this issue is about: the default was 0, which
+		// disables the timer for every route on the listener.
+		//
+		// This is asserted on the constant rather than through a request on
+		// purpose. `idleTimeout` fires on socket inactivity while a request
+		// is being read, and that timer does not run under `bun test`: the
+		// same stalled request a listener closes after ~1s under `bun run`
+		// is served in full here. A behavioural assertion would pass
+		// whatever the default is, which is worse than no test.
+		expect(DEFAULT_IDLE_TIMEOUT_SECONDS).toBeGreaterThan(0);
+	});
 });
 
 describe("startServer — routes", () => {
@@ -428,7 +399,6 @@ describe("startServer — routes", () => {
 			};
 			expect(body.ok).toBe(false);
 			const names = body.checks.map((c) => c.name);
-			expect(names).toContain("burrow_reachable");
 			expect(names).toContain("agents");
 			expect(names).toContain("bwrap");
 			expect(names).toContain("warren_config");
@@ -441,7 +411,7 @@ describe("startServer — routes", () => {
 	});
 
 	test("/readyz returns 200 when every mirrored check passes", async () => {
-		// At least one agent registered + burrow probe succeeds (stubbed) + bwrap.
+		// At least one agent registered + bwrap.
 		handle = startServer(await depsFor(repos, undefined, { db }), tcpOpts());
 		const res = await fetch(`${tcpUrl(handle)}/readyz`);
 		expect(res.status).toBe(200);

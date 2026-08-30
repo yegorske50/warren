@@ -26,55 +26,48 @@
  *     values); the pod NAME is DNS-1123-sanitized — see `podNameForRun`.
  */
 
-import type {
-	V1Container,
-	V1Pod,
-	V1PodSecurityContext,
-	V1SecurityContext,
-} from "@kubernetes/client-node";
+import type { V1Container, V1Pod, V1PodSecurityContext } from "@kubernetes/client-node";
 import {
 	DEFAULT_K8S_CPU_LIMIT_MILLICORES,
 	DEFAULT_K8S_CPU_REQUEST_MILLICORES,
-	DEFAULT_K8S_MEMORY_LIMIT_MIB,
-	DEFAULT_K8S_MEMORY_REQUEST_MIB,
 	DEFAULT_K8S_NETWORK,
 	type NetworkPolicy,
 	type ResourcesConfig,
 } from "../../warren-config/index.ts";
 import type { RunSpec } from "../contract.ts";
+import { type AgentUidDrop, WARREN_POD_AGENT_UID } from "./agent-uid-drop.ts";
 import {
+	agentContainerSecurityContext,
 	buildAgentEnv,
 	buildInitEnv,
 	buildInitVolumeMounts,
 	buildRunPodVolumes,
-	DEFAULT_K8S_ANTHROPIC_SECRET_KEY,
-	DEFAULT_K8S_ANTHROPIC_SECRET_NAME,
+	containerSecurityContext,
 	DEFAULT_K8S_GIT_SECRET_KEY,
 	DEFAULT_K8S_GIT_SECRET_NAME,
-	DEFAULT_K8S_OPENROUTER_SECRET_KEY,
-	DEFAULT_K8S_OPENROUTER_SECRET_NAME,
+	pickImagePullPolicy,
+	resolveProviderSecrets,
 	resolveRepoCacheConfig,
 } from "./pod-env.ts";
 import {
 	clampRequests,
 	type ResolvedResourceQuantities,
 	resolveEphemeralStorageMiB,
+	resolveMemoryMiB,
 	resourceRequirements,
 } from "./pod-resources.ts";
 
 // Re-exported so `./pod-spec.ts` stays the single import surface for the pod
-// shape; the env builders + ENV name constants live in `./pod-env.ts` (split
-// out to keep this file under the size ratchet).
+// shape; the env builders + ENV name constants live in `./pod-env.ts`.
 export {
+	agentContainerSecurityContext,
 	buildAgentEnv,
 	buildInitEnv,
 	buildInitVolumeMounts,
-	DEFAULT_K8S_ANTHROPIC_SECRET_KEY,
-	DEFAULT_K8S_ANTHROPIC_SECRET_NAME,
 	DEFAULT_K8S_GIT_SECRET_KEY,
 	DEFAULT_K8S_GIT_SECRET_NAME,
-	DEFAULT_K8S_OPENROUTER_SECRET_KEY,
-	DEFAULT_K8S_OPENROUTER_SECRET_NAME,
+	DEFAULT_PROVIDER_SECRET_KEY,
+	defaultProviderSecretName,
 	ENV_AGENT_METADATA,
 	ENV_AGENT_RUNTIME,
 	ENV_PROMPT,
@@ -92,6 +85,13 @@ export type { ResolvedResourceQuantities } from "./pod-resources.ts";
 /** Unprivileged uid/gid the agent + init containers run as (§2.2, was `DEFAULT_SANDBOX_UID`). */
 export const WARREN_POD_UID = 1000;
 export const WARREN_POD_GID = 1000;
+
+// warren-cb93: the drop contract lives in `./agent-uid-drop.ts`; re-exported from the pod-shape surface.
+export {
+	ENV_AGENT_RUN_AS_GID,
+	ENV_AGENT_RUN_AS_UID,
+	WARREN_POD_AGENT_UID,
+} from "./agent-uid-drop.ts";
 
 /** Shared `emptyDir` the init container materializes and the agent mounts (§4.2). */
 export const WORKSPACE_VOLUME_NAME = "workspace";
@@ -168,17 +168,17 @@ export const DEFAULT_K8S_CALLBACK_NAMESPACE = "warren";
 export const DEFAULT_K8S_CALLBACK_PORT = "8080";
 
 /**
- * SIGTERM grace on `cancel()` (pl-829f step 19 / warren-31d4). `cancel` is the
- * seam's GRACEFUL stop: it deletes the pod with this `gracePeriodSeconds`, so
- * the kubelet delivers SIGTERM and waits this long before SIGKILL — giving the
- * agent a window to flush. A positive default matters: during the window the
- * pod lingers `Terminating` (phase still `Running`), so a `status()` re-read
- * from the domain's `cancelRun` sees a NON-terminal phase and does NOT
- * prematurely reap the run as `lost`/`failed` (grace=0 would risk the pod
- * vanishing before the domain records the cancel). Overridable via
- * `WARREN_K8S_CANCEL_GRACE_SECONDS`.
+ * SIGTERM grace on `cancel()` (pl-829f step 19 / warren-31d4; warren-01d5).
+ * `cancel` is the seam's GRACEFUL stop: it deletes the pod with this
+ * `gracePeriodSeconds`, so the kubelet delivers SIGTERM and waits before
+ * SIGKILL. The grace must outlast warren-01d5's bounded in-pod salvage window
+ * (the termination handler stops the agent, then finalize/salvage runs:
+ * `WARREN_CANCEL_FINALIZE_MAX_WAIT_MS`, 25s, + push/POST) → 90s. It also
+ * keeps the pod `Terminating` (phase still `Running`) long enough that the
+ * domain's `cancelRun` status re-read does not prematurely reap the run
+ * `lost`/`failed`. Overridable via `WARREN_K8S_CANCEL_GRACE_SECONDS`.
  */
-export const DEFAULT_K8S_CANCEL_GRACE_SECONDS = 30;
+export const DEFAULT_K8S_CANCEL_GRACE_SECONDS = 90;
 /**
  * Grace on `terminate()` (pl-829f step 19 / warren-31d4). `terminate` reclaims
  * the sandbox AFTER `finalize` already ran (contract §6.8 ordering), so the
@@ -204,17 +204,38 @@ export interface K8sPodConfig {
 	network: NetworkPolicy;
 	/** In-cluster Service DNS coordinates for the agent's warren callback (§6.3). */
 	callback: { service: string; namespace: string; port: string };
-	/** K8s Secret the init container's git token is sourced from (§6.3). */
+	/** K8s Secret the git token is sourced from (§6.3) — init-container clone +
+	 * the agent container's salvage-window fallback credential (warren-6016). */
 	gitTokenSecret: { name: string; key: string };
-	/** Agent-container API-key Secrets: `ANTHROPIC_API_KEY` / `OPENROUTER_API_KEY` (§6.3). */
-	anthropicSecret: { name: string; key: string };
-	openrouterSecret: { name: string; key: string };
+	/**
+	 * Operator-overridden bookkeeping-bot identity (`WARREN_BOT_NAME` +
+	 * `WARREN_BOT_EMAIL`, both-or-nothing), threaded onto the agent container
+	 * env so the in-pod salvage commit spells it the control plane's way
+	 * (Article VII; warren-6016). Absent ⇒ the canonical default applies.
+	 */
+	botIdentity?: { name: string; email: string };
+	/**
+	 * Agent-container API-key Secrets (§6.3, warren-fb8d): one entry per
+	 * provider in the core registry (`src/core/providers.ts`), resolved
+	 * generically by `resolveProviderSecrets` — the pod-spec builder maps each
+	 * provider's canonical env key to its Secret without knowing any provider
+	 * names.
+	 */
+	providerSecrets: Record<string, { name: string; key: string }>;
 	/** Optional PVC-backed git-mirror cache on the init container (§4.3, pod-env.ts). */
 	repoCache?: { claimName: string; mountPath: string };
 	/** SIGTERM grace (seconds) `cancel()` deletes the pod with (step 19). */
 	cancelGracePeriodSeconds: number;
 	/** Grace (seconds) `terminate()` force-deletes the pod with; 0 = immediate (step 19). */
 	terminateGracePeriodSeconds: number;
+	/**
+	 * The entrypoint/agent uid split (warren-cb93, `./agent-uid-drop.ts`). When
+	 * set, the agent container carries SETUID/SETGID/KILL for the ENTRYPOINT
+	 * and `WARREN_AGENT_RUN_AS_*` env so the entrypoint setpriv-drops the agent
+	 * to this identity — closing the `/proc/1/fd/1` provenance-marker forge.
+	 * Unset (WARREN_K8S_AGENT_UID_DROP=0) ⇒ the legacy shared-uid shape.
+	 */
+	agentUidDrop?: AgentUidDrop;
 	/** optional ServiceAccount for the run pod (RBAC step). */
 	serviceAccountName?: string;
 	/**
@@ -259,6 +280,7 @@ export function resolveK8sPodConfig(
 ): K8sPodConfig {
 	// Per-project resources block > WARREN_K8S_EPHEMERAL_STORAGE_*_MIB > 10Gi (warren-4a95).
 	const ephemeral = resolveEphemeralStorageMiB(env, resources);
+	const memory = resolveMemoryMiB(env, resources); // warren-06b8 chain: see pod-resources.ts
 	const config: K8sPodConfig = {
 		namespace: pickString(env, "WARREN_K8S_NAMESPACE", DEFAULT_K8S_NAMESPACE),
 		agentImage: pickString(env, "WARREN_K8S_AGENT_IMAGE", DEFAULT_K8S_AGENT_IMAGE),
@@ -266,12 +288,12 @@ export function resolveK8sPodConfig(
 		uid: WARREN_POD_UID,
 		gid: WARREN_POD_GID,
 		requests: {
-			memoryMiB: resources?.requests?.memoryMiB ?? DEFAULT_K8S_MEMORY_REQUEST_MIB,
+			memoryMiB: memory.requestMiB,
 			cpuMillicores: resources?.requests?.cpuMillicores ?? DEFAULT_K8S_CPU_REQUEST_MILLICORES,
 			ephemeralStorageMiB: ephemeral.requestMiB,
 		},
 		limits: {
-			memoryMiB: resources?.limits?.memoryMiB ?? DEFAULT_K8S_MEMORY_LIMIT_MIB,
+			memoryMiB: memory.limitMiB,
 			cpuMillicores: resources?.limits?.cpuMillicores ?? DEFAULT_K8S_CPU_LIMIT_MILLICORES,
 			ephemeralStorageMiB: ephemeral.limitMiB,
 		},
@@ -285,18 +307,7 @@ export function resolveK8sPodConfig(
 			name: pickString(env, "WARREN_K8S_GIT_SECRET_NAME", DEFAULT_K8S_GIT_SECRET_NAME),
 			key: pickString(env, "WARREN_K8S_GIT_SECRET_KEY", DEFAULT_K8S_GIT_SECRET_KEY),
 		},
-		anthropicSecret: {
-			name: pickString(env, "WARREN_K8S_ANTHROPIC_SECRET_NAME", DEFAULT_K8S_ANTHROPIC_SECRET_NAME),
-			key: pickString(env, "WARREN_K8S_ANTHROPIC_SECRET_KEY", DEFAULT_K8S_ANTHROPIC_SECRET_KEY),
-		},
-		openrouterSecret: {
-			name: pickString(
-				env,
-				"WARREN_K8S_OPENROUTER_SECRET_NAME",
-				DEFAULT_K8S_OPENROUTER_SECRET_NAME,
-			),
-			key: pickString(env, "WARREN_K8S_OPENROUTER_SECRET_KEY", DEFAULT_K8S_OPENROUTER_SECRET_KEY),
-		},
+		providerSecrets: resolveProviderSecrets(env),
 		cancelGracePeriodSeconds: pickNonNegativeInt(
 			env,
 			"WARREN_K8S_CANCEL_GRACE_SECONDS",
@@ -308,27 +319,26 @@ export function resolveK8sPodConfig(
 			DEFAULT_K8S_TERMINATE_GRACE_SECONDS,
 		),
 	};
+	// warren-cb93: the uid split is ON by default; an operator whose runtime
+	// does not propagate ambient caps to a non-root pid 1 (containerd/runc do;
+	// the entrypoint needs effective SETUID/SETGID for setpriv) opts out here.
+	const dropRaw = env.WARREN_K8S_AGENT_UID_DROP?.trim().toLowerCase();
+	const dropDisabled =
+		dropRaw === "0" || dropRaw === "false" || dropRaw === "no" || dropRaw === "off";
+	if (!dropDisabled) config.agentUidDrop = { uid: WARREN_POD_AGENT_UID, gid: WARREN_POD_GID };
 	const sa = env.WARREN_K8S_SERVICE_ACCOUNT?.trim();
 	if (sa !== undefined && sa !== "") config.serviceAccountName = sa;
+	// warren-6016: both halves or nothing, mirroring resolveWarrenBotIdentity.
+	const botName = env.WARREN_BOT_NAME?.trim();
+	const botEmail = env.WARREN_BOT_EMAIL?.trim();
+	if (botName !== undefined && botName !== "" && botEmail !== undefined && botEmail !== "") {
+		config.botIdentity = { name: botName, email: botEmail };
+	}
 	const pullPolicy = pickImagePullPolicy(env);
 	if (pullPolicy !== undefined) config.imagePullPolicy = pullPolicy;
 	const repoCache = resolveRepoCacheConfig(env);
 	if (repoCache !== undefined) config.repoCache = repoCache;
 	return config;
-}
-
-/** Valid K8s `imagePullPolicy` values; anything else is ignored (field omitted). */
-const IMAGE_PULL_POLICIES = new Set(["Always", "IfNotPresent", "Never"]);
-
-/**
- * Resolve `WARREN_K8S_IMAGE_PULL_POLICY` to a valid K8s `imagePullPolicy`, or
- * `undefined` (omit the field ⇒ K8s default). A blank/missing/invalid value maps
- * to `undefined` rather than propagating an invalid policy the API would reject.
- */
-function pickImagePullPolicy(env: K8sPodConfigEnv): string | undefined {
-	const raw = env.WARREN_K8S_IMAGE_PULL_POLICY?.trim();
-	if (raw === undefined || raw === "") return undefined;
-	return IMAGE_PULL_POLICIES.has(raw) ? raw : undefined;
 }
 
 // --- Name sanitization -----------------------------------------------------
@@ -352,18 +362,6 @@ export function podNameForRun(runId: string): string {
 }
 
 // --- Builder ---------------------------------------------------------------
-
-/** Container-level hardening applied to BOTH the init and agent containers (§2.2). */
-function containerSecurityContext(config: K8sPodConfig): V1SecurityContext {
-	return {
-		runAsNonRoot: true,
-		runAsUser: config.uid,
-		runAsGroup: config.gid,
-		allowPrivilegeEscalation: false,
-		capabilities: { drop: ["ALL"] },
-		seccompProfile: { type: "RuntimeDefault" },
-	};
-}
 
 /** Pod-level securityContext (§2.2). `fsGroup` lets uid 1000 write the emptyDir. */
 function podSecurityContext(config: K8sPodConfig): V1PodSecurityContext {
@@ -422,7 +420,10 @@ function buildAgentContainer(spec: RunSpec, config: K8sPodConfig): V1Container {
 	const requests = clampRequests(config.requests, limits);
 	return {
 		name: AGENT_CONTAINER_NAME,
-		image: config.agentImage,
+		// warren-fabb: per-project agentImage override (RunSpec.agentImage, from
+		// `.warren/config.yaml`) wins over the env-resolved default. Precedence:
+		// project override > WARREN_K8S_AGENT_IMAGE > DEFAULT_K8S_AGENT_IMAGE.
+		image: spec.agentImage ?? config.agentImage,
 		...(config.imagePullPolicy !== undefined ? { imagePullPolicy: config.imagePullPolicy } : {}),
 		// NO `workingDir` override (warren-245d): the container starts in the image
 		// WORKDIR (`/app`) so `bun run agent:run` resolves — `bun run` reads the
@@ -433,7 +434,7 @@ function buildAgentContainer(spec: RunSpec, config: K8sPodConfig): V1Container {
 		env: buildAgentEnv(spec, config),
 		volumeMounts: [{ name: WORKSPACE_VOLUME_NAME, mountPath: WORKSPACE_MOUNT_PATH }],
 		resources: resourceRequirements(requests, limits),
-		securityContext: containerSecurityContext(config),
+		securityContext: agentContainerSecurityContext(config),
 	};
 }
 

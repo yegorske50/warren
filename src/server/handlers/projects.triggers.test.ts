@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle, ServerDeps } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./projects.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./projects.test-helpers.ts";
 
 describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state (warren-99c3)", () => {
 	let db: WarrenDb;
@@ -40,11 +40,8 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 	});
 
 	test("empty list + empty errors when .warren/ is absent", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient);
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -97,12 +94,9 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			lastRunId: seedRun.id,
 		});
 
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
+		const sandboxClient = new FakeProvider();
 		const deps: ServerDeps = {
-			...(await depsFor(repos, burrowClient)),
+			...(await depsFor(repos, sandboxClient)),
 			// Freeze "now" so the recomputed nextFireAt is deterministic.
 			now: () => new Date("2026-05-10T12:00:00.000Z"),
 		};
@@ -152,11 +146,8 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 			"- id: nightly\n  kind: cron\n  cron: '0 2 * * *'\n",
 		);
 
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient);
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,
@@ -176,11 +167,8 @@ describe("GET /projects/:id/triggers — parsed YAML joined with scheduler state
 	});
 
 	test("404 for an unknown project id", async () => {
-		const burrowClient = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: stub(async () => new Response("{}", { status: 200 })),
-		});
-		const deps = await depsFor(repos, burrowClient);
+		const sandboxClient = new FakeProvider();
+		const deps = await depsFor(repos, sandboxClient);
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: NO_AUTH,

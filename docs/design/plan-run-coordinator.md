@@ -1,5 +1,12 @@
 # PlanRun Coordinator + Ready-to-Dispatch Surface
 
+**Kind:** contract
+**Design state:** approved
+**Delivery:** shipped
+**Arrived:** 2026-08-01
+**Shipped:** v0.3.17; ready-to-dispatch followed in v0.9.4
+**Current truth:** `src/plan-runs/`
+
 > **Salvage provenance:** lifted from the retired top-level spec §11.P (PlanRun: serial
 > plan execution, pl-a258) and §11.R (ready-to-dispatch surface,
 > pl-3fc4) as part of the SPEC retirement plan `pl-1717` (step
@@ -84,7 +91,9 @@ Transitions, per advance call:
      `http_error` 4xx → `plan_failed` with reason
      `pr_closed_without_merge`;
    - linked run terminal-failed/cancelled → `plan_failed` with
-     reason `` `child_${reason ?? 'failed'}` ``.
+     reason `` `child_${reason ?? 'failed'}` `` — UNLESS the failure
+     cause is retryable and the child still has its one automatic
+     retry left (see the child-retry rule below).
 3. If no in-flight child, call `pickNextPending`:
    - null → `plan_succeeded` (transition the parent row, stamp
      `endedAt`);
@@ -98,7 +107,28 @@ Transitions, per advance call:
 Every transition is mirrored as a system event on the most-recently-
 dispatched child run via the existing emit seam — kinds: `plan_run.advanced`,
 `plan_run.dispatched`, `plan_run.waiting_for_merge`, `plan_run.merged`,
-`plan_run.failed`, `plan_run.succeeded`.
+`plan_run.failed`, `plan_run.succeeded`, `plan_run.child_retried`.
+
+**Automatic child retry (warren-6de9).** A child run that terminalizes
+`failed` with a retryable failure cause gets ONE automatic re-dispatch —
+a fresh run, same seed, same rendered prompt — before the coordinator
+declares the plan-run failed. The retryable-cause list lives in
+`src/plan-runs/retry.ts` (`RETRYABLE_CHILD_FAILURE_REASONS`, today just
+`provider_error`: a transient upstream 5xx says nothing about the
+workspace, prompt, or seed, so a fresh run has a real chance). The
+decision is two pure predicates — `isRetryableChildFailure(reason)` and
+`hasChildRetryBudget(child)` — so a second cause (warren-4af7,
+infra-lost runs) joins by appending to the list. The budget is
+per-child (`MAX_CHILD_RETRIES = 1`), persisted on
+`plan_run_children.retry_count`, so a coordinator restart or re-driven
+tick never grants a fresh retry; a second consecutive provider error on
+the same child fails the plan-run with `child_provider_error` as before.
+The re-dispatch re-points the child's `run_id` at the new run and emits
+`plan_run.child_retried` on the NEW run id (payload: `previousRunId`,
+`failureReason`, `retryCount`) so the plan-run event tail — which fans
+out over current child run ids — keeps the retry visible on the UI
+timeline. A spawn failure during retry falls back to the ordinary
+`dispatch_failed:` terminal path.
 
 **Trivial-merge advance rule.** A child run that succeeded but produced
 no commits is treated as merged without ever opening a PR. The signal
@@ -140,6 +170,28 @@ child. This makes PlanRun safe to re-invoke as a "resume from the
 next open child" operation without bookkeeping about which previous
 plan-run owned which child.
 
+**Resume semantics on the same row (warren-1eff).** Re-dispatch does
+not fit the merge-timeout failure shapes: when a child's PR waits on a
+human merge past the merge-wait budget (`child_pr_merge_timeout`), the
+child's seed is already CLOSED while its PR is still unmerged, so a
+fresh `POST /plan-runs` would skip it and bypass the merge gate.
+`POST /plan-runs/:id/resume` re-drives the SAME plan-run row instead.
+It accepts only the two human-merge-stall failure reasons —
+`child_pr_merge_timeout` and `parent_pr_merge_timeout`; any other state
+or failure reason gets a typed 409 with no state change. For the child
+shape the timed-out child flips `failed → pr_open` preserving its
+`runId` (and thereby its `prUrl`); for the parent shape no child exists
+yet, so only the plan-run row resets. Either way the plan-run goes
+`failed → running` with its `resumed_at` column stamped to the resume
+moment — the merge clock derives from the later of `run.endedAt` and
+`planRun.resumedAt` (`mergeWaitBaseline`), so the wait budget re-arms
+instead of instantly re-timing out on the stale `run.endedAt`. The
+coordinator's next tick then re-polls the EXISTING PR: merged → advance
+to the next child (no new run for the completed one); still open → wait
+within the fresh budget. `pr_closed_without_merge`, `dispatch_failed`,
+and `child_seed_not_found` remain genuine failures and are not
+resumable.
+
 **Server API.**
 
 ```
@@ -147,11 +199,12 @@ POST   /plan-runs                 dispatch (rejects without project.hasSeeds)
 GET    /plan-runs                 list (filter by project / state)
 GET    /plan-runs/:id             detail + fanned-out child runs[]
 POST   /plan-runs/:id/cancel      sets state='cancelled', cancels in-flight run
+POST   /plan-runs/:id/resume      re-drives the same row after a merge timeout (warren-1eff)
 GET    /plan-runs/:id/events      tails the union of every child run's events
 ```
 
 The dispatch handler rejects in this order: (1) project not found →
-404; (2) `!project.hasSeeds` → `ProjectLacksSeedsError` (typed 400,
+404; (2) `!project.hasSeeds` → `ProjectLacksTrackerError` (typed 400, wire code `project_lacks_seeds` unchanged,
 recoveryHint references adding `.seeds/`); (3) plan status ∉
 {`approved`,`active`,`done`} or empty children → `ValidationError` /
 `PlanHasNoOpenChildrenError`; (4) every child already closed → also
@@ -177,8 +230,8 @@ plan including one docs-only child that exercises the trivial-merge
 branch; assertions on terminal state (`succeeded`, all children
 `merged`); a second dispatch against the same plan id after closing
 one child out-of-band, asserting the close advances to `skipped`
-without a new run; stubbed `WARREN_GH_FETCH_OVERRIDE` for the PR-merge
-poll so the harness stays deterministic.
+without a new run; the PR-merge poll ran against FakeForge
+(`WARREN_FORGE=fake`, warren-2600) so the harness stays deterministic.
 
 ## Ready-to-dispatch surface (pl-3fc4, 2026-06-20)
 

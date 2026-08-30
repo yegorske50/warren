@@ -28,7 +28,7 @@ describe("advancePlanRun — completion phase", () => {
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -46,17 +46,19 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+			runId,
+			state: "pr_open",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const later = new Date(NOW.getTime() + 60 * 60 * 1000); // +1h, past 30m default
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -80,16 +82,18 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+			runId,
+			state: "pr_open",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "merged", mergedAt: "2026-05-17T01:00:00.000Z" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -115,16 +119,18 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+			runId,
+			state: "pr_open",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "closed_unmerged" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -141,10 +147,10 @@ describe("advancePlanRun — completion phase", () => {
 		expect(h.events.some((e) => e.kind === "plan_run.failed")).toBe(true);
 	});
 
-	test.each<[number, string]>([
-		[404, "Not Found"],
-		[410, "Gone"],
-	])("pr_open + http %i poll → plan_failed pr_closed_without_merge (warren-eccd)", async (status, message) => {
+	test.each([
+		"Not Found",
+		"Gone",
+	])("pr_open + not_found poll (%s) → plan_failed pr_closed_without_merge (warren-eccd)", async (detail) => {
 		await h.repos.planRuns.transitionTo(h.planRun.id, "running", {
 			startedAt: NOW.toISOString(),
 		});
@@ -152,22 +158,24 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+			runId,
+			state: "pr_open",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
-			checkPrMerged: async () => ({ kind: "http_error", status, message }),
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: async () => ({ kind: "forge_error", errorKind: "not_found", detail }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
 			now: () => NOW,
 		});
-		// 404/410 mean the PR is genuinely gone → fail the plan.
+		// not_found means the PR is genuinely gone → fail the plan.
 		expect(result.kind).toBe("plan_failed");
 		if (result.kind === "plan_failed") {
 			expect(result.reason).toBe("pr_closed_without_merge");
@@ -180,11 +188,11 @@ describe("advancePlanRun — completion phase", () => {
 		expect(failedEvent?.payload.reason).toBe("pr_closed_without_merge");
 	});
 
-	test.each<[number, string]>([
-		[401, "Unauthorized"],
-		[403, "Forbidden"],
-		[429, "rate limit"],
-	])("pr_open + http %i poll keeps waiting, not pr_closed_without_merge (warren-eccd)", async (status, message) => {
+	test.each([
+		"unauthorized",
+		"forbidden",
+		"rate_limited",
+	] as const)("pr_open + %s poll keeps waiting, not pr_closed_without_merge (warren-eccd)", async (errorKind) => {
 		await h.repos.planRuns.transitionTo(h.planRun.id, "running", {
 			startedAt: NOW.toISOString(),
 		});
@@ -192,23 +200,25 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.runs.setPrUrl(runId, "https://github.com/x/y/pull/42");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "pr_open", startedAt: NOW.toISOString() },
+			runId,
+			state: "pr_open",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
-			checkPrMerged: async () => ({ kind: "http_error", status, message }),
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: async () => ({ kind: "forge_error", errorKind, detail: errorKind }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
 			now: () => NOW,
 		});
-		// 401/403/429 are "cannot verify right now" (auth blip / rate
-		// limit) — keep waiting, bounded by the merge-wait budget
+		// unauthorized/forbidden/rate_limited are "cannot verify right now"
+		// (auth blip / rate limit) — keep waiting, bounded by the merge-wait budget
 		// (warren-3937). Do NOT fail the plan; no plan_run.failed event.
 		expect(result.kind).toBe("waiting_for_merge");
 		const reloaded = await h.repos.planRuns.require(h.planRun.id);
@@ -222,16 +232,18 @@ describe("advancePlanRun — completion phase", () => {
 		const runId = await h.makeRun("warren-a");
 		await h.repos.runs.markRunning(runId, NOW);
 		await h.repos.runs.finalize(runId, "failed", NOW, "crashed");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+			runId,
+			state: "running",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -251,16 +263,18 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.markRunning(runId, NOW);
 		// reap flips a zero-commit + dirty-tree run to failed/dropped_commit.
 		await h.repos.runs.finalize(runId, "failed", NOW, "dropped_commit");
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+			runId,
+			state: "running",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -282,22 +296,24 @@ describe("advancePlanRun — completion phase", () => {
 		// Insert an empty-push event so the coordinator's trivial-merge probe finds it.
 		await h.repos.events.append({
 			runId,
-			burrowEventSeq: 1,
+			sandboxEventSeq: 1,
 			ts: NOW.toISOString(),
 			kind: "reap.empty_push",
 			stream: "system",
 			payload: { branch: "burrow/run", baseBranch: "main", message: "no commits" },
 		});
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+			runId,
+			state: "running",
+			startedAt: NOW.toISOString(),
 		});
 		const planRun = await h.repos.planRuns.require(h.planRun.id);
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -321,16 +337,18 @@ describe("advancePlanRun — completion phase", () => {
 		await h.repos.runs.finalize(runId, "succeeded", NOW);
 		await h.repos.events.append({
 			runId,
-			burrowEventSeq: 1,
+			sandboxEventSeq: 1,
 			ts: NOW.toISOString(),
 			kind: "reap.empty_push",
 			stream: "system",
 			payload: { branch: "burrow/run", baseBranch: "main", message: "no commits" },
 		});
-		await h.repos.planRuns.updateChild({
+		await h.seedChildState({
 			planRunId: h.planRun.id,
 			seq: 1,
-			patch: { runId, state: "running", startedAt: NOW.toISOString() },
+			runId,
+			state: "running",
+			startedAt: NOW.toISOString(),
 		});
 		return runId;
 	}
@@ -341,7 +359,7 @@ describe("advancePlanRun — completion phase", () => {
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedNotFound,
+			getIssue: h.getIssueNotFound,
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -375,7 +393,7 @@ describe("advancePlanRun — completion phase", () => {
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -396,7 +414,7 @@ describe("advancePlanRun — completion phase", () => {
 		const result = await advancePlanRun({
 			planRun,
 			repos: h.repos,
-			showSeed: h.showSeedTransient,
+			getIssue: h.getIssueTransient,
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,

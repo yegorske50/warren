@@ -1,14 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { getTableColumns } from "drizzle-orm";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import { type RunRow, runs } from "../../db/schema.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { bearerAuth, publicReadAuth } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle } from "../types.ts";
 import { PUBLIC_RUN_FIELDS, REDACTED_RUN_FIELDS } from "./runs/lifecycle.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
 
 /**
  * Public projections for `GET /runs` and `GET /runs/:id` (warren-946f /
@@ -24,13 +24,8 @@ import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
 const TOKEN = "s3cret";
 
 /** A burrow client that 404s everything — no route here reaches it. */
-function inertBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(
-			async () => new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 }),
-		),
-	});
+function inertSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 describe("run field classification (warren-946f)", () => {
@@ -44,12 +39,12 @@ describe("run field classification (warren-946f)", () => {
 
 	test("the redacted set is exactly the fields pl-b82d named", () => {
 		expect([...REDACTED_RUN_FIELDS].sort()).toEqual([
-			"burrowId",
-			"burrowRunId",
 			"previewFailureMessage",
 			"renderedAgentJson",
 			// warren-cd3b: a host filesystem path is internal topology.
 			"salvagePath",
+			"sandboxId",
+			"sandboxRunId",
 			"workerId",
 		]);
 	});
@@ -98,8 +93,8 @@ describe("GET /runs projections under WARREN_AUTH=public (warren-946f)", () => {
 			prompt: "fix the flaky test",
 			renderedAgentJson: { frontmatter: { provider: "anthropic", model: "opus" } },
 			trigger: "manual",
-			burrowId: "bur_1",
-			burrowRunId: "burun_1",
+			sandboxId: "bur_1",
+			sandboxRunId: "burun_1",
 			workerId: "worker_1",
 		});
 		runId = row.id;
@@ -110,7 +105,7 @@ describe("GET /runs projections under WARREN_AUTH=public (warren-946f)", () => {
 			previewState: "failed",
 			previewFailureMessage: "bun install exited 1: EACCES /root/.bun",
 		});
-		handle = startServer(await depsFor(repos, inertBurrowClient()), {
+		handle = startServer(await depsFor(repos, inertSandboxClient()), {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth: publicReadAuth(bearerAuth(TOKEN)),
 			logger: silentLogger,
@@ -159,8 +154,28 @@ describe("GET /runs projections under WARREN_AUTH=public (warren-946f)", () => {
 		expect(run?.state).toBe("succeeded");
 	});
 
-	test("anonymous GET /runs/:id emits exactly the public field set", async () => {
-		const run = await get(`/runs/${runId}`);
+	test("anonymous GET /runs/:id round-trips the dispatch-supplied ref (warren-afeb)", async () => {
+		const project = (await repos.projects.listAll())[0];
+		if (!project) throw new Error("project missing");
+		const row = await repos.runs.create({
+			agentName: "claude-code",
+			projectId: project.id,
+			prompt: "repair the PR",
+			renderedAgentJson: { frontmatter: {} },
+			trigger: "manual",
+			ref: "fix/pr-head",
+		});
+		const body = await get(`/runs/${row.id}`);
+		expect((body.run as Record<string, unknown>).ref).toBe("fix/pr-head");
+		// The ref-less sibling row reads null, never undefined/absent.
+		const other = await get(`/runs/${runId}`);
+		expect((other.run as Record<string, unknown>).ref).toBeNull();
+	});
+
+	test("anonymous GET /runs/:id wraps the public field set in {run} (warren-7d84)", async () => {
+		const body = await get(`/runs/${runId}`);
+		expect(Object.keys(body)).toEqual(["run"]);
+		const run = body.run as Record<string, unknown>;
 		expect(Object.keys(run).sort()).toEqual([...PUBLIC_RUN_FIELDS].sort());
 		for (const dropped of REDACTED_RUN_FIELDS) {
 			expect(run).not.toHaveProperty(dropped);
@@ -176,19 +191,40 @@ describe("GET /runs projections under WARREN_AUTH=public (warren-946f)", () => {
 		}
 	});
 
-	test("the operator body is the full row plus the cost rollup", async () => {
+	test("the operator body is the full row plus the cost rollup and cap overlay (warren-f8a2)", async () => {
 		const stored = await repos.runs.require(runId);
 		const body = await get("/runs", TOKEN);
 		const list = body.runs as Record<string, unknown>[];
-		expect(Object.keys(list[0] ?? {}).sort()).toEqual(Object.keys(stored).sort());
+		// The list overlays the dispatch-context spend cap on each row — a
+		// field the stored row itself does not carry. No context row exists
+		// for this run, so it reads null, never absent.
+		expect(new Set(Object.keys(list[0] ?? {}))).toEqual(
+			new Set([...Object.keys(stored), "maxCostUsd"]),
+		);
+		expect(list[0]?.maxCostUsd).toBeNull();
 		expect(body.costTotalUsd).toBe(1.25);
 		expect(body.costPricedCount).toBe(1);
-		const detail = await get(`/runs/${runId}`, TOKEN);
+		const detailBody = await get(`/runs/${runId}`, TOKEN);
+		expect(Object.keys(detailBody)).toEqual(["run"]);
+		const detail = detailBody.run as Record<string, unknown>;
+		// Detail GETs stay the bare row: the cap overlay is a list-only join.
 		expect(Object.keys(detail).sort()).toEqual(Object.keys(stored).sort());
-		expect(detail.burrowId).toBe("bur_1");
+		expect(detail.sandboxId).toBe("bur_1");
 		expect(detail.renderedAgentJson).toEqual({
 			frontmatter: { provider: "anthropic", model: "opus" },
 		});
+	});
+
+	test("the operator list carries the dispatch-context cap; spectators never do (warren-f8a2)", async () => {
+		await repos.dispatchContext.insert({
+			runId,
+			createdAt: "2026-07-01T00:00:00.000Z",
+			maxCostUsd: 5,
+		});
+		const authed = await get("/runs", TOKEN);
+		expect((authed.runs as Record<string, unknown>[])[0]?.maxCostUsd).toBe(5);
+		const anon = await get("/runs");
+		expect((anon.runs as Record<string, unknown>[])[0]).not.toHaveProperty("maxCostUsd");
 	});
 
 	test("the operator envelope keeps its historical key order", async () => {

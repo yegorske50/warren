@@ -3,8 +3,8 @@ import { tailRunEvents } from "../../../runs/index.ts";
 import { ndjsonResponse } from "../../response.ts";
 import { reserveEventStreamSlot } from "../../stream-limits.ts";
 import type { Actor, RouteHandler, ServerDeps } from "../../types.ts";
-import { parseBoolean, parseNonNegativeInt, requireParam } from "../index.ts";
-import { projectEvent } from "./event-projection.ts";
+import { parseBoolean, parseNonNegativeInt, parsePositiveInt, requireParam } from "../index.ts";
+import { projectedWireEvent, type WireEventRow } from "./event-projection.ts";
 
 export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
@@ -19,7 +19,12 @@ export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 		// run, not replay-then-close. Terminal runs keep replay-then-close;
 		// an explicit `?follow=0|1` always wins.
 		const followParam = parseBoolean(ctx.url.searchParams.get("follow"), "follow");
-		const follow = followParam ?? !isTerminalRunState(run.state);
+		// warren-17c1: `?limit=N` is a bounded NON-streaming read — at most N
+		// events, then the response closes. It implies follow=false and wins
+		// over an explicit `?follow=1`, because the caller asked for a cheap
+		// page (liveness polls), not a held-open stream.
+		const limit = parsePositiveInt(ctx.url.searchParams.get("limit"), "limit");
+		const follow = limit === undefined ? (followParam ?? !isTerminalRunState(run.state)) : false;
 		const sinceSeq = parseNonNegativeInt(ctx.url.searchParams.get("since"), "since");
 
 		const ctrl = bridgeAbort(ctx.request.signal);
@@ -38,6 +43,7 @@ export function streamRunEventsHandler(deps: ServerDeps): RouteHandler {
 			broker: deps.broker,
 			follow,
 			...(sinceSeq !== undefined ? { sinceSeq } : {}),
+			...(limit !== undefined ? { snapshotLimit: limit } : {}),
 			signal: ctrl.signal,
 			// warren-7bff: close the tail promptly when the run finishes even
 			// if no live bridge remains to `broker.close` it (warren restart,
@@ -132,31 +138,18 @@ export function asNdjsonStream<T>(
 
 /**
  * Encode one event row as an NDJSON line, narrowed for `actor`
- * (warren-1cb7). The seven envelope keys are an allowlist by
+ * (warren-1cb7). The eight envelope keys are an allowlist by
  * construction; `projectEvent` owns the payload half and returns `null`
  * for an event a `readPublic`-only caller must not see at all.
+ *
+ * `origin` (warren-5a07) is classified spectator-safe: it is
+ * provenance metadata (`"agent"` vs warren-authored), on par with
+ * `stream`, and carries no payload content. NULL (historical rows,
+ * warren-authored internal appends) stays null on the wire — unknown,
+ * never folded into a real bucket.
  */
-export function eventToNdjson(
-	row: {
-		id: number;
-		runId: string;
-		burrowEventSeq: number;
-		ts: string;
-		kind: string;
-		stream: string | null;
-		payloadJson: unknown;
-	},
-	actor?: Actor,
-): string | null {
-	const projected = projectEvent(row, actor);
+export function eventToNdjson(row: WireEventRow, actor?: Actor): string | null {
+	const projected = projectedWireEvent(row, actor);
 	if (projected === null) return null;
-	return `${JSON.stringify({
-		id: projected.id,
-		runId: projected.runId,
-		seq: projected.burrowEventSeq,
-		ts: projected.ts,
-		kind: projected.kind,
-		stream: projected.stream,
-		payload: projected.payloadJson,
-	})}\n`;
+	return `${JSON.stringify(projected)}\n`;
 }

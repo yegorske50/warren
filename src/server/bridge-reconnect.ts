@@ -4,7 +4,7 @@
  * `runWithReconnect` runs `bridgeRunStream` in a backoff loop, surfaces degraded
  * state via `bridge_stalled` / `bridge_recovered` events (warren-6376), gives up
  * past a hard stall ceiling (warren-af76), reaps inline on terminal-detect, and
- * reconciles ghost runs (warren-b1a9) via `reconcileLostBurrowRun` (also called
+ * reconciles ghost runs (warren-b1a9) via `reconcileLostSandboxRun` (also called
  * at boot). Lost-run sandbox teardown lives in `./bridge-reconnect-teardown.ts`.
  */
 
@@ -19,11 +19,13 @@ import {
 	type BridgeRunStreamInput,
 	type BridgeRunStreamResult,
 	bindBridgeLogger,
+	isInfraLostRunFailure,
 	type RunEventBroker,
 	type WatchdogReap,
 } from "../runs/index.ts";
 import type { RuntimeProvider } from "../runtime/contract.ts";
 import type { SeedsCliDeps } from "../seeds-cli/index.ts";
+import type { IssueTracker } from "../tracker/contract.ts";
 import type { WarrenConfigCache } from "../warren-config/index.ts";
 import {
 	resolveProjectPreviewConfig,
@@ -39,14 +41,14 @@ export const TERMINAL_RUN_STATES: ReadonlySet<RunState> = new Set([
 
 export interface RunWithReconnectInput {
 	readonly runId: string;
-	readonly burrowRunId: string;
-	readonly burrowId: string;
+	readonly sandboxRunId: string;
+	readonly sandboxId: string;
 	readonly repos: Repos;
 	readonly broker: RunEventBroker;
 	/**
 	 * Runtime-provider seam (warren-c531 / warren-5a3f). Forwarded into every
 	 * `bridgeRunStream` pass so the event stream + run-state poller speak the ACTIVE
-	 * backend (`streamEvents`/`status`), and into `reconcileLostBurrowRun` so lost-run
+	 * backend (`streamEvents`/`status`), and into `reconcileLostSandboxRun` so lost-run
 	 * teardown routes through `provider.terminate()`. The registry threads the
 	 * boot-resolved instance; the reconnect loop never speaks the burrow dialect.
 	 */
@@ -60,7 +62,7 @@ export interface RunWithReconnectInput {
 	 * warren-af76: hard ceiling on consecutive errored reconnects with no
 	 * forward progress. Past it the bridge stops looping against an
 	 * unresponsive-but-present burrow and finalizes the run `failed` with
-	 * `failure_reason='burrow_unreachable'`. Must be `>= stallThreshold`.
+	 * `failure_reason='sandbox_unreachable'`. Must be `>= stallThreshold`.
 	 */
 	readonly stallCeiling: number;
 	readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
@@ -73,10 +75,13 @@ export interface RunWithReconnectInput {
 	readonly previewLaunchConfig?: PreviewLaunchConfig;
 	/**
 	 * Optional seeds-CLI seam (warren-41d5). Forwarded to the inline reap
-	 * call so the auto_plan_run sub-step validates a new plan's child seeds
-	 * before dispatching a plan-run.
+	 * call so the auto_plan_run sub-step validates child seeds first.
 	 */
 	readonly seedsCli?: SeedsCliDeps;
+	/** Boot-resolved IssueTracker (warren-5819) — seam for the inline reap call. */
+	readonly issueTracker?: IssueTracker;
+	/** Infra-lost auto-retry hook (warren-4af7), forwarded to the 404 reconcile. */
+	readonly onInfraLostRun?: (runId: string) => Promise<void>;
 }
 
 /**
@@ -88,10 +93,10 @@ export interface RunWithReconnectInput {
 export async function runWithReconnect(
 	input: RunWithReconnectInput,
 ): Promise<BridgeRunStreamResult> {
-	// warren-9f06: bind run_id + burrow_run_id once; downstream lines add `event`.
+	// warren-9f06: bind run_id + sandbox_run_id once; downstream lines add `event`.
 	const log = bindBridgeLogger(input.logger, {
 		run_id: input.runId,
-		burrow_run_id: input.burrowRunId,
+		sandbox_run_id: input.sandboxRunId,
 	});
 	let totalWritten = 0;
 	let totalSkipped = 0;
@@ -103,8 +108,8 @@ export async function runWithReconnect(
 	while (true) {
 		const bridgeInput: BridgeRunStreamInput = {
 			runId: input.runId,
-			burrowRunId: input.burrowRunId,
-			burrowId: input.burrowId,
+			sandboxRunId: input.sandboxRunId,
+			sandboxId: input.sandboxId,
 			repos: input.repos,
 			broker: input.broker,
 			// warren-1fce / warren-5a3f: bridge requires the provider seam; the registry
@@ -128,7 +133,7 @@ export async function runWithReconnect(
 					repos: input.repos,
 					broker: input.broker,
 					kind: "bridge_recovered",
-					payload: { burrowRunId: input.burrowRunId, totalWritten },
+					payload: { sandboxRunId: input.sandboxRunId, totalWritten },
 					logger: log,
 				});
 				log.info(
@@ -140,20 +145,21 @@ export async function runWithReconnect(
 			attempt = 0;
 		}
 
-		if (result.burrowRunMissing === true) {
+		if (result.sandboxRunMissing === true) {
 			// warren-b1a9: burrow returned 404 mid-stream. The run is
 			// unrecoverable — reconcile the warren row to `failed` so the UI,
 			// /readyz, and the next bootBridges pass all stop treating it as
 			// live. Don't reconnect; the only thing waiting on the wire is
 			// another 404.
-			await reconcileLostBurrowRun({
+			await reconcileLostSandboxRun({
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				repos: input.repos,
 				broker: input.broker,
 				// warren-a7cb: route lost-run teardown through the active backend.
 				runtimeProvider: input.runtimeProvider,
 				logger: log,
+				...(input.onInfraLostRun !== undefined ? { onInfraLostRun: input.onInfraLostRun } : {}),
 			});
 			return { written: totalWritten, skipped: totalSkipped, errored: false };
 		}
@@ -198,6 +204,7 @@ export async function runWithReconnect(
 						: {}),
 					...(prTemplate !== undefined ? { prTemplate } : {}),
 					...(input.seedsCli !== undefined ? { seedsCli: input.seedsCli } : {}),
+					...(input.issueTracker !== undefined ? { issueTracker: input.issueTracker } : {}),
 				});
 			} catch (err) {
 				log.error(
@@ -254,7 +261,7 @@ export async function runWithReconnect(
 				repos: input.repos,
 				broker: input.broker,
 				kind: "bridge_stalled",
-				payload: { burrowRunId: input.burrowRunId, attempts: attempt },
+				payload: { sandboxRunId: input.sandboxRunId, attempts: attempt },
 				logger: log,
 			});
 			log.warn(
@@ -264,21 +271,21 @@ export async function runWithReconnect(
 			stalled = true;
 		}
 		// warren-af76: hard stall ceiling. Without this, an up-but-unresponsive
-		// burrow (socket probe times out ⇒ `burrowRunMissing:false`) reconnects
-		// forever and the run wedges in `running`; finalize `burrow_unreachable`.
+		// burrow (socket probe times out ⇒ `sandboxRunMissing:false`) reconnects
+		// forever and the run wedges in `running`; finalize `sandbox_unreachable`.
 		if (attempt >= input.stallCeiling) {
 			log.error(
 				{ event: "bridge.giving_up", attempts: attempt },
 				"bridge giving up: burrow unreachable past stall ceiling; finalizing run as failed",
 			);
-			await reconcileLostBurrowRun({
+			await reconcileLostSandboxRun({
 				runId: input.runId,
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				repos: input.repos,
 				broker: input.broker,
 				// warren-a7cb: route lost-run teardown through the active backend.
 				runtimeProvider: input.runtimeProvider,
-				failureReason: "burrow_unreachable",
+				failureReason: "sandbox_unreachable",
 				logger: log,
 			});
 			return { written: totalWritten, skipped: totalSkipped, errored: true };
@@ -315,7 +322,7 @@ async function emitBridgeSystemEvent(input: EmitBridgeSystemEventInput): Promise
 		const seq = ((await input.repos.events.maxSeqForRun(input.runId)) ?? 0) + 1;
 		const row = await input.repos.events.append({
 			runId: input.runId,
-			burrowEventSeq: seq,
+			sandboxEventSeq: seq,
 			ts: new Date().toISOString(),
 			kind: input.kind,
 			stream: "system",
@@ -334,9 +341,9 @@ async function emitBridgeSystemEvent(input: EmitBridgeSystemEventInput): Promise
 	}
 }
 
-interface ReconcileLostBurrowRunInput {
+interface ReconcileLostSandboxRunInput {
 	readonly runId: string;
-	readonly burrowRunId: string;
+	readonly sandboxRunId: string;
 	readonly repos: Repos;
 	readonly broker: RunEventBroker;
 	/** warren-9f06: bound at the call site; the boot reconciler may omit it. */
@@ -344,10 +351,15 @@ interface ReconcileLostBurrowRunInput {
 	readonly now?: () => Date;
 	/**
 	 * warren-af76: failure reason for `runs.finalize` + `bridge_lost`.
-	 * Default `'burrow_run_lost'`; stall-ceiling caller passes
-	 * `'burrow_unreachable'`.
+	 * Default `'sandbox_run_lost'`; stall-ceiling caller passes
+	 * `'sandbox_unreachable'`.
 	 */
 	readonly failureReason?: RunFailureReason;
+	/**
+	 * Infra-lost auto-retry hook (warren-4af7), fired after a successful
+	 * infra-lost finalize — see `src/runs/retry/infra-lost-retry.ts`. Fire-and-log.
+	 */
+	readonly onInfraLostRun?: (runId: string) => Promise<void>;
 	/**
 	 * warren-a7cb / warren-5a3f: active backend the lost-run teardown routes through
 	 * (`provider.terminate` — K8s pod delete / burrow destroy) so a wedged run's
@@ -359,33 +371,33 @@ interface ReconcileLostBurrowRunInput {
 
 /**
  * warren-b1a9: transition a non-terminal warren run to `failed` with
- * `failure_reason='burrow_run_lost'` and emit a `bridge_lost` audit event.
+ * `failure_reason='sandbox_run_lost'` and emit a `bridge_lost` audit event.
  * Used both by the live-bridge 404 catch and by the boot-time reconciler.
  * Idempotent: an already-terminal run is left alone (the event is still
  * appended). The state machine forbids `queued → failed` directly, so this
  * mirrors reap's `markRunning` shim for queued ghost runs.
  */
-export async function reconcileLostBurrowRun(input: ReconcileLostBurrowRunInput): Promise<void> {
+export async function reconcileLostSandboxRun(input: ReconcileLostSandboxRunInput): Promise<void> {
 	const now = (input.now ?? (() => new Date()))();
-	const failureReason: RunFailureReason = input.failureReason ?? "burrow_run_lost";
+	const failureReason: RunFailureReason = input.failureReason ?? "sandbox_run_lost";
 	const log = bindBridgeLogger(input.logger, {
 		run_id: input.runId,
-		burrow_run_id: input.burrowRunId,
+		sandbox_run_id: input.sandboxRunId,
 	});
 	let finalized = false;
-	let burrowToDestroy: { id: string; mode: RunMode } | null = null;
+	let sandboxToDestroy: { id: string; mode: RunMode } | null = null;
 	try {
 		const run = await input.repos.runs.get(input.runId);
 		if (run === null) {
 			return;
 		}
-		if (run.burrowId !== null) {
-			burrowToDestroy = { id: run.burrowId, mode: run.mode };
+		if (run.sandboxId !== null) {
+			sandboxToDestroy = { id: run.sandboxId, mode: run.mode };
 		}
 		if (TERMINAL_RUN_STATES.has(run.state)) {
 			log.info(
 				{ event: "bridge.reconcile_skipped", state: run.state },
-				"reconcileLostBurrowRun: run already terminal; skipping finalize",
+				"reconcileLostSandboxRun: run already terminal; skipping finalize",
 			);
 		} else {
 			if (run.state === "queued") {
@@ -400,19 +412,19 @@ export async function reconcileLostBurrowRun(input: ReconcileLostBurrowRunInput)
 				event: "bridge.reconcile_finalize_failed",
 				err: err instanceof Error ? err.message : String(err),
 			},
-			"reconcileLostBurrowRun: failed to finalize run",
+			"reconcileLostSandboxRun: failed to finalize run",
 		);
 	}
 	try {
 		const seq = ((await input.repos.events.maxSeqForRun(input.runId)) ?? 0) + 1;
 		const row: EventRow = await input.repos.events.append({
 			runId: input.runId,
-			burrowEventSeq: seq,
+			sandboxEventSeq: seq,
 			ts: now.toISOString(),
 			kind: "bridge_lost",
 			stream: "system",
 			payload: {
-				burrowRunId: input.burrowRunId,
+				sandboxRunId: input.sandboxRunId,
 				reason: failureReason,
 				finalized,
 			},
@@ -424,18 +436,18 @@ export async function reconcileLostBurrowRun(input: ReconcileLostBurrowRunInput)
 				event: "bridge.lost_event_failed",
 				err: err instanceof Error ? err.message : String(err),
 			},
-			"reconcileLostBurrowRun: failed to emit bridge_lost event",
+			"reconcileLostSandboxRun: failed to emit bridge_lost event",
 		);
 	}
 	// warren-4f01 / warren-a7cb / warren-5a3f: tear down the sandbox (the terminal
 	// run's later `reapRun` short-circuits without doing it) via the provider seam
 	// — see `./bridge-reconnect-teardown.ts`, which calls `provider.terminate()` on
 	// the boot-resolved backend so nothing here speaks burrow.
-	if (burrowToDestroy !== null) {
+	if (sandboxToDestroy !== null) {
 		await teardownLostRunWorkspace({
 			runId: input.runId,
-			burrowRunId: input.burrowRunId,
-			burrow: burrowToDestroy,
+			sandboxRunId: input.sandboxRunId,
+			sandbox: sandboxToDestroy,
 			runtimeProvider: input.runtimeProvider,
 			emit: (kind, payload) =>
 				emitBridgeSystemEvent({
@@ -451,8 +463,20 @@ export async function reconcileLostBurrowRun(input: ReconcileLostBurrowRunInput)
 	}
 	log.warn(
 		{ event: "bridge.reconciled", finalized },
-		"reconciled ghost run: burrow no longer knows this burrow_run_id",
+		"reconciled ghost run: burrow no longer knows this sandbox_run_id",
 	);
+	// warren-4af7: a freshly-finalized infra-lost run earns ONE automatic retry
+	// (src/runs/retry/infra-lost-retry.ts); a stall-ceiling `sandbox_unreachable` does not qualify.
+	if (finalized && isInfraLostRunFailure(failureReason) && input.onInfraLostRun !== undefined) {
+		try {
+			await input.onInfraLostRun(input.runId);
+		} catch (err) {
+			log.error(
+				{ event: "run.retry_failed", err: err instanceof Error ? err.message : String(err) },
+				"infra-lost run retry failed",
+			);
+		}
+	}
 }
 
 export function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {

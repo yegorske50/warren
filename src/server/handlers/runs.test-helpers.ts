@@ -1,7 +1,7 @@
-import { BurrowClient } from "../../burrow-client/index.ts";
 import type { Repos } from "../../db/repos/index.ts";
+import { FakeForge } from "../../forge/fake/fake-forge.ts";
 import { RunEventBroker } from "../../runs/index.ts";
-import { resolveRuntimeProvider } from "../../runtime/registry.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import type { BridgeRegistry, ServeHandle, ServerDeps } from "../types.ts";
 
@@ -9,15 +9,43 @@ import type { BridgeRegistry, ServeHandle, ServerDeps } from "../types.ts";
  * Shared test helpers and stubs for run-related handler tests (warren-6566).
  */
 
-export async function poolFor(_repos: Repos, client: BurrowClient): Promise<BurrowClient> {
-	return client;
-}
-
 export const silentLogger = {
 	info() {},
 	warn() {},
 	error() {},
 };
+
+/**
+ * Recording logger with pino-style `child` binding merge (warren-9ce3).
+ * Use to assert dispatch provenance (`dispatch_origin`, `dispatcher_handle`)
+ * rides onto spawn log lines from HTTP call sites that go through real
+ * `spawnRun` rather than a stubbed `spawnRunFn`.
+ */
+export function makeRecordingLogger(bound: Record<string, unknown> = {}): {
+	logger: {
+		info(obj: object, msg?: string): void;
+		warn(obj: object, msg?: string): void;
+		error(obj: object, msg?: string): void;
+		child(extra: object): unknown;
+	};
+	lines: Array<{ level: string; obj: Record<string, unknown>; msg?: string }>;
+} {
+	const lines: Array<{ level: string; obj: Record<string, unknown>; msg?: string }> = [];
+	const merge = (bindings: Record<string, unknown>, obj: object) => ({
+		...bindings,
+		...(obj as Record<string, unknown>),
+	});
+	const make = (bindings: Record<string, unknown>) => ({
+		info: (obj: object, msg?: string) =>
+			lines.push({ level: "info", obj: merge(bindings, obj), msg }),
+		warn: (obj: object, msg?: string) =>
+			lines.push({ level: "warn", obj: merge(bindings, obj), msg }),
+		error: (obj: object, msg?: string) =>
+			lines.push({ level: "error", obj: merge(bindings, obj), msg }),
+		child: (extra: object) => make(merge(bindings, extra)),
+	});
+	return { logger: make(bound), lines };
+}
 
 export function stub(
 	impl: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>,
@@ -26,78 +54,35 @@ export function stub(
 }
 
 export interface BurrowFixture {
-	burrowId: string;
-	burrowRunId: string;
+	sandboxId: string;
+	sandboxRunId: string;
 	workspacePath: string;
 }
 
-export function makeBurrowClient(
+/**
+ * The provider fake the handler tests dispatch through (warren-ea0a). The
+ * fixture keeps the historical field names — the recorded calls and the
+ * returned handle ids are the same ones the retired burrow stub produced,
+ * so the assertions that pin the provider-boundary payloads read unchanged.
+ */
+export function makeSandboxClient(
 	fix: BurrowFixture,
 	calls: { method: string; path: string; body: unknown }[],
-): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(async (input, init) => {
-			const url = new URL(String(input), "http://localhost");
-			const path = url.pathname;
-			const method = init?.method ?? "GET";
-			const reqBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-			calls.push({ method, path, body: reqBody });
-			if (method === "POST" && path === "/burrows") {
-				const burrow = {
-					id: fix.burrowId,
-					name: "burrow",
-					kind: "task",
-					projectRoot: "/data/projects/x/y",
-					branch: "main",
-					baseBranch: "main",
-					originUrl: "https://github.com/x/y.git",
-					workspacePath: fix.workspacePath,
-					provider: "local",
-					sandbox: { network: "open" },
-					state: "running",
-					createdAt: "2026-05-08T12:00:00Z",
-					updatedAt: "2026-05-08T12:00:00Z",
-				};
-				return new Response(JSON.stringify(burrow), {
-					status: 201,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			if (method === "POST" && path === `/burrows/${fix.burrowId}/runs`) {
-				const run = {
-					id: fix.burrowRunId,
-					burrowId: fix.burrowId,
-					agentId: "refactor-bot",
-					prompt: "hello",
-					resumeOfRunId: null,
-					state: "queued",
-					exitCode: null,
-					errorMessage: null,
-					metadataJson: null,
-					queuedAt: "2026-05-08T12:00:01Z",
-					startedAt: null,
-					completedAt: null,
-				};
-				return new Response(JSON.stringify(run), {
-					status: 201,
-					headers: { "content-type": "application/json" },
-				});
-			}
-			return new Response(
-				JSON.stringify({ error: { code: "not_found", message: `unmatched ${method} ${path}` } }),
-				{
-					status: 404,
-					headers: { "content-type": "application/json" },
-				},
-			);
-		}),
-	});
+): FakeProvider {
+	return new FakeProvider(
+		{
+			sandboxId: fix.sandboxId,
+			providerRunId: fix.sandboxRunId,
+			workspacePath: fix.workspacePath,
+		},
+		undefined,
+		calls,
+	);
 }
 
 export async function depsFor(
 	repos: Repos,
-	burrowClient: BurrowClient,
+	provider: FakeProvider,
 	bridges?: BridgeRegistry,
 	extras?: {
 		finalizeCoordinator?: import("../../runtime/k8s/finalize-coordinator.ts").FinalizeCoordinator;
@@ -108,17 +93,17 @@ export async function depsFor(
 	},
 ): Promise<ServerDeps> {
 	const broker = new RunEventBroker();
-	await poolFor(repos, burrowClient);
 	return {
 		repos,
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+		runtimeProvider: provider,
+		forge: new FakeForge(),
 		broker,
 		bridges:
 			bridges ??
 			createBridgeRegistry({
 				repos,
 				broker,
-				runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+				runtimeProvider: provider,
 				bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 			}),
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },

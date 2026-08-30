@@ -28,8 +28,18 @@
  * by run count then key ascending, so golden/unit tests are stable.
  */
 
-import type { RunFailureReason, RunState } from "../../db/schema.ts";
+import type { PullRequestLifecycle, RunFailureReason, RunState } from "../../db/schema.ts";
+import {
+	buildFailureReasons,
+	buildTopSeeds,
+	type FailureBucket,
+	type SeedContextBucket,
+} from "./run-metrics-breakdowns.ts";
 import { buildTokenDimSeries, buildTokenTimeSeries } from "./run-metrics-token-series.ts";
+
+// The bucket types live in `run-metrics-breakdowns.ts` (file-size split);
+// re-export so existing consumers keep importing from this module.
+export type { FailureBucket, SeedContextBucket } from "./run-metrics-breakdowns.ts";
 
 /**
  * Token-kind breakdown for a set of runs. All four counters plus their sum.
@@ -65,6 +75,20 @@ export interface RunMetricsRow {
 	readonly tokensCacheWrite: number | null;
 	readonly startedAt: string | null;
 	readonly endedAt: string | null;
+	/**
+	 * The queued instant as epoch ms (warren-0af9 / pl-103e step 1). Null on
+	 * rows written before the column existed — those are "unknown", excluded
+	 * from queue-wait denominators, never counted as zero wait.
+	 */
+	readonly createdAt: number | null;
+	/**
+	 * The forge-reported PR lifecycle (warren-3bc6 / pl-103e step 6). Null
+	 * means the merge watcher has never resolved this run's PR (historical
+	 * rows, no `pr_url`, or a PR not yet polled) — landed-work semantics
+	 * (warren-bd57) treat that as "unknown": excluded from merge-rate
+	 * denominators, never counted as a failure to land.
+	 */
+	readonly prState: PullRequestLifecycle | null;
 }
 
 /** avg/median/p95 over the non-null sample, or all-null when the sample is empty. */
@@ -85,7 +109,23 @@ export interface RunTotals {
 	readonly active: number;
 	/** succeeded / (succeeded + failed + cancelled), or null when no terminal runs. */
 	readonly successRate: number | null;
+	/**
+	 * Landed-work rollup (warren-bd57): rows whose `prState` the merge
+	 * watcher has resolved (the merge-rate denominator), how many of those
+	 * merged, and the rate. NULL `prState` rows are unknown and excluded —
+	 * `mergedPrRate` is null when no row carries a resolved PR state.
+	 */
+	readonly prStateKnown: number;
+	readonly prsMerged: number;
+	readonly mergedPrRate: number | null;
 	readonly durationMs: StatSummary;
+	/**
+	 * Queue wait (`startedAt - createdAt`) over rows where both are known
+	 * (warren-0af9). Pre-migration rows (null `createdAt`) and runs that
+	 * never left the queue are excluded from the sample — `count` is the
+	 * known-row denominator.
+	 */
+	readonly queueWaitMs: StatSummary;
 	readonly contextTokens: StatSummary;
 	readonly tokens: TokenBreakdown;
 	readonly cost: {
@@ -113,24 +153,16 @@ export interface RunGroupBucket {
 	readonly failed: number;
 	readonly cancelled: number;
 	readonly successRate: number | null;
+	/** Landed-work rollup for this bucket (warren-bd57) — see `RunTotals`. */
+	readonly prStateKnown: number;
+	readonly prsMerged: number;
+	readonly mergedPrRate: number | null;
 	readonly contextTokensTotal: number;
 	readonly avgContextTokens: number | null;
 	readonly tokens: TokenBreakdown;
 	readonly costUsd: number;
 	readonly priced: number;
 	readonly avgDurationMs: number | null;
-}
-
-export interface FailureBucket {
-	readonly key: string;
-	readonly runs: number;
-}
-
-export interface SeedContextBucket {
-	readonly seedId: string;
-	readonly runs: number;
-	readonly contextTokensTotal: number;
-	readonly avgContextTokens: number | null;
 }
 
 /** One calendar-day's token counts in a time-series. `date` is YYYY-MM-DD or NONE_KEY. */
@@ -187,6 +219,19 @@ export function durationMsOf(row: RunMetricsRow): number | null {
 	return delta < 0 ? null : delta;
 }
 
+/**
+ * Queue wait in milliseconds (`startedAt - createdAt`, warren-0af9), or null
+ * unless both instants are present + valid. A null `createdAt` means the row
+ * predates the column — its wait is unknown, not zero.
+ */
+export function queueWaitMsOf(row: RunMetricsRow): number | null {
+	if (row.createdAt === null || row.startedAt === null) return null;
+	const start = Date.parse(row.startedAt);
+	if (Number.isNaN(start)) return null;
+	const delta = start - row.createdAt;
+	return delta < 0 ? null : delta;
+}
+
 function summarize(values: readonly number[]): StatSummary {
 	if (values.length === 0) return { avg: null, median: null, p95: null, count: 0 };
 	const sorted = [...values].sort((a, b) => a - b);
@@ -226,27 +271,46 @@ function addTokenBreakdowns(a: TokenBreakdown, b: TokenBreakdown): TokenBreakdow
 
 const ZERO_TOKENS: TokenBreakdown = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
 
+/**
+ * Landed-work tallies for one row (warren-bd57). `known` counts rows whose
+ * `prState` is resolved (open / merged / closed_unmerged); `merged` counts
+ * the merged subset. NULL `prState` contributes to neither — unknown is not
+ * a failure to land.
+ */
+function landedOf(row: RunMetricsRow): { known: number; merged: number } {
+	if (row.prState === null) return { known: 0, merged: 0 };
+	return { known: 1, merged: row.prState === "merged" ? 1 : 0 };
+}
+
 function computeTotals(rows: readonly RunMetricsRow[]): RunTotals {
 	let succeeded = 0;
 	let failed = 0;
 	let cancelled = 0;
 	let active = 0;
+	let prStateKnown = 0;
+	let prsMerged = 0;
 	let costTotal = 0;
 	let priced = 0;
 	let tokens: TokenBreakdown = ZERO_TOKENS;
 	const durations: number[] = [];
+	const queueWaits: number[] = [];
 	const contexts: number[] = [];
 	for (const r of rows) {
 		if (r.state === "succeeded") succeeded += 1;
 		else if (r.state === "failed") failed += 1;
 		else if (r.state === "cancelled") cancelled += 1;
 		else active += 1;
+		const landed = landedOf(r);
+		prStateKnown += landed.known;
+		prsMerged += landed.merged;
 		if (r.costUsd !== null) {
 			priced += 1;
 			costTotal += r.costUsd;
 		}
 		const dur = durationMsOf(r);
 		if (dur !== null) durations.push(dur);
+		const wait = queueWaitMsOf(r);
+		if (wait !== null) queueWaits.push(wait);
 		const ctx = contextTokensOf(r);
 		if (ctx !== null) contexts.push(ctx);
 		tokens = addTokenBreakdowns(tokens, tokenBreakdownOf(r));
@@ -259,7 +323,11 @@ function computeTotals(rows: readonly RunMetricsRow[]): RunTotals {
 		cancelled,
 		active,
 		successRate: terminal === 0 ? null : succeeded / terminal,
+		prStateKnown,
+		prsMerged,
+		mergedPrRate: prStateKnown === 0 ? null : prsMerged / prStateKnown,
 		durationMs: summarize(durations),
+		queueWaitMs: summarize(queueWaits),
 		contextTokens: summarize(contexts),
 		tokens,
 		cost: { total: costTotal, avg: priced === 0 ? null : costTotal / priced, priced },
@@ -307,6 +375,8 @@ interface GroupAcc {
 	succeeded: number;
 	failed: number;
 	cancelled: number;
+	prStateKnown: number;
+	prsMerged: number;
 	contextTotal: number;
 	contextCount: number;
 	tokens: TokenBreakdown;
@@ -321,6 +391,8 @@ function emptyGroupAcc(): GroupAcc {
 		succeeded: 0,
 		failed: 0,
 		cancelled: 0,
+		prStateKnown: 0,
+		prsMerged: 0,
 		contextTotal: 0,
 		contextCount: 0,
 		tokens: ZERO_TOKENS,
@@ -335,6 +407,9 @@ function accumulateGroup(g: GroupAcc, r: RunMetricsRow): void {
 	if (r.state === "succeeded") g.succeeded += 1;
 	else if (r.state === "failed") g.failed += 1;
 	else if (r.state === "cancelled") g.cancelled += 1;
+	const landed = landedOf(r);
+	g.prStateKnown += landed.known;
+	g.prsMerged += landed.merged;
 	if (r.costUsd !== null) {
 		g.priced += 1;
 		g.costUsd += r.costUsd;
@@ -358,6 +433,9 @@ function finalizeGroup(key: string, g: GroupAcc): RunGroupBucket {
 		failed: g.failed,
 		cancelled: g.cancelled,
 		successRate: terminal === 0 ? null : g.succeeded / terminal,
+		prStateKnown: g.prStateKnown,
+		prsMerged: g.prsMerged,
+		mergedPrRate: g.prStateKnown === 0 ? null : g.prsMerged / g.prStateKnown,
 		contextTokensTotal: g.contextTotal,
 		avgContextTokens: g.contextCount === 0 ? null : g.contextTotal / g.contextCount,
 		tokens: g.tokens,
@@ -387,57 +465,6 @@ function buildGroup(rows: readonly RunMetricsRow[], dim: GroupDimension): RunGro
 		}
 		if (b.runs !== a.runs) return b.runs - a.runs;
 		return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-	});
-	return out;
-}
-
-function buildFailureReasons(rows: readonly RunMetricsRow[]): FailureBucket[] {
-	const acc = new Map<string, number>();
-	for (const r of rows) {
-		if (r.state !== "failed") continue;
-		const key = r.failureReason ?? NONE_KEY;
-		acc.set(key, (acc.get(key) ?? 0) + 1);
-	}
-	const out: FailureBucket[] = [];
-	for (const [key, runs] of acc) out.push({ key, runs });
-	out.sort((a, b) => {
-		if (b.runs !== a.runs) return b.runs - a.runs;
-		return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
-	});
-	return out;
-}
-
-function buildTopSeeds(rows: readonly RunMetricsRow[]): SeedContextBucket[] {
-	const acc = new Map<string, { runs: number; total: number; count: number }>();
-	for (const r of rows) {
-		if (r.seedId === null) continue; // seed-originated runs only (risk #4)
-		let s = acc.get(r.seedId);
-		if (s === undefined) {
-			s = { runs: 0, total: 0, count: 0 };
-			acc.set(r.seedId, s);
-		}
-		s.runs += 1;
-		const ctx = contextTokensOf(r);
-		if (ctx !== null) {
-			s.total += ctx;
-			s.count += 1;
-		}
-	}
-	const out: SeedContextBucket[] = [];
-	for (const [seedId, s] of acc) {
-		out.push({
-			seedId,
-			runs: s.runs,
-			contextTokensTotal: s.total,
-			avgContextTokens: s.count === 0 ? null : s.total / s.count,
-		});
-	}
-	out.sort((a, b) => {
-		if (b.contextTokensTotal !== a.contextTokensTotal) {
-			return b.contextTokensTotal - a.contextTokensTotal;
-		}
-		if (b.runs !== a.runs) return b.runs - a.runs;
-		return a.seedId < b.seedId ? -1 : a.seedId > b.seedId ? 1 : 0;
 	});
 	return out;
 }

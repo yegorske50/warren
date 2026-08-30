@@ -3,7 +3,8 @@
  *
  * Injects a callback credential + a loopback base URL into a run's burrow
  * env so the agent/finalize harness can call back into warren's own HTTP API
- * (the in-pod steering poll and the two finalize legs). Without a credential
+ * (the in-pod steering poll, the two finalize legs, and the salvage intake).
+ * Without a credential
  * such calls return 401 (`src/server/auth.ts` requires a bearer token) because
  * the burrow otherwise carries only `ANTHROPIC_API_KEY` + `WARREN_QUALITY_GATE`.
  *
@@ -13,7 +14,7 @@
  * run's own callback surface and only while the run is live. On a public
  * instance the sandbox inputs are attacker-influenced (issue/PR text, repo
  * contents, contributed test/build scripts), so a captured callback token must
- * buy nothing beyond the run's own inbox + finalize.
+ * buy nothing beyond the run's own inbox, finalize, and salvage.
  */
 
 import { createHmacRunTokenMinter } from "./run-token.ts";

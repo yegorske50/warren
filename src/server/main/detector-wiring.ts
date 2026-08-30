@@ -15,6 +15,10 @@
 
 import type { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
 import type { Repos } from "../../db/repos/index.ts";
+import type { Forge } from "../../forge/contract.ts";
+import type { ForgeHeartbeatHandle } from "../../forge/github-app/heartbeat.ts";
+import type { MetricsRegistry } from "../../observability/metrics-registry.ts";
+import { createFinalizeRecovery, type FinalizeRecoveryHook } from "../../runs/finalize-recovery.ts";
 import {
 	type AutoOpenPrConfig,
 	bootWatchdog,
@@ -25,9 +29,11 @@ import {
 } from "../../runs/index.ts";
 import { bootOpsStatsWorker, type OpsStatsWorkerHandle } from "../../runs/ops-stats.ts";
 import type { RuntimeProvider } from "../../runtime/contract.ts";
+import { resolveRuntimeKind } from "../../runtime/registry.ts";
 import type { WarrenConfigCache } from "../../warren-config/index.ts";
 import type { EnvLike } from "../config.ts";
 import type { BridgeRegistry, Logger } from "../types.ts";
+import { bootForgeHeartbeatFromEnv } from "./forge-heartbeat-wiring.ts";
 import { bridgeLoggerFromPino } from "./logging.ts";
 
 export interface WatchdogWiringInput {
@@ -68,6 +74,7 @@ export function bootWatchdogFromEnv(input: WatchdogWiringInput): WatchdogHandle 
 		reap: input.reap,
 		heartbeatTimeoutMs: config.heartbeatTimeoutMs,
 		terminalReconcileGraceMs: config.terminalReconcileGraceMs,
+		cancelReconcileGraceMs: config.cancelReconcileGraceMs,
 		tickMs: config.tickMs,
 		disabled: !config.enabled,
 		logger: bridgeLoggerFromPino(logger),
@@ -81,6 +88,7 @@ export function bootWatchdogFromEnv(input: WatchdogWiringInput): WatchdogHandle 
 				tickMs: config.tickMs,
 				heartbeatTimeoutMs: config.heartbeatTimeoutMs,
 				terminalReconcileGraceMs: config.terminalReconcileGraceMs,
+				cancelReconcileGraceMs: config.cancelReconcileGraceMs,
 			},
 			"run watchdog running",
 		);
@@ -111,6 +119,13 @@ export interface BackgroundDetectorWiringInput {
 	 * Runtime-provider seam — forwarded to the watchdog tick.
 	 */
 	readonly runtimeProvider: RuntimeProvider;
+	/**
+	 * The boot-resolved forge (warren-1295) — the GitHub App credential
+	 * heartbeat boots only when this is the `app` provider.
+	 */
+	readonly forge: Forge;
+	/** Counter sink for the forge-heartbeat probe ticks (warren-1295). */
+	readonly metricsRegistry: MetricsRegistry | undefined;
 	readonly logger: Logger;
 	readonly now?: () => Date;
 }
@@ -119,6 +134,18 @@ export interface BackgroundDetectorHandles {
 	readonly watchdog: WatchdogHandle;
 	/** Periodic operational-stats log line (warren-b2dd / pl-f700 step 6). */
 	readonly opsStatsWorker: OpsStatsWorkerHandle;
+	/**
+	 * GitHub App credential heartbeat (warren-1295) — `undefined` unless the
+	 * resolved forge is the App provider and the probe is not opted out.
+	 */
+	readonly forgeHeartbeat: ForgeHeartbeatHandle | undefined;
+	/**
+	 * K8s finalize-intent recovery hook (warren-5202) — turns a run pod's
+	 * post-restart `GET /runs/:id/finalize-intent` misses into a recovery reap
+	 * so the finalize handshake completes instead of deadlocking. `undefined`
+	 * under `local` (no pod ever polls the route there).
+	 */
+	readonly finalizeRecovery: FinalizeRecoveryHook | undefined;
 }
 
 /**
@@ -149,5 +176,28 @@ export function bootBackgroundDetectors(
 		logger: input.logger,
 		env: input.env,
 	});
-	return { watchdog, opsStatsWorker };
+	const forgeHeartbeat = bootForgeHeartbeatFromEnv({
+		env: input.env,
+		forge: input.forge,
+		logger: input.logger,
+		metricsRegistry: input.metricsRegistry,
+	});
+	// warren-5202: a control-plane replacement mid-run wipes the in-memory
+	// finalize coordinator; the surviving pod keeps polling for an intent no
+	// lost reap will ever park. The hook turns that poll into the recovery
+	// signal — a miss that outlives its grace drives a fresh reap, re-parking
+	// the intent so the normal finalize handshake completes. K8s topology only.
+	const finalizeRecovery =
+		resolveRuntimeKind(input.env) === "k8s"
+			? createFinalizeRecovery({
+					repos: input.repos,
+					runtimeProvider: input.runtimeProvider,
+					reap: input.reap,
+					broker: input.broker,
+					autoOpenPr: input.autoOpenPr,
+					logger: bridgeLoggerFromPino(input.logger),
+					...now,
+				})
+			: undefined;
+	return { watchdog, opsStatsWorker, forgeHeartbeat, finalizeRecovery };
 }

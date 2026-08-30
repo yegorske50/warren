@@ -7,38 +7,53 @@ harness and there is nothing to drift.
 
 ## What this project is
 
-Warren is a self-hostable control plane for ephemeral cloud agents.
-Point it at a GitHub repo, pick an agent, write a prompt. Warren spawns
-the agent inside a sandbox, streams events to the UI, accepts steering
-mid-run, then pushes the workspace branch. One container, one volume,
-one HTTP API, one UI.
+Coding agents are tools. Warren turns them into infrastructure.
 
-The fresh-install path is standalone. A user with a GitHub URL and an
-Anthropic key can dispatch a run end-to-end with no other tooling.
-Around that kernel, three [os-eco](https://github.com/jayminwest/os-eco)
-data-plane tools integrate as opt-in features, not required
-infrastructure.
+It runs agent harnesses as isolated workloads on infrastructure the
+operator controls. Warren owns the workspace, lifecycle, limits,
+events, intervention, recovery, and Git delivery.
+
+`AgentRuntimeAdapter` keeps the kernel harness-neutral. A harness needs
+an adapter before the runtime can drive it. The current distribution
+ships Pi and Claude Code adapters.
+
+Runtime providers place each run in a local `bwrap` sandbox on Linux or
+`sandbox-exec` sandbox on macOS, a sibling Docker container, or a
+Kubernetes pod.
+
+The kernel guarantees a pushed workspace branch. Project settings can
+add PR creation and tracker reactions around that boundary.
+
+The fresh-install path is standalone. A user with a GitHub URL and the
+model credential for a shipped harness can dispatch a run end-to-end
+with no other os-eco tooling. Around that kernel, two
+[os-eco](https://github.com/jayminwest/os-eco) data-plane tools integrate
+as opt-in features, not required infrastructure.
 
 - **mulch** — persistent agent memory across runs. Activated by a
   `.mulch/` directory in the project.
 - **seeds** — the integrated issue queue agents read from and write to.
-  Activated by a `.seeds/` directory.
-- **sapling** — alternative steerable coding harness. Ships inline as a
-  built-in agent.
+  Activated by a `.seeds/` directory. Seeds is implementation #1 of the
+  `IssueTracker` seam (`src/tracker/contract.ts`), with external
+  trackers reachable through the `RemoteTracker` bridge — see
+  [docs/design/issue-tracker.md](docs/design/issue-tracker.md).
 
 The agent registry is entirely inline. `BUILTIN_AGENTS`
-(`src/registry/builtins/`) ships eight agents and boot seeds them into
-the agents table on every start: `claude-code`, `sapling`, `pi`,
+(`src/registry/builtins/`) ships seven agents and boot seeds them into
+the agents table on every start: `claude-code`, `pi`,
 `planner`, `nightwatch`, `bugwatch`, `pr-fixer`, and `healer`. There is
 no external agent library. `GET /agents` still reports
 `source: "builtin" | "library"` provenance. The `library` arm survives
 only for legacy rows.
 
 **plan-run** is a dispatch mode over the single-run primitive, unlocked
-by a `.seeds/` plan. `POST /plan-runs` walks a seeds plan's children
-one at a time and gates each on the previous PR merging.
-Re-dispatching the same plan resumes from the next open child. See
-[docs/design/plan-run-coordinator.md](docs/design/plan-run-coordinator.md).
+by a plan in the project's issue tracker — `POST /plan-runs` with
+`planId` (requires a `supportsPlans` tracker, such as a `.seeds/` plan)
+or with an explicit ordered list of issue ids (any tracker). Warren
+walks the children one at a time and gates each on the previous PR
+merging. Re-dispatching the same plan resumes from the next open
+child. See [docs/design/plan-run-coordinator.md](docs/design/plan-run-coordinator.md)
+and the issue-tracker design record.
 
 Plan pl-3a79 retired and deleted two former data-plane features:
 `plot` (a shared coordination substrate) and `canopy` (an external
@@ -49,47 +64,44 @@ the sequencing and [docs/PHILOSOPHY.md](docs/PHILOSOPHY.md) for policy.
 
 Warren runs against a swappable runtime provider, resolved once at boot
 from `WARREN_RUNTIME` (`src/runtime/registry.ts`) behind the
-`RuntimeProvider` contract (`src/runtime/contract.ts`). Two backends
-exist.
+`RuntimeProvider` contract (`src/runtime/contract.ts`). Three
+backends exist.
 
-- `LocalProvider` (`src/runtime/local/`, the default) wraps the
-  co-tenanted [burrow](https://github.com/jayminwest/burrow) sandbox
-  daemon.
+- `LocalProvider` (`src/runtime/local/`, the default) runs the
+  in-process engine. It materializes a worktree, composes a bwrap
+  profile from the warren-owned sandbox (`src/sandbox/`), and drives
+  the agent through a host-side loop. The runtime adapters
+  (`src/runtime/adapters/`) own the per-harness command, parser, and
+  steering shapes.
+- `DockerProvider` (`src/runtime/docker/`, `WARREN_RUNTIME=docker`)
+  runs each agent as a sibling container over the docker socket. The
+  container boundary is the sandbox. See
+  [docs/design/runtime-docker-provider.md](docs/design/runtime-docker-provider.md).
 - `K8sProvider` (`src/runtime/k8s/`, `WARREN_RUNTIME=k8s`) runs each
-  agent as a Kubernetes pod. No burrow daemon runs there, so no
-  `burrow serve`, no unix socket, and no bwrap. The pod boundary is the
-  sandbox, and `/readyz` drops the burrow probes. Warren still links
-  `@os-eco/burrow-cli` as a library for shared types and error classes.
+  agent as a Kubernetes pod. The pod boundary is the sandbox, so no
+  bwrap runs there.
 
-Burrow the daemon is the LocalProvider's substrate, not a required
-warren dependency. For the K8s topology see
+For the K8s topology see
 [docs/RUNBOOK-K8S.md](docs/RUNBOOK-K8S.md) and the design records
 [docs/design/runtime-provider-contract.md](docs/design/runtime-provider-contract.md)
 and [docs/design/k8s-migration.md](docs/design/k8s-migration.md).
 
-### Relationship to burrow (local topology)
+### The burrow absorption (plan pl-3007)
 
-Under `local`, burrow is the sandbox runtime and warren is the
-orchestrator that spawns it and talks to it over HTTP. **Read
-`../burrow/SPEC.md` before changing anything that crosses the
-warren↔burrow boundary**. That boundary covers the supervisor's
-`burrow serve` invocation (`src/supervisor/main.ts`), the
-`src/burrow-client/` HTTP facade, and the bwrap-friendly security flags
-in `docker-compose.yml`.
+Warren once delegated the local sandbox to the co-tenanted
+[burrow](https://github.com/jayminwest/burrow) daemon. Plan pl-3007
+absorbed that substrate: the sandbox, the harness adapters, the spawn
+path, and the preview sidecars are warren-owned now. Warren no longer
+spawns `burrow serve`, links `@os-eco/burrow-cli`, or talks to a burrow
+socket. The burrow repo stays a standalone project.
 
-- The supervisor spawns `burrow serve` as a sibling process and
-  forwards SIGTERM/SIGINT. The two share a unix socket (default path
-  `/var/run/burrow.sock`) and a bearer token (`BURROW_API_TOKEN` equals
-  `WARREN_BURROW_TOKEN`).
-- `src/burrow-client/` is a typed facade over burrow's `HttpClient`.
-  Call the facade, never the socket directly, so the HTTP surface stays
-  mirrored.
-- The `@os-eco/burrow-cli` pin lives in two places, the `Dockerfile`
-  global install and `package.json` + `bun.lock`. Bumping only one is a
-  no-op, because the supervisor resolves the local copy from
-  node_modules before PATH. Update both and regenerate the lockfile.
-- Burrow needs three apparmor/seccomp/systempaths-unconfined flags plus
-  `cap_add: SYS_ADMIN` on Linux for user-namespace nesting.
+- The supervisor spawns only warren's HTTP server and forwards
+  SIGTERM/SIGINT to it.
+- The local engine persists run state in-process
+  (`src/runtime/local/run-store.ts`). A warren restart reconciles live
+  rows as lost, same as a daemon restart did.
+- The sandbox needs three apparmor/seccomp/systempaths-unconfined flags
+  plus `cap_add: SYS_ADMIN` on Linux for user-namespace nesting.
   `docker-compose.yml` bakes them in. See
   [docs/design/runtime-and-supervisor.md](docs/design/runtime-and-supervisor.md).
 
@@ -103,12 +115,23 @@ and `loadWarrenConfig()` surfaces it. Notable knobs:
 - `defaultRole`, `defaultPrompt`, `defaultProvider`, `defaultModel`,
   `defaultBranch`, `runBranchPrefix` — dispatch-time defaults. See
   [docs/design/warren-config.md](docs/design/warren-config.md).
+- `repoContext` (warren-540f) — free-text onboarding block (≤8 KiB)
+  injected into every dispatched agent's prompt between the agent system
+  section and the user task. The blessed way to onboard a mirror of a
+  repo you do not control — see
+  [docs/onboarding-external-repos.md](docs/onboarding-external-repos.md).
 - `preview` — per-run preview environments. The canonical home is
   `.warren/preview.yaml`. See
   [docs/design/preview-environments.md](docs/design/preview-environments.md).
 - `agent.skipGitHooks` (default `false`) — set `true` to skip arming
   the project's git pre-commit gate on the host clone before each run
   (warren-8f4c).
+- `maxCostUsd` — project-wide default per-run USD spend cap
+  (warren-a63d), enforced mid-run by the event bridge. Weakest source in
+  the cap chain: dispatch override (`POST /runs` `maxCostUsd`,
+  `warren run --max-cost-usd`, or a trigger entry's cap) > agent
+  `frontmatter.maxCostUsd` > this default — applied only when the agent
+  declares no cap (malformed agent values still fail open).
 - `admission.maxConcurrentRuns` — per-project cap on simultaneous
   non-terminal runs, enforced by the K8s admission gate. Over the cap
   the gate rejects the dispatch with HTTP 429 and reason
@@ -120,6 +143,52 @@ and `loadWarrenConfig()` surfaces it. Notable knobs:
   non-terminal pods. `WARREN_K8S_MAX_PENDING_PODS` (default 20) caps
   Pending pods. `0` disables a cap. LocalProvider ignores all of these.
 
+## Agent session bootstrap (warren CLI)
+
+Agents driving warren from the shell get their session context from the
+CLI itself, the same way `sd prime` and `ml prime` make seeds and mulch
+discoverable. The CLI installs from npm (`npm i -g @os-eco/warren-cli`) and
+runs on Bun v1.1+ (the package ships raw bun-shebang TypeScript).
+**At the start of every session**, run:
+
+```bash
+warren prime
+```
+
+The command reference lists each command with its purpose and key
+flags, derived from the program definition so it cannot drift from the code.
+The same walk generates `docs/cli-reference.md` (`bun run gen:cli-ref`).
+The env contract documents `WARREN_BASE_URL`, `WARREN_API_TOKEN`, and
+`WARREN_CLIENT_CONFIG`.
+
+- The CLI never auto-loads a cwd `.env`: the `src/cli/main.ts` shebang
+  passes `--env-file=/dev/null`, so only genuinely exported environment
+  variables participate in credential resolution. This closed the
+  stale-dotfile trap of warren-8807/warren-2244 structurally. A guard
+  test in `src/cli/main.test.ts` pins the shebang.
+- `warren login` prefers a token piped on stdin over an ambient env
+  token.
+- Auth-rejection errors name the environment as the token source when
+  it supplied the credential.
+- `warren doctor` names the slot that supplied the token, in the ok line
+  and in the rejection hint.
+
+The exit-code table is the stable warren-b61e one. The workflows cover
+dispatch-and-wait, tail-and-steer, and plan runs. Default output is
+ndjson for machines. Pass `--output pretty` for humans.
+
+To store credentials for the session, pipe the token on stdin so it stays
+out of shell history:
+
+```bash
+echo "$WARREN_API_TOKEN" | warren login --url https://warren.example.com
+```
+
+`warren login` verifies the credential against `/whoami`, then writes
+base URL + token (only — never a DB credential, per decision D5) to the
+client config at `~/.warren/client.json` with mode 0600. Resolution
+precedence everywhere: flags > env > config file > built-in default.
+
 ## Tech stack
 
 - **Runtime:** Bun (runs TypeScript directly, no server build step)
@@ -130,8 +199,8 @@ and `loadWarrenConfig()` surfaces it. Notable knobs:
 - **UI:** React + Vite + Tailwind + shadcn-style components, in
   `src/ui/` as the `@os-eco/warren-ui` package, built into `src/ui/dist/`
 - **Sandbox primitive:** a `RuntimeProvider` (`src/runtime/`), not a
-  direct dependency. `LocalProvider` delegates to burrow over a unix
-  socket. `K8sProvider` runs pods.
+  direct dependency. `LocalProvider` runs the in-process engine.
+  `K8sProvider` runs pods.
 
 ## Build & test commands
 
@@ -147,6 +216,7 @@ bun run lint                   # biome + layers + version-sync + wire-types + pr
 bun run typecheck              # tsc --noEmit
 bun run build:ui               # cd src/ui && bun install && bun run build
 bun run db:generate            # regenerate drizzle migrations (sqlite + postgres)
+bun run gen:cli-ref            # regenerate the CLI reference (docs/cli-reference.md)
 bun run version:bump           # bump version across all four sites
 bun run acceptance             # end-to-end acceptance scenarios
 bun run acceptance:container   # acceptance scenarios in container mode
@@ -205,12 +275,41 @@ CI would reject. `check:ci-parity` proves the local manifest and the CI
 workflow agree in both directions. Per-repo escape hatches live in
 `scripts/ci-parity-config.json`.
 
-Four repo-specific guards ride inside the `lint` gate rather than
+Nine repo-specific guards ride inside the `lint` gate rather than
 taking a manifest slot, because the canonical gate vocabulary is
-frozen. They are `scripts/check-layers.ts`,
-`scripts/check-version-sync.ts`, `scripts/check-wire-types.ts`, and
-`scripts/check-prose.ts`. Each also runs standalone under the matching
-`check:` script name.
+frozen. Each also runs standalone under the matching `check:` script
+name.
+
+- `scripts/check-layers.ts`, `scripts/check-version-sync.ts`,
+  `scripts/check-wire-types.ts`, `scripts/check-prose.ts`,
+  `scripts/check-merge-strategy.ts`
+- `scripts/check-seeds-integrity.ts` (warren-a71f) — catches duplicate
+  and contradictory rows in `.seeds/issues.jsonl`, the shape a git
+  auto-merge leaves behind
+- `scripts/check-rls.ts` (warren-3206) — replays the Postgres
+  migrations in journal order and fails any still-live table without
+  `ENABLE ROW LEVEL SECURITY`
+- `scripts/check-runtime-ids.ts` (warren-c80e) — fails a runtime-id
+  literal written outside `src/runtime/adapters/`. Per-runtime behavior
+  belongs behind the adapter registry. The allowlist has two buckets:
+  files that name a runtime on purpose, and the older conditional code
+  that phase 2 moves behind the seam
+- `scripts/check-client-contract.ts` (warren-4d2d) reads the request
+  paths in `src/ui/src/api/client.ts` and fails any call that
+  `ROUTE_TABLE` does not serve. A path the parser cannot resolve
+  statically fails too, because a silent skip hides the drift this
+  guard exists to catch
+
+`gen:cli-ref:check` rides the same gate and holds the generated CLI
+reference in place.
+
+`check:design-docs` also rides inside `lint` and enforces these rules:
+
+- Every record has controlled metadata and one row in `docs/design/README.md`.
+- Shipped records point to current truth.
+- Mixed records have a scope-status table.
+- Records in `next` state name their ROADMAP order.
+- Approval alone never means roadmap commitment.
 
 Details on the additional checks:
 
@@ -221,7 +320,12 @@ Details on the additional checks:
   goes down. `src/ui/` is in scope as of warren-c8bd with three
   grandfathered entries. The walk skips only `src/ui/dist/`. Biome's
   `noExcessiveLinesPerFunction` rule enforces the same 500-line cap at
-  the function level.
+  the function level. `bun run scripts/check-file-sizes.ts --headroom 10`
+  reports the files with 10 lines of slack or less, and never fails
+  (warren-8746). A file at its ceiling passes every PR that touches it
+  alone. It then fails once a merge lands the union of two of them.
+  `.github/workflows/size-overshoot-report.yml` names what overshot, on
+  the PR itself.
 - **`check:debt`** (warren-7f2b) — scans `src/` and `scripts/` for
   `TODO` / `FIXME` / `HACK` / `XXX`. Any marker without a tracker
   reference on the same line fails the gate. Accepted references are
@@ -249,11 +353,16 @@ Details on the additional checks:
   Vite's build-log gzip number, which runs about 2KB cooler than this
   guard's Node-zlib measure. Re-baseline with
   `bun run check:bundle-size --update`, which always builds first and
-  writes measured numbers. Lowering always applies. Ordinary growth
-  auto-raises within `AUTO_RAISE_CAP`. A heavy new dep past the cap
-  needs `WARREN_BUNDLE_SIZE_ALLOW_RAISE=1`. On a PR that fails on a
+  writes measured numbers. Ordinary growth auto-raises within
+  `AUTO_RAISE_CAP`. A heavy new dep past the cap needs
+  `WARREN_BUNDLE_SIZE_ALLOW_RAISE=1`. On a PR that fails on a
   within-cap overshoot, the `bundle-size-autoheal` workflow
-  re-baselines and pushes for you.
+  re-baselines and pushes for you. Lowering applies on a laptop or in
+  CI, but `--update` REFUSES to lower budgets when running inside a
+  warren-dispatched run (warren-6397): the agent image's toolchain
+  gzips the build ~1.3-1.5KB cooler than CI, so a pod-written lower
+  budget corrupts the CI-enforced number. Re-baseline lowers from a
+  CI-matching environment instead.
 - **`check:coverage`** (warren-e4b1) — wraps `bun test --coverage` and
   enforces the floors in `scripts/coverage-budgets.json` against the
   "All files" row of Bun's text reporter. CI invokes
@@ -261,23 +370,31 @@ Details on the additional checks:
   uploads `coverage/lcov.info`. The ratchet only goes up. Lowering a
   floor means you deleted tests, and it needs a tracker reference.
 - **`gen:docs:check`** (warren-e5fb) — keeps `docs/http-api.md` in sync
-  with the `ROUTE_TABLE` array in `src/server/handlers/index.ts`, the
+  with the `ROUTE_TABLE` array in `src/server/handlers/route-table.ts`, the
   canonical HTTP API surface. Refresh with `bun run gen:docs` and
   commit the result.
 - **`gen:openapi:check`** (warren-b46b) — keeps `docs/openapi.yaml`
   (OpenAPI 3.1, derived from the same `ROUTE_TABLE`) up to date.
   Refresh with `bun run gen:openapi` and commit.
+- **`gen:cli-ref:check`** (warren-1caf) — keeps `docs/cli-reference.md`
+  in sync with the commander command definitions in `src/cli/main.ts`,
+  the canonical CLI surface. Refresh with `bun run gen:cli-ref` and
+  commit the result. The check rides inside the `lint` gate.
 
 Biome's `noExcessiveCognitiveComplexity` rule (warren-d3a6, ceiling 15)
 holds a project-wide complexity budget. New code must stay under the
-threshold. The first `overrides` block of `biome.json` grandfathers
-existing offenders, including the 15 `src/ui/` files warren-c8bd
-brought into scope. The second `overrides` block names 32 legacy
-PascalCase and camelCase UI filenames exempt from
-`useFilenamingConvention`. Both lists are ratchets that only shrink.
+threshold. Existing complexity and filename exceptions document their
+ratchet policies inline in `biome.jsonc`. Both lists only shrink.
 
-`biome.json` goes through strict `JSON.parse`, so it cannot carry
-comments. The rationale for those two lists lives here.
+## Docs are a public surface
+
+Downstream readers link to `docs/` paths, so treat every one as
+published (warren-d602).
+
+- Deleting or moving any `docs/` path requires a one-line pointer entry
+  in `docs/README.md` of the form `<old path> -> <successor>` or
+  `<old path> — retired, see <X>`.
+- Add the tombstone in the same commit that removes or renames the file.
 
 ## Naming conventions
 
@@ -287,11 +404,11 @@ comments. The rationale for those two lists lives here.
   dot-segment must itself be kebab-case. Biome's
   `useFilenamingConvention` rule enforces this.
 - **Filenames (`src/ui/`):** the same kebab-case rule applies as of
-  warren-c8bd. Write new UI files in kebab-case. To clear a
-  grandfathered entry, rename the file and delete its line in
-  `biome.json`.
-- **Directories:** `kebab-case` (`src/burrow-client/`,
-  `src/plan-runs/`, `src/warren-config/`).
+  warren-c8bd. Write new UI files in kebab-case. PR #922 cleared the
+  grandfathered exception list in `biome.jsonc`, so the rule now
+  applies to every UI filename with no exceptions.
+- **Directories:** `kebab-case` (`src/plan-runs/`,
+  `src/warren-config/`, `src/runtime/local/`).
 - **Identifiers:** `camelCase` for functions, variables, and instance
   fields. `PascalCase` for types, interfaces, classes, and React
   components. `SCREAMING_SNAKE_CASE` for true module-level constants
@@ -368,11 +485,9 @@ Two guards hold the rule, and both run inside `bun run lint`.
   prints `file:line` plus the rule's `why`. A deliberate exception goes
   in that rule's `allow` list with a `why` field.
 
-Seven seams ship today:
+Ten seams ship today (the two burrow boundaries left with the facade
+and the package in warren-ea0a):
 
-- The two burrow boundaries inherited from the retired burrow-boundary
-  guard (warren-f796). No direct `src/burrow-client/` or
-  `@os-eco/burrow-cli` import outside the local-topology allowlist.
 - Domain modules must not import `src/server/**` or `src/cli/**`.
 - `src/cli/**` must not import `src/server/**`.
   `src/cli/commands/serve.ts` is the one exception, because booting the
@@ -380,7 +495,24 @@ Seven seams ship today:
 - `src/server/handlers/**` must not import `src/db/schema/**` and must
   not build a repo out of `deps.db`. Use the boot-wired seams
   `deps.repos`, `deps.dbAdapter`, and `deps.runPreviews`.
+- `extensions/**` must not import `src/**` or `scripts/**`, and neither
+  may import `extensions/**`. The seam is symmetric on purpose. See
+  "Extensions" below.
+- The two forge boundaries (plan pl-d1c9). Only `src/forge/**` may
+  speak the GitHub REST API (`api.github.com` literals), and only
+  `src/forge/**` may import the `src/forge/github/` transport core.
+  Everything else consumes the boot-resolved `Forge` instance. See
+  [docs/design/forge-contract.md](docs/design/forge-contract.md).
 - `src/core/` may import only itself.
+- `src/ui/` is a browser consumer: it imports the `src/core/` kernel, the
+  SDK's browser-safe `src/client/ndjson.ts` reader, and its own code —
+  nothing else under `src/` (warren-f0ae).
+
+Beside the layer rules, the `IssueTracker` seam (`src/tracker/contract.ts`,
+boot-wired as `deps.issueTracker`) is a provider seam, not a bus
+subscriber: call sites consume the boot-resolved instance and branch
+on its capability flags. See
+[docs/design/issue-tracker.md](docs/design/issue-tracker.md).
 
 Two sharp edges:
 
@@ -438,8 +570,7 @@ it from the matching `CHANGELOG.md` section.
 
 `bun run check:version-sync` (warren-0210,
 `scripts/check-version-sync.ts`) asserts on every PR that all four
-sites agree. It also checks that the `@os-eco/burrow-cli` pin agrees
-across the `Dockerfile`, `package.json`, and the README. It shares the
+sites agree. It shares the
 README locator with `scripts/version-bump.ts`, so the gate and the
 bumper can never disagree about where the version lives. It rides
 inside `bun run lint` because the canonical gate manifest is frozen.
@@ -493,6 +624,42 @@ observe-only process singleton that run-lifecycle call sites emit into.
 Proof consumers are the healer (`src/healer/lifecycle.ts`) and the
 seed-close reap hook (`src/runs/reap/seed-close-lifecycle.ts`). See
 [docs/design/tier1-observation-bus.md](docs/design/tier1-observation-bus.md).
+The run-level provider retry (`src/runs/retry/provider-retry.ts`) is a
+third consumer. Its policy is in
+[docs/design/provider-retry.md](docs/design/provider-retry.md).
+
+## Extensions
+
+`extensions/` holds out-of-process packages built against warren's
+published HTTP surface only. Each one is standalone: own
+`package.json`, own lockfile, own tsconfig, own tests.
+
+An extension never imports `src/` or `scripts/`, and core never
+imports it. `check:layers` enforces both directions, because an import
+either way compiles the extension into core and makes its removal
+breaking.
+
+Five extension packages ship today. The flagship is
+`extensions/audit-log/` (plan pl-116e), a collector that tails run
+events, normalizes them into an append-only audit log, and exports it
+over `GET /audit-log.jsonl`. Beside it sits `extensions/judge/`
+(plan pl-17ca), which reads finished runs, judges them against the
+15-class rubric v1, stores verdicts append-only, and exports them
+over `GET /verdicts.jsonl`. `extensions/tracker-jira/` (warren-27d9)
+speaks the warren-tracker/v1 protocol against Jira Cloud and holds
+its own Jira credential. Its README carries the friction list for
+that build. `extensions/tracker-conformance/` (warren-53ea) is the
+warren-tracker/v1 conformance suite plus FakeTracker, the reference
+in-memory server. `extensions/campaign-controller/` (plan pl-91b6) is
+the first controller extension: it owns durable campaign state and
+drives warren's HTTP command APIs under an operator-approved policy —
+dry-run journaling in V0, plus a single policy-gated create-PR
+mutation from Phase 2.
+
+`extensions/audit-log/FRICTION.md` logs every place the extension
+author had to work around a missing warren surface, and that list is
+the spec for warren's delivery mechanism. Add to it when you hit a new
+one. See [docs/design/extensions.md](docs/design/extensions.md).
 
 ## Golden snapshots
 
@@ -513,7 +680,7 @@ directories under the same name so those exclusions keep applying.
 ## Acceptance harness
 
 `scripts/acceptance/` runs scenario-based end-to-end checks against a
-real warren+burrow stack. Scenarios live in
+real warren boot. Scenarios live in
 `scripts/acceptance/scenarios/` and use the helpers in
 `scripts/acceptance/lib/`. New scenarios must be deterministic,
 idempotent, and clean up after themselves.
@@ -631,6 +798,16 @@ context, run `ml search --archived <query>`.
    ml sync
    ```
 <!-- mulch:end -->
+
+## Without the sd/ml CLIs
+
+The seeds and mulch sections above assume you have the sd and ml CLIs.
+If you do not, skip those steps.
+
+Everything else applies as written: make the change, run the quality
+gates, open the PR. The project's own tooling maintains the issue queue
+and expertise records. PRs from contributors without the CLIs are
+welcome.
 
 ## Further reading
 

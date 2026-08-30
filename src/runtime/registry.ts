@@ -3,27 +3,29 @@
  *
  * One place resolves which `RuntimeProvider` (contract in `./contract.ts`) a
  * warren process runs against, exactly once at boot. The default is the
- * burrow-backed `LocalProvider`; the `k8s` backend (`K8sProvider`, pl-829f phase
+ * in-process `LocalProvider`; the `k8s` backend (`K8sProvider`, pl-829f phase
  * K8S) is opt-in behind `WARREN_RUNTIME=k8s`.
  *
  * Selection rules (design doc §5 registry/selector semantics):
  *   - `WARREN_RUNTIME` unset (or blank) → `local` (the default backend).
- *   - `local` → burrow-backed `LocalProvider`.
- *   - `k8s`   → `K8sProvider` (skeleton at step 14 — the pod-spec builder is real,
- *     the method bodies land in later steps and throw until then).
+ *   - `local` → in-process `LocalProvider` (warren-413d; the burrow-backed
+ *     legacy mode was deleted in warren-ea0a).
+ *   - `k8s`   → `K8sProvider`.
+ *   - `docker` → `DockerProvider` (warren-3732, sibling containers).
  *   - anything else → `UnknownRuntimeError` (fail loud — never silently fall
  *     back to the default, so a typo can't route runs onto the wrong backend).
  *
- * Composition point: `src/server/main/index.ts` (`bootServer`) builds the
- * single `burrowClient` and threads a `resolveRuntimeProvider({ burrowClient:
- * () => client })` provider onto `ServerDeps` for the domain.
+ * Composition point: `src/server/main/index.ts` (`bootServer`) resolves the
+ * local backend via `src/runtime/local/boot-backend.ts`, which builds the
+ * in-process engine directly (warren-413d).
  */
 
 import type { CoreV1Api } from "@kubernetes/client-node";
-import { BurrowClient } from "../burrow-client/index.ts";
 import type { ReapExec, ReapFs } from "../runs/reap/types.ts";
 import type { EnvLike } from "../runs/spawn/callback-env.ts";
 import type { RuntimeProvider } from "./contract.ts";
+import { DockerProvider, type DockerProviderDeps } from "./docker/provider.ts";
+import type { DockerSpawnDeps } from "./docker/spawn.ts";
 import { UnknownRuntimeError } from "./errors.ts";
 import type { AdmissionCounterSink, PodAdmissionSource } from "./k8s/admission.ts";
 import type { FinalizeCoordinator } from "./k8s/finalize-coordinator.ts";
@@ -31,16 +33,18 @@ import type { StreamLogger } from "./k8s/log-stream.ts";
 import type { PodCacheReader } from "./k8s/pod-watcher.ts";
 import { defaultCoreApiFactory, K8sProvider } from "./k8s/provider.ts";
 import type { K8sInboxStore } from "./k8s/send-message.ts";
+import type { SidecarCascade } from "./local/engine.ts";
 import { LocalProvider } from "./local/provider.ts";
+import type { LocalRunStore } from "./local/run-store.ts";
 
 /** Runtime backends the selector understands. */
-export type RuntimeKind = "local" | "k8s";
+export type RuntimeKind = "local" | "k8s" | "docker";
 
 /** Selector default when `WARREN_RUNTIME` is unset — the self-host backend. */
 export const DEFAULT_RUNTIME_KIND: RuntimeKind = "local";
 
 /** Every recognized `WARREN_RUNTIME` value (used for validation + error hints). */
-export const RUNTIME_KINDS: readonly RuntimeKind[] = ["local", "k8s"];
+export const RUNTIME_KINDS: readonly RuntimeKind[] = ["local", "k8s", "docker"];
 
 /** Minimal env surface the selector reads. */
 export type RuntimeEnv = Readonly<Record<string, string | undefined>>;
@@ -53,15 +57,6 @@ export type RuntimeEnv = Readonly<Record<string, string | undefined>>;
  */
 export interface RuntimeProviderDeps {
 	/**
-	 * OPTIONAL burrow client factory the `local` backend's `LocalProvider` wraps
-	 * (warren-f796). Callers that own a live client (the server boot backend in
-	 * `src/runtime/local/boot-backend.ts`, the CLI's `resolveLocalRunBackend`,
-	 * tests) supply it so they can share + close the client; when omitted for
-	 * `local` the selector builds one lazily from env (`BurrowClient.fromEnv`).
-	 * Ignored entirely by the `k8s` backend — agents run in pods, no burrow.
-	 */
-	readonly burrowClient?: () => BurrowClient;
-	/**
 	 * Server-process env a provider reads to compute its own plumbing (the
 	 * LocalProvider's loopback callback URL, §6.3). Optional — providers
 	 * default to `process.env`. Kept on the shared bag so the selector's
@@ -69,7 +64,7 @@ export interface RuntimeProviderDeps {
 	 */
 	readonly serverEnv?: EnvLike;
 	/**
-	 * Disk/shell seam the burrow-backed `LocalProvider.finalize()` runs the reap
+	 * Disk/shell seam the `LocalProvider.finalize()` runs the reap
 	 * merge functions over (`ReapFs` / `ReapExec`, `src/runs/reap/types.ts`) —
 	 * only consulted for `WARREN_RUNTIME=local`; the `K8sProvider` ignores them.
 	 * Optional so callers (and tests) that accept the real `defaultFs` /
@@ -131,6 +126,41 @@ export interface RuntimeProviderDeps {
 	 * absent ⇒ the pump logs nothing. Boot threads the shared pino logger.
 	 */
 	readonly k8sLogger?: StreamLogger;
+	/**
+	 * OPTIONAL git-credential mint seam for the K8s token windows
+	 * (forge-contract.md §4.1, warren-c9ac) — only consulted for
+	 * `WARREN_RUNTIME=k8s`. Boot wires it to `mintGitCredential` over the
+	 * resolved forge so `create()` mints the init-container clone credential at
+	 * pod-spec time (window 1).
+	 */
+	readonly k8sMintGitCredential?: (gitUrl: string) => Promise<string | undefined>;
+	/**
+	 * Whether the K8s window-2 finalize push may fall back to the static
+	 * control-plane env token (warren-c9ac). Boot sets it from the forge's
+	 * `credentialLifetime`; absent, the provider's own default (allow) applies.
+	 */
+	readonly k8sAllowStaticPushTokenFallback?: boolean;
+	/**
+	 * OPTIONAL shared run store for the in-process LocalProvider engine
+	 * (warren-413d) — only consulted for `WARREN_RUNTIME=local`. Boot
+	 * threads the store it also hands the preview sidecar registry
+	 * (warren-4bf3), so sidecars resolve profiles off the same records the
+	 * engine writes. Absent ⇒ the provider's private default (tests).
+	 */
+	readonly localStore?: LocalRunStore;
+	/**
+	 * OPTIONAL preview sidecar cascade for the in-process LocalProvider
+	 * (warren-4bf3) — only consulted for `WARREN_RUNTIME=local`. Boot
+	 * threads the warren-owned registry so `terminate` releases sidecars +
+	 * port forwards. Absent ⇒ terminate skips the cascade (tests).
+	 */
+	readonly localSidecars?: SidecarCascade;
+	/**
+	 * OPTIONAL docker spawn seams — only consulted for `WARREN_RUNTIME=docker`
+	 * (warren-3732). A test injects a scripted docker CLI here; production
+	 * leaves it unset so the seam spawns the real CLI.
+	 */
+	readonly docker?: DockerSpawnDeps;
 }
 
 /**
@@ -162,15 +192,37 @@ export function resolveRuntimeProvider(
 	const kind = resolveRuntimeKind(env);
 	switch (kind) {
 		case "local":
+			// warren-413d + warren-ea0a: the local backend is the in-process
+			// engine, full stop — there is no client to wire.
 			return new LocalProvider({
-				burrowClient: deps.burrowClient ?? lazyBurrowClientFromEnv(env),
 				...(deps.serverEnv !== undefined ? { serverEnv: deps.serverEnv } : {}),
 				...(deps.fs !== undefined ? { fs: deps.fs } : {}),
 				...(deps.exec !== undefined ? { exec: deps.exec } : {}),
+				...(deps.localStore !== undefined ? { store: deps.localStore } : {}),
+				...(deps.localSidecars !== undefined ? { sidecars: deps.localSidecars } : {}),
 			});
 		case "k8s":
 			return buildK8sProvider(deps);
+		case "docker":
+			return buildDockerProvider(deps);
 	}
+}
+
+/**
+ * Construct the `DockerProvider` (warren-3732) from the shared deps bag.
+ * The sibling-container backend reuses the local state roots, run store,
+ * and reap seams; only the spawn boundary differs.
+ */
+function buildDockerProvider(deps: RuntimeProviderDeps): DockerProvider {
+	const providerDeps: DockerProviderDeps = {
+		...(deps.serverEnv !== undefined ? { serverEnv: deps.serverEnv } : {}),
+		...(deps.fs !== undefined ? { fs: deps.fs } : {}),
+		...(deps.exec !== undefined ? { exec: deps.exec } : {}),
+		...(deps.localStore !== undefined ? { store: deps.localStore } : {}),
+		...(deps.localSidecars !== undefined ? { sidecars: deps.localSidecars } : {}),
+		...(deps.docker !== undefined ? { docker: deps.docker } : {}),
+	};
+	return new DockerProvider(providerDeps);
 }
 
 /**
@@ -180,20 +232,6 @@ export function resolveRuntimeProvider(
  * coordinator, cache-cold status/admission). Extracted from
  * `resolveRuntimeProvider` to keep that selector under the complexity budget.
  */
-/**
- * Lazy env-derived burrow client factory for `local` callers that don't own a
- * client (warren-f796). The client is built on first use so `resolveRuntimeProvider`
- * never touches a socket at construction time; callers that need to close it (boot)
- * pass their own factory instead.
- */
-function lazyBurrowClientFromEnv(env: RuntimeEnv): () => BurrowClient {
-	let client: BurrowClient | undefined;
-	return () => {
-		if (client === undefined) client = BurrowClient.fromEnv(env);
-		return client;
-	};
-}
-
 function buildK8sProvider(deps: RuntimeProviderDeps): K8sProvider {
 	return new K8sProvider({
 		coreApi: deps.k8sCoreApi ?? defaultCoreApiFactory(),
@@ -208,5 +246,11 @@ function buildK8sProvider(deps: RuntimeProviderDeps): K8sProvider {
 		...(deps.k8sPodCache !== undefined ? { podCache: deps.k8sPodCache } : {}),
 		...(deps.k8sPodAdmission !== undefined ? { podAdmission: deps.k8sPodAdmission } : {}),
 		...(deps.k8sLogger !== undefined ? { logger: deps.k8sLogger } : {}),
+		...(deps.k8sMintGitCredential !== undefined
+			? { mintGitCredential: deps.k8sMintGitCredential }
+			: {}),
+		...(deps.k8sAllowStaticPushTokenFallback !== undefined
+			? { allowStaticPushTokenFallback: deps.k8sAllowStaticPushTokenFallback }
+			: {}),
 	});
 }

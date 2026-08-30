@@ -46,6 +46,29 @@ domains:
   testing: {}
   types: {}
   seeds-tracker: {}
+  security: {}
+  healer: {}
+  architecture: {}
+  docker: {}
+  extensions: {}
+  api: {}
+  forge: {}
+  wire-vocabulary: {}
+  seeds: {}
+  dogfood: {}
+  deploy: {}
+  judge: {}
+  gates: {}
+  observability: {}
+  tracker: {}
+  dispatch: {}
+  tracker-port: {}
+  campaign-controller: {}
+  storage: {}
+  warren-api: {}
+  github: {}
+  packaging: {}
+  warren-deploy: {}
 governance:
   max_entries: 100
   warn_entries: 150

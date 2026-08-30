@@ -31,14 +31,15 @@
  */
 
 import { ValidationError } from "../../core/errors.ts";
+import { isSalvageTrigger, type SalvageTrigger } from "../../core/wire.ts";
 import type {
 	ArtifactDelta,
 	ArtifactDeltaFile,
 	FinalizeEvent,
 	FinalizeResult,
-	FinalizeStage,
 	FinalizeStageOutcome,
 } from "../contract.ts";
+import { isFinalizeStage } from "../contract.ts";
 
 /** Wire-format version tag so the intent shape can evolve unambiguously. */
 export const IN_POD_FINALIZE_WIRE_VERSION = 1 as const;
@@ -62,11 +63,9 @@ export interface InPodFinalizeIntent {
 	/** Opaque artifact-set keys to extract (mirrors `FinalizeIntent.artifacts`). */
 	artifacts: string[];
 	/** Bookkeeping commits to author before the push (mirrors `FinalizeIntent.commit`). */
-	commit: "seeds"[];
+	commit: string[];
 	/** Base ref for the commits-ahead count; omitted ⇒ count skipped (`null`). */
 	baseBranch?: string;
-	/** Run seed to close host-side (carried for parity; the entrypoint no-ops it). */
-	closeSeedId?: string;
 	/**
 	 * Short-lived git push credential. Delivered here — over the authenticated
 	 * callback, AFTER the agent exits — rather than in the agent container's
@@ -94,11 +93,16 @@ export interface FinalizeResultEnvelope {
  * control-plane restart / severed callback). Unlike the finalize result, this
  * carries the work ITSELF (a git bundle) because the pod's volume is about to
  * die with the container. See `../salvage.ts` for the two capture forms.
+ *
+ * warren-985e: a third trigger, `empty_push_dirty`, covers the run that died
+ * mid-work (e.g. provider_error credit exhaustion) with ZERO commits ahead
+ * and a dirty tree — the push "succeeded" but carried nothing, so the
+ * uncommitted diff is folded into a salvage commit and captured here.
  */
 export interface SalvageEnvelope {
 	version: typeof IN_POD_FINALIZE_WIRE_VERSION;
-	/** Why salvage ran. */
-	trigger: "push_failed" | "no_intent";
+	/** Why salvage ran (canonical vocabulary: `src/core/wire.ts`). */
+	trigger: SalvageTrigger;
 	/** The rescue branch the pod pushed to origin, when that push landed. */
 	rescueRef: string | null;
 	/** base64 git bundle of the run's commits, when one was produced. */
@@ -127,6 +131,18 @@ function reqString(obj: Record<string, unknown>, key: string, label: string): st
 	if (typeof v !== "string" || v.length === 0) {
 		throw new ValidationError(`${label}.${key} must be a non-empty string`);
 	}
+	return v;
+}
+
+/**
+ * warren-8e05: a delta file's body may be legitimately empty — `ml prune` leaves
+ * zero-byte `.mulch/expertise/*.jsonl` domain files, and the collector ships
+ * workspace truth verbatim. Rejecting `""` here failed every finalize-result
+ * POST from a workspace with an empty tracker file.
+ */
+function reqStringAllowEmpty(obj: Record<string, unknown>, key: string, label: string): string {
+	const v = obj[key];
+	if (typeof v !== "string") throw new ValidationError(`${label}.${key} must be a string`);
 	return v;
 }
 
@@ -189,7 +205,7 @@ function validateArtifactDelta(value: unknown, key: string): ArtifactDelta {
 		const fo = asRecord(f, `${label}.files[${i}]`);
 		return {
 			path: reqString(fo, "path", `${label}.files[${i}]`),
-			mergedBody: reqString(fo, "mergedBody", `${label}.files[${i}]`),
+			mergedBody: reqStringAllowEmpty(fo, "mergedBody", `${label}.files[${i}]`),
 		};
 	});
 	const countsRaw = asRecord(o.counts ?? {}, `${label}.counts`);
@@ -200,21 +216,17 @@ function validateArtifactDelta(value: unknown, key: string): ArtifactDelta {
 	return { version: 1, files, counts };
 }
 
-const FINALIZE_STAGES: readonly FinalizeStage[] = [
-	"mulch_merge",
-	"seeds_mirror",
-	"plans_mirror",
-	"seeds_commit",
-	"branch_push",
-	"commits_ahead",
-];
-
+/**
+ * warren-357c: stage names are no longer a fixed union — the merge/commit
+ * stages derive from the opaque artifact keys, so intake validates the SHAPE
+ * (pipeline stage or `${key}_merge` / `${key}_commit`), not a feature list.
+ */
 function validateStages(value: unknown): FinalizeStageOutcome[] {
 	if (!Array.isArray(value)) throw new ValidationError("result.stages must be an array");
 	return value.map((s, i) => {
 		const so = asRecord(s, `result.stages[${i}]`);
 		const stage = reqString(so, "stage", `result.stages[${i}]`);
-		if (!(FINALIZE_STAGES as readonly string[]).includes(stage)) {
+		if (!isFinalizeStage(stage)) {
 			throw new ValidationError(
 				`result.stages[${i}].stage "${stage}" is not a known finalize stage`,
 			);
@@ -228,7 +240,7 @@ function validateStages(value: unknown): FinalizeStageOutcome[] {
 			throw new ValidationError(`result.stages[${i}].error must be a string when present`);
 		}
 		return {
-			stage: stage as FinalizeStage,
+			stage,
 			status,
 			...(typeof error === "string" ? { error } : {}),
 		};
@@ -259,9 +271,12 @@ export function validateFinalizeResult(value: unknown): FinalizeResult {
 	}
 
 	const dirtyPaths = optStringArray(o, "dirtyPaths", "result");
+	// warren-ba08: optional — an older in-pod image omits it (domain falls back to baseBranch).
+	const commitsAheadBase = optStringOrNull(o, "commitsAheadBase", "result");
 	return {
 		pushed: reqBoolean(o, "pushed", "result"),
 		commitsAhead: reqNumberOrNull(o, "commitsAhead", "result"),
+		...(commitsAheadBase !== null ? { commitsAheadBase } : {}),
 		emptyPush: reqBoolean(o, "emptyPush", "result"),
 		dirty: reqBoolean(o, "dirty", "result"),
 		...(dirtyPaths !== undefined ? { dirtyPaths } : {}),
@@ -307,10 +322,13 @@ export function parseSalvageEnvelope(value: unknown): SalvageEnvelope {
 			`unsupported salvage wire version ${String(version)} (expected ${IN_POD_FINALIZE_WIRE_VERSION})`,
 		);
 	}
-	const trigger = reqString(o, "trigger", "body");
-	if (trigger !== "push_failed" && trigger !== "no_intent") {
-		throw new ValidationError('body.trigger must be "push_failed" or "no_intent"');
+	const triggerRaw = reqString(o, "trigger", "body");
+	if (!isSalvageTrigger(triggerRaw)) {
+		throw new ValidationError(
+			'body.trigger must be "push_failed", "no_intent", or "empty_push_dirty"',
+		);
 	}
+	const trigger: SalvageTrigger = triggerRaw;
 	const notes = optStringArray(o, "notes", "body");
 	return {
 		version: IN_POD_FINALIZE_WIRE_VERSION,

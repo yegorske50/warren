@@ -42,8 +42,11 @@ import {
 	INBOX_STATES,
 	INDEX_NAMES,
 	PLAN_RUN_CHILD_STATES,
+	PLAN_RUN_SOURCES,
 	PLAN_RUN_STATES,
 	PREVIEW_STATES,
+	PULL_REQUEST_LIFECYCLES,
+	RUN_COST_BASES,
 	RUN_FAILURE_REASONS,
 	RUN_MODES,
 	RUN_STATES,
@@ -117,11 +120,11 @@ export const runs = sqliteTable(
 		// the bridge/reconnect path (`bootBridges`, `server/bridge-reconnect.ts`)
 		// reads it after a host restart to re-attach the run's live event stream.
 		// Nullable — a run that fails before dispatch never gets one.
-		burrowId: text("burrow_id"),
+		sandboxId: text("sandbox_id"),
 		// Provider-side run/dispatch id (burrow run id under LocalProvider).
-		// Load-bearing alongside `burrow_id` for the same resume path (it scopes
+		// Load-bearing alongside `sandbox_id` for the same resume path (it scopes
 		// cancel / steer / status against the sandbox). Nullable, same reason.
-		burrowRunId: text("burrow_run_id"),
+		sandboxRunId: text("sandbox_run_id"),
 		// Retired multi-worker placement copy (warren-135b / pl-9ba1 step 2).
 		// The workers + burrows placement tables were dropped in warren-3743 once
 		// LocalProvider absorbed the single-burrow runtime; new runs write NULL.
@@ -140,6 +143,13 @@ export const runs = sqliteTable(
 		renderedAgentJson: text("rendered_agent_json", { mode: "json" }).notNull(),
 		state: text("state", { enum: RUN_STATES }).notNull(),
 		failureReason: text("failure_reason", { enum: RUN_FAILURE_REASONS }),
+		// The queued instant (warren-0af9 / pl-103e step 1): epoch ms stamped by
+		// RunsRepo.create at insert, so queue wait is `started_at - created_at`.
+		// Epoch-ms integer rather than the ISO8601 TEXT of started_at/ended_at
+		// per the pl-103e spec. Nullable: rows written before the column existed
+		// carry NULL, which analytics must read as "unknown" (excluded from
+		// queue-wait denominators), never as zero wait.
+		createdAt: integer("created_at"),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
 		prompt: text("prompt").notNull(),
@@ -152,6 +162,15 @@ export const runs = sqliteTable(
 		prUrl: text("pr_url"),
 		// Operator-requested target branch (warren-1f81, #419); null = none.
 		targetBranch: text("target_branch"),
+		branch: text("branch"), // composed workspace branch frozen at dispatch (warren-5255)
+		// Operator-requested git ref the workspace was cloned from (warren-afeb),
+		// frozen from the dispatch body's explicit `ref` so the run projections
+		// echo it. Null = the resolved default/continuation base was used.
+		ref: text("ref"),
+		// Base-commit pinning (warren-aaf7): a 40-hex commit SHA the workspace is
+		// cut at, SPLIT from `ref` (which stays branch-shaped and feeds the PR
+		// base). Null = the workspace cut follows `ref`/continuation/default.
+		baseCommit: text("base_commit"),
 		// Salvage-before-destroy (warren-cd3b). When a reap's branch push never
 		// landed, the workspace's committed work is captured BEFORE destroy:
 		// `salvage_ref` is the rescue branch pushed to origin
@@ -161,12 +180,11 @@ export const runs = sqliteTable(
 		// local). Both null ⇒ no salvage was captured (or none was needed).
 		salvageRef: text("salvage_ref"),
 		salvagePath: text("salvage_path"),
-		// Per-run cost + token accounting (warren-a7dc). All nullable: only the
-		// pi runtime reports session-cumulative stats via get_session_stats today,
-		// and even there the value is best-effort (null when the bridge can't
-		// snapshot the RPC). Cost is the persisted delta between run-start and
-		// run-end snapshots so resumed pi sessions don't double-count prior turns.
+		// Per-run cost + token accounting (warren-a7dc). All nullable: the pi runtime's
+		// best-effort session stats; cost is the persisted start/end delta.
 		costUsd: real("cost_usd"),
+		// Cost basis (warren-f3c3): `subscription_estimate` = subscription auth — an estimate, not a bill.
+		costBasis: text("cost_basis", { enum: RUN_COST_BASES }).notNull().default("api"),
 		tokensInput: integer("tokens_input"),
 		tokensOutput: integer("tokens_output"),
 		tokensCacheRead: integer("tokens_cache_read"),
@@ -205,6 +223,46 @@ export const runs = sqliteTable(
 		// parent's pushed branch; `replicate` re-dispatches its exact config
 		// against the project default base. Null for root runs. See `CLONE_KINDS`.
 		cloneKind: text("clone_kind", { enum: CLONE_KINDS }),
+		// Infra-lost auto-retry back-link (warren-4af7): when a run terminalizes
+		// `failed` with an infra-lost failure reason (`sandbox_run_lost`), warren
+		// dispatches ONE replacement run and records the original run's id here.
+		// Distinct from `parent_run_id`: a retry re-dispatches the SAME prompt
+		// against the same base (no continuation), and the link drives the
+		// one-retry budget — a run whose `retry_of` is set, or that already has
+		// a retry pointing at it, gets no further automatic retry. Nullable:
+		// the overwhelming majority of runs are first attempts. Plain text (no
+		// FK) for symmetry with the other run back-links.
+		retryOf: text("retry_of"),
+		// Declared provider/model at dispatch time (warren-2ede / pl-103e),
+		// frozen from the rendered agent frontmatter after the override chain
+		// (operator override > project default > agent frontmatter) resolves.
+		// These record the DECLARED model; what the harness actually used is
+		// future work that needs a harness that can emit it. Nullable:
+		// historical rows predate the columns — analytics labels them
+		// "unknown" and excludes them from denominators rather than folding
+		// them into a real bucket.
+		provider: text("provider"),
+		model: text("model"),
+		// Merge-watcher PR facts (warren-3bc6 / pl-103e step 6). The post_reap
+		// lifecycle subscriber polls the run's PR through the boot-resolved
+		// forge until terminal and writes the provider-neutral lifecycle here;
+		// pr_merged_at is the forge-reported merge instant (ISO8601 TEXT, the
+		// started_at/ended_at convention). Both nullable: rows whose run never
+		// opened a PR (pr_url null) or that predate the watcher stay NULL —
+		// read NULL as "unknown", never as "not merged".
+		prState: text("pr_state", { enum: PULL_REQUEST_LIFECYCLES }),
+		prMergedAt: text("pr_merged_at"),
+		// Reap-time outcome facts (warren-ab2b / pl-103e): what the reap
+		// pipeline MEASURED at finalize — commits the pushed branch was ahead
+		// of the base, plus the parsed `git diff --numstat` totals. Recorded,
+		// not interpreted: no derived judgments. All nullable — rows written
+		// before the columns existed, runs whose finalize was skipped/failed,
+		// and diffs that could not be measured are NULL, which analytics reads
+		// as "unknown" (excluded from denominators), never as zero.
+		commitsAhead: integer("commits_ahead"),
+		filesChanged: integer("files_changed"),
+		insertions: integer("insertions"),
+		deletions: integer("deletions"),
 	},
 	(t) => [
 		index(INDEX_NAMES.runsState).on(t.state),
@@ -226,15 +284,24 @@ export const events = sqliteTable(
 		runId: text("run_id")
 			.notNull()
 			.references(() => runs.id, { onDelete: "cascade" }),
-		burrowEventSeq: integer("burrow_event_seq").notNull(),
+		sandboxEventSeq: integer("sandbox_event_seq").notNull(),
 		ts: text("ts").notNull(),
 		kind: text("kind").notNull(),
 		stream: text("stream", { enum: EVENT_STREAMS }),
+		// Parse-boundary provenance (warren-5a07) — `"agent"` marks an
+		// unattributed line re-parsed off a transport the agent can write
+		// to; absent reads as warren-authored in the in-memory stream view.
+		// Nullable: historical rows predate the column and read as unknown
+		// — never fold NULL into a real bucket (mixed-semantics rule).
+		origin: text("origin"),
 		payloadJson: text("payload_json", { mode: "json" }).notNull(),
 	},
 	(t) => [
-		index(INDEX_NAMES.eventsRunSeq).on(t.runId, t.burrowEventSeq),
+		index(INDEX_NAMES.eventsRunSeq).on(t.runId, t.sandboxEventSeq),
 		index(INDEX_NAMES.eventsRunTs).on(t.runId, t.ts),
+		// warren-55cf: healer attempt history filters by kind + payload
+		// fingerprint at the SQL level; this keeps the kind scan bounded.
+		index(INDEX_NAMES.eventsKindTs).on(t.kind, t.ts),
 	],
 );
 
@@ -289,7 +356,9 @@ export const planRuns = sqliteTable(
 	TABLE_NAMES.planRuns,
 	{
 		id: text("id").primaryKey(),
-		planId: text("plan_id").notNull(),
+		planId: text("plan_id"),
+		// warren-de42: 'plan' (classic plan id) | 'issues' (explicit ordered issue-id list).
+		source: text("source", { enum: PLAN_RUN_SOURCES }).notNull().default("plan"),
 		projectId: text("project_id")
 			.notNull()
 			.references(() => projects.id, { onDelete: "cascade" }),
@@ -298,6 +367,10 @@ export const planRuns = sqliteTable(
 		ref: text("ref"),
 		providerOverride: text("provider_override"),
 		modelOverride: text("model_override"),
+		// warren-a63d: per-dispatch USD spend cap applied to EACH child run
+		// (forwarded as spawnRun maxCostUsdOverride), persisted like the
+		// provider/model overrides so the coordinator re-reads it per child.
+		maxCostUsd: real("max_cost_usd"),
 		dispatcherHandle: text("dispatcher_handle").notNull().default("operator"),
 		trigger: text("trigger").notNull().default("manual"),
 		// Back-link to the parent run that created this plan-run via
@@ -313,6 +386,10 @@ export const planRuns = sqliteTable(
 		createdAt: text("created_at").notNull(),
 		startedAt: text("started_at"),
 		endedAt: text("ended_at"),
+		// warren-1eff: last same-row resume time. The merge-wait clock derives
+		// from the later of endedAt and this stamp, so a resume re-arms the
+		// budget instead of re-timing out on the stale run.endedAt.
+		resumedAt: text("resumed_at"),
 	},
 	(t) => [
 		index(INDEX_NAMES.planRunsProjectState).on(t.projectId, t.state),
@@ -349,6 +426,10 @@ export const planRunChildren = sqliteTable(
 		endedAt: text("ended_at"),
 		prMergedAt: text("pr_merged_at"),
 		failureReason: text("failure_reason"),
+		// warren-6de9: automatic child re-dispatch budget consumed so far.
+		// Persisted so a coordinator restart / re-driven tick never grants a
+		// child a fresh retry.
+		retryCount: integer("retry_count").notNull().default(0),
 	},
 	(t) => [
 		primaryKey({ columns: [t.planRunId, t.seq] }),
@@ -401,9 +482,83 @@ export const runInbox = sqliteTable(
 	(t) => [index(INDEX_NAMES.runInboxRunState).on(t.runId, t.state)],
 );
 
+/** Tool-calls rollup (warren-7746). One row per tool_use; CASCADE with run. */
+export const toolCalls = sqliteTable(
+	TABLE_NAMES.toolCalls,
+	{
+		id: integer("id").primaryKey({ autoIncrement: true }),
+		runId: text("run_id")
+			.notNull()
+			.references(() => runs.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+		ts: text("ts").notNull(),
+		toolName: text("tool_name"),
+		command: text("command"),
+		filePaths: text("file_paths", { mode: "json" }),
+		toolUseId: text("tool_use_id"),
+		isError: integer("is_error", { mode: "boolean" }).notNull().default(false),
+		resultBytes: integer("result_bytes"),
+		origin: text("origin"),
+	},
+	(t) => [
+		uniqueIndex(INDEX_NAMES.toolCallsRunSeq).on(t.runId, t.seq),
+		index(INDEX_NAMES.toolCallsRunUseId).on(t.runId, t.toolUseId),
+	],
+);
+
+/**
+ * Dispatch-context log (warren-36e7). Insert-only fact row per dispatch;
+ * PK run_id CASCADE. created_at is ISO8601 TEXT (analytics window).
+ * NULL means unknown. Four groups: action, queue, provenance, issue.
+ */
+export const dispatchContext = sqliteTable(
+	TABLE_NAMES.dispatchContext,
+	{
+		runId: text("run_id")
+			.primaryKey()
+			.references(() => runs.id, { onDelete: "cascade" }),
+		createdAt: text("created_at").notNull(),
+		agentName: text("agent_name"),
+		provider: text("provider"),
+		model: text("model"),
+		providerSource: text("provider_source"),
+		modelSource: text("model_source"),
+		capSource: text("cap_source"),
+		maxCostUsd: real("max_cost_usd"),
+		runtimeId: text("runtime_id"),
+		runtimeBackend: text("runtime_backend"),
+		promptBytes: integer("prompt_bytes"),
+		mode: text("mode"),
+		network: text("network"),
+		queueQueuedRuns: integer("queue_queued_runs"),
+		queueRunningRuns: integer("queue_running_runs"),
+		queueProjectNonTerminal: integer("queue_project_non_terminal"),
+		queueSnapshotSource: text("queue_snapshot_source"),
+		trigger: text("trigger"),
+		dispatchOrigin: text("dispatch_origin"),
+		dispatcherHandle: text("dispatcher_handle"),
+		triggerId: text("trigger_id"),
+		planRunId: text("plan_run_id"),
+		retryKind: text("retry_kind"),
+		retryOfRunId: text("retry_of_run_id"),
+		parentRunId: text("parent_run_id"),
+		attemptNo: integer("attempt_no"),
+		rootRunId: text("root_run_id"),
+		seedId: text("seed_id"),
+		seedStatus: text("seed_status"),
+		seedPriority: integer("seed_priority"),
+		seedSize: text("seed_size"),
+	},
+	(t) => [index(INDEX_NAMES.dispatchContextCreatedAt).on(t.createdAt)],
+);
+
 export type PlanRunRow = typeof planRuns.$inferSelect;
 export type PlanRunInsert = typeof planRuns.$inferInsert;
 export type PlanRunChildRow = typeof planRunChildren.$inferSelect;
 export type PlanRunChildInsert = typeof planRunChildren.$inferInsert;
 export type RunInboxRow = typeof runInbox.$inferSelect;
 export type RunInboxInsert = typeof runInbox.$inferInsert;
+export type ToolCallRow = typeof toolCalls.$inferSelect;
+export type ToolCallInsert = typeof toolCalls.$inferInsert;
+export type DispatchContextRow = typeof dispatchContext.$inferSelect;
+export type DispatchContextInsert = typeof dispatchContext.$inferInsert;

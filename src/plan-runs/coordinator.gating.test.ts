@@ -33,7 +33,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: h.planRun,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "run_x"),
 			emit: h.emit,
@@ -51,13 +51,51 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "merged", mergedAt: NOW.toISOString() }),
 			spawn: h.spawnStub(() => "run_child"),
 			emit: h.emit,
 			now: () => NOW,
 		});
 		expect(result.kind).toBe("dispatched");
+	});
+
+	test("plan-run with ref: parent PR merged-into-ref passes the gate and the child spawn keeps the ref (warren-8cbf)", async () => {
+		const parentRunId = await h.makeRun("warren-parent");
+		await h.repos.runs.markRunning(parentRunId, NOW);
+		await h.repos.runs.finalize(parentRunId, "succeeded", NOW);
+		await h.repos.runs.setPrUrl(parentRunId, "https://github.com/x/y/pull/99");
+		const { planRun } = await h.repos.planRuns.create({
+			planId: "pl-ref-gate",
+			projectId: h.projectId,
+			agentName: "claude-code",
+			parentRunId,
+			ref: "feature/parent",
+			children: [{ seq: 1, seedId: "warren-c" }],
+			now: NOW,
+		});
+		let seenRef: string | null | undefined;
+		const innerSpawn = h.spawnStub(() => "run_child");
+		const result = await advancePlanRun({
+			planRun,
+			repos: h.repos,
+			getIssue: h.getIssueStub("open"),
+			// The merged check polls the PR itself; with reap threading the run's
+			// ref as the PR base, "merged" here means merged-into-ref — the gate
+			// needs no extra base input.
+			checkPrMerged: async (url) => {
+				expect(url).toBe("https://github.com/x/y/pull/99");
+				return { kind: "merged", mergedAt: NOW.toISOString() };
+			},
+			spawn: (args) => {
+				seenRef = args.planRun.ref;
+				return innerSpawn(args);
+			},
+			emit: h.emit,
+			now: () => NOW,
+		});
+		expect(result.kind).toBe("dispatched");
+		expect(seenRef).toBe("feature/parent");
 	});
 
 	test("parentRunId set, parent PR open → waiting_for_parent_merge", async () => {
@@ -69,7 +107,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -90,7 +128,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -121,7 +159,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -140,7 +178,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "open" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -159,7 +197,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: async () => ({ kind: "closed_unmerged" }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
@@ -174,10 +212,10 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		expect(reloaded.failureReason).toBe("parent_pr_not_merged");
 	});
 
-	test.each<[number, string]>([
-		[404, "Not Found"],
-		[410, "Gone"],
-	])("parent PR http %i poll → plan_failed parent_pr_not_merged (warren-eccd)", async (status, message) => {
+	test.each([
+		"Not Found",
+		"Gone",
+	])("parent PR not_found poll (%s) → plan_failed parent_pr_not_merged (warren-eccd)", async (detail) => {
 		const parentRunId = await h.makeRun("warren-parent");
 		await h.repos.runs.markRunning(parentRunId, NOW);
 		await h.repos.runs.finalize(parentRunId, "succeeded", NOW);
@@ -186,13 +224,13 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
-			checkPrMerged: async () => ({ kind: "http_error", status, message }),
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: async () => ({ kind: "forge_error", errorKind: "not_found", detail }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
 			now: () => NOW,
 		});
-		// 404/410 mean the parent PR is genuinely gone → fail the gate.
+		// not_found means the parent PR is genuinely gone → fail the gate.
 		expect(result.kind).toBe("plan_failed");
 		if (result.kind === "plan_failed") {
 			expect(result.reason).toBe("parent_pr_not_merged");
@@ -207,11 +245,11 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		expect(failedEvent?.payload.reason).toBe("parent_pr_not_merged");
 	});
 
-	test.each<[number, string]>([
-		[401, "Unauthorized"],
-		[403, "Forbidden"],
-		[429, "rate limit"],
-	])("parent PR http %i poll keeps waiting, not parent_pr_not_merged (warren-eccd)", async (status, message) => {
+	test.each([
+		"unauthorized",
+		"forbidden",
+		"rate_limited",
+	] as const)("parent PR %s poll keeps waiting, not parent_pr_not_merged (warren-eccd)", async (errorKind) => {
 		const parentRunId = await h.makeRun("warren-parent");
 		await h.repos.runs.markRunning(parentRunId, NOW);
 		await h.repos.runs.finalize(parentRunId, "succeeded", NOW);
@@ -220,14 +258,14 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
-			checkPrMerged: async () => ({ kind: "http_error", status, message }),
+			getIssue: h.getIssueStub("open"),
+			checkPrMerged: async () => ({ kind: "forge_error", errorKind, detail: errorKind }),
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,
 			now: () => NOW,
 		});
-		// 401/403/429 are "cannot verify right now" (auth blip / rate
-		// limit) — keep waiting for the parent merge, bounded by the
+		// unauthorized/forbidden/rate_limited are "cannot verify right now"
+		// (auth blip / rate limit) — keep waiting for the parent merge, bounded by the
 		// merge-wait budget (warren-3937). Do NOT fail the gate; no
 		// plan_run.failed event.
 		expect(result.kind).toBe("waiting_for_parent_merge");
@@ -244,7 +282,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const seq = ((await h.repos.events.maxSeqForRun(parentRunId)) ?? 0) + 1;
 		await h.repos.events.append({
 			runId: parentRunId,
-			burrowEventSeq: seq,
+			sandboxEventSeq: seq,
 			ts: NOW.toISOString(),
 			kind: "reap.empty_push",
 			stream: "system",
@@ -254,7 +292,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "run_child"),
 			emit: h.emit,
@@ -268,7 +306,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "run_child"),
 			emit: h.emit,
@@ -284,7 +322,7 @@ describe("advancePlanRun — parentRunId gate (warren-d9a2)", () => {
 		const result = await advancePlanRun({
 			planRun: pr,
 			repos: h.repos,
-			showSeed: h.showSeedStub("open"),
+			getIssue: h.getIssueStub("open"),
 			checkPrMerged: neverPoll,
 			spawn: h.spawnStub(() => "unused"),
 			emit: h.emit,

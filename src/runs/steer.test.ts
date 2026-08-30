@@ -1,109 +1,52 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Message } from "@os-eco/burrow-cli";
-import { BurrowClient, BurrowUnreachableError } from "../burrow-client/index.ts";
-import { NotFoundError, ValidationError } from "../core/errors.ts";
+import { NotFoundError, StateTransitionError, ValidationError } from "../core/errors.ts";
 import { openDatabase, type WarrenDb } from "../db/client.ts";
 import { createRepos, type Repos } from "../db/repos/index.ts";
-import type { RuntimeProvider } from "../runtime/contract.ts";
-import { resolveRuntimeProvider } from "../runtime/registry.ts";
+import { AgentSchemaError } from "../registry/errors.ts";
+import type { Message, RuntimeProvider } from "../runtime/contract.ts";
+import { RuntimeRunNotFoundError, RuntimeUnreachableError } from "../runtime/errors.ts";
+import {
+	type FakeProvider,
+	type FakeProviderCall,
+	makeFakeProvider,
+} from "../runtime/fake/fake-provider.ts";
 import { RunEventBroker } from "./events.ts";
 import { steerRun } from "./steer.ts";
 
 /**
- * One-worker pool wired to a stub burrow client (warren-c0c9). Upserts a
- * `local` worker row so `pool.clientFor` resolves cleanly; the per-burrow
- * `burrows` row is seeded by the test that needs it.
+ * The provider seam `steerRun` speaks (pl-829f step 13; re-based onto the
+ * contract-typed `FakeProvider` in warren-ea0a when the burrow facade left).
+ * `steerRun` calls only `provider.sendMessage`; the fake records the inbox
+ * call and returns the canned message row.
  */
-async function makePool(
-	client: BurrowClient,
-	_repos: Repos,
-	_workerName = "local",
-): Promise<BurrowClient> {
+async function makeProvider(client: FakeProvider, _repos: Repos): Promise<RuntimeProvider> {
 	return client;
 }
 
-/**
- * Build the runtime-provider seam over the same single-`local`-worker pool
- * (pl-829f step 13). The LocalProvider resolves the sole burrow worker itself,
- * so `sendMessage` reaches the stub client exactly as the pre-seam
- * `pool.clientFor` did. Mechanical injection-shape update — no behavior change.
- */
-async function makeProvider(client: BurrowClient, repos: Repos): Promise<RuntimeProvider> {
-	const pool = await makePool(client, repos);
-	return resolveRuntimeProvider({ burrowClient: () => pool });
-}
-
-function stub(
-	impl: (input: URL | RequestInfo, init?: RequestInit) => Promise<Response>,
-): typeof fetch {
-	return impl as unknown as typeof fetch;
-}
-
-function jsonResponse(status: number, body: unknown): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json" },
-	});
-}
-
-interface RecordedCall {
-	method: string;
-	path: string;
-	body: unknown;
-}
-
 interface InboxFetchPlan {
+	/** Overrides on the `Message` row `sendMessage` returns. */
 	message?: Partial<Message>;
+	/** 400 ⇒ a backend validation failure; 404 ⇒ backend run-not-found. */
 	status?: number;
-	body?: unknown;
 }
 
-function makeBurrowClient(plan: InboxFetchPlan = {}): {
-	client: BurrowClient;
-	calls: RecordedCall[];
+function makeSandboxClient(plan: InboxFetchPlan = {}): {
+	client: FakeProvider;
+	calls: FakeProviderCall[];
 } {
-	const calls: RecordedCall[] = [];
-	const fetchImpl = stub(async (input, init) => {
-		const url = new URL(String(input), "http://localhost");
-		const path = url.pathname;
-		const method = init?.method ?? "GET";
-		const reqBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-		calls.push({ method, path, body: reqBody });
-		if (method === "POST" && path.match(/^\/burrows\/[^/]+\/inbox$/)) {
-			const message: Message = {
-				id: "msg_aaaaaaaaaaaa",
-				burrowId: "bur_aaaaaaaaaaaa",
-				fromActor: "operator",
-				body:
-					typeof reqBody === "object" && reqBody !== null
-						? String((reqBody as { body?: unknown }).body ?? "")
-						: "",
-				priority: "normal",
-				state: "unread",
-				deliveredAtRunId: null,
-				createdAt: new Date("2026-05-08T12:00:00Z"),
-				deliveredAt: null,
-				...plan.message,
-			};
-			return jsonResponse(plan.status ?? 201, plan.body ?? serializeMessage(message));
-		}
-		return jsonResponse(404, {
-			error: { code: "not_found", message: `unmatched ${method} ${path}` },
-		});
+	const sendMessageError =
+		plan.status === 404
+			? new RuntimeRunNotFoundError("burrow bur_aaaaaaaaaaaa not found", {
+					recoveryHint: "the run is unknown to the backend; reconcile the warren row as lost",
+				})
+			: plan.status !== undefined
+				? new Error("body too long")
+				: undefined;
+	const client = makeFakeProvider({
+		...(plan.message !== undefined ? { message: plan.message } : {}),
+		...(sendMessageError !== undefined ? { sendMessageError } : {}),
 	});
-	const client = new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: fetchImpl,
-	});
-	return { client, calls };
-}
-
-function serializeMessage(m: Message): unknown {
-	return {
-		...m,
-		createdAt: m.createdAt.toISOString(),
-		deliveredAt: m.deliveredAt?.toISOString() ?? null,
-	};
+	return { client, calls: client.calls };
 }
 
 describe("steerRun", () => {
@@ -131,25 +74,34 @@ describe("steerRun", () => {
 	});
 
 	async function createRunningRun(
-		opts: { burrowId?: string | null; burrowRunId?: string | null } = {},
+		opts: {
+			sandboxId?: string | null;
+			sandboxRunId?: string | null;
+			renderedAgentJson?: unknown;
+		} = {},
 	): Promise<string> {
-		const burrowId = opts.burrowId === undefined ? "bur_aaaaaaaaaaaa" : opts.burrowId;
+		const sandboxId = opts.sandboxId === undefined ? "bur_aaaaaaaaaaaa" : opts.sandboxId;
 		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId,
 			prompt: "p",
-			renderedAgentJson: {},
+			renderedAgentJson: opts.renderedAgentJson ?? {},
 			trigger: "manual",
-			burrowId,
-			burrowRunId: opts.burrowRunId === undefined ? "run_zzzzzzzzzzzz" : opts.burrowRunId,
+			sandboxId,
+			sandboxRunId: opts.sandboxRunId === undefined ? "run_zzzzzzzzzzzz" : opts.sandboxRunId,
 		});
 		await repos.runs.markRunning(run.id);
 		return run.id;
 	}
 
+	/** A frozen agent definition carrying the given `frontmatter.steering` value. */
+	function renderedWithSteering(steering: unknown): unknown {
+		return { sections: { system: "x" }, frontmatter: { steering } };
+	}
+
 	test("rejects an empty body before touching db or burrow", async () => {
 		const runId = await createRunningRun();
-		const { client, calls } = makeBurrowClient();
+		const { client, calls } = makeSandboxClient();
 		await expect(
 			steerRun({ runId, body: "   ", repos, runtimeProvider: await makeProvider(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
@@ -158,7 +110,7 @@ describe("steerRun", () => {
 	});
 
 	test("throws NotFoundError when the run is not registered", async () => {
-		const { client, calls } = makeBurrowClient();
+		const { client, calls } = makeSandboxClient();
 		await expect(
 			steerRun({
 				runId: "run_doesnotexist",
@@ -170,7 +122,7 @@ describe("steerRun", () => {
 		expect(calls).toHaveLength(0);
 	});
 
-	test("rejects when the run has no burrow_id (partial spawn window)", async () => {
+	test("rejects when the run has no sandbox_id (partial spawn window)", async () => {
 		const runId = (
 			await repos.runs.create({
 				agentName: "refactor-bot",
@@ -180,7 +132,7 @@ describe("steerRun", () => {
 				trigger: "manual",
 			})
 		).id;
-		const { client, calls } = makeBurrowClient();
+		const { client, calls } = makeSandboxClient();
 		await expect(
 			steerRun({ runId, body: "hi", repos, runtimeProvider: await makeProvider(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
@@ -190,16 +142,111 @@ describe("steerRun", () => {
 	test("rejects when the run is in a terminal state", async () => {
 		const runId = await createRunningRun();
 		await repos.runs.finalize(runId, "succeeded");
-		const { client, calls } = makeBurrowClient();
+		const { client, calls } = makeSandboxClient();
 		await expect(
 			steerRun({ runId, body: "hi", repos, runtimeProvider: await makeProvider(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);
 		expect(calls).toHaveLength(0);
 	});
 
+	test("rejects 409 when the harness declares steering: none (warren-3305)", async () => {
+		const runId = await createRunningRun({ renderedAgentJson: renderedWithSteering("none") });
+		const { client, calls } = makeSandboxClient();
+		const err = await steerRun({
+			runId,
+			body: "hi",
+			repos,
+			runtimeProvider: await makeProvider(client, repos),
+		}).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(StateTransitionError);
+		expect((err as Error).message).toContain("cannot consume steering");
+		expect(calls).toHaveLength(0);
+		expect(await repos.events.countByRun(runId)).toBe(0);
+	});
+
+	test("rejects 409 steering a running spawn-only harness (warren-3305)", async () => {
+		const runId = await createRunningRun({
+			renderedAgentJson: renderedWithSteering("spawn-only"),
+		});
+		const { client, calls } = makeSandboxClient();
+		const err = await steerRun({
+			runId,
+			body: "hi",
+			repos,
+			runtimeProvider: await makeProvider(client, repos),
+		}).catch((e: unknown) => e);
+		expect(err).toBeInstanceOf(StateTransitionError);
+		expect((err as Error).message).toContain("only consumes steering at spawn");
+		expect(calls).toHaveLength(0);
+		expect(await repos.events.countByRun(runId)).toBe(0);
+	});
+
+	test("allows steering a queued spawn-only run (message folds into the spawn prompt)", async () => {
+		const run = await repos.runs.create({
+			agentName: "refactor-bot",
+			projectId,
+			prompt: "p",
+			renderedAgentJson: renderedWithSteering("spawn-only"),
+			trigger: "manual",
+			sandboxId: "bur_aaaaaaaaaaaa",
+			sandboxRunId: "run_zzzzzzzzzzzz",
+		});
+		const { client, calls } = makeSandboxClient();
+		const result = await steerRun({
+			runId: run.id,
+			body: "hi",
+			repos,
+			runtimeProvider: await makeProvider(client, repos),
+		});
+		expect(result.message.body).toBe("hi");
+		expect(calls).toHaveLength(1);
+	});
+
+	test("allows a mid-run-capable harness on a running run", async () => {
+		const runId = await createRunningRun({ renderedAgentJson: renderedWithSteering("mid-run") });
+		const { client, calls } = makeSandboxClient();
+		const result = await steerRun({
+			runId,
+			body: "hi",
+			repos,
+			runtimeProvider: await makeProvider(client, repos),
+		});
+		expect(result.message.body).toBe("hi");
+		expect(calls).toHaveLength(1);
+	});
+
+	test("fails loudly on a malformed steering capability in the frozen definition", async () => {
+		const runId = await createRunningRun({ renderedAgentJson: renderedWithSteering("sometimes") });
+		const { client, calls } = makeSandboxClient();
+		await expect(
+			steerRun({
+				runId,
+				body: "hi",
+				repos,
+				runtimeProvider: await makeProvider(client, repos),
+			}),
+		).rejects.toBeInstanceOf(AgentSchemaError);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("an agent without a steering declaration stays fail-open (legacy behavior)", async () => {
+		const runId = await createRunningRun({
+			renderedAgentJson: { sections: { system: "x" }, frontmatter: { runtime: "pi" } },
+		});
+		const { client, calls } = makeSandboxClient();
+		const result = await steerRun({
+			runId,
+			body: "hi",
+			repos,
+			runtimeProvider: await makeProvider(client, repos),
+		});
+		expect(result.message.body).toBe("hi");
+		expect(calls).toHaveLength(1);
+	});
+
 	test("forwards body, priority, and fromActor onto the burrow inbox call", async () => {
 		const runId = await createRunningRun();
-		const { client, calls } = makeBurrowClient({
+		const { client, calls } = makeSandboxClient({
 			message: { priority: "high", fromActor: "alice" },
 		});
 		const result = await steerRun({
@@ -214,7 +261,7 @@ describe("steerRun", () => {
 		expect(calls).toEqual([
 			{
 				method: "POST",
-				path: "/burrows/bur_aaaaaaaaaaaa/inbox",
+				path: "/sandboxes/bur_aaaaaaaaaaaa/inbox",
 				body: {
 					body: "stop and write tests",
 					priority: "high",
@@ -226,7 +273,7 @@ describe("steerRun", () => {
 
 	test("appends a steer.sent system event to the run's event log", async () => {
 		const runId = await createRunningRun();
-		const { client } = makeBurrowClient({ message: { priority: "urgent" } });
+		const { client } = makeSandboxClient({ message: { priority: "urgent" } });
 		await steerRun({
 			runId,
 			body: "remember to lint",
@@ -241,7 +288,7 @@ describe("steerRun", () => {
 		if (!event) throw new Error("no event");
 		expect(event.kind).toBe("steer.sent");
 		expect(event.stream).toBe("system");
-		expect(event.burrowEventSeq).toBe(1);
+		expect(event.sandboxEventSeq).toBe(1);
 		const payload = event.payloadJson as {
 			messageId: string;
 			priority: string;
@@ -257,13 +304,13 @@ describe("steerRun", () => {
 		const runId = await createRunningRun();
 		await repos.events.append({
 			runId,
-			burrowEventSeq: 7,
+			sandboxEventSeq: 7,
 			ts: "2026-05-08T12:00:00Z",
 			kind: "text",
 			stream: "stdout",
 			payload: {},
 		});
-		const { client } = makeBurrowClient();
+		const { client } = makeSandboxClient();
 		await steerRun({
 			runId,
 			body: "hi",
@@ -273,7 +320,7 @@ describe("steerRun", () => {
 		const events = await repos.events.listByRun(runId);
 		const sent = events.find((e) => e.kind === "steer.sent");
 		expect(sent).toBeDefined();
-		expect(sent?.burrowEventSeq).toBe(8);
+		expect(sent?.sandboxEventSeq).toBe(8);
 	});
 
 	test("publishes the audit event to the broker for live tailers", async () => {
@@ -287,7 +334,7 @@ describe("steerRun", () => {
 				if (consumed.length >= 1) break;
 			}
 		})();
-		const { client } = makeBurrowClient();
+		const { client } = makeSandboxClient();
 		await steerRun({
 			runId,
 			body: "hi",
@@ -301,7 +348,7 @@ describe("steerRun", () => {
 
 	test("does not change the run's state", async () => {
 		const runId = await createRunningRun();
-		const { client } = makeBurrowClient();
+		const { client } = makeSandboxClient();
 		await steerRun({
 			runId,
 			body: "hi",
@@ -311,48 +358,41 @@ describe("steerRun", () => {
 		expect((await repos.runs.require(runId)).state).toBe("running");
 	});
 
-	test("steers a queued run that already has a burrow_id", async () => {
+	test("steers a queued run that already has a sandbox_id", async () => {
 		const run = await repos.runs.create({
 			agentName: "refactor-bot",
 			projectId,
 			prompt: "p",
 			renderedAgentJson: {},
 			trigger: "manual",
-			burrowId: "bur_aaaaaaaaaaaa",
+			sandboxId: "bur_aaaaaaaaaaaa",
 		});
-		const { client, calls } = makeBurrowClient();
+		const { client, calls } = makeSandboxClient();
 		await steerRun({
 			runId: run.id,
 			body: "hi",
 			repos,
 			runtimeProvider: await makeProvider(client, repos),
 		});
-		expect(calls[0]?.path).toBe("/burrows/bur_aaaaaaaaaaaa/inbox");
+		expect(calls[0]?.path).toBe("/sandboxes/bur_aaaaaaaaaaaa/inbox");
 		expect((await repos.runs.require(run.id)).state).toBe("queued");
 	});
 
-	test("transport errors are mapped to BurrowUnreachableError", async () => {
+	test("transport errors surface as RuntimeUnreachableError", async () => {
 		const runId = await createRunningRun();
-		const fetchImpl = stub(async () => {
-			throw new TypeError("fetch failed");
-		});
-		const client = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: fetchImpl,
+		const client = makeFakeProvider({
+			sendMessageError: new RuntimeUnreachableError("fetch failed"),
 		});
 		await expect(
 			steerRun({ runId, body: "hi", repos, runtimeProvider: await makeProvider(client, repos) }),
-		).rejects.toBeInstanceOf(BurrowUnreachableError);
+		).rejects.toBeInstanceOf(RuntimeUnreachableError);
 		// No audit event was emitted for a failed forward.
 		expect(await repos.events.countByRun(runId)).toBe(0);
 	});
 
 	test("server-side burrow errors propagate without emitting an audit event", async () => {
 		const runId = await createRunningRun();
-		const { client } = makeBurrowClient({
-			status: 400,
-			body: { error: { code: "validation_error", message: "body too long" } },
-		});
+		const { client } = makeSandboxClient({ status: 400 });
 		await expect(
 			steerRun({ runId, body: "hi", repos, runtimeProvider: await makeProvider(client, repos) }),
 		).rejects.toThrow();
@@ -361,10 +401,7 @@ describe("steerRun", () => {
 
 	test("warren-b1a9: burrow 404 on inbox surfaces as ValidationError (run is lost)", async () => {
 		const runId = await createRunningRun();
-		const { client } = makeBurrowClient({
-			status: 404,
-			body: { error: { code: "not_found", message: "burrow bur_aaaaaaaaaaaa not found" } },
-		});
+		const { client } = makeSandboxClient({ status: 404 });
 		await expect(
 			steerRun({ runId, body: "hi", repos, runtimeProvider: await makeProvider(client, repos) }),
 		).rejects.toBeInstanceOf(ValidationError);

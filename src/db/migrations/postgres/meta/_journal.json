@@ -218,6 +218,139 @@
 			"when": 1785607965211,
 			"tag": "0030_freezing_thunderball",
 			"breakpoints": true
+		},
+		{
+			"idx": 31,
+			"version": "7",
+			"when": 1785708466296,
+			"tag": "0031_talented_darwin",
+			"breakpoints": true
+		},
+		{
+			"idx": 32,
+			"version": "7",
+			"when": 1785868933551,
+			"tag": "0032_enable_rls_run_inbox",
+			"breakpoints": true
+		},
+		{
+			"idx": 33,
+			"version": "7",
+			"when": 1786160749050,
+			"tag": "0033_futuristic_randall",
+			"breakpoints": true
+		},
+		{
+			"idx": 34,
+			"version": "7",
+			"when": 1786724702243,
+			"tag": "0034_glorious_franklin_richards",
+			"breakpoints": true
+		},
+		{
+			"idx": 35,
+			"version": "7",
+			"when": 1786726545291,
+			"tag": "0035_perpetual_chameleon",
+			"breakpoints": true
+		},
+		{
+			"idx": 36,
+			"version": "7",
+			"when": 1786727687602,
+			"tag": "0036_easy_warlock",
+			"breakpoints": true
+		},
+		{
+			"idx": 37,
+			"version": "7",
+			"when": 1786729852343,
+			"tag": "0037_sloppy_dorian_gray",
+			"breakpoints": true
+		},
+		{
+			"idx": 38,
+			"version": "7",
+			"when": 1786732707252,
+			"tag": "0038_clumsy_newton_destine",
+			"breakpoints": true
+		},
+		{
+			"idx": 39,
+			"version": "7",
+			"when": 1786736385078,
+			"tag": "0039_dear_calypso",
+			"breakpoints": true
+		},
+		{
+			"idx": 40,
+			"version": "7",
+			"when": 1786880590718,
+			"tag": "0040_dear_piledriver",
+			"breakpoints": true
+		},
+		{
+			"idx": 41,
+			"version": "7",
+			"when": 1786906128930,
+			"tag": "0041_talented_lenny_balinger",
+			"breakpoints": true
+		},
+		{
+			"idx": 42,
+			"version": "7",
+			"when": 1786908875883,
+			"tag": "0042_amazing_gravity",
+			"breakpoints": true
+		},
+		{
+			"idx": 43,
+			"version": "7",
+			"when": 1786917355769,
+			"tag": "0043_fantastic_shooting_star",
+			"breakpoints": true
+		},
+		{
+			"idx": 44,
+			"version": "7",
+			"when": 1786944302747,
+			"tag": "0044_melted_the_executioner",
+			"breakpoints": true
+		},
+		{
+			"idx": 45,
+			"version": "7",
+			"when": 1787159414284,
+			"tag": "0045_lively_zombie",
+			"breakpoints": true
+		},
+		{
+			"idx": 46,
+			"version": "7",
+			"when": 1787172354069,
+			"tag": "0046_normal_imperial_guard",
+			"breakpoints": true
+		},
+		{
+			"idx": 47,
+			"version": "7",
+			"when": 1787179365706,
+			"tag": "0047_red_skrulls",
+			"breakpoints": true
+		},
+		{
+			"idx": 48,
+			"version": "7",
+			"when": 1787850245665,
+			"tag": "0048_legal_wild_child",
+			"breakpoints": true
+		},
+		{
+			"idx": 49,
+			"version": "7",
+			"when": 1787855601644,
+			"tag": "0049_lively_terrax",
+			"breakpoints": true
 		}
 	]
 }

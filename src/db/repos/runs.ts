@@ -1,14 +1,4 @@
-/**
- * Repository for the `runs` table.
- *
- * Warren's run row mirrors the lifecycle of the underlying burrow run
- * (queued → running → succeeded|failed|cancelled). The state is updated as
- * we observe burrow's stream; warren itself does not pick runs off a queue.
- *
- * `attachBurrow` exists because the composition flow (docs/design/agent-composition.md) creates the warren
- * row before burrow's `POST /burrows` and `POST /burrows/:id/runs` return —
- * the burrow IDs are written back once we have them.
- */
+/** Repository for the `runs` table (queued → running → terminal). */
 
 import { and, eq } from "drizzle-orm";
 import { NotFoundError, StateTransitionError, ValidationError } from "../../core/errors.ts";
@@ -16,7 +6,8 @@ import { generateId } from "../../core/ids.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type {
 	CloneKind,
-	PreviewState,
+	PullRequestLifecycle,
+	RunCostBasis,
 	RunFailureReason,
 	RunMode,
 	RunRow,
@@ -25,15 +16,26 @@ import type {
 } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
 import { fixAttemptHistoryByPrUrl, listPrCandidatesByProject } from "./runs-ci-fixer.ts";
+import { deleteNeverStarted } from "./runs-delete.ts";
+import {
+	type RunOutcomeFacts,
+	setOutcomeFacts as setOutcomeFactsBody,
+} from "./runs-outcome-facts.ts";
+import { setBranch, setPrState, setPrUrl } from "./runs-pr.ts";
+import { type AttachPreviewInput, attachPreview } from "./runs-preview.ts";
 import {
 	aggregate,
+	findByRetryOf,
 	listAll,
 	listByAgent,
 	listByIds,
 	listByProject,
 	listByState,
 	listForAnalytics,
+	listWithUnresolvedPr,
 } from "./runs-queries.ts";
+import { countNonTerminal } from "./runs-stats.ts";
+import { clearBurrowIdForWorkspace } from "./runs-workspace.ts";
 
 const ALLOWED_TRANSITIONS: Record<RunState, readonly RunState[]> = {
 	queued: ["running", "cancelled"],
@@ -49,6 +51,10 @@ export function assertRunTransition(from: RunState, to: RunState): void {
 	}
 }
 
+// Preview-transition guard + input shape live in runs-preview.ts (file-size
+// split); re-exported here so existing import sites keep working.
+export { type AttachPreviewInput, assertPreviewTransition } from "./runs-preview.ts";
+
 export interface CreateRunInput {
 	id?: string;
 	agentName: string;
@@ -56,8 +62,8 @@ export interface CreateRunInput {
 	prompt: string;
 	renderedAgentJson: unknown;
 	trigger: string;
-	burrowId?: string | null;
-	burrowRunId?: string | null;
+	sandboxId?: string | null;
+	sandboxRunId?: string | null;
 	/** Worker hosting the burrow (warren-135b); denormalized for run routing. */
 	workerId?: string | null;
 	/** Seeds issue back-link (pl-bb70 step 3); null = no seed. */
@@ -68,25 +74,31 @@ export interface CreateRunInput {
 	 * primitive (warren-1117). Fixed at run-create time.
 	 */
 	mode?: RunMode;
-	/**
-	 * Continuation/replicate back-link (warren-4b11 / warren-e96f). Null for
-	 * root runs; plain text id, no FK. `cloneKind` tells the two chain kinds
-	 * apart: `continue` (seed from parent's pushed branch) vs `replicate`.
-	 */
+	/** Continuation/replicate back-link (warren-4b11 / warren-e96f); null for root runs. */
 	parentRunId?: string | null;
+	/** Infra-lost auto-retry back-link (warren-4af7); null for first attempts. */
+	retryOf?: string | null;
 	/** Chain kind (warren-e96f); null for root runs. */
 	cloneKind?: CloneKind | null;
-	/**
-	 * Operator-requested target branch the run was dispatched against
-	 * (warren-1f81, #419). Null/omitted = no explicit target branch.
-	 */
+	/** Operator-requested target branch (warren-1f81, #419); null = none. */
 	targetBranch?: string | null;
+	/** Dispatch-supplied git ref the workspace clones from (warren-afeb); null = none. */
+	ref?: string | null;
+	/** Base-commit pin (warren-aaf7): 40-hex SHA the workspace is cut at; null = none. */
+	baseCommit?: string | null;
+	/** Declared provider/model frozen at dispatch (warren-2ede / pl-103e).
+	 * Null = agent declares none (or a historical row). */
+	provider?: string | null;
+	model?: string | null;
+	/** Cost basis (warren-f3c3); defaults to `api`. */
+	costBasis?: RunCostBasis;
+	/** Queued-instant override (warren-0af9); defaults to the wall clock at insert. */
 	now?: Date;
 }
 
 export interface AttachBurrowInput {
-	burrowId?: string;
-	burrowRunId?: string;
+	sandboxId?: string;
+	sandboxRunId?: string;
 	workerId?: string;
 }
 
@@ -96,14 +108,6 @@ export interface AttachStatsInput {
 	tokensOutput?: number | null;
 	tokensCacheRead?: number | null;
 	tokensCacheWrite?: number | null;
-}
-
-export interface AttachPreviewInput {
-	previewState?: PreviewState | null;
-	previewPort?: number | null;
-	previewStartedAt?: string | null;
-	previewLastHitAt?: string | null;
-	previewFailureMessage?: string | null;
 }
 
 export class RunsRepo {
@@ -118,28 +122,47 @@ export class RunsRepo {
 	}
 
 	async create(input: CreateRunInput): Promise<RunRow> {
+		const { costBasis = "api" } = input;
 		const row: RunRow = {
 			id: input.id ?? generateId("run"),
 			agentName: input.agentName,
 			projectId: input.projectId,
-			burrowId: input.burrowId ?? null,
-			burrowRunId: input.burrowRunId ?? null,
+			sandboxId: input.sandboxId ?? null,
+			sandboxRunId: input.sandboxRunId ?? null,
 			workerId: input.workerId ?? null,
 			seedId: input.seedId ?? null,
 			parentRunId: input.parentRunId ?? null,
 			cloneKind: input.cloneKind ?? null,
+			retryOf: input.retryOf ?? null,
 			renderedAgentJson: input.renderedAgentJson,
 			state: "queued",
 			failureReason: null,
+			// The queued instant (warren-0af9), stamped at insert; queue wait is
+			// `startedAt - createdAt`.
+			createdAt: (input.now ?? new Date()).getTime(),
 			startedAt: null,
 			endedAt: null,
 			prompt: input.prompt,
 			trigger: input.trigger,
 			prUrl: null,
 			targetBranch: input.targetBranch ?? null,
+			branch: null,
+			ref: input.ref ?? null,
+			baseCommit: input.baseCommit ?? null,
+			provider: input.provider ?? null,
+			model: input.model ?? null,
+			// Merge-watcher facts (warren-3bc6): unset until post_reap settles the PR.
+			prState: null,
+			prMergedAt: null,
+			// Outcome facts (warren-ab2b): unknown until reap measures them — NULL.
+			commitsAhead: null,
+			filesChanged: null,
+			insertions: null,
+			deletions: null,
 			salvageRef: null,
 			salvagePath: null,
 			costUsd: null,
+			costBasis,
 			tokensInput: null,
 			tokensOutput: null,
 			tokensCacheRead: null,
@@ -168,40 +191,9 @@ export class RunsRepo {
 		return row;
 	}
 
-	/**
-	 * Hard-delete a run row that never reached the runtime (warren-a0a2).
-	 *
-	 * The scheduler's bounded-retry GC calls this to drop the transient
-	 * `never_started` rows a persistently-unreachable runtime would otherwise
-	 * mint one-per-tick, so the runs list isn't flooded during an outage. It
-	 * is deliberately narrow:
-	 *
-	 *   - Guarded to `state=failed` + `failureReason=never_started`. Any other
-	 *     row (a real queued/running/succeeded run, or a `failed` run that
-	 *     actually dispatched) is left untouched and the method returns false.
-	 *   - `events.run_id` carries no `ON DELETE` cascade, so the write-through
-	 *     event rows are cleared first, then the run row, inside one
-	 *     transaction. `triggers.last_run_id` / `plan_run_children.run_id`
-	 *     (both `ON DELETE SET NULL`) and `run_inbox` (`CASCADE`) fall away on
-	 *     their own; a never_started cron retry has none of them anyway.
-	 *
-	 * Returns true when a row was deleted, false when the id was missing or
-	 * the guard rejected it.
-	 */
-	async deleteNeverStarted(id: string): Promise<boolean> {
-		return this.adapter.runInTransaction(async (tx) => {
-			const txDb = tx.drizzle as SqliteDrizzleDb;
-			const runs = tx.schema.runs;
-			const events = tx.schema.events;
-			const existing = await tx.pickOne<RunRow>(txDb.select().from(runs).where(eq(runs.id, id)));
-			if (!existing) return false;
-			if (existing.state !== "failed" || existing.failureReason !== "never_started") {
-				return false;
-			}
-			await tx.runWrite(txDb.delete(events).where(eq(events.runId, id)));
-			await tx.runWrite(txDb.delete(runs).where(eq(runs.id, id)));
-			return true;
-		});
+	/** Hard-delete a never-started run row (warren-a0a2); body in runs-delete.ts. */
+	deleteNeverStarted(id: string): Promise<boolean> {
+		return deleteNeverStarted(this.adapter, id);
 	}
 
 	/** Read/query methods (warren-ac7f); bodies live in runs-queries.ts. */
@@ -262,29 +254,39 @@ export class RunsRepo {
 		return listByState(this.adapter, state);
 	}
 
-	/**
-	 * Write back the burrow IDs as they become available. The spawn flow (docs/design/agent-composition.md)
-	 * provisions the burrow first (`POST /burrows`) and dispatches the run
-	 * second (`POST /burrows/:id/runs`), so each ID lands on a different turn.
-	 * Both fields are optional, but at least one must be set.
-	 */
+	/** Non-terminal (`queued`+`running`) count; body in runs-stats.ts (warren-e1f1). */
+	countNonTerminal(projectId?: string): Promise<number> {
+		return countNonTerminal(this.adapter, projectId);
+	}
+
+	/** The retry a `sandbox_run_lost` original spawned (warren-4af7); body in runs-queries.ts. */
+	findByRetryOf(runId: string): Promise<RunRow | null> {
+		return findByRetryOf(this.adapter, runId);
+	}
+
+	/** Write back sandbox IDs as spawn provisions them; at least one field required. */
 	async attachBurrow(id: string, input: AttachBurrowInput): Promise<RunRow> {
 		if (
-			input.burrowId === undefined &&
-			input.burrowRunId === undefined &&
+			input.sandboxId === undefined &&
+			input.sandboxRunId === undefined &&
 			input.workerId === undefined
 		) {
 			throw new ValidationError(
-				"attachBurrow requires at least one of burrowId, burrowRunId, or workerId",
+				"attachBurrow requires at least one of sandboxId, sandboxRunId, or workerId",
 			);
 		}
 		const current = await this.require(id);
-		const patch: { burrowId?: string; burrowRunId?: string; workerId?: string } = {};
-		if (input.burrowId !== undefined) patch.burrowId = input.burrowId;
-		if (input.burrowRunId !== undefined) patch.burrowRunId = input.burrowRunId;
+		const patch: { sandboxId?: string; sandboxRunId?: string; workerId?: string } = {};
+		if (input.sandboxId !== undefined) patch.sandboxId = input.sandboxId;
+		if (input.sandboxRunId !== undefined) patch.sandboxRunId = input.sandboxRunId;
 		if (input.workerId !== undefined) patch.workerId = input.workerId;
 		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
 		return { ...current, ...patch };
+	}
+
+	/** Null sandboxId after workspace destroy (warren-9b77); body in runs-workspace.ts. */
+	clearBurrowIdForWorkspace(sandboxId: string): Promise<void> {
+		return clearBurrowIdForWorkspace(this.adapter, sandboxId);
 	}
 
 	async markRunning(id: string, now: Date = new Date()): Promise<RunRow> {
@@ -346,57 +348,42 @@ export class RunsRepo {
 		return { ...current, ...patch };
 	}
 
-	/**
-	 * Persist per-run preview environment fields (R-19 / docs/design/preview-environments.md). Mirrors
-	 * `attachStats`'s partial-input semantics (mx-49272e): omitted fields
-	 * preserve existing values, explicit `null` clears. Throws ValidationError
-	 * when called with no fields, matching `attachBurrow` / `attachStats`.
-	 * Used by reap's `preview_launch` sub-step, the readiness probe, the host
-	 * reverse proxy (debounced `previewLastHitAt`), the eviction worker, and
-	 * the manual teardown route.
-	 */
-	async attachPreview(id: string, input: AttachPreviewInput): Promise<RunRow> {
-		const keys: (keyof AttachPreviewInput)[] = [
-			"previewState",
-			"previewPort",
-			"previewStartedAt",
-			"previewLastHitAt",
-			"previewFailureMessage",
-		];
-		if (keys.every((k) => input[k] === undefined)) {
-			throw new ValidationError("attachPreview requires at least one preview field");
-		}
-		const current = await this.require(id);
-		const patch: Partial<RunRow> = {};
-		for (const k of keys) {
-			if (input[k] !== undefined) {
-				(patch as Record<string, unknown>)[k] = input[k];
-			}
-		}
-		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
-		return { ...current, ...patch };
+	/** Preview-environment write (R-19); body lives in runs-preview.ts. */
+	attachPreview(id: string, input: AttachPreviewInput): Promise<RunRow> {
+		return attachPreview(this.adapter, id, input);
+	}
+
+	/** PR-fact writes (warren-f6af / warren-3bc6); bodies live in runs-pr.ts. */
+	setPrUrl(id: string, prUrl: string | null): Promise<RunRow> {
+		return setPrUrl(this.adapter, id, prUrl);
+	}
+
+	/** Branch-fact write (warren-5255); body lives in runs-pr.ts. */
+	setBranch(id: string, branch: string): Promise<RunRow> {
+		return setBranch(this.adapter, id, branch);
+	}
+
+	setPrState(
+		id: string,
+		prState: PullRequestLifecycle,
+		prMergedAt: string | null,
+	): Promise<RunRow> {
+		return setPrState(this.adapter, id, prState, prMergedAt);
 	}
 
 	/**
-	 * Persist the PR URL reap's `pr_open` sub-step opened (warren-f6af).
-	 * Last write wins; passing `null` clears the field. Separate from
-	 * `finalize` because reap fires this *before* the terminal transition
-	 * (so the URL lands on the `reap.completed` event payload too).
+	 * Runs whose PR the merge watcher still has to settle (warren-3bc6):
+	 * `pr_url` set and `pr_state` NULL or `open`. Boot re-adoption
+	 * enumerates these so a restart never orphans an in-flight poll.
 	 */
-	async setPrUrl(id: string, prUrl: string | null): Promise<RunRow> {
-		const current = await this.require(id);
-		await this.adapter.runWrite(
-			this.db.update(this.runs).set({ prUrl }).where(eq(this.runs.id, id)),
-		);
-		return { ...current, prUrl };
+	listWithUnresolvedPr(): Promise<RunRow[]> {
+		return listWithUnresolvedPr(this.adapter);
 	}
 
 	/**
 	 * Persist where a failed finalize's work was salvaged to (warren-cd3b):
 	 * the rescue branch on origin (`salvageRef`) and/or the durable git-bundle
-	 * file (`salvagePath`). Written by the salvage intake handler (k8s) or
-	 * reap's local salvage step before the workspace is destroyed. Last write
-	 * wins (a retried/re-dispatched salvage overwrites the stale location).
+	 * file (`salvagePath`). Last write wins.
 	 */
 	async setSalvage(
 		id: string,
@@ -410,6 +397,15 @@ export class RunsRepo {
 				.where(eq(this.runs.id, id)),
 		);
 		return { ...current, salvageRef: salvage.rescueRef, salvagePath: salvage.bundlePath };
+	}
+
+	/**
+	 * Persist the reap-time outcome facts (warren-ab2b / pl-103e). Last
+	 * write wins; NULL means unknown, never zero. Body lives in
+	 * runs-outcome-facts.ts (file-size budget).
+	 */
+	async setOutcomeFacts(id: string, facts: RunOutcomeFacts): Promise<RunRow> {
+		return setOutcomeFactsBody(this.adapter, id, facts);
 	}
 
 	/** CI-fixer queries (warren-0b75); bodies live in runs-ci-fixer.ts. */

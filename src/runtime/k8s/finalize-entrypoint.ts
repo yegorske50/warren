@@ -37,7 +37,15 @@
  *
  * The push credential arrives IN the intent (`gitToken`) — fetched over the
  * authenticated callback after the agent exited — so a compromised agent
- * never held it (`provider.ts` decision).
+ * never held it (`provider.ts` decision). For the salvage windows an intent
+ * never reaches, warren-c9ac routes the fallback through the SAME channel:
+ * the harness POSTs `/runs/:id/git-credential` and warren mints a fresh
+ * credential off the forge (forge-contract.md §4.1 — the pod cannot hold an
+ * App private key, so it asks the control plane). The warren-6016
+ * pod-carried `WARREN_GIT_TOKEN` (off the `warren-git-token` Secret) remains
+ * only as the PAT-mode last resort for an unreachable control plane; the
+ * agent child is still spawned with it scrubbed (`agent-io.ts`), so the
+ * blast-radius posture is unchanged for the agent itself.
  */
 
 import { readdir as nodeReaddir, readFile as nodeReadFile, rm as nodeRm } from "node:fs/promises";
@@ -46,13 +54,9 @@ import {
 	type FinalizeFs,
 	type FinalizeGitRunner,
 } from "./finalize-collect.ts";
-import type {
-	FinalizeResultEnvelope,
-	InPodFinalizeIntent,
-	SalvageEnvelope,
-} from "./finalize-wire.ts";
+import type { FinalizeResultEnvelope, InPodFinalizeIntent } from "./finalize-wire.ts";
 import { IN_POD_FINALIZE_WIRE_VERSION } from "./finalize-wire.ts";
-import { collectSalvage } from "./salvage.ts";
+import { salvageAndPost, salvageTriggerForResult } from "./salvage-post.ts";
 
 /* -------------------------------------------------------------------------- */
 /* Env                                                                        */
@@ -67,6 +71,18 @@ export interface FinalizeEntrypointEnv {
 	baseBranch: string | undefined;
 	/** The run's own branch (WARREN_BRANCH); surfaced on the salvage envelope. */
 	branch: string | undefined;
+	/**
+	 * Pod-carried push credential (warren-6016) — `WARREN_GIT_TOKEN`, falling
+	 * back to `GITHUB_TOKEN`. Sourced from the `warren-git-token` Secret on
+	 * the agent container (or, under App mode, the token minted at pod-spec
+	 * time — warren-c9ac) and held ONLY by this harness (the agent child
+	 * spawns with it scrubbed — see `agent-io.ts`). It is the salvage window's
+	 * LAST-RESORT credential: an intent-carried `gitToken` wins, then a
+	 * credential freshly minted over the `POST /runs/:id/git-credential`
+	 * callback (warren-c9ac); this one covers only the case where the control
+	 * plane itself is unreachable in the `no_intent` window.
+	 */
+	gitToken: string | undefined;
 	/** Poll interval for the intent fetch (ms). */
 	pollIntervalMs: number;
 	/**
@@ -93,6 +109,16 @@ export interface FinalizeEntrypointEnv {
 	postMaxAttempts: number;
 	/** Base backoff between result-POST retries (ms); doubles each attempt. */
 	postRetryBaseMs: number;
+	/**
+	 * The AGENT process's exit code (warren-5202), overlaid onto the env by
+	 * `agent-entrypoint` (`WARREN_AGENT_EXIT_CODE`) before this step runs.
+	 * Reported on every intent poll as `?agent_exit=` so a recovering control
+	 * plane can classify the run's outcome without the (possibly log-rotated)
+	 * terminal envelope. `undefined` when the overlay is absent — e.g. a pod
+	 * image predating the hint — and the recovery scan falls back to the
+	 * persisted event log.
+	 */
+	agentExitCode: number | undefined;
 }
 
 export type FinalizeEnvSource = Readonly<Record<string, string | undefined>>;
@@ -113,6 +139,16 @@ function intEnv(env: FinalizeEnvSource, key: string, fallback: number, min: 0 | 
 	return Number.isInteger(n) && n >= min ? n : fallback;
 }
 
+/**
+ * Default ceiling for the intent poll (warren-9d24): 40 minutes. Deliberately
+ * below the heartbeat watchdog budget (`DEFAULT_WATCHDOG_HEARTBEAT_TIMEOUT_MS`,
+ * 45 min) — a pod waiting on an intent is silent for the whole wait, so a
+ * ceiling above the watchdog budget would let the watchdog terminalize the run
+ * before the terminal `no_intent` salvage POST lands, and the run-scope gate
+ * would then 401 every attempt. A cross-budget test pins this ordering.
+ */
+export const DEFAULT_FINALIZE_MAX_WAIT_MS = 2_400_000;
+
 /** Parse + validate the finalize entrypoint env. Pure. */
 export function parseFinalizeEntrypointEnv(env: FinalizeEnvSource): FinalizeEntrypointEnv {
 	return {
@@ -122,13 +158,23 @@ export function parseFinalizeEntrypointEnv(env: FinalizeEnvSource): FinalizeEntr
 		workspacePath: env.WARREN_WORKSPACE_PATH?.trim() || "/workspace",
 		baseBranch: env.WARREN_BASE_BRANCH?.trim() || undefined,
 		branch: env.WARREN_BRANCH?.trim() || undefined,
+		gitToken: env.WARREN_GIT_TOKEN?.trim() || env.GITHUB_TOKEN?.trim() || undefined,
 		pollIntervalMs: intEnv(env, "WARREN_FINALIZE_POLL_INTERVAL_MS", 2_000, 1),
-		maxWaitMs: intEnv(env, "WARREN_FINALIZE_MAX_WAIT_MS", 3_000_000, 1),
+		maxWaitMs: intEnv(env, "WARREN_FINALIZE_MAX_WAIT_MS", DEFAULT_FINALIZE_MAX_WAIT_MS, 1),
 		earlySalvageMs: intEnv(env, "WARREN_FINALIZE_EARLY_SALVAGE_MS", 300_000, 0),
 		salvageMaxWaitMs: intEnv(env, "WARREN_SALVAGE_MAX_WAIT_MS", 120_000, 1),
 		postMaxAttempts: intEnv(env, "WARREN_FINALIZE_POST_MAX_ATTEMPTS", 5, 1),
 		postRetryBaseMs: intEnv(env, "WARREN_FINALIZE_POST_RETRY_BASE_MS", 1_000, 1),
+		agentExitCode: parseAgentExitCode(env.WARREN_AGENT_EXIT_CODE),
 	};
+}
+
+/** Optional `WARREN_AGENT_EXIT_CODE` overlay (warren-5202): an integer 0-255, else absent. */
+function parseAgentExitCode(raw: string | undefined): number | undefined {
+	const trimmed = raw?.trim();
+	if (trimmed === undefined || trimmed === "") return undefined;
+	const n = Number(trimmed);
+	return Number.isInteger(n) && n >= 0 && n <= 255 ? n : undefined;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -137,7 +183,7 @@ export function parseFinalizeEntrypointEnv(env: FinalizeEnvSource): FinalizeEntr
 
 export interface FinalizeHttp {
 	get: (url: string, token: string) => Promise<{ status: number; body: unknown }>;
-	post: (url: string, token: string, body: unknown) => Promise<{ status: number }>;
+	post: (url: string, token: string, body: unknown) => Promise<{ status: number; body?: unknown }>;
 }
 
 export interface FinalizeEntrypointDeps {
@@ -159,6 +205,9 @@ export interface FinalizeEntrypointDeps {
 const defaultGit: FinalizeGitRunner = async (args, opts) => {
 	const proc = Bun.spawn(["git", ...args], {
 		cwd: opts?.cwd,
+		// warren-6016: an `undefined` overlay value REMOVES the key (the
+		// repo-context scrub a warren-authored commit spawns with).
+		...(opts?.env !== undefined ? { env: applyGitEnvOverlay(opts.env) } : {}),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -169,6 +218,24 @@ const defaultGit: FinalizeGitRunner = async (args, opts) => {
 	]);
 	return { exitCode, stdout, stderr };
 };
+
+/**
+ * Merge a git-spawn env overlay over the process env: defined values set,
+ * `undefined` values delete (warren-6016). The overlay exists so a
+ * warren-authored commit can pin its identity env AND scrub the inherited
+ * `GIT_*` repo-context family (`src/bot-identity.ts`).
+ */
+function applyGitEnvOverlay(overlay: Record<string, string | undefined>): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	for (const [key, value] of Object.entries(overlay)) {
+		if (value === undefined) delete env[key];
+		else env[key] = value;
+	}
+	return env;
+}
 
 const defaultFs: FinalizeFs = {
 	readFile: (path) => nodeReadFile(path, "utf8"),
@@ -187,7 +254,7 @@ const defaultHttp: FinalizeHttp = {
 			headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
 			body: JSON.stringify(body),
 		});
-		return { status: res.status };
+		return { status: res.status, body: await res.json().catch(() => null) };
 	},
 };
 
@@ -223,7 +290,14 @@ export async function pollForIntent(
 	log: (m: string) => void,
 	onEarlySalvage?: () => Promise<unknown>,
 ): Promise<InPodFinalizeIntent | null> {
-	const url = `${env.apiUrl}/runs/${env.runId}/finalize-intent`;
+	// warren-5202: report the agent's exit code on every poll so a recovered
+	// control plane classifies the outcome from the pod's own witness instead
+	// of the (possibly log-rotated) terminal envelope. Pre-hint control planes
+	// ignore the unknown query param.
+	const url =
+		env.agentExitCode !== undefined
+			? `${env.apiUrl}/runs/${env.runId}/finalize-intent?agent_exit=${env.agentExitCode}`
+			: `${env.apiUrl}/runs/${env.runId}/finalize-intent`;
 	const startedAt = now();
 	const deadline = startedAt + env.maxWaitMs;
 	// warren-5ea1: `onEarlySalvage` fires ONCE at the `earlySalvageMs` mark.
@@ -318,83 +392,6 @@ export async function postResultWithRetry(
 }
 
 /**
- * Salvage-before-exit (warren-cd3b): capture the workspace's committed work
- * (rescue-ref push when a credential is available + a git bundle) and POST it
- * to `POST /runs/:id/salvage` BEFORE the container exits and the `emptyDir`
- * dies with it. Retried until `deadlineMs` of wall-clock budget is spent — in
- * the `no_intent` window that budget (`salvageMaxWaitMs`) is sized to outlast
- * a control-plane rollout; in the `push_failed` window warren is demonstrably
- * reachable so the standard bounded retry applies. `bounded` forces that
- * bounded-attempt budget for a `no_intent` post too (the warren-5ea1 EARLY
- * salvage, which must not stall the intent poll). Best-effort: never throws,
- * so a salvage failure can never mask the finalize path it rode in on.
- */
-export async function salvageAndPost(
-	env: FinalizeEntrypointEnv,
-	http: FinalizeHttp,
-	sleep: (ms: number) => Promise<void>,
-	now: () => number,
-	log: (m: string) => void,
-	trigger: SalvageEnvelope["trigger"],
-	gitToken: string | undefined,
-	git: FinalizeGitRunner,
-	readFileBytes: (path: string) => Promise<Uint8Array>,
-	rm: (path: string) => Promise<void>,
-	bounded?: boolean,
-): Promise<boolean> {
-	const salvage = await collectSalvage(
-		{
-			runId: env.runId,
-			workspacePath: env.workspacePath,
-			baseBranch: env.baseBranch,
-			gitToken,
-		},
-		{ git, readFileBytes, rm },
-	);
-	if (salvage.rescueRef === null && salvage.bundleBase64 === null) {
-		log(`finalize-entrypoint: salvage (${trigger}) captured nothing: ${salvage.notes.join("; ")}`);
-	}
-	const envelope: SalvageEnvelope = {
-		version: IN_POD_FINALIZE_WIRE_VERSION,
-		trigger,
-		rescueRef: salvage.rescueRef,
-		bundleBase64: salvage.bundleBase64,
-		branch: env.branch ?? null,
-		baseBranch: env.baseBranch ?? null,
-		notes: salvage.notes,
-	};
-	const url = `${env.apiUrl}/runs/${env.runId}/salvage`;
-	const deadline = now() + (trigger === "no_intent" ? env.salvageMaxWaitMs : 0);
-	// Bounded attempts when warren is reachable; wall-clock deadline otherwise.
-	const exhausted = (attempt: number): boolean =>
-		trigger === "push_failed" || bounded === true
-			? attempt >= env.postMaxAttempts
-			: now() >= deadline;
-	let backoff = env.postRetryBaseMs;
-	for (let attempt = 1; ; attempt += 1) {
-		let accepted = false;
-		try {
-			accepted = postAccepted((await http.post(url, env.apiToken, envelope)).status);
-		} catch (err) {
-			log(
-				`finalize-entrypoint: salvage POST attempt ${attempt} failed (${err instanceof Error ? err.message : String(err)})`,
-			);
-		}
-		if (accepted) {
-			log(
-				`finalize-entrypoint: salvage (${trigger}) delivered on attempt ${attempt} (rescueRef=${salvage.rescueRef}, bundle=${salvage.bundleBase64 !== null})`,
-			);
-			return true;
-		}
-		if (exhausted(attempt)) break;
-		await sleep(backoff);
-		backoff *= 2;
-	}
-	log(`finalize-entrypoint: salvage (${trigger}) POST gave up; work may be unrecoverable`);
-	return false;
-}
-
-/**
  * Full entrypoint: poll for the intent, run the workspace collection, and POST
  * the `FinalizeResult`. Returns `true` when a result was POSTed, `false` when no
  * intent arrived (nothing to do). The workspace-touching seams are injectable so
@@ -403,7 +400,10 @@ export async function salvageAndPost(
  * warren-cd3b: both loss windows run salvage BEFORE the process can exit —
  * no intent at all ⇒ bundle + retry through a rollout; a failed branch push
  * ⇒ rescue-ref + bundle BEFORE the result POST. warren-5ea1: and a proactive
- * bundle at the early-salvage mark, mid-wait.
+ * bundle at the early-salvage mark, mid-wait. warren-985e: a third window —
+ * a SUCCESSFUL push with zero commits ahead and a dirty tree (the run died
+ * mid-work before its first commit) folds the dirty tree into a salvage
+ * commit and captures it before the result POST.
  */
 export async function runFinalizeEntrypoint(
 	envSource: FinalizeEnvSource,
@@ -455,11 +455,15 @@ export async function runFinalizeEntrypoint(
 
 	log(`finalize-entrypoint: intent ${intent.attemptId} received; collecting`);
 	const result = await collectFinalizeResult(intent, env.workspacePath, { fs, git });
-	// The primary push failed (timeout / push protection / auth). Salvage FIRST:
-	// the result POST below resolves warren's awaiting finalize, which proceeds
-	// straight to `terminate` (contract §6.8) — after it, this volume is gone.
-	const pushFailed = result.stages.some((s) => s.stage === "branch_push" && s.status === "failed");
-	if (pushFailed) {
+	// Loss-window salvage (warren-cd3b, warren-985e) runs BEFORE the result
+	// POST below resolves warren's awaiting finalize, which proceeds straight
+	// to `terminate` (contract §6.8) — after it, this volume is gone. The
+	// `empty_push_dirty` window is the warren-985e fix: the push can SUCCEED
+	// and still carry nothing (the run died mid-work, e.g. provider_error
+	// credit exhaustion, before its first commit), leaving the uncommitted
+	// diff to die with the emptyDir unless the pod captures it here.
+	const salvageTrigger = salvageTriggerForResult(result);
+	if (salvageTrigger !== null) {
 		// The intent's baseBranch narrows the bundle range; the env carries the
 		// pod-spec copy for the salvage envelope's bookkeeping fields.
 		const salvageEnv: FinalizeEntrypointEnv =
@@ -472,7 +476,7 @@ export async function runFinalizeEntrypoint(
 			sleep,
 			now,
 			log,
-			"push_failed",
+			salvageTrigger,
 			intent.gitToken,
 			git,
 			readFileBytes,

@@ -36,11 +36,10 @@
 
 import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { join } from "node:path";
 import { dump } from "js-yaml";
-import { NotFoundError, ValidationError } from "../../core/errors.ts";
-import type { AgentsRepo } from "../../db/repos/agents.ts";
-import type { ProjectsRepo } from "../../db/repos/projects.ts";
+import { type WarrenClient, WarrenClientError } from "../../client/index.ts";
+import { ValidationError } from "../../core/errors.ts";
 import {
 	WARREN_CONFIG_DIR,
 	WARREN_CONFIG_FILES,
@@ -48,7 +47,8 @@ import {
 } from "../../warren-config/config.ts";
 import { type DefaultsConfig, parseConfigFile } from "../../warren-config/schema.ts";
 import type { CliContext } from "../output.ts";
-import { formatError, writeJsonLine } from "../output.ts";
+import { commandFailure, writeResult } from "../output.ts";
+import { resolveTargetDir } from "./target-dir.ts";
 
 export type InitArgs =
 	| {
@@ -63,8 +63,12 @@ export type InitArgs =
 	  };
 
 export interface InitDeps {
-	readonly projects: ProjectsRepo;
-	readonly agents: AgentsRepo;
+	/**
+	 * Remote warren client (warren-97a2). `--project` resolves the clone
+	 * path via `GET /projects/:id`; `--default-role` validates against
+	 * `GET /agents/:name`. The CLI no longer opens the server's DB.
+	 */
+	readonly client: WarrenClient;
 }
 
 export interface InitResult {
@@ -107,7 +111,7 @@ export async function runInit(
 	args: InitArgs,
 ): Promise<InitResult> {
 	try {
-		const targetDir = await resolveTargetDir(deps, args);
+		const targetDir = await resolveTargetDir(deps.client, args);
 		const warrenDir = join(targetDir, WARREN_CONFIG_DIR);
 		const triggersAbs = join(warrenDir, WARREN_CONFIG_FILES.triggers);
 		const configAbs = join(warrenDir, WARREN_CONFIG_FILES.config);
@@ -141,53 +145,32 @@ export async function runInit(
 		await writeFile(triggersAbs, TRIGGERS_TEMPLATE, "utf8");
 		await writeFile(configAbs, configYaml, "utf8");
 
-		writeJsonLine(context.stdio.stdout, {
-			ok: true,
-			scaffolded: {
-				root: targetDir,
-				files: [warrenConfigRelativePath("triggers"), warrenConfigRelativePath("config")],
-				defaultRole: defaults.defaultRole ?? null,
+		writeResult(
+			context,
+			{
+				ok: true,
+				scaffolded: {
+					root: targetDir,
+					files: [warrenConfigRelativePath("triggers"), warrenConfigRelativePath("config")],
+					defaultRole: defaults.defaultRole ?? null,
+				},
 			},
-		});
+			`✔ scaffolded .warren/ in ${targetDir} (triggers.yaml + config.yaml)`,
+		);
 		return { exitCode: 0 };
 	} catch (err) {
-		context.stdio.stderr.write(`warren: ${formatError(err)}\n`);
-		return { exitCode: err instanceof ValidationError ? 2 : 1 };
+		return commandFailure(context, err);
 	}
-}
-
-async function resolveTargetDir(deps: InitDeps, args: InitArgs): Promise<string> {
-	if (args.mode === "cwd") {
-		const cwd = args.cwd;
-		if (cwd === "") {
-			throw new ValidationError("--cwd path is empty");
-		}
-		const abs = isAbsolute(cwd) ? cwd : resolve(cwd);
-		if (!existsSync(abs)) {
-			throw new ValidationError(`target directory does not exist: ${abs}`);
-		}
-		return abs;
-	}
-	const row = await deps.projects.get(args.projectId);
-	if (row === null) {
-		throw new NotFoundError(`project not found: ${args.projectId}`);
-	}
-	if (!existsSync(row.localPath)) {
-		throw new ValidationError(`project clone missing on disk: ${row.localPath}`, {
-			recoveryHint: "POST /projects/:id/refresh or re-add the project",
-		});
-	}
-	return row.localPath;
 }
 
 async function resolveDefaults(deps: InitDeps, args: InitArgs): Promise<DefaultsConfig> {
 	const candidate: Record<string, string> = {};
 	const explicit = args.defaultRole;
 	if (explicit !== undefined && explicit !== "") {
-		const agent = await deps.agents.get(explicit);
+		const agent = await getAgentOrNull(deps.client, explicit);
 		if (agent === null) {
 			throw new ValidationError(`unknown agent: ${explicit}`, {
-				recoveryHint: "run `warren register-agent <name>` first, or omit --default-role",
+				recoveryHint: "register the agent on the server first, or omit --default-role",
 			});
 		}
 		candidate.defaultRole = explicit;
@@ -195,7 +178,7 @@ async function resolveDefaults(deps: InitDeps, args: InitArgs): Promise<Defaults
 		// No explicit pick — auto-fill only when there's exactly one agent
 		// registered. Multiple agents and we leave the field blank so the
 		// operator picks at edit time (the schema accepts empty defaults).
-		const agents = await deps.agents.listAll();
+		const { agents } = await deps.client.listAgents();
 		if (agents.length === 1) {
 			const only = agents[0];
 			if (only !== undefined) {
@@ -211,6 +194,19 @@ async function resolveDefaults(deps: InitDeps, args: InitArgs): Promise<Defaults
 		throw new ValidationError(`config.yaml failed schema validation: ${parsed.message}`);
 	}
 	return parsed.value;
+}
+
+/** `GET /agents/:name`, mapping a 404 to null (unknown agent is a validation miss). */
+async function getAgentOrNull(
+	client: WarrenClient,
+	name: string,
+): Promise<{ readonly name: string } | null> {
+	try {
+		return await client.getAgent(name);
+	} catch (err) {
+		if (err instanceof WarrenClientError && err.status === 404) return null;
+		throw err;
+	}
 }
 
 /**

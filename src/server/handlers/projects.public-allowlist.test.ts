@@ -18,14 +18,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { PublicAllowlist } from "../../projects/public-allowlist.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle, ServerDeps } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./projects.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./projects.test-helpers.ts";
 
 const ALLOWED: PublicAllowlist = { owners: new Set(["os-eco"]), repos: new Set<string>() };
 
@@ -33,11 +33,8 @@ interface ErrorBody {
 	readonly error: { readonly code: string; readonly message: string };
 }
 
-function inertBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(async () => new Response("{}", { status: 200 })),
-	});
+function inertSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 describe("POST /projects org allowlist", () => {
@@ -48,7 +45,7 @@ describe("POST /projects org allowlist", () => {
 
 	/** Start a server whose projects root is the temp dir. `undefined` ⇒ token mode. */
 	async function serve(allowlist: PublicAllowlist | undefined): Promise<void> {
-		const base = await depsFor(repos, inertBurrowClient());
+		const base = await depsFor(repos, inertSandboxClient());
 		const deps: ServerDeps = {
 			...base,
 			projectsConfig: { root: projectsRoot, gitBinary: "git" },

@@ -11,52 +11,15 @@
  *     `GET /_next/static/foo.js` doesn't itself match `/p/...` but its
  *     `Referer:` does, route it to that preview.
  *
- * `isWarrenApiPath` is the dual: it lets the referer fallback skip
- * "looks like a warren API call" so a click from inside a preview into
- * `/runs/<id>/cancel` still reaches the real handler.
+ * The old `isWarrenApiPath` carve-out is gone (warren-3f8a): the
+ * path-mode proxy now runs on a dedicated preview listener that serves
+ * nothing but previews, so there is no warren API on this origin for
+ * the referer fallback to protect. A preview reaching for the control
+ * plane must cross origins explicitly, which is the point.
  */
 
 /** URL path prefix the path-mode matcher anchors to (`/p/<runId>/...`). */
 export const PREVIEW_PATH_PREFIX = "/p";
-
-/**
- * Warren API path prefixes (warren-63e1). Mirrors
- * `src/server/handlers/index.ts::API_PREFIXES` — duplicated here so referer-
- * based asset routing can skip "looks like a warren API call" without
- * pulling the whole handlers module into the preview/ tree. The
- * `warren-api-prefixes-stay-in-sync` test in `route-match.test.ts`
- * asserts set-equality in both directions (warren-abaa) so a future
- * API surface addition *or* a stale extra left behind after a prefix
- * removal both surface here as a failed assertion.
- */
-export const WARREN_API_PATH_PREFIXES: readonly string[] = [
-	"/alerts",
-	"/analytics",
-	"/runs",
-	"/projects",
-	"/agents",
-	"/healthz",
-	"/readyz",
-	"/version",
-	"/metrics",
-	"/preview",
-	"/plan-runs",
-	"/whoami",
-];
-
-/**
- * True iff `pathname` matches a warren API prefix. The referer-based
- * routing path consults this so a click from inside a preview into
- * (e.g.) `/runs/<id>/cancel` reaches the real handler rather than the
- * preview's upstream port. The `/p/...` prefix is left out — the
- * direct path-mode match upstream of this check already routes those.
- */
-export function isWarrenApiPath(pathname: string): boolean {
-	for (const prefix of WARREN_API_PATH_PREFIXES) {
-		if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return true;
-	}
-	return false;
-}
 
 /**
  * Match `run-<runId>.<host>` against `Host:`. Returns the runId on a

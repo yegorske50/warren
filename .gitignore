@@ -25,6 +25,7 @@ supabase/
 # pi agent session transcripts: leaked run logs (prompts, thinking, tool
 # calls). Never commit — see sd warren-4c8d.
 .pi/sessions/
+.pi/tasks/
 .idea/
 .vscode/
 test-results/
@@ -32,6 +33,8 @@ coverage/
 
 # live GKE deployment values (real project ids / identity) — template: overlays/gke
 deploy/k8s/overlays/gke-live/
+deploy/k8s/overlays/gke-live-judge/
+deploy/k8s/overlays/gke-live-campaign-controller/
 
 # local design-sync working dirs + MCP config (may contain secrets)
 .design-sync/
@@ -42,3 +45,4 @@ deploy/k8s/overlays/gke-live/
 # plan. Thinking-in-progress lives here so it has a home outside the tracker
 # and outside git history; promote anything durable into docs or `sd plan`.
 local-planning/
+.atlas/

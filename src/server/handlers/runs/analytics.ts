@@ -7,27 +7,30 @@
  * `?projectId` window, fetch the matching `runs` rows via
  * `RunsRepo.listForAnalytics`, hydrate usage so bridge-died terminal
  * runs still carry cost/token totals, map each row into a flat
- * `RunMetricsRow` (extracting `provider`/`model` from the rendered
- * agent frontmatter), then emit the rollup wrapped in the resolved
+ * `RunMetricsRow` (reading the `provider`/`model` columns frozen at
+ * dispatch — warren-2ede), then emit the rollup wrapped in the resolved
  * `filter` echo.
  */
 
-import type { EventsRepo } from "../../../db/repos/events.ts";
-import type { RunRow } from "../../../db/schema.ts";
+import type { RuntimeId } from "../../../core/wire.ts";
+import { DEFAULT_RUNTIME_ID } from "../../../registry/schema.ts";
+import type { RunRow } from "../../../runs/index.ts";
 import {
-	buildCommandMining,
-	buildInsights,
 	buildRunMetrics,
-	buildSteeringSignals,
+	buildRunOutcomes,
+	type CostPerMergedPr,
+	type CostPerMergedPrBucket,
 	type DimensionTokenSeries,
+	type DirectoryToolCallRow,
 	hydrateRunsUsage,
 	type RunGroupBucket,
 	type RunMetrics,
 	type RunMetricsRow,
+	type RunOutcomes,
 	type RunTotals,
 	type TokenBreakdown,
 	type TokenDayBucket,
-	type ToolEventRow,
+	type ToolCallMiningRow,
 } from "../../../runs/index.ts";
 import { isPublicOnly, pickFields } from "../../projection.ts";
 import { jsonResponse } from "../../response.ts";
@@ -74,7 +77,7 @@ interface AnalyticsWindow {
  * lexicographic ISO8601 compare in `listForAnalytics` would silently produce
  * surprising results otherwise.
  */
-function parseAnalyticsWindow(ctx: { url: URL }): {
+export function parseAnalyticsWindow(ctx: { url: URL }): {
 	echo: { projectId: string | null; from: string | null; to: string | null };
 	filter: AnalyticsWindow;
 } {
@@ -90,16 +93,26 @@ function parseAnalyticsWindow(ctx: { url: URL }): {
 	};
 }
 
-/** Map hydrated `runs` rows into the flat aggregator input shape. */
-function toMetricsRows(rows: readonly RunRow[]): RunMetricsRow[] {
+/**
+ * Map hydrated `runs` rows into the flat aggregator input shape.
+ *
+ * warren-2ede / pl-103e: `provider`/`model` come from the real columns
+ * written at dispatch. `extractProviderModel` survives only as the
+ * historical-row fallback — rows written before the columns existed have
+ * NULL and get one re-parse of `rendered_agent_json`; rows whose agent
+ * genuinely declares no provider/model stay null, group under NONE_KEY
+ * ("unknown"), and are excluded from the real buckets' denominators.
+ */
+export function toMetricsRows(rows: readonly RunRow[]): RunMetricsRow[] {
 	return rows.map((r) => {
-		const { provider, model } = extractProviderModel(r.renderedAgentJson);
+		const fallback =
+			r.provider === null || r.model === null ? extractProviderModel(r.renderedAgentJson) : {};
 		return {
 			runId: r.id,
 			projectId: r.projectId,
 			agentName: r.agentName,
-			provider: provider ?? null,
-			model: model ?? null,
+			provider: r.provider ?? fallback.provider ?? null,
+			model: r.model ?? fallback.model ?? null,
 			seedId: r.seedId,
 			state: r.state,
 			failureReason: r.failureReason,
@@ -110,6 +123,10 @@ function toMetricsRows(rows: readonly RunRow[]): RunMetricsRow[] {
 			tokensCacheWrite: r.tokensCacheWrite,
 			startedAt: r.startedAt,
 			endedAt: r.endedAt,
+			createdAt: r.createdAt,
+			// warren-bd57: the merge-watcher column feeds landed-work rates
+			// directly — no rendered_agent_json re-parse in this path.
+			prState: r.prState,
 		};
 	});
 }
@@ -121,7 +138,7 @@ function toMetricsRows(rows: readonly RunRow[]): RunMetricsRow[] {
  * insights layer). Returns the hydrated rows too so the behavior handler can
  * derive the run-id set for its event scan without a second query.
  */
-async function loadRunMetrics(
+export async function loadRunMetrics(
 	deps: ServerDeps,
 	filter: AnalyticsWindow,
 ): Promise<{ rows: RunRow[]; metrics: RunMetrics }> {
@@ -131,18 +148,66 @@ async function loadRunMetrics(
 	return { rows, metrics: buildRunMetrics(toMetricsRows(rows)) };
 }
 
-/** Map capped `tool_use`/`tool_result` event rows into the mining input shape. */
-async function loadToolEventRows(
-	events: EventsRepo,
+/**
+ * Build the outcome-joined `outcomes` section (warren-be04 / pl-103e step
+ * 12) from the hydrated rows + run-metrics rollup. Shared by
+ * `GET /analytics/runs` (the section ships on the body) and
+ * `GET /analytics/behavior` (the same bundle feeds the two outcome-joined
+ * insight kinds). Fetches the uncapped `steer.sent` trace for the window's
+ * runs — the same query the behavior handler already runs for
+ * {@link SteeringSignals}.
+ */
+async function loadRunOutcomes(
+	deps: ServerDeps,
+	rows: readonly RunRow[],
+	metrics: RunMetrics,
+): Promise<RunOutcomes> {
+	const steeringRows = await deps.repos.events.listSteeringEventsForRuns(rows.map((r) => r.id));
+	return buildRunOutcomes(toMetricsRows(rows), steeringRows, metrics);
+}
+
+/**
+ * Read the structured `tool_calls` rollup (warren-7746) into the mining
+ * input shape, attaching each row's runtime id. Unlike the retired raw
+ * event scan, a capped read REPORTS truncation via the returned flag —
+ * the response surfaces it as `truncated: true`, never silent.
+ */
+export async function loadToolCallRows(
+	deps: ServerDeps,
 	runIds: readonly string[],
-): Promise<ToolEventRow[]> {
-	const rows = await events.listToolEventsForRuns(runIds);
-	return rows.map((e) => ({
-		runId: e.runId,
-		kind: e.kind,
-		seq: e.burrowEventSeq,
-		payload: e.payloadJson,
-	}));
+	runtimeByRunId: ReadonlyMap<string, RuntimeId>,
+): Promise<{
+	rows: ToolCallMiningRow[];
+	directoryRows: DirectoryToolCallRow[];
+	truncated: boolean;
+}> {
+	const { rows, truncated } = await deps.repos.toolCalls.listForRuns(runIds);
+	return {
+		rows: rows.map((r) => ({
+			runId: r.runId,
+			seq: r.seq,
+			toolName: r.toolName,
+			command: r.command,
+			toolUseId: r.toolUseId,
+			isError: r.isError,
+			resultBytes: r.resultBytes,
+			runtime: runtimeByRunId.get(r.runId) ?? DEFAULT_RUNTIME_ID,
+		})),
+		// warren-8f1b: the same rollup rows, reduced to the directory-join
+		// shape. `filePaths` is the JSON column the fileShape extractor
+		// wrote at rollup time; narrow defensively since drizzle types the
+		// json mode as unknown.
+		directoryRows: rows.map((r) => ({
+			runId: r.runId,
+			seq: r.seq,
+			toolName: r.toolName,
+			isError: r.isError,
+			filePaths: Array.isArray(r.filePaths)
+				? r.filePaths.filter((p): p is string => typeof p === "string")
+				: [],
+		})),
+		truncated,
+	};
 }
 
 /**
@@ -165,6 +230,8 @@ function buildTokensSection(metrics: RunMetrics): RunAnalyticsTokensSection {
 export interface RunAnalyticsBody extends RunMetrics {
 	readonly filter: { projectId: string | null; from: string | null; to: string | null };
 	readonly tokens: RunAnalyticsTokensSection;
+	/** Outcome-joined rollup (warren-be04): steering deltas + cost per merged PR. */
+	readonly outcomes: RunOutcomes;
 }
 
 /**
@@ -189,6 +256,10 @@ export const PUBLIC_RUN_ANALYTICS_FIELDS = [
 	"tokenByModelSeries",
 	"tokenByProviderSeries",
 	"tokens",
+	// warren-be04: rates + counts are public (same call as the warren-bd57
+	// landed-work fields); the cost halves inside are redacted one level
+	// down — see PUBLIC_COST_PER_MERGED_PR_*_FIELDS below.
+	"outcomes",
 ] as const satisfies readonly (keyof RunAnalyticsBody)[];
 
 /**
@@ -211,6 +282,15 @@ export const PUBLIC_RUN_TOTALS_FIELDS = [
 	"active",
 	"successRate",
 	"durationMs",
+	// warren-0af9: queue wait is a load-shape signal (how backed-up the
+	// instance is), not a private fact — same posture as durationMs.
+	"queueWaitMs",
+	// warren-bd57: how much dispatched work actually lands is the public
+	// posture's own headline ("how much of it lands") — a rate, not a
+	// private fact.
+	"prStateKnown",
+	"prsMerged",
+	"mergedPrRate",
 	"contextTokens",
 	"tokens",
 ] as const satisfies readonly (keyof RunTotals)[];
@@ -230,6 +310,11 @@ export const PUBLIC_RUN_GROUP_FIELDS = [
 	"failed",
 	"cancelled",
 	"successRate",
+	// warren-bd57: per-bucket landed-work rate, public on the same call as
+	// the totals fields.
+	"prStateKnown",
+	"prsMerged",
+	"mergedPrRate",
 	"contextTokensTotal",
 	"avgContextTokens",
 	"tokens",
@@ -246,15 +331,67 @@ export const REDACTED_RUN_GROUP_FIELDS = [
 	"priced",
 ] as const satisfies readonly (keyof RunGroupBucket)[];
 
+/**
+ * `CostPerMergedPrBucket` minus its USD figures (warren-be04). The merged
+ * counts and resolved denominators are public on the warren-bd57 call;
+ * the cost numerator, the priced-run count, and the resulting ratio are
+ * cost figures and go the way of `totals.cost`.
+ */
+export const PUBLIC_COST_PER_MERGED_PR_BUCKET_FIELDS = [
+	"key",
+	"prStateKnown",
+	"prsMerged",
+] as const satisfies readonly (keyof CostPerMergedPrBucket)[];
+
+export const REDACTED_COST_PER_MERGED_PR_BUCKET_FIELDS = [
+	"costUsd",
+	"priced",
+	"costPerMergedPrUsd",
+] as const satisfies readonly (keyof CostPerMergedPrBucket)[];
+
+/** The keyless `overall` shape shares the bucket's classification minus `key`. */
+export const PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS = [
+	"prStateKnown",
+	"prsMerged",
+] as const satisfies readonly (keyof CostPerMergedPr["overall"])[];
+
+export const REDACTED_COST_PER_MERGED_PR_OVERALL_FIELDS = [
+	"costUsd",
+	"priced",
+	"costPerMergedPrUsd",
+] as const satisfies readonly (keyof CostPerMergedPr["overall"])[];
+
 /** The `GET /analytics/runs` body as a `readPublic`-only caller sees it. */
+type PublicCostPerMergedPrBucket = Pick<
+	CostPerMergedPrBucket,
+	(typeof PUBLIC_COST_PER_MERGED_PR_BUCKET_FIELDS)[number]
+>;
+
+/** `RunOutcomes` as a spectator sees it: steering intact, USD figures gone. */
+export type PublicRunOutcomes = Omit<RunOutcomes, "costPerMergedPr"> & {
+	readonly costPerMergedPr: Omit<
+		CostPerMergedPr,
+		"overall" | "byAgent" | "byModel" | "byProvider"
+	> & {
+		readonly overall: Pick<
+			CostPerMergedPr["overall"],
+			(typeof PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS)[number]
+		>;
+		readonly byAgent: readonly PublicCostPerMergedPrBucket[];
+		readonly byModel: readonly PublicCostPerMergedPrBucket[];
+		readonly byProvider: readonly PublicCostPerMergedPrBucket[];
+	};
+};
+
 export type PublicRunAnalytics = Omit<
 	Pick<RunAnalyticsBody, (typeof PUBLIC_RUN_ANALYTICS_FIELDS)[number]>,
-	"totals" | "byAgent" | "byModel" | "byProvider"
+	"totals" | "byAgent" | "byModel" | "byProvider" | "outcomes"
 > & {
 	readonly totals: Pick<RunTotals, (typeof PUBLIC_RUN_TOTALS_FIELDS)[number]>;
 	readonly byAgent: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
 	readonly byModel: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
 	readonly byProvider: readonly Pick<RunGroupBucket, (typeof PUBLIC_RUN_GROUP_FIELDS)[number]>[];
+	readonly outcomes: PublicRunOutcomes;
 };
 
 /**
@@ -269,12 +406,26 @@ function projectRunAnalytics(
 	if (!isPublicOnly(actor)) return body;
 	const groups = (buckets: readonly RunGroupBucket[]) =>
 		buckets.map((b) => pickFields(b, PUBLIC_RUN_GROUP_FIELDS));
+	const costBuckets = (buckets: readonly CostPerMergedPrBucket[]) =>
+		buckets.map((b) => pickFields(b, PUBLIC_COST_PER_MERGED_PR_BUCKET_FIELDS));
+	const costPerMergedPr = body.outcomes.costPerMergedPr;
+	const outcomes: PublicRunOutcomes = {
+		steering: body.outcomes.steering,
+		costPerMergedPr: {
+			overall: pickFields(costPerMergedPr.overall, PUBLIC_COST_PER_MERGED_PR_OVERALL_FIELDS),
+			byAgent: costBuckets(costPerMergedPr.byAgent),
+			byModel: costBuckets(costPerMergedPr.byModel),
+			byProvider: costBuckets(costPerMergedPr.byProvider),
+			confidence: costPerMergedPr.confidence,
+		},
+	};
 	return {
 		...pickFields(body, PUBLIC_RUN_ANALYTICS_FIELDS),
 		totals: pickFields(body.totals, PUBLIC_RUN_TOTALS_FIELDS),
 		byAgent: groups(body.byAgent),
 		byModel: groups(body.byModel),
 		byProvider: groups(body.byProvider),
+		outcomes,
 	};
 }
 
@@ -295,42 +446,10 @@ function projectRunAnalytics(
 export function listRunAnalyticsHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const { echo, filter } = parseAnalyticsWindow(ctx);
-		const { metrics } = await loadRunMetrics(deps, filter);
-		const tokens = buildTokensSection(metrics);
-		const body: RunAnalyticsBody = { filter: echo, ...metrics, tokens };
-		return jsonResponse(200, projectRunAnalytics(body, ctx.actor));
-	};
-}
-
-/**
- * `GET /analytics/behavior?from=&to=&projectId=` (warren-5d50 / pl-ad0f step 9).
- *
- * The heavier companion to `GET /analytics/runs`. Resolves the same window,
- * loads the run-level rollup, then scans the capped `tool_use`/`tool_result`
- * event trace for those runs (`EventsRepo.listToolEventsForRuns`) and mines it
- * for the generalized command-frequency / failure / stuck-loop rankings
- * (`buildCommandMining`). Finally distills the metrics + mining into the
- * ranked, severity-coded callout list (`buildInsights`). The run-level rollup
- * itself stays on `/analytics/runs` — this endpoint returns just the behavior
- * layers (`mining` + `insights`) so the fast view can render independently.
- *
- * Steering event kinds scanned when building {@link SteeringSignals}
- * for `buildInsights`. The `steer.sent` kind is lightweight (at most a
- * handful per run) so it is fetched in a separate, uncapped query rather
- * than being mixed into the tool-event cap that bounds command mining.
- */
-export function listBehaviorAnalyticsHandler(deps: ServerDeps): RouteHandler {
-	return async (ctx) => {
-		const { echo, filter } = parseAnalyticsWindow(ctx);
 		const { rows, metrics } = await loadRunMetrics(deps, filter);
-		const runIds = rows.map((r) => r.id);
-		const [eventRows, steeringRows] = await Promise.all([
-			loadToolEventRows(deps.repos.events, runIds),
-			deps.repos.events.listSteeringEventsForRuns(runIds),
-		]);
-		const mining = buildCommandMining(eventRows);
-		const steering = buildSteeringSignals(steeringRows, rows.length);
-		const insights = buildInsights({ metrics, mining, steering });
-		return jsonResponse(200, { filter: echo, mining, insights });
+		const tokens = buildTokensSection(metrics);
+		const outcomes = await loadRunOutcomes(deps, rows, metrics);
+		const body: RunAnalyticsBody = { filter: echo, ...metrics, tokens, outcomes };
+		return jsonResponse(200, projectRunAnalytics(body, ctx.actor));
 	};
 }

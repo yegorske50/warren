@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import type { Run as BurrowRun, Message } from "@os-eco/burrow-cli";
-import { BurrowClient } from "../../burrow-client/index.ts";
+import { INBOX_PRIORITIES } from "../../core/wire.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
 import type { AutoOpenPrConfig } from "../../runs/pr.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { NO_AUTH } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
 
 /**
  * HTTP-layer coverage for `steerRunHandler` and `cancelRunHandler`
@@ -31,126 +31,37 @@ interface RecordedCall {
 }
 
 interface PauseResumeFixture {
-	burrowId: string;
-	burrowRunId: string;
-}
-
-function jsonResponse(status: number, body: unknown): Response {
-	return new Response(JSON.stringify(body), {
-		status,
-		headers: { "content-type": "application/json" },
-	});
-}
-
-function serializeMessage(m: Message): unknown {
-	return {
-		...m,
-		createdAt: m.createdAt.toISOString(),
-		deliveredAt: m.deliveredAt?.toISOString() ?? null,
-	};
-}
-
-function serializeRun(r: BurrowRun): unknown {
-	return {
-		...r,
-		queuedAt: r.queuedAt.toISOString(),
-		startedAt: r.startedAt?.toISOString() ?? null,
-		completedAt: r.completedAt?.toISOString() ?? null,
-	};
+	sandboxId: string;
+	sandboxRunId: string;
 }
 
 /**
- * Burrow client whose fetch stub answers the two endpoints the pause/
- * resume handlers hit — `POST /burrows/:id/inbox` (steer) and
- * `POST /runs/:id/cancel` (cancel) — and records every call so tests can
- * assert on the forwarded wire body. Anything else falls through to a 404
- * so an accidental extra wire call surfaces loudly.
+ * Provider fake for the pause/resume handler tests (warren-ea0a). Steer
+ * records the inbox call and echoes the body on the returned message; the
+ * status snapshot stays `running` so cancel keeps off the inline-reap path
+ * (warren-a69a). Every call is recorded so tests can assert on the
+ * forwarded body.
  */
-/** A non-terminal (`running`) burrow run — keeps cancel off the inline reap path. */
-function runningBurrowRun(fix: PauseResumeFixture): BurrowRun {
-	return {
-		id: fix.burrowRunId,
-		burrowId: fix.burrowId,
-		agentId: "refactor-bot",
-		prompt: "p",
-		resumeOfRunId: null,
-		state: "running",
-		exitCode: null,
-		errorMessage: null,
-		metadataJson: null,
-		queuedAt: new Date("2026-05-08T12:00:00Z"),
-		startedAt: null,
-		completedAt: null,
-	};
-}
-
-/** Burrow inbox-send response for the steer path. */
-function inboxSendResponse(fix: PauseResumeFixture, reqBody: unknown): Response {
-	const body =
-		typeof reqBody === "object" && reqBody !== null
-			? String((reqBody as { body?: unknown }).body ?? "")
-			: "";
-	const message: Message = {
-		id: "msg_aaaaaaaaaaaa",
-		burrowId: fix.burrowId,
-		fromActor: "operator",
-		body,
-		priority: "normal",
-		state: "unread",
-		deliveredAtRunId: null,
-		createdAt: new Date("2026-05-08T12:00:00Z"),
-		deliveredAt: null,
-	};
-	return jsonResponse(201, serializeMessage(message));
-}
-
-/**
- * Route one burrow request for the pause/resume handler tests. Steer hits the
- * inbox; cancel hits `POST /runs/:id/cancel` then re-reads phase via
- * `provider.status()` (runs.get + a bounded events replay, warren-1f56) — both
- * resolve the run as still `running` to keep these tests off the inline-reap
- * path (warren-a69a).
- */
-function routePauseResume(
-	fix: PauseResumeFixture,
-	method: string,
-	path: string,
-	reqBody: unknown,
-): Response {
-	if (method === "POST" && path === `/burrows/${fix.burrowId}/inbox`) {
-		return inboxSendResponse(fix, reqBody);
-	}
-	if (method === "POST" && path === `/runs/${fix.burrowRunId}/cancel`) {
-		return jsonResponse(200, serializeRun(runningBurrowRun(fix)));
-	}
-	if (method === "GET" && path === `/burrows/${fix.burrowId}/events`) {
-		return new Response("", { status: 200, headers: { "content-type": "application/x-ndjson" } });
-	}
-	if (method === "GET" && path === `/runs/${fix.burrowRunId}`) {
-		return jsonResponse(200, serializeRun(runningBurrowRun(fix)));
-	}
-	return jsonResponse(404, {
-		error: { code: "not_found", message: `unmatched ${method} ${path}` },
-	});
-}
-
-function makePauseResumeClient(fix: PauseResumeFixture, calls: RecordedCall[]): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(async (input, init) => {
-			const url = new URL(String(input), "http://localhost");
-			const path = url.pathname;
-			const method = init?.method ?? "GET";
-			const reqBody = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
-			calls.push({ method, path, body: reqBody });
-			return routePauseResume(fix, method, path, reqBody);
-		}),
-	});
+function makePauseResumeClient(fix: PauseResumeFixture, calls: RecordedCall[]): FakeProvider {
+	return new FakeProvider(
+		{
+			sandboxId: fix.sandboxId,
+			providerRunId: fix.sandboxRunId,
+			statusValue: {
+				phase: "running",
+				exitCode: null,
+				lastEventSeq: 0,
+				lastEventTs: null,
+				exists: true,
+			},
+		},
+		undefined,
+		calls,
+	);
 }
 
 const DISABLED_AUTO_OPEN_PR: AutoOpenPrConfig = {
 	enabled: false,
-	token: "",
 	warrenBaseUrl: null,
 };
 
@@ -161,8 +72,8 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 	let projectId: string;
 
 	const fix: PauseResumeFixture = {
-		burrowId: "bur_aaaaaaaaaaaa",
-		burrowRunId: "run_zzzzzzzzzzzz",
+		sandboxId: "bur_aaaaaaaaaaaa",
+		sandboxRunId: "run_zzzzzzzzzzzz",
 	};
 
 	beforeEach(async () => {
@@ -196,8 +107,8 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			prompt: "p",
 			renderedAgentJson: {},
 			trigger: "manual",
-			burrowId: fix.burrowId,
-			burrowRunId: fix.burrowRunId,
+			sandboxId: fix.sandboxId,
+			sandboxRunId: fix.sandboxRunId,
 		});
 		await repos.runs.markRunning(run.id);
 		return run.id;
@@ -227,7 +138,7 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			expect(calls).toEqual([
 				{
 					method: "POST",
-					path: `/burrows/${fix.burrowId}/inbox`,
+					path: `/sandboxes/${fix.sandboxId}/inbox`,
 					body: { body: "stop and write tests" },
 				},
 			]);
@@ -262,13 +173,80 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			expect(calls).toEqual([
 				{
 					method: "POST",
-					path: `/burrows/${fix.burrowId}/inbox`,
+					path: `/sandboxes/${fix.sandboxId}/inbox`,
 					body: {
 						body: "remember to lint",
 						priority: "high",
 						fromActor: "alice",
 					},
 				},
+			]);
+		});
+
+		test("rejects an unknown priority with 400 and sends nothing to burrow", async () => {
+			// warren-b27c: `{"priority":"CRITICAL"}` used to sail past an unchecked
+			// cast, persist verbatim, and make the inbox comparator return NaN.
+			const runId = await createRunningRun();
+			const calls: RecordedCall[] = [];
+			const deps = await depsFor(repos, makePauseResumeClient(fix, calls));
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: NO_AUTH,
+				logger: silentLogger,
+			});
+
+			const res = await fetch(`${tcpUrl(handle)}/runs/${runId}/steer`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ body: "do it", priority: "CRITICAL" }),
+			});
+			expect(res.status).toBe(400);
+			const err = (await res.json()) as { error: { message: string } };
+			expect(err.error.message).toContain("priority");
+			// Nothing forwarded, nothing persisted.
+			expect(calls).toEqual([]);
+			expect(await repos.runInbox.listByRun(runId)).toEqual([]);
+		});
+
+		test("rejects a non-string priority with 400", async () => {
+			const runId = await createRunningRun();
+			const calls: RecordedCall[] = [];
+			const deps = await depsFor(repos, makePauseResumeClient(fix, calls));
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: NO_AUTH,
+				logger: silentLogger,
+			});
+
+			const res = await fetch(`${tcpUrl(handle)}/runs/${runId}/steer`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ body: "do it", priority: 3 }),
+			});
+			expect(res.status).toBe(400);
+			expect(calls).toEqual([]);
+		});
+
+		test("accepts every canonical INBOX_PRIORITIES value", async () => {
+			const runId = await createRunningRun();
+			const calls: RecordedCall[] = [];
+			const deps = await depsFor(repos, makePauseResumeClient(fix, calls));
+			handle = startServer(deps, {
+				transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
+				auth: NO_AUTH,
+				logger: silentLogger,
+			});
+
+			for (const priority of INBOX_PRIORITIES) {
+				const res = await fetch(`${tcpUrl(handle)}/runs/${runId}/steer`, {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({ body: `at ${priority}`, priority }),
+				});
+				expect(res.status).toBe(200);
+			}
+			expect(calls.map((c) => (c.body as { priority?: string }).priority)).toEqual([
+				...INBOX_PRIORITIES,
 			]);
 		});
 	});
@@ -291,18 +269,18 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			const body = (await res.json()) as {
 				state: string;
 				alreadyTerminal: boolean;
-				burrowRun: { id: string; state: string } | null;
+				sandboxRun: { id: string; state: string } | null;
 			};
 			expect(body.state).toBe("running");
 			expect(body.alreadyTerminal).toBe(false);
-			expect(body.burrowRun?.id).toBe(fix.burrowRunId);
-			expect(body.burrowRun?.state).toBe("running");
+			expect(body.sandboxRun?.id).toBe(fix.sandboxRunId);
+			expect(body.sandboxRun?.state).toBe("running");
 			// No reason key on the wire — `HttpRunsClient.cancel` omits the
 			// jsonBody entirely when `opts.reason` is undefined. The graceful
 			// cancel POST rides the seam; the status re-read follows it (warren-1f56).
 			expect(calls).toContainEqual({
 				method: "POST",
-				path: `/runs/${fix.burrowRunId}/cancel`,
+				path: `/runs/${fix.sandboxRunId}/cancel`,
 				body: undefined,
 			});
 		});
@@ -331,7 +309,7 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			expect(res.status).toBe(200);
 			expect(calls).toContainEqual({
 				method: "POST",
-				path: `/runs/${fix.burrowRunId}/cancel`,
+				path: `/runs/${fix.sandboxRunId}/cancel`,
 				body: { reason: "operator changed their mind" },
 			});
 		});
@@ -356,11 +334,11 @@ describe("POST /runs/:id/steer and POST /runs/:id/cancel — HTTP handlers", () 
 			const body = (await res.json()) as {
 				state: string;
 				alreadyTerminal: boolean;
-				burrowRun: unknown;
+				sandboxRun: unknown;
 			};
 			expect(body.state).toBe("succeeded");
 			expect(body.alreadyTerminal).toBe(true);
-			expect(body.burrowRun).toBeNull();
+			expect(body.sandboxRun).toBeNull();
 			// `cancelRun` short-circuits on a terminal row — no wire call.
 			expect(calls).toHaveLength(0);
 		});

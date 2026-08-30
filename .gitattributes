@@ -1,6 +1,22 @@
-.seeds/issues.jsonl merge=union
-.seeds/templates.jsonl merge=union
-.seeds/plans.jsonl merge=union
-.mulch/expertise/*.jsonl merge=union
-.canopy/prompts.jsonl merge=union
-.canopy/schemas.jsonl merge=union
+# The seeds and mulch state files are id-keyed JSONL whose writers REWRITE
+# rows in place (closing an issue rewrites its row and every sibling's
+# blockedBy; writePlans/writeTemplates rewrite plans and templates; mulch
+# upserts merge outcomes into existing records). merge=union therefore
+# emitted two contradictory copies of any concurrently rewritten row
+# (warren-9c90). merge=seeds-jsonl runs scripts/merge-seeds-jsonl.ts, a real
+# 3-way id-keyed merge registered via `git config merge.seeds-jsonl.driver`
+# in package.json's prepare script.
+# DO NOT let `sd doctor --fix` or `sd init` re-add a `merge=union` line for
+# these paths. Both tools GENERATE the union lines and match on the literal
+# string, so they report a correct driver as a "missing" entry and APPEND the
+# union line back. .gitattributes is LAST MATCH WINS, so an appended union
+# line silently OVERRIDES the driver above it and restores the bug while
+# doctor calls the repo healthy. `bun run check:merge-strategy` (inside the
+# lint gate) asks git what it actually resolves and fails if that happens.
+# Upstream fix tracked as seeds-6e2d.
+# The .canopy/* merge=union entries were removed: canopy was retired (pl-3a79)
+# and those files no longer exist.
+.seeds/issues.jsonl merge=seeds-jsonl
+.seeds/templates.jsonl merge=seeds-jsonl
+.seeds/plans.jsonl merge=seeds-jsonl
+.mulch/expertise/*.jsonl merge=seeds-jsonl

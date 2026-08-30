@@ -5,18 +5,27 @@
  * `proxy/` modules in warren-b902.
  *
  * The proxy is an in-process Bun route, not a separate reverse proxy.
- * `tryHandlePreviewProxy` runs *before* the normal auth gate and route
- * match in `src/server/server.ts`. There are two routing modes, picked
- * at config time from `WARREN_PREVIEW_MODE`:
+ * There are two routing modes, picked at config time from
+ * `WARREN_PREVIEW_MODE`:
  *
- *   - **Subdomain mode** (operator owns a wildcard CNAME + cert):
- *     match `Host: run-<runId>.<previewHost>`. URL forwarded upstream
- *     keeps `url.pathname` verbatim.
+ *   - **Subdomain mode** (operator owns a wildcard CNAME + cert): the
+ *     handler runs as a preamble *before* the normal auth gate and
+ *     route match in `src/server/server.ts` and matches
+ *     `Host: run-<runId>.<previewHost>`. URL forwarded upstream keeps
+ *     `url.pathname` verbatim.
  *
- *   - **Path mode** (default; reuses warren's own host + cert): match
- *     `^/p/<runId>(/<rest>)?$` on the request path. The `/p/<runId>`
- *     prefix is stripped before forwarding so the upstream sees a
- *     request rooted at `<rest>` (or `/` when `rest` is empty).
+ *   - **Path mode** (default; reuses warren's own hostname + cert):
+ *     match `^/p/<runId>(/<rest>)?$` on the request path. The
+ *     `/p/<runId>` prefix is stripped before forwarding so the
+ *     upstream sees a request rooted at `<rest>` (or `/` when `rest`
+ *     is empty). Since warren-3f8a the handler is mounted on a
+ *     DEDICATED listener (`WARREN_PREVIEW_PORT`, default bind port +
+ *     1) so previews get their own browser origin — same-origin
+ *     preview code must not be able to read the operator token out of
+ *     the warren UI's storage. The main listener answers `/p/...` with
+ *     a 308 to the preview origin (`createPreviewPathRedirect`). The
+ *     unix transport keeps the legacy same-origin mounting (no TCP
+ *     port to bind) and warns at boot.
  *
  *     **Referer-based asset routing (warren-63e1):** when the request
  *     path does NOT match `/p/<runId>/...` but the `Referer` header's
@@ -28,15 +37,22 @@
  *
  * In either mode the rest of the seam is identical:
  *
- *   1. **Resolve the run.** `runs.preview_state` must be `live`;
+ *   1. **Signed-cookie auth** (warren-820e: FIRST, before any run
+ *      lookup). The preamble runs below warren's auth gate, so
+ *      unauthenticated callers must see one uniform **401** whether
+ *      the runId is unknown, previewless, or remote — anything else
+ *      is a run-existence / topology oracle. The cookie verifies
+ *      against the URL-derived runId alone, so it can be checked
+ *      without touching the database.
+ *
+ *   2. **Resolve the run.** `runs.preview_state` must be `live`;
  *      anything else (`starting`, `failed`, `torn-down`, null) → 503.
- *      Unknown runId → 404.
+ *      Unknown runId → 404. These distinct answers only reach
+ *      cookie-verified callers.
  *
- *   2. **Cross-host check.** `runs.worker_id !== LOCAL_WORKER_NAME`
- *      returns **501** with an R-12 deferral message.
- *
- *   3. **Signed-cookie auth.** Missing / invalid / expired cookie →
- *      **401** pointing the browser at `/runs/:id/preview/login`.
+ *   3. **Cross-host check.** `runs.worker_id !== LOCAL_WORKER_NAME`
+ *      returns **501** with an R-12 deferral message that never
+ *      interpolates the worker id.
  *
  *   4. **last_hit_at debounce.** Update `runs.preview_last_hit_at`
  *      **before** forwarding (docs/design/preview-environments.md) — debounced via an in-memory
@@ -62,7 +78,6 @@ import type { PreviewMode } from "../../warren-config/index.ts";
 import { DEFAULT_DEBOUNCE_MS, forwardToUpstream, maybeFlushLastHit } from "./forward.ts";
 import { previewError, previewUnauthorized } from "./responses.ts";
 import {
-	isWarrenApiPath,
 	PREVIEW_PATH_PREFIX,
 	parsePreviewPathPrefix,
 	parseRunIdFromHost,
@@ -75,6 +90,7 @@ import type { PreviewProxyDeps, PreviewProxyHandler } from "./types.ts";
 // `import ... from "../preview/proxy/index.ts"` (or just
 // `"../preview/proxy"`) keeps working after the split.
 export { DEFAULT_DEBOUNCE_MS } from "./forward.ts";
+export { createPreviewPathRedirect } from "./redirect.ts";
 export { LOGIN_PATH_PREFIX } from "./responses.ts";
 export {
 	HTML_HEAD_LOOKAHEAD_BYTES,
@@ -84,7 +100,6 @@ export {
 	rewriteRootRelativeAttrs,
 } from "./rewrite.ts";
 export {
-	isWarrenApiPath,
 	PREVIEW_PATH_PREFIX,
 	parsePreviewPathPrefix,
 	parseRunIdFromHost,
@@ -131,11 +146,10 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 				runId = parsed.runId;
 				upstreamPath = parsed.rest;
 			} else {
-				// Referer-based asset routing (warren-63e1). Skip when the
-				// path looks like a warren API call so a click from inside a
-				// preview into `/runs/<id>/cancel` (etc.) still reaches the
-				// real handler.
-				if (isWarrenApiPath(url.pathname)) return null;
+				// Referer-based asset routing (warren-63e1). The path-mode
+				// proxy runs on the dedicated preview listener (warren-3f8a),
+				// which serves nothing but previews — every unmatched path is
+				// a candidate sub-resource, so no API carve-out applies.
 				const refererRunId = parseRunIdFromReferer(request.headers.get("referer"));
 				if (refererRunId === null) return null;
 				runId = refererRunId;
@@ -145,16 +159,30 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 			}
 		}
 
+		// Auth FIRST (warren-820e): closing the run-existence oracle means the
+		// uniform 401 must be decided from the URL + cookie alone, before any
+		// repo lookup. Signed cookie verifies against this run's id (so a cookie
+		// scoped to .<host> can't be used to reach a sibling preview).
+		const cookieHeader = request.headers.get("cookie");
+		if (!deps.previewAuth.verifyCookie(cookieHeader, runId, now())) {
+			return previewUnauthorized(runId, deps.config, url);
+		}
+
 		const run = await deps.repos.runs.get(runId);
 		if (run === null) {
 			return previewError(404, "preview_not_found", `no run with id ${runId}`);
 		}
 
 		if (run.workerId !== null && run.workerId !== localWorkerName) {
+			// The preamble runs BEFORE the auth gate, so this body reaches
+			// anonymous callers — never interpolate `run.workerId` into it.
+			// `workerId` is a REDACTED_RUN_FIELDS member (warren-946f): internal
+			// worker topology is operator-only shape, and scenario 39 now drives
+			// this exact path with a sentinel in the column (warren-b0bd).
 			return previewError(
 				501,
 				"preview_remote_worker",
-				`preview proxying is local-worker-only in V1; run.worker_id=${run.workerId} (R-12 deferral, see docs/design/preview-environments.md)`,
+				"preview proxying is local-worker-only in V1; the run lives on a remote worker (R-12 deferral, see docs/design/preview-environments.md)",
 			);
 		}
 
@@ -186,13 +214,6 @@ export function createPreviewProxyHandler(deps: PreviewProxyDeps): PreviewProxyH
 				"preview_ws_not_implemented",
 				"WebSocket proxying is not yet implemented for preview environments",
 			);
-		}
-
-		// Auth: signed cookie verifies against this run's id (so a cookie
-		// scoped to .<host> can't be used to reach a sibling preview).
-		const cookieHeader = request.headers.get("cookie");
-		if (!deps.previewAuth.verifyCookie(cookieHeader, runId, now())) {
-			return previewUnauthorized(runId, deps.config, url);
 		}
 
 		// docs/design/preview-environments.md: update last_hit_at BEFORE forwarding (debounced).

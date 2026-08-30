@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import type { WarrenDb } from "../../db/client.ts";
 import type { Repos } from "../../db/repos/index.ts";
+import { RuntimeUnreachableError } from "../../runtime/errors.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { spawnRun } from "./index.ts";
-import { makeBurrowClient, makeProvider, setupRepos, stub } from "./test-helpers.ts";
+import { makeProvider, makeSandboxClient, setupRepos } from "./test-helpers.ts";
 import type { SpawnLogger } from "./types.ts";
 
 interface LogLine {
@@ -44,7 +45,7 @@ describe("spawnRun: instrumentation (warren-c686)", () => {
 	});
 
 	test("logs placement, provision, and dispatch with run_id and request_id", async () => {
-		const { client } = makeBurrowClient();
+		const { client } = makeSandboxClient();
 		const { logger, lines } = makeRecordingLogger({ request_id: "req_abc" });
 		const result = await spawnRun({
 			repos,
@@ -64,17 +65,38 @@ describe("spawnRun: instrumentation (warren-c686)", () => {
 		const provisioned = byEvent("spawn.provisioned");
 		expect(provisioned?.obj.run_id).toBe(result.run.id);
 		expect(provisioned?.obj.request_id).toBe("req_abc");
-		expect(provisioned?.obj.burrow_id).toBe(result.burrow.id);
+		expect(provisioned?.obj.sandbox_id).toBe(result.sandbox.id);
 		expect(typeof provisioned?.obj.duration_ms).toBe("number");
 
 		const dispatched = byEvent("spawn.dispatched");
 		expect(dispatched?.obj.run_id).toBe(result.run.id);
-		expect(dispatched?.obj.burrow_run_id).toBe(result.burrowRun.id);
+		expect(dispatched?.obj.sandbox_run_id).toBe(result.sandboxRun.id);
 		expect(typeof dispatched?.obj.duration_ms).toBe("number");
 	});
 
+	test("binds dispatcherHandle + dispatchOrigin onto post-placement log lines (warren-9ce3)", async () => {
+		const { client } = makeSandboxClient();
+		const { logger, lines } = makeRecordingLogger({ request_id: "req_prov" });
+		const result = await spawnRun({
+			repos,
+			runtimeProvider: makeProvider(client),
+			agentName: "refactor-bot",
+			projectId: "prj_xxxxxxxxxxxx",
+			prompt: "p",
+			dispatcherHandle: "@operator",
+			dispatchOrigin: "api",
+			logger,
+		});
+
+		const provisioned = lines.find((l) => l.obj.event === "spawn.provisioned");
+		expect(provisioned?.obj.run_id).toBe(result.run.id);
+		expect(provisioned?.obj.dispatcher_handle).toBe("@operator");
+		expect(provisioned?.obj.dispatch_origin).toBe("api");
+		expect(provisioned?.obj.request_id).toBe("req_prov");
+	});
+
 	test("logs the rollback branch when burrow dispatch fails", async () => {
-		const { client } = makeBurrowClient({
+		const { client } = makeSandboxClient({
 			runsCreateStatus: 500,
 			runsCreateBody: { error: { code: "internal_error", message: "boom" } },
 		});
@@ -103,40 +125,8 @@ describe("spawnRun: instrumentation (warren-c686)", () => {
 		// `spawn.rollback.burrow_destroy_failed`. Provision succeeds, dispatch AND
 		// the provider's cleanup DELETE both throw; the domain surfaces the
 		// original failure as `spawn.failed` and unwinds the warren row.
-		let call = 0;
-		const fetchImpl = stub(async (input, init) => {
-			const path = new URL(String(input), "http://localhost").pathname;
-			const method = init?.method ?? "GET";
-			call += 1;
-			if (method === "POST" && path === "/burrows") {
-				return new Response(
-					JSON.stringify({
-						id: "bur_aaaaaaaaaaaa",
-						parentId: null,
-						kind: "task",
-						name: null,
-						projectRoot: "/data/projects/x/y",
-						workspacePath: "/w",
-						branch: "b",
-						provider: "local",
-						providerStateJson: null,
-						profileJson: {},
-						state: "active",
-						createdAt: "2026-05-08T12:00:00Z",
-						updatedAt: "2026-05-08T12:00:00Z",
-						destroyedAt: null,
-					}),
-					{ status: 201, headers: { "content-type": "application/json" } },
-				);
-			}
-			// Both the dispatch (POST .../runs) and the destroy (DELETE) throw.
-			const e = new TypeError("fetch failed");
-			(e as unknown as { cause: { code: string } }).cause = { code: "ECONNREFUSED" };
-			throw e;
-		});
-		const client = new BurrowClient({
-			config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-			fetch: fetchImpl,
+		const client = new FakeProvider({
+			dispatchError: new RuntimeUnreachableError("fetch failed"),
 		});
 		const { logger, lines } = makeRecordingLogger();
 		await expect(
@@ -150,8 +140,8 @@ describe("spawnRun: instrumentation (warren-c686)", () => {
 			}),
 		).rejects.toBeDefined();
 
-		// burrowsUp + runs.create + the provider's cleanup DELETE all fired.
-		expect(call).toBeGreaterThan(1);
+		// Provision + dispatch + the provider's cleanup DELETE all fired.
+		expect(client.calls.length).toBeGreaterThan(1);
 		// The domain surfaces the dispatch failure it saw rethrown…
 		const failed = lines.find((l) => l.obj.event === "spawn.failed");
 		expect(failed?.level).toBe("warn");
@@ -163,6 +153,6 @@ describe("spawnRun: instrumentation (warren-c686)", () => {
 		// The warren row was rolled back to failed with no burrow attached.
 		const rows = await repos.runs.listAll();
 		expect(rows[0]?.state).toBe("failed");
-		expect(rows[0]?.burrowId).toBeNull();
+		expect(rows[0]?.sandboxId).toBeNull();
 	});
 });

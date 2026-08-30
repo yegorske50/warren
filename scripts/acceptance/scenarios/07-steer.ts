@@ -3,7 +3,7 @@
  *
  * Acceptance criterion #7:
  *   "POST /runs/:id/steer accepts a steering body, forwards it to the
- *   burrow inbox (`POST /burrows/:burrow_id/inbox` under the hood), and
+ *   burrow inbox (`POST /burrows/:sandbox_id/inbox` under the hood), and
  *   emits a `steer.sent` audit event onto the warren run's event log."
  *
  * The verification surface uses two pieces of evidence the operator can
@@ -26,13 +26,14 @@
  * empty-body case so the error contract is anchored.
  *
  * Stays self-contained: spawns its own long-running stub run (sleep set
- * via `[sleep_ms=...]` in the prompt — see lib/stub-agent/agent.sh) so
+ * via `[sleep_ms=...]` in the prompt — see lib/stub-agent/claude-code-path-shim.sh) so
  * the warren row stays non-terminal during the steer call. Cleanup
  * cancels the run so teardown doesn't trip over a live agent.
  */
 
 import { AcceptanceError, assertEqual, assertTrue, type Scenario } from "../lib/assert.ts";
 import { WarrenHttp } from "../lib/http.ts";
+import { waitForRunTerminal } from "./lib/poll-helpers.ts";
 
 interface ProjectRow {
 	readonly id: string;
@@ -40,14 +41,14 @@ interface ProjectRow {
 
 interface RunRow {
 	readonly id: string;
-	readonly burrowId: string | null;
-	readonly burrowRunId: string | null;
+	readonly sandboxId: string | null;
+	readonly sandboxRunId: string | null;
 	readonly state: string;
 }
 
 interface CreateRunResponse {
 	readonly run: RunRow;
-	readonly burrow: { readonly id: string; readonly workspacePath: string };
+	readonly sandbox: { readonly id: string; readonly workspacePath: string };
 }
 
 interface SteerMessage {
@@ -76,7 +77,8 @@ interface ErrorEnvelope {
 }
 
 const RUN_ID_PATTERN = /^run_[0-9a-hjkmnpqrstvwxyz]{12}$/;
-const MESSAGE_ID_PATTERN = /^msg_[0-9a-hjkmnpqrstvwxyz]+$/;
+// Inbox message ids are `msg_<uuid>` (src/runtime/local/run-store.ts).
+const MESSAGE_ID_PATTERN = /^msg_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const scenario: Scenario = {
 	id: "07",
@@ -91,11 +93,18 @@ export const scenario: Scenario = {
 		// harness invocation), so the sample project may already exist
 		// from a sibling scenario — reuse it instead of failing on the
 		// "already exists" 400.
-		await http.expectStatus("POST", "/agents/refresh", 200);
+		// The stub agent was seeded at boot via WARREN_SEED_AGENTS_FILE
+		// (warren-e376); POST /agents/refresh is deleted (pl-3a79). GET it
+		// to prove boot seeding landed before spawning against it.
+		await http.expectStatus(
+			"GET",
+			`/agents/${encodeURIComponent(ctx.fixtures.stubAgentName)}`,
+			200,
+		);
 		const project = await ensureSampleProject(http, ctx.fixtures.sampleProjectGitUrl);
 
 		// Spawn a long-running run. The stub agent reads `[sleep_ms=...]`
-		// from its prompt arg (see lib/stub-agent/agent.sh) and sleeps so
+		// from its prompt arg (see lib/stub-agent/claude-code-path-shim.sh) and sleeps so
 		// the warren row stays non-terminal across the steer call.
 		const spawnPrompt = "[sleep_ms=8000] scenario-07 steerable run";
 		const spawn = await http.expectJson<CreateRunResponse>("POST", "/runs", 201, {
@@ -111,8 +120,8 @@ export const scenario: Scenario = {
 			`spawn run.id ${run.id} does not match ${RUN_ID_PATTERN}`,
 		);
 		assertTrue(
-			typeof run.burrowId === "string" && run.burrowId !== null && run.burrowId.length > 0,
-			"spawn response missing burrowId — steer needs burrow_id (mx-37e6ff)",
+			typeof run.sandboxId === "string" && run.sandboxId !== null && run.sandboxId.length > 0,
+			"spawn response missing sandboxId — steer needs sandbox_id (mx-37e6ff)",
 		);
 
 		// 1. Steer with a known body. 200 + message envelope from burrow.
@@ -186,7 +195,7 @@ export const scenario: Scenario = {
 		);
 		assertTrue(typeof cancelRes.alreadyTerminal === "boolean", "cancel response shape");
 
-		const terminalState = await waitForTerminal(http, run.id, 8_000);
+		const terminalState = (await waitForRunTerminal(http, run.id, 8_000)).state;
 		const terminalSteerRes = await http.request(
 			"POST",
 			`/runs/${encodeURIComponent(run.id)}/steer`,
@@ -223,27 +232,4 @@ async function fetchAllEvents(http: WarrenHttp, runId: string): Promise<EventRow
 		events.push(row as EventRow);
 	}
 	return events;
-}
-
-async function waitForTerminal(
-	http: WarrenHttp,
-	runId: string,
-	timeoutMs: number,
-): Promise<string> {
-	const start = Date.now();
-	const terminal = new Set(["succeeded", "failed", "cancelled"]);
-	let lastState = "unknown";
-	while (Date.now() - start < timeoutMs) {
-		const row = await http.expectJson<RunRow>("GET", `/runs/${encodeURIComponent(runId)}`, 200);
-		lastState = row.state;
-		if (terminal.has(row.state)) return row.state;
-		await sleep(100);
-	}
-	throw new AcceptanceError(
-		`run ${runId} did not reach a terminal state within ${timeoutMs}ms (last state=${lastState})`,
-	);
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

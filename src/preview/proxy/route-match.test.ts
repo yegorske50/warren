@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
-	isWarrenApiPath,
 	parsePreviewPathPrefix,
 	parseRunIdFromHost,
 	parseRunIdFromReferer,
-	WARREN_API_PATH_PREFIXES,
 } from "./route-match.ts";
 
 const HOST = "preview.warren.example.com";
@@ -107,66 +105,5 @@ describe("parseRunIdFromReferer (warren-63e1)", () => {
 		// referers still get parsed because the cookie check below anchors
 		// authorization on the runId-bound signature.
 		expect(parseRunIdFromReferer("https://other.example.com/p/run_abc/")).toBe("run_abc");
-	});
-});
-
-describe("warren-api-prefixes-stay-in-sync (warren-63e1)", () => {
-	test("local WARREN_API_PATH_PREFIXES matches handlers.API_PREFIXES", async () => {
-		// proxy/route-match.ts duplicates the prefix list to avoid pulling
-		// all of handlers/index.ts into the preview tree. This test makes
-		// the duplication safe by asserting parity at build time — adding
-		// a new API surface to handlers/index.ts surfaces here as a failed
-		// assertion.
-		const handlers = await import("../../server/handlers/index.ts");
-		const { API_ROUTE_PATTERNS } = handlers;
-		// Derive prefixes from the pattern list: the first path segment.
-		const observedPrefixes = new Set<string>();
-		for (const { pattern } of API_ROUTE_PATTERNS) {
-			const segments = pattern.split("/").filter((s) => s.length > 0);
-			const first = segments[0];
-			if (first !== undefined) observedPrefixes.add(`/${first}`);
-		}
-		// Every observed prefix must be in our local list.
-		for (const p of observedPrefixes) {
-			expect(isWarrenApiPath(p)).toBe(true);
-		}
-		// Reverse direction (warren-abaa): every prefix in our local list
-		// must still be a real handler surface. This catches a *stale
-		// extra* — a prefix removed from handlers/index.ts but left behind
-		// here — which the forward check above can't see. Without it, the
-		// duplicated list silently drifts to over-route paths that no
-		// longer exist as API surfaces.
-		for (const local of WARREN_API_PATH_PREFIXES) {
-			expect(observedPrefixes.has(local)).toBe(true);
-		}
-		// Belt-and-suspenders: the two sets are exactly equal, so neither
-		// direction can drift without this suite failing.
-		expect([...WARREN_API_PATH_PREFIXES].sort()).toEqual([...observedPrefixes].sort());
-	});
-});
-
-describe("isWarrenApiPath (warren-63e1)", () => {
-	test("matches known warren API prefixes", () => {
-		expect(isWarrenApiPath("/runs")).toBe(true);
-		expect(isWarrenApiPath("/runs/run_abc")).toBe(true);
-		expect(isWarrenApiPath("/projects")).toBe(true);
-		expect(isWarrenApiPath("/agents/foo")).toBe(true);
-		expect(isWarrenApiPath("/healthz")).toBe(true);
-		expect(isWarrenApiPath("/readyz")).toBe(true);
-		expect(isWarrenApiPath("/version")).toBe(true);
-		expect(isWarrenApiPath("/preview/config")).toBe(true);
-	});
-
-	test("rejects non-API paths", () => {
-		expect(isWarrenApiPath("/")).toBe(false);
-		expect(isWarrenApiPath("/_next/static/foo.js")).toBe(false);
-		expect(isWarrenApiPath("/favicon.ico")).toBe(false);
-		expect(isWarrenApiPath("/assets/x.svg")).toBe(false);
-	});
-
-	test("does not match prefixes that share a non-`/` boundary", () => {
-		// `/runscape` shouldn't count as `/runs` — only `/runs` or `/runs/...`.
-		expect(isWarrenApiPath("/runscape")).toBe(false);
-		expect(isWarrenApiPath("/projectsx")).toBe(false);
 	});
 });

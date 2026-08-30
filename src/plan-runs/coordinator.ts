@@ -34,18 +34,19 @@
  */
 
 import { formatError } from "../core/errors.ts";
+import { renderPlanRunPrompt } from "../core/plan-run-prompt.ts";
+import { type Issue, IssueNotFoundError } from "../core/wire.ts";
 import type { Repos } from "../db/repos/index.ts";
 import type { PlanRunChildRow, PlanRunChildState, PlanRunRow } from "../db/schema.ts";
-import { SeedNotFoundError, type SeedShowResult } from "../seeds-cli/index.ts";
+import type { PrMergeChecker } from "../runs/pr-merge.ts";
 import { handleInFlight } from "./in-flight.ts";
 import { type CoordinatorReopenPrFn, checkParentRunMerged } from "./merge-gate.ts";
-import type { PrMergeChecker } from "./pr-merge.ts";
 
 export type { CoordinatorReopenPrFn } from "./merge-gate.ts";
 
 export type CoordinatorRepos = Pick<Repos, "planRuns" | "runs" | "events">;
 
-export type CoordinatorShowSeedFn = (projectId: string, seedId: string) => Promise<SeedShowResult>;
+export type CoordinatorGetIssueFn = (projectId: string, issueId: string) => Promise<Issue>;
 
 export interface CoordinatorSpawnInput {
 	readonly planRun: PlanRunRow;
@@ -88,6 +89,8 @@ export const PLAN_RUN_EVENT_KINDS = [
 	"plan_run.failed",
 	"plan_run.succeeded",
 	"plan_run.waiting_for_pr_reopen",
+	"plan_run.child_retried",
+	"plan_run.resumed",
 ] as const;
 export type PlanRunEventKind = (typeof PLAN_RUN_EVENT_KINDS)[number];
 
@@ -108,7 +111,7 @@ export type AdvanceResult =
 export interface AdvancePlanRunInput {
 	readonly planRun: PlanRunRow;
 	readonly repos: CoordinatorRepos;
-	readonly showSeed: CoordinatorShowSeedFn;
+	readonly getIssue: CoordinatorGetIssueFn;
 	readonly checkPrMerged: PrMergeChecker;
 	readonly spawn: CoordinatorSpawnFn;
 	readonly emit: CoordinatorEmitFn;
@@ -167,10 +170,11 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 				repos: input.repos,
 				checkPrMerged: input.checkPrMerged,
 				emit: input.emit,
-				showSeed: input.showSeed,
+				getIssue: input.getIssue,
 				mergeTimeoutMs,
 				now: nowFn,
 				reopenPr: input.reopenPr,
+				spawn: input.spawn,
 				...(input.closeChildSeed !== undefined ? { closeChildSeed: input.closeChildSeed } : {}),
 			});
 			if (decision.kind === "merged") {
@@ -195,18 +199,18 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 			return { kind: "plan_succeeded" };
 		}
 
-		// Resume semantics — closed seed → skip without dispatch.
-		let seedShow: SeedShowResult;
+		// Resume semantics — closed child issue → skip without dispatch.
+		let issue: Issue;
 		try {
-			seedShow = await input.showSeed(planRun.projectId, next.seedId);
+			issue = await input.getIssue(planRun.projectId, next.seedId);
 		} catch (err) {
-			// warren-0fed: a definitive "seed not found" is terminal — the
+			// warren-0fed: a definitive "issue not found" is terminal — the
 			// plan references an id that doesn't resolve (planned-but-never-
 			// created, or only on an unmerged branch), so retrying forever
 			// just spams plan_run.noop. Fail the child + plan-run. Any other
-			// (transient: timeout / lock / malformed) sd failure stays a
-			// retryable noop so a hung seed store can't kill healthy runs.
-			if (err instanceof SeedNotFoundError) {
+			// (transient: timeout / lock / malformed) tracker failure stays a
+			// retryable noop so a hung tracker can't kill healthy runs.
+			if (err instanceof IssueNotFoundError) {
 				const reason = `child_seed_not_found:${next.seedId}`;
 				const endedAt = nowFn().toISOString();
 				await input.repos.planRuns.updateChild({
@@ -234,7 +238,7 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 				reason: `show_seed_failed:${formatError(err)}`,
 			};
 		}
-		if (seedShow.status === "closed") {
+		if (issue.status === "closed") {
 			await input.repos.planRuns.updateChild({
 				planRunId: planRun.id,
 				seq: next.seq,
@@ -245,7 +249,8 @@ export async function advancePlanRun(input: AdvancePlanRunInput): Promise<Advanc
 		}
 
 		// Dispatch the next child; legacy {seed_id}-only template render.
-		const prompt = planRun.promptTemplate.replace(/\{seed_id\}/g, next.seedId);
+		// Every occurrence is substituted (warren-b3be).
+		const prompt = renderPlanRunPrompt(planRun.promptTemplate, next.seedId);
 		let spawnResult: CoordinatorSpawnResult;
 		try {
 			spawnResult = await input.spawn({ planRun, child: next, prompt });

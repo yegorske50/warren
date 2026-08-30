@@ -49,7 +49,7 @@ export async function resolveChildPrReopen(input: {
 	return { kind: "pending" };
 }
 
-import type { PrMergeChecker } from "./pr-merge.ts";
+import type { PrMergeChecker, PrMergePollResult } from "../runs/pr-merge.ts";
 
 /**
  * Gate auto-plan-runs on the parent run's PR being merged (warren-d9a2).
@@ -99,7 +99,13 @@ export async function checkParentRunMerged(input: {
 		// checks, BLOCKED mergeStateStatus, stuck auto-merge) would otherwise
 		// block the plan forever. Bound the wait by a wall-clock budget that
 		// starts when the parent run ended (PR-open time), then fail.
-		if (mergeDeadlineExceeded(parentRun.endedAt, now, mergeTimeoutMs)) {
+		if (
+			mergeDeadlineExceeded(
+				mergeWaitBaseline(parentRun.endedAt, planRun.resumedAt),
+				now,
+				mergeTimeoutMs,
+			)
+		) {
 			return failParentGate({
 				planRun,
 				repos,
@@ -112,7 +118,7 @@ export async function checkParentRunMerged(input: {
 		}
 		return { kind: "waiting_for_parent_merge" };
 	}
-	if (polled.kind === "closed_unmerged" || isFatalHttpError(polled)) {
+	if (polled.kind === "closed_unmerged" || isFatalForgeError(polled)) {
 		return failParentGate({
 			planRun,
 			repos,
@@ -123,7 +129,9 @@ export async function checkParentRunMerged(input: {
 			prUrl: parentRun.prUrl,
 		});
 	}
-	// Transient error / missing token — keep waiting.
+	// Every other shape — `unparseable` (foreign-host PR), `forge_error`
+	// (transient, no_credential, unauthorized after the checker's loud
+	// notice) — keeps waiting, bounded by the merge-wait budget.
 	return { kind: "waiting_for_parent_merge" };
 }
 
@@ -160,6 +168,28 @@ async function failParentGate(input: {
  * timeout is disabled (≤ 0), the run hasn't ended, or the timestamp is
  * unparseable — i.e. err toward waiting rather than a spurious failure.
  */
+/**
+ * Merge-wait clock baseline (warren-1eff). The budget normally starts at
+ * the producing run's `endedAt` (the PR-open moment), but a same-row
+ * resume stamps the plan-run's `resumedAt` — the stale `run.endedAt`
+ * would otherwise instantly re-timeout. The effective baseline is the
+ * LATER of the two. Unparseable timestamps defer to the other side;
+ * both null/unparseable returns null (err toward waiting, matching
+ * mergeDeadlineExceeded's own posture).
+ */
+export function mergeWaitBaseline(
+	runEndedAt: string | null,
+	planRunResumedAt: string | null,
+): string | null {
+	if (planRunResumedAt === null) return runEndedAt;
+	if (runEndedAt === null) return planRunResumedAt;
+	const ended = Date.parse(runEndedAt);
+	const resumed = Date.parse(planRunResumedAt);
+	if (Number.isNaN(ended)) return planRunResumedAt;
+	if (Number.isNaN(resumed)) return runEndedAt;
+	return resumed > ended ? planRunResumedAt : runEndedAt;
+}
+
 export function mergeDeadlineExceeded(
 	endedAt: string | null,
 	now: () => Date,
@@ -174,20 +204,19 @@ export function mergeDeadlineExceeded(
 
 /**
  * Classify a PR-merge poll result as a *fatal* "the PR is gone" signal
- * (warren-eccd / pl-30ae). Only HTTP 404 (Not Found) and 410 (Gone)
- * genuinely mean the PR no longer exists; GitHub's 401/403/429 are
- * "cannot verify right now" (auth blip / rate limit) and must fall
- * through to keep-waiting in both consumers (`checkParentRunMerged` and
- * `pollMergeState`), bounded by the merge-wait budget (warren-3937). A
- * permanently-bad token still fails eventually via
- * `child_pr_merge_timeout` / `parent_pr_merge_timeout` rather than
- * hanging forever.
+ * (warren-eccd / pl-30ae; switched onto `ForgeErrorKind` in warren-63e7 —
+ * forge-contract.md §0 names the old `status === 404 || status === 410`
+ * line as the leak test, so no raw HTTP status survives in the domain).
+ * Only `not_found` genuinely means the PR no longer exists;
+ * `unauthorized` / `forbidden` / `rate_limited` are "cannot verify right
+ * now" and must fall through to keep-waiting in both consumers
+ * (`checkParentRunMerged` and `pollMergeState`), bounded by the
+ * merge-wait budget (warren-3937). A permanently-bad credential still
+ * fails eventually via `child_pr_merge_timeout` /
+ * `parent_pr_merge_timeout` rather than hanging forever.
  */
-export function isFatalHttpError(result: {
-	kind: string;
-	status?: number;
-}): result is { kind: "http_error"; status: number; message: string } {
-	return result.kind === "http_error" && (result.status === 404 || result.status === 410);
+export function isFatalForgeError(result: PrMergePollResult): boolean {
+	return result.kind === "forge_error" && result.errorKind === "not_found";
 }
 
 export function isTerminalRun(run: RunRow): boolean {

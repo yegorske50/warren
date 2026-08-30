@@ -13,34 +13,19 @@
  *      missing-clone-hint guard.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
-import type { WarrenDb } from "../../db/client.ts";
-import {
-	createRepos,
-	fakeBurrowClient,
-	fakeExec,
-	fakeFs,
-	makeBurrow,
-	makePool,
-	openDatabase,
-} from "../../runs/reap/test-helpers.ts";
+import { describe, expect, test } from "bun:test";
+import { fakeBurrowClient, fakeExec, fakeFs, makeBurrow } from "../../runs/reap/test-helpers.ts";
+import type { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import type { FinalizeIntent, FinalizeResult, RunHandle } from "../contract.ts";
 import { RuntimeProviderError } from "../errors.ts";
-import { LocalProvider } from "./provider.ts";
 
-const WS = "/data/burrow/ws";
+const WS = "/data/sandbox/ws";
 const CLONE = "/data/projects/x/y";
 const HANDLE: RunHandle = {
 	runId: "run_domain0001",
 	sandboxId: "bur_aaaaaaaaaaaa",
 	providerRunId: "run_zzzzzzzzzzzz",
 };
-
-let openDb: WarrenDb | null = null;
-afterEach(() => {
-	openDb?.close();
-	openDb = null;
-});
 
 /** A full-tracker workspace + clone seed exercising every merge stage. */
 function fullSeed(): Record<string, string> {
@@ -49,7 +34,7 @@ function fullSeed(): Record<string, string> {
 		[`${WS}/.mulch/expertise/build.jsonl`]:
 			'{"id":"mx-1","recorded_at":"2026-05-08T20:00:00Z","content":"a"}\n',
 		[`${CLONE}/.mulch/expertise/build.jsonl`]: "",
-		// seeds clone baseline (workspace side rides the burrow files.read stub).
+		// seeds clone baseline (workspace side rides the tracker-read stub).
 		[`${CLONE}/.seeds/issues.jsonl`]:
 			'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
 	};
@@ -66,27 +51,23 @@ function intent(overrides: Partial<FinalizeIntent> = {}): FinalizeIntent {
 	};
 }
 
-async function provider(opts: {
+function provider(opts: {
 	fs: ReturnType<typeof fakeFs>;
 	exec: ReturnType<typeof fakeExec>;
 	seedsIssuesBody?: string;
 	seedsPlansBody?: string;
-	filesRead?: (burrowId: string, path: string) => Promise<{ contents: string }>;
-}): Promise<LocalProvider> {
-	const db = await openDatabase({ path: ":memory:" });
-	openDb = db;
-	const repos = createRepos(db);
+	filesRead?: (sandboxId: string, path: string) => Promise<{ contents: string }>;
+}): FakeProvider {
 	const clientOpts: {
 		seedsIssuesBody?: string;
 		seedsPlansBody?: string;
-		filesRead?: (burrowId: string, path: string) => Promise<{ contents: string }>;
+		filesRead?: (sandboxId: string, path: string) => Promise<{ contents: string }>;
 	} = {};
 	if (opts.seedsIssuesBody !== undefined) clientOpts.seedsIssuesBody = opts.seedsIssuesBody;
 	if (opts.seedsPlansBody !== undefined) clientOpts.seedsPlansBody = opts.seedsPlansBody;
 	if (opts.filesRead !== undefined) clientOpts.filesRead = opts.filesRead;
 	const client = fakeBurrowClient(makeBurrow({ workspacePath: WS }), clientOpts);
-	const pool = await makePool(client, repos);
-	return new LocalProvider({ burrowClient: () => pool, fs: opts.fs.fs, exec: opts.exec.exec });
+	return client.withFinalizeSeams(opts.fs.fs, opts.exec.exec);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -97,7 +78,7 @@ describe("finalize delta shapes — JSON round-trip", () => {
 	test("the whole FinalizeResult round-trips deep-equal", async () => {
 		const fs = fakeFs(fullSeed());
 		const exec = fakeExec();
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec,
 			seedsIssuesBody:
@@ -112,7 +93,7 @@ describe("finalize delta shapes — JSON round-trip", () => {
 
 	test("each artifact delta is populated and version-tagged", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
 			seedsIssuesBody:
@@ -133,7 +114,7 @@ describe("finalize delta shapes — JSON round-trip", () => {
 describe("finalize — artifacts delta assembly", () => {
 	test("mulch delta carries LWW counts + per-domain merged body", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		const { artifacts } = await p.finalize(HANDLE, intent({ artifacts: ["mulch"] }));
 		expect(artifacts.mulch).toEqual({
 			version: 1,
@@ -149,7 +130,7 @@ describe("finalize — artifacts delta assembly", () => {
 
 	test("seeds delta carries closed/created counts + merged issues.jsonl", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
 			seedsIssuesBody:
@@ -166,7 +147,7 @@ describe("finalize — artifacts delta assembly", () => {
 
 	test("seeds delta files is empty on a no-op mirror (no workspace file)", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() }); // no seedsIssuesBody → 404 → no-op
+		const p = provider({ fs, exec: fakeExec() }); // no seedsIssuesBody → 404 → no-op
 		const { artifacts } = await p.finalize(HANDLE, intent({ artifacts: ["seeds"] }));
 		expect(artifacts.seeds).toEqual({
 			version: 1,
@@ -177,7 +158,7 @@ describe("finalize — artifacts delta assembly", () => {
 
 	test("plans delta carries appended count + merged plans.jsonl", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
 			seedsPlansBody: '{"id":"pl-1","title":"a plan"}\n',
@@ -196,7 +177,7 @@ describe("finalize — artifacts delta assembly", () => {
 describe("finalize — stage trail + push reporting", () => {
 	test("runs every stage in pipeline order and reports ok", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
 			seedsIssuesBody:
@@ -206,8 +187,8 @@ describe("finalize — stage trail + push reporting", () => {
 		const result = await p.finalize(HANDLE, intent());
 		expect(result.stages.map((s) => s.stage)).toEqual([
 			"mulch_merge",
-			"seeds_mirror",
-			"plans_mirror",
+			"seeds_merge",
+			"plans_merge",
 			"seeds_commit",
 			"branch_push",
 			"commits_ahead",
@@ -217,7 +198,7 @@ describe("finalize — stage trail + push reporting", () => {
 
 	test("push + commits-ahead: pushed, commitsAhead, prBranch set", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ revListCount: "3" }), seedsPlansBody: "" });
+		const p = provider({ fs, exec: fakeExec({ revListCount: "3" }), seedsPlansBody: "" });
 		const result = await p.finalize(HANDLE, intent());
 		expect(result.pushed).toBe(true);
 		expect(result.commitsAhead).toBe(3);
@@ -225,9 +206,37 @@ describe("finalize — stage trail + push reporting", () => {
 		expect(result.prBranch).toBe("warren/run-1");
 	});
 
+	test("the push spawns with the intent's minted credential as GIT_CONFIG_* env (warren-4e1c)", async () => {
+		const fs = fakeFs(fullSeed());
+		const exec = fakeExec({ revListCount: "3" });
+		const p = provider({ fs, exec, seedsPlansBody: "" });
+		const result = await p.finalize(
+			HANDLE,
+			intent({
+				gitCredential: { username: "x-access-token", secret: "ghp_pushsecret", host: "github.com" },
+			}),
+		);
+		expect(result.pushed).toBe(true);
+		const push = exec.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+		expect(push?.env?.GIT_CONFIG_COUNT).toBe("1");
+		expect(push?.env?.GIT_CONFIG_KEY_0).toBe(
+			"url.https://x-access-token:ghp_pushsecret@github.com/.insteadOf",
+		);
+		expect(push?.env?.GIT_CONFIG_VALUE_0).toBe("https://github.com/");
+	});
+
+	test("no intent credential keeps the push anonymous (empty env overrides)", async () => {
+		const fs = fakeFs(fullSeed());
+		const exec = fakeExec({ revListCount: "3" });
+		const p = provider({ fs, exec, seedsPlansBody: "" });
+		await p.finalize(HANDLE, intent());
+		const push = exec.calls.find((c) => c.cmd === "git" && c.args[0] === "push");
+		expect(push?.env).toEqual({});
+	});
+
 	test("empty push: zero commits ahead → emptyPush true, prBranch null", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ revListCount: "0" }) });
+		const p = provider({ fs, exec: fakeExec({ revListCount: "0" }) });
 		const result = await p.finalize(HANDLE, intent());
 		expect(result.pushed).toBe(true);
 		expect(result.commitsAhead).toBe(0);
@@ -238,7 +247,7 @@ describe("finalize — stage trail + push reporting", () => {
 	test("push disabled: branch_push + commits_ahead skipped, commitsAhead null", async () => {
 		const fs = fakeFs(fullSeed());
 		const exec = fakeExec();
-		const p = await provider({ fs, exec });
+		const p = provider({ fs, exec });
 		const result = await p.finalize(HANDLE, intent({ artifacts: [], push: false }));
 		expect(result.pushed).toBe(false);
 		expect(result.commitsAhead).toBe(null);
@@ -252,13 +261,26 @@ describe("finalize — stage trail + push reporting", () => {
 
 	test("missing baseBranch → commits_ahead skipped, commitsAhead null", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		const result = await p.finalize(HANDLE, intent({ artifacts: [], baseBranch: undefined }));
 		expect(result.pushed).toBe(true);
 		expect(result.commitsAhead).toBe(null);
+		expect(result.commitsAheadBase).toBeUndefined();
 		expect(result.stages).toEqual([
 			{ stage: "branch_push", status: "ok" },
 			{ stage: "commits_ahead", status: "skipped" },
+		]);
+	});
+
+	test("fresh-branch dispatch counts baseBranch..HEAD with no rev-parse and reports the base", async () => {
+		const fs = fakeFs(fullSeed());
+		const exec = fakeExec({ revListCount: "3" });
+		const result = await provider({ fs, exec }).finalize(HANDLE, intent({ artifacts: [] }));
+		expect(result.commitsAhead).toBe(3);
+		expect(result.commitsAheadBase).toBe("main");
+		expect(exec.calls.map((c) => c.args)).toEqual([
+			["push", "origin", "HEAD:warren/run-1"],
+			["rev-list", "--count", "main..HEAD"],
 		]);
 	});
 });
@@ -270,16 +292,16 @@ describe("finalize — stage trail + push reporting", () => {
 describe("finalize — error capture + guards", () => {
 	test("a failing seeds mirror is captured as a failed stage, others proceed", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
-			// non-NotFound error from files.read → mirrorSeeds re-throws → stage failed.
+			// a tracker-read error → mirrorSeeds re-throws → stage failed.
 			filesRead: async () => {
-				throw new Error("burrow files.read boom");
+				throw new Error("tracker read boom");
 			},
 		});
 		const result = await p.finalize(HANDLE, intent({ artifacts: ["seeds"] }));
-		const seedsStage = result.stages.find((s) => s.stage === "seeds_mirror");
+		const seedsStage = result.stages.find((s) => s.stage === "seeds_merge");
 		expect(seedsStage?.status).toBe("failed");
 		expect(seedsStage?.error).toContain("boom");
 		// delta still present, zeroed — the domain sees the no-op explicitly.
@@ -294,7 +316,7 @@ describe("finalize — error capture + guards", () => {
 
 	test("a failing branch push is captured; commits_ahead is skipped", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ fail: "push rejected" }) });
+		const p = provider({ fs, exec: fakeExec({ fail: "push rejected" }) });
 		const result = await p.finalize(HANDLE, intent({ artifacts: [] }));
 		expect(result.pushed).toBe(false);
 		expect(result.commitsAhead).toBe(null);
@@ -306,7 +328,7 @@ describe("finalize — error capture + guards", () => {
 
 	test("non-empty artifacts without projectClonePathHint throws RuntimeProviderError", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		await expect(
 			p.finalize(HANDLE, intent({ projectClonePathHint: undefined })),
 		).rejects.toBeInstanceOf(RuntimeProviderError);
@@ -314,7 +336,7 @@ describe("finalize — error capture + guards", () => {
 
 	test("empty artifacts needs no clone hint and skips every merge stage", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		const result = await p.finalize(
 			HANDLE,
 			intent({ artifacts: [], projectClonePathHint: undefined }),
@@ -328,7 +350,7 @@ describe("finalize — error capture + guards", () => {
 describe("finalize — collected events", () => {
 	test("collects every per-record merge event in pipeline order", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec(),
 			seedsIssuesBody:
@@ -348,7 +370,7 @@ describe("finalize — collected events", () => {
 
 	test("event payloads are JSON-serializable (round-trip deep-equal)", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		const { events } = await p.finalize(HANDLE, intent({ artifacts: ["mulch"] }));
 		const roundTripped = JSON.parse(JSON.stringify(events));
 		expect(roundTripped).toEqual(events);
@@ -358,7 +380,7 @@ describe("finalize — collected events", () => {
 
 	test("a failing branch push is collected as a reap_failed event", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ fail: "push rejected" }) });
+		const p = provider({ fs, exec: fakeExec({ fail: "push rejected" }) });
 		const { events } = await p.finalize(HANDLE, intent({ artifacts: [] }));
 		const failed = events.find((e) => e.kind === "reap_failed");
 		expect(failed).toBeDefined();
@@ -367,7 +389,7 @@ describe("finalize — collected events", () => {
 
 	test("a rev-list failure emits NO reap_failed event (log-only in reap)", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ failRevList: "bad revision" }) });
+		const p = provider({ fs, exec: fakeExec({ failRevList: "bad revision" }) });
 		const { events } = await p.finalize(HANDLE, intent({ artifacts: [] }));
 		expect(events.some((e) => e.kind === "reap_failed")).toBe(false);
 	});
@@ -377,7 +399,7 @@ describe("finalize — collected events", () => {
 describe("finalize — dirty probe", () => {
 	test("zero-commit push + dirty tree → dirty true", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec: fakeExec({ revListCount: "0", gitStatus: " M src/foo.ts\n" }),
 		});
@@ -389,7 +411,7 @@ describe("finalize — dirty probe", () => {
 
 	test("zero-commit push + clean tree → dirty false", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec({ revListCount: "0" }) });
+		const p = provider({ fs, exec: fakeExec({ revListCount: "0" }) });
 		const result = await p.finalize(HANDLE, intent({ artifacts: [] }));
 		expect(result.emptyPush).toBe(true);
 		expect(result.dirty).toBe(false);
@@ -413,7 +435,7 @@ describe("finalize — commit decoupling", () => {
 				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
 		});
 		const exec = fakeExec({ stagedDelta: true });
-		const p = await provider({
+		const p = provider({
 			fs,
 			exec,
 			seedsIssuesBody:
@@ -433,7 +455,7 @@ describe("finalize — commit decoupling", () => {
 				'{"id":"sd-1","status":"open","updatedAt":"2026-05-08T19:00:00Z","title":"x"}\n',
 		});
 		const exec = fakeExec({ stagedDelta: true });
-		const p = await provider({ fs, exec });
+		const p = provider({ fs, exec });
 		const result = await p.finalize(
 			HANDLE,
 			intent({ artifacts: ["seeds"], commit: ["seeds"], push: false }),
@@ -451,14 +473,14 @@ describe("finalize — workspacePlansBody snapshot", () => {
 			[`${CLONE}/.seeds/issues.jsonl`]: "",
 			[`${CLONE}/.seeds/plans.jsonl`]: "",
 		});
-		const p = await provider({ fs, exec: fakeExec({ stagedDelta: true }) });
+		const p = provider({ fs, exec: fakeExec({ stagedDelta: true }) });
 		const result = await p.finalize(HANDLE, intent({ artifacts: ["seeds"], commit: ["seeds"] }));
 		expect(result.workspacePlansBody).toBe(workspacePlans);
 	});
 
 	test("null when the workspace has no plans.jsonl", async () => {
 		const fs = fakeFs(fullSeed());
-		const p = await provider({ fs, exec: fakeExec() });
+		const p = provider({ fs, exec: fakeExec() });
 		const result = await p.finalize(HANDLE, intent({ artifacts: [] }));
 		expect(result.workspacePlansBody).toBeNull();
 	});

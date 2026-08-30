@@ -43,7 +43,6 @@ import { scenario as scenario08 } from "./scenarios/08-cancel.ts";
 import { scenario as scenario09 } from "./scenarios/09-reap-mulch-roundtrip.ts";
 import { scenario as scenario10 } from "./scenarios/10-reap-seeds-roundtrip.ts";
 import { scenario as scenario11 } from "./scenarios/11-doctor-exit-codes.ts";
-import { scenario as scenario12 } from "./scenarios/12-supervisor-restart-budget.ts";
 import { scenario as scenario13 } from "./scenarios/13-container-smoke.ts";
 import { scenario as scenario14 } from "./scenarios/14-warren-config.ts";
 import { scenario as scenario15 } from "./scenarios/15-triggers-roundtrip.ts";
@@ -62,6 +61,11 @@ import { scenario as scenario36 } from "./scenarios/36-ready-to-dispatch-plans.t
 import { scenario as scenario37 } from "./scenarios/37-k8s-oom-fast-fail.ts";
 import { scenario as scenario38 } from "./scenarios/38-k8s-steer-delivery.ts";
 import { scenario as scenario39 } from "./scenarios/39-public-exposure.ts";
+import { scenario as scenario40 } from "./scenarios/40-fake-forge-roundtrip.ts";
+import { scenario as scenario41 } from "./scenarios/41-local-topology-self-host.ts";
+import { scenario as scenario42 } from "./scenarios/42-self-host-one-liner.ts";
+import { scenario as scenario43 } from "./scenarios/43-remote-tracker-roundtrip.ts";
+import { scenario as scenario44 } from "./scenarios/44-existing-branch.ts";
 
 const SCENARIOS: readonly Scenario[] = [
 	scenario01,
@@ -74,7 +78,6 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario09,
 	scenario10,
 	scenario11,
-	scenario12,
 	scenario13,
 	scenario14,
 	scenario15,
@@ -93,6 +96,11 @@ const SCENARIOS: readonly Scenario[] = [
 	scenario37,
 	scenario38,
 	scenario39,
+	scenario40,
+	scenario41,
+	scenario42,
+	scenario43,
+	scenario44,
 ];
 
 interface ParsedArgs {
@@ -212,17 +220,27 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 		// POST /agents/refresh endpoint the scenarios used to call was
 		// deleted in pl-3a79. bootInProc passes this var through.
 		process.env.WARREN_SEED_AGENTS_FILE = fixtures.seedAgentsFilePath;
+		// The stub agent pins runtime=stub-shell (warren-83b5), an id outside
+		// warren's canonical KNOWN_RUNTIME_IDS. Declare it as an operator
+		// extension so registration and dispatch accept it while validation
+		// stays fail-closed by default (warren-c4be).
+		process.env.WARREN_EXTRA_RUNTIME_IDS = fixtures.stubAgentName;
+		// The stub agent pins runtime=claude-code and the internalized local
+		// engine execs the bare `claude` binary (warren-dc19). Prepend the
+		// fixture shim dir so every warren this harness boots (shared and
+		// scenario-owned, via PATH passthrough) resolves the deterministic
+		// stub instead of a real claude install.
+		process.env.PATH = `${fixtures.claudeShimBinDir}:${process.env.PATH ?? ""}`;
 		handle = await bootInProc({
 			tmpRoot,
 			token,
 			canopyRepoUrl: fixtures.canopyRepoUrl,
 			gitConfigPath: fixtures.gitConfigPath,
 			extraEnv: {
-				// Stub agent reads this; burrow's [env].optional in the sample
-				// project's burrow.toml forwards it into the sandbox. 8s gives
-				// scenarios 05/06 a steady stream of per-second heartbeat
-				// events while leaving room to kill+restart warren mid-run.
-				WARREN_STUB_SLEEP_MS: "8000",
+				// The internalized engine execs the bare names `claude`/`pi`
+				// (warren-0f18/warren-ea0a): the fixture shim dir wins
+				// resolution, so runs drive the deterministic stub agents.
+				PATH: `${fixtures.shimBinDir}:${process.env.PATH ?? ""}`,
 				// Scenario 15 drives a live cron + scheduledFor dispatch via
 				// the R-06 tick loop; the 60s production default would push
 				// the scenario past any reasonable budget. Other scenarios
@@ -239,7 +257,6 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 			mode: args.mode,
 			warrenUrl: handle.warrenUrl,
 			token: handle.token,
-			socketPath: handle.socketPath,
 			fixtures: {
 				canopyRepoUrl: fixtures.canopyRepoUrl,
 				canopyRepoPath: fixtures.canopyRepoPath,
@@ -250,13 +267,14 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 				knownSeedTitle: fixtures.knownSeedTitle,
 				knownMulchDomain: fixtures.knownMulchDomain,
 				gitConfigPath: fixtures.gitConfigPath,
+				shimBinDir: fixtures.shimBinDir,
+				seedAgentsFilePath: fixtures.seedAgentsFilePath,
 			},
 			logger,
 			tmp: tmpRoot,
 			lifecycle: {
 				killWarren: () => bootHandle.killWarren(),
 				restartWarren: () => bootHandle.restartWarren(),
-				killBurrow: () => bootHandle.killBurrow(),
 			},
 		};
 
@@ -293,7 +311,6 @@ async function runInProcMode(opts: RunModeArgs): Promise<number> {
 				if (args.keepTmp) {
 					// Stop processes but don't rm-rf the tmp dir.
 					await handle.killWarren().catch(() => undefined);
-					await handle.killBurrow().catch(() => undefined);
 					console.log(`acceptance: kept tmp dir at ${tmpRoot}`);
 				} else {
 					await handle.stop();
@@ -391,7 +408,6 @@ async function runContainerMode(opts: RunModeArgs): Promise<number> {
 			mode: args.mode,
 			warrenUrl: handle.warrenUrl,
 			token: handle.token,
-			socketPath: handle.socketPath,
 			fixtures: {
 				canopyRepoUrl: "",
 				canopyRepoPath: "",
@@ -402,6 +418,8 @@ async function runContainerMode(opts: RunModeArgs): Promise<number> {
 				knownSeedTitle: "",
 				knownMulchDomain: "",
 				gitConfigPath: "",
+				shimBinDir: "",
+				seedAgentsFilePath: "",
 			},
 			logger,
 			tmp: tmpRoot,

@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeForge } from "../../forge/fake/fake-forge.ts";
 import { MetricsRegistry } from "../../observability/metrics-registry.ts";
 import { RunEventBroker } from "../../runs/index.ts";
-import { resolveRuntimeProvider } from "../../runtime/registry.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { bearerAuth } from "../auth.ts";
 import { createBridgeRegistry } from "../bridges.ts";
 import { createDbSeams } from "../db-seams.ts";
@@ -16,11 +16,8 @@ const TOKEN = "metrics-test-token-0000000000000000000000";
 
 const silentLogger = { info() {}, warn() {}, error() {}, debug() {} };
 
-function makeBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: (async () => new Response(JSON.stringify({ ok: true }))) as unknown as typeof fetch,
-	});
+function makeSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 async function depsFor(
@@ -29,19 +26,20 @@ async function depsFor(
 	registry?: MetricsRegistry,
 	streamLimiter?: EventStreamLimiter,
 ): Promise<ServerDeps> {
-	const burrowClient = makeBurrowClient();
+	const sandboxClient = makeSandboxClient();
 	const broker = new RunEventBroker();
 	const bridges = createBridgeRegistry({
 		repos,
 		broker,
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+		runtimeProvider: sandboxClient,
 		bridge: async () => ({ written: 0, skipped: 0, errored: false }),
 	});
 	return {
 		repos,
 		db,
 		...createDbSeams(db),
-		runtimeProvider: resolveRuntimeProvider({ burrowClient: () => burrowClient }),
+		runtimeProvider: sandboxClient,
+		forge: new FakeForge(),
 		broker,
 		bridges,
 		projectsConfig: { root: "/tmp/projects", gitBinary: "git" },
@@ -105,7 +103,12 @@ describe("GET /metrics", () => {
 	});
 
 	test("reports event-stream saturation when a stream limiter is wired (warren-25f6)", async () => {
-		const limiter = new EventStreamLimiter({ maxGlobal: 8, maxPerClient: 2, maxLifetimeMs: 0 });
+		const limiter = new EventStreamLimiter({
+			maxGlobal: 8,
+			maxPerClient: 2,
+			maxLifetimeMs: 0,
+			trustedProxyHops: 0,
+		});
 		limiter.acquire("1.2.3.4");
 		limiter.acquire("5.6.7.8");
 		handle = startServer(await depsFor(repos, db, undefined, limiter), {

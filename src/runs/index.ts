@@ -4,6 +4,9 @@
  * out to call sites.
  */
 
+// Row type re-export at the domain seam (warren-02c9): the drizzle schema
+// stays the source of the inferred type; handlers import `RunRow` from here.
+export type { RunRow } from "../db/schema.ts";
 export {
 	buildCommandMining,
 	type CategoryBucket,
@@ -14,18 +17,56 @@ export {
 	categorize,
 	generalizeCommand,
 	isOsEcoCommand,
-	type ToolEventRow,
+	type RuntimeCommandCoverage,
+	type ToolCallMiningRow,
 } from "./analytics/command-mining.ts";
+export {
+	buildContextWaste,
+	type ContextWasteProxy,
+	type ContextWasteShare,
+} from "./analytics/context-waste.ts";
+export {
+	buildDirectoryDifficulty,
+	DEFAULT_DIRECTORY_LIMIT,
+	type DirectoryDifficulty,
+	type DirectoryDifficultyTotals,
+	type DirectoryRunOutcome,
+	type DirectoryStat,
+	type DirectoryToolCallRow,
+	MIN_DIRECTORY_RUNS,
+	normalizeDirectory,
+} from "./analytics/directory-difficulty.ts";
+export {
+	buildDispatchAnalytics,
+	type DispatchAnalytics,
+	type DispatchAnalyticsRow,
+	type DispatchCountBucket,
+	NONE_KEY as DISPATCH_ANALYTICS_NONE_KEY,
+} from "./analytics/dispatch-analytics.ts";
 export {
 	buildInsights,
 	buildSteeringSignals,
+	countSteeringByRun,
 	type Insight,
+	type InsightConfidence,
 	type InsightKind,
 	type InsightSeverity,
 	type InsightsInput,
 	type SteeringEventRow,
 	type SteeringSignals,
 } from "./analytics/insights.ts";
+export {
+	buildCostPerMergedPr,
+	buildRunOutcomes,
+	buildSteeringOutcomeComparison,
+	type CostPerMergedPr,
+	type CostPerMergedPrBucket,
+	confidenceForSample,
+	type OutcomeTally,
+	type RunOutcomes,
+	type SteeringOutcomeComparison,
+	type SteeringOutcomeEventRow,
+} from "./analytics/outcome-analytics.ts";
 export {
 	buildRunMetrics,
 	contextTokensOf,
@@ -35,6 +76,7 @@ export {
 	type GroupDimension as RunGroupDimension,
 	NONE_KEY as RUN_METRICS_NONE_KEY,
 	OTHER_KEY as RUN_METRICS_OTHER_KEY,
+	queueWaitMsOf,
 	type RunDayBucket,
 	type RunGroupBucket,
 	type RunMetrics,
@@ -45,6 +87,13 @@ export {
 	type TokenBreakdown,
 	type TokenDayBucket,
 } from "./analytics/run-metrics.ts";
+export {
+	extractToolResult,
+	extractToolUse,
+	runtimeFromRenderedAgent,
+	type ToolResultExtraction,
+	type ToolUseExtraction,
+} from "./analytics/tool-call-extract.ts";
 export {
 	composeRunBranch,
 	DEFAULT_RUN_BRANCH_PREFIX,
@@ -101,12 +150,16 @@ export {
 	type WarrenExtProtocol,
 } from "./lifecycle-bus.ts";
 export {
+	createLifecycleStreamExtension,
+	DEFAULT_LIFECYCLE_STREAM_BUFFER,
+	LifecycleStreamBroker,
+	type LifecycleStreamNotification,
+	type LifecycleStreamSubscribeOptions,
+} from "./lifecycle-stream.ts";
+export {
 	type AutoOpenPrConfig,
 	buildPrContent,
 	loadAutoOpenPrConfigFromEnv,
-	type OpenPullRequestInput,
-	type OpenPullRequestResult,
-	openPullRequest,
 } from "./pr.ts";
 export {
 	mergeMulchFile,
@@ -119,11 +172,38 @@ export {
 	reapRun,
 } from "./reap/index.ts";
 export {
+	type CreateInfraLostRetryHookInput,
+	createInfraLostRetryHook,
+	decideInfraLostRetry,
+	INFRA_LOST_RUN_FAILURE_REASONS,
+	type InfraLostRetryDecision,
+	type InfraLostRetryHook,
+	type InfraLostRetrySkip,
+	type InfraLostRunFailureReason,
+	isInfraLostRunFailure,
+	RUN_RETRY_DISPATCHED_KIND,
+	RUN_RETRY_OF_KIND,
+} from "./retry/infra-lost-retry.ts";
+export {
+	classifyProviderError,
+	createProviderRetryLifecycleExtension,
+	PROVIDER_RETRY_EVENTS,
+	type ProviderErrorClass,
+	type ProviderRetryLifecycleExtensionInput,
+	type ProviderRetryLogger,
+} from "./retry/provider-retry.ts";
+export {
 	type BuildSeedFilesResult,
 	buildSeedFiles,
 	type SeedFile,
 } from "./seed.ts";
-export { type SpawnRunInput, type SpawnRunResult, spawnRun } from "./spawn/index.ts";
+export {
+	DISPATCH_ORIGINS,
+	type DispatchOrigin,
+	type SpawnRunInput,
+	type SpawnRunResult,
+	spawnRun,
+} from "./spawn/index.ts";
 export { type SteerRunInput, type SteerRunResult, steerRun } from "./steer.ts";
 export {
 	type ActiveBridge,
@@ -160,12 +240,14 @@ export {
 	bootWatchdog,
 	computeIdleMs,
 	DEFAULT_WATCHDOG_TICK_MS,
-	loadWatchdogConfigFromEnv,
 	tickWatchdog,
 	WATCHDOG_TIMED_OUT_KIND,
-	type WatchdogConfig,
 	type WatchdogHandle,
 	type WatchdogReap,
 	type WatchdogTickDeps,
 	type WatchdogTickResult,
 } from "./watchdog.ts";
+export {
+	loadWatchdogConfigFromEnv,
+	type WatchdogConfig,
+} from "./watchdog-config.ts";

@@ -131,6 +131,23 @@ export class RunInboxRepo {
 		return claimed.sort(compareForDelivery);
 	}
 
+	/**
+	 * List a run's `unread` rows WITHOUT claiming them (warren-3305) — the
+	 * peek half of `GET /runs/:id/inbox?peek=1`, for operator/UI inspection
+	 * that must not steal messages from the pod's poll. Same delivery order
+	 * as `claimForDelivery` (priority-desc, then FIFO-by-`seq`) so a peek
+	 * shows exactly what the next claim would take.
+	 */
+	async listUnreadByRun(runId: string): Promise<RunInboxRow[]> {
+		const rows = await this.adapter.pickAll<RunInboxRow>(
+			this.db
+				.select()
+				.from(this.runInbox)
+				.where(and(eq(this.runInbox.runId, runId), eq(this.runInbox.state, "unread"))),
+		);
+		return rows.sort(compareForDelivery);
+	}
+
 	/** All rows for a run, oldest-first by `seq` (test/inspection helper). */
 	async listByRun(runId: string): Promise<RunInboxRow[]> {
 		const rows = await this.adapter.pickAll<RunInboxRow>(
@@ -140,8 +157,19 @@ export class RunInboxRepo {
 	}
 }
 
+/**
+ * Rank for a stored priority, defensively total (warren-b27c). Handlers refuse
+ * an out-of-vocabulary priority at the boundary, but the column carries no SQL
+ * CHECK, so a legacy or hand-edited row could still hold one. An unknown value
+ * ranks below `low` instead of yielding `undefined` → NaN, which would make the
+ * comparator non-total and hand `Array.sort` implementation-defined ordering.
+ */
+function rankOf(priority: string): number {
+	return (PRIORITY_RANK as Record<string, number | undefined>)[priority] ?? -1;
+}
+
 /** priority-desc, then FIFO (`seq`-asc) within a priority class. */
 function compareForDelivery(a: RunInboxRow, b: RunInboxRow): number {
-	const byPriority = PRIORITY_RANK[b.priority] - PRIORITY_RANK[a.priority];
+	const byPriority = rankOf(b.priority) - rankOf(a.priority);
 	return byPriority !== 0 ? byPriority : a.seq - b.seq;
 }

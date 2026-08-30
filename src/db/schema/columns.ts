@@ -38,6 +38,10 @@ export const TABLE_NAMES = {
 	planRuns: "plan_runs",
 	planRunChildren: "plan_run_children",
 	runInbox: "run_inbox",
+	toolCalls: "tool_calls",
+	// warren-36e7 / pl-a37b Track A: one insert-only fact row per dispatched
+	// run. PK is run_id; cascade on runs delete matches tool_calls.
+	dispatchContext: "dispatch_context",
 } as const;
 
 /**
@@ -59,6 +63,10 @@ export const INDEX_NAMES = {
 	runsPrUrl: "runs_pr_url_idx",
 	eventsRunSeq: "events_run_seq_idx",
 	eventsRunTs: "events_run_ts_idx",
+	// warren-55cf: the healer counts prior heal.dispatched attempts per alert
+	// fingerprint with a `kind = ?` predicate, so index the kind it filters on
+	// (newest-first by ts) instead of scanning the whole events table.
+	eventsKindTs: "events_kind_ts_idx",
 	triggersProject: "triggers_project_idx",
 	// warren-f787: agents are identified by `name` alone (the project tier
 	// and its `project_id` column were removed). A single unique index on
@@ -79,6 +87,17 @@ export const INDEX_NAMES = {
 	// undelivered-per-run claim a covered index scan instead of a full-table
 	// filter, and FIFO ordering within the claimed set is done in-app by seq.
 	runInboxRunState: "run_inbox_run_state_idx",
+	// warren-7746. The tool_calls rollup writes one row per tool_use event
+	// and joins each tool_result back by (run_id, tool_use_id); the unique
+	// (run_id, seq) index doubles as the backfill idempotency guard (one
+	// row per tool_use event, INSERT ON CONFLICT DO NOTHING) and covers the
+	// analytics read's (run_id, seq) ordering. The (run_id, tool_use_id)
+	// index keeps the result-join UPDATE a covered lookup.
+	toolCallsRunSeq: "tool_calls_run_seq_idx",
+	toolCallsRunUseId: "tool_calls_run_use_id_idx",
+	// warren-36e7. GET /analytics/dispatch (warren-5423) windows on
+	// created_at, not started_at, so never-started dispatches stay visible.
+	dispatchContextCreatedAt: "dispatch_context_created_at_idx",
 } as const;
 
 /**

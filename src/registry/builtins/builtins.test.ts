@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { isKnownRuntimeId } from "../../core/wire.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { AgentsRepo } from "../../db/repos/agents.ts";
 import { DrizzleAdapter } from "../../db/repos/drizzle-adapter.ts";
-import { parseRenderedAgent, type RenderResponse } from "../schema.ts";
+import { ALL_PROMPT_CAPABILITIES, withGatedPromptFragments } from "../prompt-gating.ts";
+import {
+	AgentNameSchema,
+	parseRenderedAgent,
+	type RenderResponse,
+	readRuntimeId,
+} from "../schema.ts";
 import {
 	BUILTIN_AGENT_NAMES,
 	BUILTIN_AGENTS,
@@ -11,21 +18,26 @@ import {
 	PLANNER_BUILTIN,
 	PR_FIXER_BUILTIN,
 	readAgentSource,
-	SAPLING_BUILTIN,
 	seedBuiltinAgents,
 	stampAgentSource,
 } from "./index.ts";
 
 describe("BUILTIN_AGENTS", () => {
-	test("includes claude-code, sapling, pi, planner, pr-fixer, and healer", () => {
+	test("includes claude-code, pi, planner, pr-fixer, and healer", () => {
 		expect(BUILTIN_AGENT_NAMES.has("claude-code")).toBe(true);
-		expect(BUILTIN_AGENT_NAMES.has("sapling")).toBe(true);
+		expect(BUILTIN_AGENT_NAMES.has("sapling")).toBe(false);
 		expect(BUILTIN_AGENT_NAMES.has("pi")).toBe(true);
 		expect(BUILTIN_AGENT_NAMES.has("brainstorm")).toBe(false);
 		expect(BUILTIN_AGENT_NAMES.has("planner")).toBe(true);
 		expect(BUILTIN_AGENT_NAMES.has("pr-fixer")).toBe(true);
 		expect(BUILTIN_AGENT_NAMES.has("leveret")).toBe(false);
 		expect(BUILTIN_AGENT_NAMES.has("healer")).toBe(true);
+	});
+
+	test("each builtin name passes the shared kebab grammar (warren-2b75)", () => {
+		for (const builtin of BUILTIN_AGENTS) {
+			expect(AgentNameSchema.safeParse(builtin.name).success).toBe(true);
+		}
 	});
 
 	test("each builtin has a non-empty system section (warren's required schema field)", () => {
@@ -51,9 +63,27 @@ describe("BUILTIN_AGENTS", () => {
 		}
 	});
 
+	// warren-c4be: every shipped built-in must resolve to a runtime burrow
+	// actually knows. warren-ebca was exactly this failing at dispatch instead.
+	test("each builtin resolves to a known runtime id (warren-c4be)", () => {
+		for (const builtin of BUILTIN_AGENTS) {
+			expect(isKnownRuntimeId(readRuntimeId(builtin))).toBe(true);
+		}
+	});
+
 	test("each builtin's frontmatter declares source = 'builtin' for provenance", () => {
 		for (const builtin of BUILTIN_AGENTS) {
 			expect(builtin.frontmatter.source).toBe("builtin");
+		}
+	});
+
+	// warren-3305: no builtin runtime consumes steering mid-run (pi reads
+	// stdin only at a turn boundary and warren closes stdin at agent_end), so
+	// every builtin must declare spawn-only — the flag drives the 409 that
+	// replaced the silent steer.sent no-op.
+	test("each builtin declares steering: 'spawn-only' (warren-3305)", () => {
+		for (const builtin of BUILTIN_AGENTS) {
+			expect(builtin.frontmatter.steering).toBe("spawn-only");
 		}
 	});
 
@@ -62,8 +92,8 @@ describe("BUILTIN_AGENTS", () => {
 	// This regression test prevents the bullet from drifting back to softer
 	// "run gates before committing" wording that lets agents declare success
 	// on a red tree.
-	test("claude-code / sapling / pi declare the quality gate as terminal (warren-6a34)", () => {
-		for (const builtin of [CLAUDE_CODE_BUILTIN, SAPLING_BUILTIN, PI_BUILTIN]) {
+	test("claude-code / pi declare the quality gate as terminal (warren-6a34)", () => {
+		for (const builtin of [CLAUDE_CODE_BUILTIN, PI_BUILTIN]) {
 			const system = builtin.sections.system ?? "";
 			expect(system).toContain("$WARREN_QUALITY_GATE");
 			expect(system).toContain("NOT done until the gate exits zero");
@@ -76,7 +106,6 @@ describe("BUILTIN_AGENTS", () => {
 describe("readAgentSource", () => {
 	test("returns 'builtin' when frontmatter.source === 'builtin'", () => {
 		expect(readAgentSource(CLAUDE_CODE_BUILTIN)).toBe("builtin");
-		expect(readAgentSource(SAPLING_BUILTIN)).toBe("builtin");
 		expect(readAgentSource(PI_BUILTIN)).toBe("builtin");
 		expect(readAgentSource(PLANNER_BUILTIN)).toBe("builtin");
 	});
@@ -121,26 +150,33 @@ describe("PLANNER_BUILTIN", () => {
 		expect(PLANNER_BUILTIN.frontmatter.tags).toContain("interactive");
 	});
 
-	test("system prompt allows .plot/ and .seeds/ writes only, forbids source + dispatch", () => {
+	test("system prompt allows .seeds/ writes only, forbids source + dispatch", () => {
 		// Warren's burrow_config only forwards [sandbox].network onto
 		// POST /burrows (src/runs/burrow_config.ts), so the path-scoped
 		// write contract is enforced in the prompt for now. These string
 		// checks pin the contract so a casual edit doesn't silently widen
-		// the role.
-		const system = PLANNER_BUILTIN.sections.system ?? "";
+		// the role. Asserted against the fully-composed render (warren-cb46)
+		// because the tracker text now rides gatedPrompts.
+		const system = withGatedPromptFragments(PLANNER_BUILTIN, ALL_PROMPT_CAPABILITIES).sections
+			.system;
 		expect(system).toMatch(/must NOT/);
 		expect(system).toMatch(/source files/);
 		expect(system).toMatch(/Dispatch agent runs/);
-		expect(system).toMatch(/\.plot\//);
 		expect(system).toMatch(/\.seeds\//);
+		// warren-427b: plot integration retired (pl-3a79); the prompt must
+		// not promise .plot/ writes or a `chore(warren): plot state` commit.
+		expect(system).not.toMatch(/\.plot\//);
+		expect(system).not.toMatch(/plot state/);
 	});
 
 	test("references the sd plan submit pipeline that produces seeds", () => {
 		// The planner's only side effect on work items is via
 		// `sd plan submit`, which spawns child seeds (mx-77117c documents
 		// the 0-BASED `steps[i].blocks` index semantics — the prompt
-		// reiterates that so the agent doesn't off-by-one).
-		const system = PLANNER_BUILTIN.sections.system ?? "";
+		// reiterates that so the agent doesn't off-by-one). That text rides
+		// gatedPrompts.tracker (warren-cb46) — assert on the composed render.
+		const system = withGatedPromptFragments(PLANNER_BUILTIN, ALL_PROMPT_CAPABILITIES).sections
+			.system;
 		expect(system).toMatch(/sd plan prompt/);
 		expect(system).toMatch(/sd plan submit/);
 		expect(system).toMatch(/0-BASED/);
@@ -216,6 +252,60 @@ describe("seedBuiltinAgents", () => {
 		const stored = await repo.get("claude-code");
 		expect(stored).not.toBeNull();
 		expect(readAgentSource(stored?.renderedJson)).toBe("builtin");
+	});
+
+	// warren-c4be: registration is the boundary that can still answer 4xx, but
+	// seeding is a BOOT path — it refuses the row loudly instead of throwing,
+	// so a legacy/seed-file definition can never take the server down.
+	test("refuses to seed an agent whose runtime id is unknown (warren-c4be)", async () => {
+		const bad = {
+			name: "stub-shell",
+			version: 1,
+			sections: { system: "hi" },
+			resolvedFrom: [],
+			frontmatter: { source: "builtin", runtime: "planner" },
+		};
+		const result = await seedBuiltinAgents(repo, [bad]);
+		expect(result.seeded).toEqual([]);
+		expect(result.rejected).toHaveLength(1);
+		expect(result.rejected[0]?.name).toBe("stub-shell");
+		expect(result.rejected[0]?.reason).toMatch(/is not a known runtime id/);
+		expect(await repo.get("stub-shell")).toBeNull();
+	});
+
+	test("seeds the good agents alongside a rejected one (boot completes)", async () => {
+		const bad = {
+			name: "bad-runtime",
+			version: 1,
+			sections: { system: "hi" },
+			resolvedFrom: [],
+			frontmatter: { source: "builtin", runtime: "nope" },
+		};
+		const result = await seedBuiltinAgents(repo, [bad, CLAUDE_CODE_BUILTIN]);
+		expect(result.seeded).toEqual(["claude-code"]);
+		expect(result.rejected.map((r) => r.name)).toEqual(["bad-runtime"]);
+		expect(await repo.get("claude-code")).not.toBeNull();
+	});
+
+	test("accepts an operator-declared extra runtime id (warren-c4be)", async () => {
+		const previous = process.env.WARREN_EXTRA_RUNTIME_IDS;
+		process.env.WARREN_EXTRA_RUNTIME_IDS = "stub-shell";
+		try {
+			const result = await seedBuiltinAgents(repo, [
+				{
+					name: "stub-shell",
+					version: 1,
+					sections: { system: "hi" },
+					resolvedFrom: [],
+					frontmatter: { source: "builtin", runtime: "stub-shell" },
+				},
+			]);
+			expect(result.rejected).toEqual([]);
+			expect(result.seeded).toEqual(["stub-shell"]);
+		} finally {
+			if (previous === undefined) delete process.env.WARREN_EXTRA_RUNTIME_IDS;
+			else process.env.WARREN_EXTRA_RUNTIME_IDS = previous;
+		}
 	});
 
 	test("preserves existing rows (library override) and skips them", async () => {

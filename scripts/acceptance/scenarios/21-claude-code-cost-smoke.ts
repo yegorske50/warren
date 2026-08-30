@@ -9,13 +9,12 @@
  * `tokens_cache_read` / `tokens_cache_write` columns, the same way pi
  * runs do.
  *
- * The acceptance harness overrides burrow's built-in `claude-code`
- * runtime (which would otherwise invoke the real `claude` CLI and
- * require an Anthropic API key) with a custom AgentRuntime in
- * `burrow-with-stub.ts` — declarative spawn into
- * `tools/claude-code-stub-agent.sh`, event parsing via burrow's real
- * `parseJsonlClaude`. The stub emits a fixed-shape stream-json result
- * envelope so cost assertions are deterministic.
+ * The acceptance harness injects a stub `claude` binary via a PATH
+ * shim (lib/stub-agent/claude-code-path-shim.sh, warren-0f18), so no
+ * real Anthropic API key is needed. The shim emits a fixed-shape
+ * stream-json result envelope that warren's own parseJsonlClaude
+ * (src/runtime/adapters/parsers/) reads, so cost assertions are
+ * deterministic.
  */
 
 import {
@@ -26,6 +25,7 @@ import {
 	type ScenarioCtx,
 } from "../lib/assert.ts";
 import { WarrenHttp } from "../lib/http.ts";
+import { waitForFirstEvent, waitForRunPredicate } from "./lib/poll-helpers.ts";
 
 interface ProjectRow {
 	readonly id: string;
@@ -49,8 +49,8 @@ interface RunRow {
 	readonly id: string;
 	readonly agentName: string;
 	readonly projectId: string | null;
-	readonly burrowId: string | null;
-	readonly burrowRunId: string | null;
+	readonly sandboxId: string | null;
+	readonly sandboxRunId: string | null;
 	readonly renderedAgentJson: AgentDefinitionEnvelope;
 	readonly state: string;
 	readonly costUsd?: number | null;
@@ -62,16 +62,7 @@ interface RunRow {
 
 interface CreateRunResponse {
 	readonly run: RunRow;
-	readonly burrow: { readonly id: string; readonly workspacePath: string };
-}
-
-interface EventEnvelope {
-	readonly id: number;
-	readonly runId: string;
-	readonly seq: number;
-	readonly kind: string;
-	readonly stream: string | null;
-	readonly payload: unknown;
+	readonly sandbox: { readonly id: string; readonly workspacePath: string };
 }
 
 const RUN_ID_PATTERN = /^run_[0-9a-hjkmnpqrstvwxyz]{12}$/;
@@ -83,7 +74,7 @@ export const scenario: Scenario = {
 	title:
 		"claude-code cost smoke — POST /runs agent=claude-code populates cost_usd/tokens_* on terminal",
 	// Same constraint as 16: needs the host-side sample project + the
-	// claude-code stub registered in burrow-with-stub.ts.
+	// claude-code PATH-shim stub (fixtures shim-bin, warren-ea0a).
 	modes: ["in-proc"],
 	async run(ctx) {
 		const http = new WarrenHttp({ baseUrl: ctx.warrenUrl, token: ctx.token });
@@ -110,12 +101,14 @@ export const scenario: Scenario = {
 		);
 		assertEqual(run.agentName, "claude-code", "POST /runs run.agentName");
 		assertTrue(
-			typeof run.burrowId === "string" && run.burrowId !== null && run.burrowId.length > 0,
-			"POST /runs run.burrowId populated (proves burrow.up was invoked)",
+			typeof run.sandboxId === "string" && run.sandboxId !== null && run.sandboxId.length > 0,
+			"POST /runs run.sandboxId populated (proves burrow.up was invoked)",
 		);
 		assertTrue(
-			typeof run.burrowRunId === "string" && run.burrowRunId !== null && run.burrowRunId.length > 0,
-			"POST /runs run.burrowRunId populated",
+			typeof run.sandboxRunId === "string" &&
+				run.sandboxRunId !== null &&
+				run.sandboxRunId.length > 0,
+			"POST /runs run.sandboxRunId populated",
 		);
 
 		try {
@@ -165,25 +158,13 @@ async function ensureProject(http: WarrenHttp, gitUrl: string): Promise<ProjectR
 	return await http.expectJson<ProjectRow>("POST", "/projects", 201, { body: { gitUrl } });
 }
 
-async function waitForFirstEvent(
-	http: WarrenHttp,
-	runId: string,
-	timeoutMs: number,
-): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() < deadline) {
-		const events: EventEnvelope[] = [];
-		for await (const env of http.streamNdjson(`/runs/${encodeURIComponent(runId)}/events`)) {
-			events.push(env as EventEnvelope);
-			if (events.length >= 1) break;
-		}
-		if (events.length >= 1) return;
-		await sleep(100);
-	}
-	throw new AcceptanceError(
-		`no events landed for run ${runId} within ${timeoutMs}ms — bridge or dispatch wiring is broken`,
-	);
-}
+/**
+ * Poll GET /runs/:id until claude-code usage columns are populated, or
+ * throw on timeout. Mirror of scenario 16's waitForPiUsage. The bridge
+ * persists on terminalDetected (claude-code result envelope), so the
+ * first non-null read should come within a few hundred ms of the stub
+ * exiting.
+ */
 
 /**
  * Poll GET /runs/:id until claude-code usage columns are populated, or
@@ -192,31 +173,28 @@ async function waitForFirstEvent(
  * first non-null read should come within a few hundred ms of the stub
  * exiting.
  */
-async function waitForClaudeUsage(
-	http: WarrenHttp,
-	runId: string,
-	timeoutMs: number,
-): Promise<RunRow> {
-	const deadline = Date.now() + timeoutMs;
-	let last: RunRow | undefined;
-	while (Date.now() < deadline) {
-		const row = await http.expectJson<RunRow>("GET", `/runs/${encodeURIComponent(runId)}`, 200);
-		last = row;
-		if (
-			typeof row.costUsd === "number" &&
-			typeof row.tokensInput === "number" &&
-			typeof row.tokensOutput === "number"
-		) {
-			return row;
+async function waitForClaudeUsage(http: WarrenHttp, runId: string, timeoutMs: number) {
+	try {
+		return await waitForRunPredicate(
+			http,
+			runId,
+			(row) =>
+				typeof row.costUsd === "number" &&
+				typeof row.tokensInput === "number" &&
+				typeof row.tokensOutput === "number",
+			timeoutMs,
+			(row) =>
+				`state=${row.state} costUsd=${JSON.stringify(row.costUsd)} ` +
+				`tokensInput=${JSON.stringify(row.tokensInput)} tokensOutput=${JSON.stringify(row.tokensOutput)}`,
+		);
+	} catch (err) {
+		if (err instanceof AcceptanceError) {
+			throw new AcceptanceError(
+				`${err.message} — warren's bridge did not extract the claude-code result envelope`,
+			);
 		}
-		await sleep(150);
+		throw err;
 	}
-	throw new AcceptanceError(
-		`claude-code usage columns stayed null on run ${runId} after ${timeoutMs}ms ` +
-			`(state=${JSON.stringify(last?.state)} costUsd=${JSON.stringify(last?.costUsd)} ` +
-			`tokensInput=${JSON.stringify(last?.tokensInput)} tokensOutput=${JSON.stringify(last?.tokensOutput)}) ` +
-			"— warren's bridge did not extract the claude-code result envelope",
-	);
 }
 
 async function safelyCancel(http: WarrenHttp, runId: string, ctx: ScenarioCtx): Promise<void> {
@@ -227,8 +205,4 @@ async function safelyCancel(http: WarrenHttp, runId: string, ctx: ScenarioCtx): 
 			`scenario-21: cancel failed (${err instanceof Error ? err.message : String(err)}) — best-effort`,
 		);
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }

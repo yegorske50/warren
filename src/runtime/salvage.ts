@@ -34,6 +34,9 @@
  * as `reap.workspace_salvaged` / `reap.workspace_salvage_failed` run events.
  */
 
+import { resolve, sep } from "node:path";
+import { ValidationError } from "../core/errors.ts";
+
 /** Prefix for the per-run rescue branch pushed to the project's origin. */
 export const RESCUE_BRANCH_PREFIX = "warren/rescue/";
 
@@ -45,6 +48,46 @@ export function rescueBranchFor(runId: string): string {
 /** The warren-side durable file name for a salvaged bundle (`<runId>.bundle`). */
 export function salvageBundleFileName(runId: string): string {
 	return `${runId}.bundle`;
+}
+
+/**
+ * Charset a run id may use once it is about to become a file name
+ * (warren-7c1e). Generated ids are `run_<base32>` so this is deliberately
+ * loose relative to `isId("run", …)` — fixtures and older rows use other
+ * shapes — but tight enough that the value cannot express a path segment.
+ */
+const FILE_SAFE_RUN_ID = /^[A-Za-z0-9_.-]+$/;
+
+/**
+ * Resolve the durable bundle path for `runId` under `salvageDir`, refusing
+ * anything that would land outside it.
+ *
+ * `POST /runs/:id/salvage` reaches here with a route param, and the router
+ * percent-decodes params — so before warren-7c1e a request for
+ * `/runs/..%2F..%2Fetc%2Fpwn/salvage` decoded to `../../etc/pwn` and this
+ * join wrote 32 MiB of caller-supplied bytes wherever it pointed. The
+ * router now refuses separators in a param; this is the second lock on the
+ * same door, at the sink rather than the source, so a future caller that
+ * reaches the store from somewhere other than a route (a CLI flag, a
+ * queue) inherits the check instead of re-deriving it.
+ *
+ * Rejects: a relative/absolute-looking or dot-bearing id (`FILE_SAFE_RUN_ID`),
+ * and — belt and braces — any resolved target that is not a direct child of
+ * the resolved `salvageDir`.
+ */
+export function salvageBundlePath(salvageDir: string, runId: string): string {
+	if (!FILE_SAFE_RUN_ID.test(runId) || runId === "." || runId === "..") {
+		throw new ValidationError(
+			`run id ${JSON.stringify(runId)} is not usable as a salvage file name`,
+			{ recoveryHint: "a run id may contain only letters, digits, '.', '_' and '-'" },
+		);
+	}
+	const root = resolve(salvageDir);
+	const target = resolve(root, salvageBundleFileName(runId));
+	if (!target.startsWith(root + sep)) {
+		throw new ValidationError(`salvage bundle path for run ${runId} escapes the salvage directory`);
+	}
+	return target;
 }
 
 /**

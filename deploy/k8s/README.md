@@ -11,6 +11,7 @@ deploy/k8s/
     serviceaccount.yaml   control-plane ServiceAccount
     rbac.yaml             Role + RoleBinding scoped to warren-runs ONLY
     resourcequota.yaml    ResourceQuota (50 pods) + LimitRange defaults
+    networkpolicy.yaml    run-pod NetworkPolicy (default-deny ingress + coarse egress)
     secrets.yaml          Secret TEMPLATES (placeholders — do not apply as-is)
     pvc.yaml              warren-data (5Gi) — the repo-cache is opt-in, see below
     deployment.yaml       warren control-plane Deployment
@@ -101,6 +102,8 @@ kubectl -n warren create secret generic warren-secrets \
   --from-literal=sentry-dsn=<optional>
 
 # The init container reads WARREN_GIT_TOKEN from THIS secret, in warren-runs.
+# The agent container references it too — held by the in-pod harness for the
+# salvage-window rescue push and scrubbed from the agent child's env.
 # Same value as github-token. Optional — public repos clone without it.
 kubectl -n warren-runs create secret generic warren-git-token \
   --from-literal=token=<gh PAT>
@@ -120,7 +123,8 @@ kubectl -n warren-runs create secret generic warren-openrouter-key \
 | `warren-secrets/sentry-dsn` | warren | `SENTRY_DSN` | error reporting (optional) |
 | `warren-secrets/warren-auth` | warren | `WARREN_AUTH` | auth posture: `token` (default) or `public` (optional) |
 | `warren-secrets/warren-public-allowlist` | warren | `WARREN_PUBLIC_ALLOWLIST` | owners (`my-org`) and/or repos (`some-owner/some-repo`) a public instance may hold (required iff `warren-auth=public`) |
-| `warren-git-token/token` | warren-runs | `WARREN_GIT_TOKEN` (init pod) | init-container clone |
+| `judge-secrets/judge-export-token` | warren | `WARREN_JUDGE_EXPORT_TOKEN` | bearer credential for the judge export proxy (`WARREN_JUDGE_BASE_URL` in `base/deployment.yaml`; optional — unset disables the surface) |
+| `warren-git-token/token` | warren-runs | `WARREN_GIT_TOKEN` (init pod + agent pod) | init-container clone; salvage-window rescue push (harness-only, scrubbed from the agent child) |
 | `warren-openrouter-key/api-key` | warren-runs | `OPENROUTER_API_KEY` (agent pod) | OpenRouter auth for `openrouter`-provider runs (optional) |
 
 ### Going public
@@ -380,6 +384,39 @@ schedules on one node.
 Before scaling out, migrate the claim to a `ReadWriteMany` class (GKE Filestore
 CSI; Longhorn on bare metal) and pin it via an overlay `storageClassName`
 (design R2) — or simply leave the cache off.
+
+**Multi-node clusters enable the cache with an RWX claim** (warren-8175).
+The cache is worth the cost only when a repo is large. Each openclaw run pod
+(~2.9GB) spent ~20min in Init on a fresh clone.
+
+On GKE the cheapest RWX class is `standard-rwx` (Filestore Basic HDD). The
+tier minimum is 1TiB, about $160–200/mo. The operator makes the cost call.
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: warren-repo-cache
+  namespace: warren-runs
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: standard-rwx
+  resources: {requests: {storage: 1Ti}}
+```
+
+Create the claim with `kubectl apply -f`, like the Secrets. The deploy
+workflow never creates storage.
+
+Then set the repo variable `WARREN_K8S_REPO_CACHE_PVC=warren-repo-cache`.
+The render step in `deploy-gke.yml` wires the env onto the Deployment on
+each deploy, so the setting survives releases.
+
+The class binds on first consumer, and a Filestore instance takes about
+15–25min to provision. The first pod that mounts the claim waits for that
+provisioning.
+
+A one-off pre-warm Job that mounts the claim moves the wait off the first
+real run. The same Job can also seed the mirror of a large repo.
 
 ## Known follow-ups
 

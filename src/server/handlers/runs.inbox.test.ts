@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { BurrowClient } from "../../burrow-client/index.ts";
 import { openDatabase, type WarrenDb } from "../../db/client.ts";
 import { createRepos, type Repos } from "../../db/repos/index.ts";
+import { FakeProvider } from "../../runtime/fake/fake-provider.ts";
 import { bearerAuth, NO_AUTH, publicReadAuth } from "../auth.ts";
 import { startServer } from "../server.ts";
 import type { ServeHandle } from "../types.ts";
-import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
+import { depsFor, silentLogger, tcpUrl } from "./runs.test-helpers.ts";
 
 /**
  * HTTP-layer coverage for `GET /runs/:id/inbox` — the in-pod steering poll
@@ -15,13 +15,8 @@ import { depsFor, silentLogger, stub, tcpUrl } from "./runs.test-helpers.ts";
  */
 
 /** A burrow client that 404s everything — the inbox poll never touches burrow. */
-function inertBurrowClient(): BurrowClient {
-	return new BurrowClient({
-		config: { transport: { kind: "unix", path: "/tmp/x.sock" } },
-		fetch: stub(
-			async () => new Response(JSON.stringify({ error: { code: "not_found" } }), { status: 404 }),
-		),
-	});
+function inertSandboxClient(): FakeProvider {
+	return new FakeProvider();
 }
 
 describe("GET /runs/:id/inbox — HTTP handler", () => {
@@ -61,7 +56,7 @@ describe("GET /runs/:id/inbox — HTTP handler", () => {
 	}
 
 	async function serveWith(auth = NO_AUTH): Promise<string> {
-		const deps = await depsFor(repos, inertBurrowClient());
+		const deps = await depsFor(repos, inertSandboxClient());
 		handle = startServer(deps, {
 			transport: { kind: "tcp", hostname: "127.0.0.1", port: 0 },
 			auth,
@@ -93,6 +88,48 @@ describe("GET /runs/:id/inbox — HTTP handler", () => {
 		const res2 = await fetch(`${base}/runs/${runId}/inbox`);
 		const body2 = (await res2.json()) as { messages: unknown[] };
 		expect(body2.messages).toEqual([]);
+	});
+
+	test("?peek=1 lists the unread queue WITHOUT claiming it (warren-3305)", async () => {
+		const runId = await createRun();
+		await repos.runInbox.enqueue({ runId, body: "n1", priority: "normal" });
+		await repos.runInbox.enqueue({ runId, body: "u1", priority: "urgent" });
+		const base = await serveWith();
+
+		const res = await fetch(`${base}/runs/${runId}/inbox?peek=1`);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { messages: { body: string; state: string }[] };
+		// Delivery order, still unread, and nothing claimed.
+		expect(body.messages.map((m) => m.body)).toEqual(["u1", "n1"]);
+		expect(body.messages.map((m) => m.state)).toEqual(["unread", "unread"]);
+		expect((await repos.runInbox.listByRun(runId)).map((r) => r.state)).toEqual([
+			"unread",
+			"unread",
+		]);
+		expect(await repos.events.countByRun(runId)).toBe(0);
+
+		// The pod's later bare poll still claims the queue exactly once.
+		const claim = await fetch(`${base}/runs/${runId}/inbox`);
+		const claimed = (await claim.json()) as { messages: { body: string }[] };
+		expect(claimed.messages.map((m) => m.body)).toEqual(["u1", "n1"]);
+		expect((await repos.runInbox.listByRun(runId)).map((r) => r.state)).toEqual([
+			"delivered",
+			"delivered",
+		]);
+	});
+
+	test("a claiming poll emits one steer.delivered event per message (warren-3305)", async () => {
+		const runId = await createRun();
+		await repos.runInbox.enqueue({ runId, body: "n1", priority: "normal" });
+		const base = await serveWith();
+
+		const res = await fetch(`${base}/runs/${runId}/inbox`);
+		expect(res.status).toBe(200);
+		const events = (await repos.events.listByRun(runId)).filter(
+			(e) => e.kind === "steer.delivered",
+		);
+		expect(events).toHaveLength(1);
+		expect(events[0]?.stream).toBe("system");
 	});
 
 	test("returns 404 for an unknown run", async () => {

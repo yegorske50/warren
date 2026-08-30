@@ -29,6 +29,39 @@ describe("DefaultsConfigSchema", () => {
 		expect(parsed.success).toBe(true);
 	});
 
+	test("accepts a per-project agentImage override and rejects a blank one (warren-fabb)", () => {
+		const parsed = DefaultsConfigSchema.safeParse({ agentImage: "ghcr.io/acme/agent-py:1.0" });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect(parsed.data.agentImage).toBe("ghcr.io/acme/agent-py:1.0");
+
+		expect(DefaultsConfigSchema.safeParse({ agentImage: "" }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ agentImage: 7 }).success).toBe(false);
+	});
+
+	test("accepts a positive maxCostUsd project-wide spend cap (warren-a63d)", () => {
+		const parsed = DefaultsConfigSchema.safeParse({ maxCostUsd: 2.5 });
+		expect(parsed.success).toBe(true);
+		if (parsed.success) expect(parsed.data.maxCostUsd).toBe(2.5);
+	});
+
+	// warren-540f: repoContext — free-text onboarding block, capped at 8 KiB so
+	// a runaway blob cannot silently eat the prompt budget.
+	test("accepts repoContext up to 8192 characters and rejects longer or empty values", () => {
+		const ok = DefaultsConfigSchema.safeParse({ repoContext: "python repo; gate is pytest -q" });
+		expect(ok.success).toBe(true);
+		if (ok.success) expect(ok.data.repoContext).toBe("python repo; gate is pytest -q");
+
+		expect(DefaultsConfigSchema.safeParse({ repoContext: "x".repeat(8192) }).success).toBe(true);
+		expect(DefaultsConfigSchema.safeParse({ repoContext: "x".repeat(8193) }).success).toBe(false);
+		expect(DefaultsConfigSchema.safeParse({ repoContext: "" }).success).toBe(false);
+	});
+
+	test("rejects a non-positive or string maxCostUsd", () => {
+		for (const bad of [0, -1, "2.5"]) {
+			expect(DefaultsConfigSchema.safeParse({ maxCostUsd: bad }).success).toBe(false);
+		}
+	});
+
 	test("rejects extra fields so typos surface loudly", () => {
 		const parsed = DefaultsConfigSchema.safeParse({ defaultRoll: "claude-code" });
 		expect(parsed.success).toBe(false);
@@ -131,11 +164,11 @@ describe("DefaultsConfigSchema interactiveAgents block (warren-b802)", () => {
 
 	test("accepts plannerRuntime field", () => {
 		const parsed = DefaultsConfigSchema.safeParse({
-			interactiveAgents: { plannerRuntime: "sapling" },
+			interactiveAgents: { plannerRuntime: "claude-code" },
 		});
 		expect(parsed.success).toBe(true);
 		if (parsed.success) {
-			expect(parsed.data.interactiveAgents?.plannerRuntime).toBe("sapling");
+			expect(parsed.data.interactiveAgents?.plannerRuntime).toBe("claude-code");
 		}
 	});
 
@@ -180,14 +213,14 @@ describe("interactiveRuntimeOverride (warren-b802)", () => {
 	});
 
 	test("returns the configured runtime for planner", () => {
-		const defaults = { interactiveAgents: { plannerRuntime: "sapling" as const } };
-		expect(interactiveRuntimeOverride("planner", defaults)).toBe("sapling");
+		const defaults = { interactiveAgents: { plannerRuntime: "claude-code" as const } };
+		expect(interactiveRuntimeOverride("planner", defaults)).toBe("claude-code");
 	});
 
 	test("returns undefined for non-interactive agents", () => {
 		const defaults = {
 			interactiveAgents: {
-				plannerRuntime: "sapling" as const,
+				plannerRuntime: "claude-code" as const,
 			},
 		};
 		expect(interactiveRuntimeOverride("claude-code", defaults)).toBeUndefined();

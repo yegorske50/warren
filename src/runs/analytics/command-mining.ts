@@ -22,14 +22,22 @@
  * "Generalization" collapses a raw command string to a stable signature — the
  * binary plus (for multi-subcommand CLIs like `git`/`gh`/`sd`/`ml`/`bun`) its
  * first subcommand — so `bun run check:all` and `bun check:all` rank together
- * and per-invocation arguments don't fragment the ranking. Only `tool_use`
- * rows that actually carry a command (`payload.input.command` or
- * `payload.command`) are mined; structured tool calls (Read/Edit/etc.) are
- * counted in `totals.toolUses` but contribute no command rows.
+ * and per-invocation arguments don't fragment the ranking. Only rows carrying
+ * a command are mined; structured tool calls (Read/Edit/etc.) are counted in
+ * `totals.toolUses` but contribute no command rows.
  *
- * Failure correlation joins each `tool_result` back to its `tool_use` via
- * `tool_use_id` (per run); a tool_use with no matching result, or no id, is
- * treated as non-error. A "retry" is an invocation of a command that had
+ * Payload reading already happened at extraction time through the per-runtime
+ * shape registries (`src/core/tool-shape.ts`, warren-c116): each row carries
+ * its run's runtime id plus the shape-extracted fields, so the report can
+ * still tell "this harness emitted no commands" (no shape declared, or every
+ * call was a non-command tool) apart from "commands did not parse" per
+ * runtime (`totals.byRuntime`). A row whose runtime shape could not read the
+ * source payload at all lands with `toolName`/`command`/`toolUseId` all null
+ * — the registry's exact parse-failure condition — and counts as unparsed.
+ *
+ * Failure correlation is pre-joined in the rollup: the tool_result's
+ * `is_error` was folded onto its tool_use row at extraction time, and a
+ * tool_use whose result never arrived reads as non-error. A "retry" is an invocation of a command that had
  * already failed earlier in the same run; "stuckScore" counts the retries that
  * failed again. Both are computed in run-local seq order, so a tight
  * fail→retry→fail loop scores higher than scattered one-off failures.
@@ -39,26 +47,51 @@
  * golden/unit tests are stable regardless of input row order.
  */
 
-/** One tool-call trace row, mapped from an `events` row by the handler. */
-export interface ToolEventRow {
-	readonly runId: string;
-	/** `"tool_use"` | `"tool_result"` (other kinds are ignored). */
-	readonly kind: string;
-	/** burrow_event_seq — orders events within a run. */
-	readonly seq: number;
-	/** the raw `payload_json`, parsed defensively. */
-	readonly payload: unknown;
-}
+import { toolShapeFor } from "../../core/tool-shape.ts";
+import type { RuntimeId } from "../../core/wire.ts";
+import {
+	type CommandCategory,
+	categorize,
+	generalizeCommand,
+	isOsEcoCommand,
+} from "./command-generalize.ts";
 
-export type CommandCategory =
-	| "os-eco"
-	| "vcs"
-	| "package"
-	| "build"
-	| "test"
-	| "filesystem"
-	| "network"
-	| "other";
+// Re-export the generalization vocabulary so existing import sites
+// (`src/runs/index.ts`, tests) keep working after the file split.
+export {
+	type CommandCategory,
+	categorize,
+	generalizeCommand,
+	isOsEcoCommand,
+} from "./command-generalize.ts";
+
+/**
+ * One structured tool-call row (warren-7746): a `tool_calls` rollup row
+ * plus its run's runtime id, resolved by the handler from the rendered
+ * agent frontmatter. All shape reading happened at extraction time — the
+ * fields here are the extraction's output, not a payload to re-parse.
+ */
+export interface ToolCallMiningRow {
+	readonly runId: string;
+	/** sandbox_event_seq of the tool_use event — orders calls within a run. */
+	readonly seq: number;
+	/** The invoked tool's name, or null when the shape read none. */
+	readonly toolName: string | null;
+	/** The shell command for Bash-class calls, or null for structured tools. */
+	readonly command: string | null;
+	/** The id the tool_result joined back on, or null. */
+	readonly toolUseId: string | null;
+	/** The tool_result's error flag, pre-joined at extraction time. */
+	readonly isError: boolean;
+	/** UTF-8 byte size of the result body, or null when absent/unjoined. */
+	readonly resultBytes: number | null;
+	/**
+	 * The run's runtime id (warren-c116). Drives the per-runtime coverage
+	 * rollup's `shaped` flag; `null` marks a row whose runtime could not be
+	 * attributed.
+	 */
+	readonly runtime: RuntimeId | null;
+}
 
 export interface CommandStat {
 	/** generalized signature, e.g. `"bun test"` or `"bun run check:all"`. */
@@ -86,6 +119,28 @@ export interface CategoryBucket {
 	readonly commands: number;
 }
 
+/**
+ * Per-runtime parse coverage (warren-c116): how many `tool_use` rows a
+ * runtime produced, how many yielded a command, and how many the
+ * runtime's declared tool shape could not read at all. This is what
+ * lets `/analytics/behavior` distinguish "the harness emitted no
+ * commands" (`shaped: false` — no tool shape is declared for the
+ * runtime; or every call was a non-command tool) from
+ * "commands did not parse" (`unparsed > 0`).
+ */
+export interface RuntimeCommandCoverage {
+	/** the runtime id, or `"unknown"` for unattributed rows. */
+	readonly runtime: RuntimeId | "unknown";
+	/** whether a tool shape is declared for this runtime. */
+	readonly shaped: boolean;
+	/** `tool_use` rows seen for this runtime. */
+	readonly toolUses: number;
+	/** `tool_use` rows that yielded a generalized command. */
+	readonly commands: number;
+	/** `tool_use` rows whose shape read returned null (parse failures). */
+	readonly unparsed: number;
+}
+
 export interface CommandMiningTotals {
 	/** all `tool_use` rows seen (command-bearing or not). */
 	readonly toolUses: number;
@@ -94,6 +149,8 @@ export interface CommandMiningTotals {
 	readonly distinctCommands: number;
 	readonly failures: number;
 	readonly retries: number;
+	/** per-runtime parse coverage, sorted by runtime id ascending. */
+	readonly byRuntime: readonly RuntimeCommandCoverage[];
 }
 
 export interface CommandMining {
@@ -106,175 +163,9 @@ export interface CommandMining {
 	readonly byCategory: readonly CategoryBucket[];
 }
 
-/** CLIs whose first subcommand is part of the generalized signature. */
-const MULTI_SUBCOMMAND = new Set([
-	"git",
-	"gh",
-	"sd",
-	"ml",
-	"bun",
-	"npm",
-	"pnpm",
-	"yarn",
-	"cargo",
-	"docker",
-	"kubectl",
-	"go",
-]);
-const FS_BINS = new Set([
-	"cat",
-	"ls",
-	"grep",
-	"rg",
-	"find",
-	"sed",
-	"awk",
-	"head",
-	"tail",
-	"cp",
-	"mv",
-	"rm",
-	"mkdir",
-	"touch",
-	"echo",
-	"chmod",
-	"wc",
-	"sort",
-	"uniq",
-	"tee",
-	"cd",
-	"pwd",
-	"tree",
-	"stat",
-	"diff",
-]);
-const NET_BINS = new Set(["curl", "wget", "ping", "ssh", "scp", "nc", "dig"]);
-const PKG_SUBS = new Set(["install", "add", "remove", "ci", "uninstall", "update"]);
-const PKG_MANAGERS = new Set(["bun", "npm", "pnpm", "yarn"]);
-
-function basename(token: string): string {
-	const slash = token.lastIndexOf("/");
-	return slash === -1 ? token : token.slice(slash + 1);
-}
-
-/**
- * Collapse a raw command string to a stable signature, or null when it carries
- * no runnable binary. `cd x && bun test` → `bun test` (the trailing `&&`
- * segment); leading `sudo` / `VAR=val` prefixes and flags are stripped.
- */
-export function generalizeCommand(raw: string): string | null {
-	const trimmed = raw.trim();
-	if (trimmed === "") return null;
-	// Use the last &&-joined segment so `cd dir && bun test` mines `bun test`.
-	const segments = trimmed
-		.split("&&")
-		.map((s) => s.trim())
-		.filter((s) => s !== "");
-	const segment = segments[segments.length - 1] ?? trimmed;
-	const tokens = segment.split(/\s+/).filter((t) => t !== "");
-	let i = 0;
-	while (i < tokens.length && (/^[A-Za-z_]\w*=/.test(tokens[i] ?? "") || tokens[i] === "sudo")) {
-		i += 1;
-	}
-	const binToken = tokens[i];
-	if (binToken === undefined) return null;
-	const base = basename(binToken);
-	if (base === "") return null;
-	if (!MULTI_SUBCOMMAND.has(base)) return base;
-	const rest = tokens.slice(i + 1).filter((t) => !t.startsWith("-"));
-	if (base === "bun") return generalizeBun(rest);
-	const sub = rest[0];
-	return sub === undefined ? base : `${base} ${sub}`;
-}
-
-/**
- * Bun's own subcommands, which must not be collapsed into the
- * `bun run <script>` family — `bun install` is package management, not a
- * user script named `install`. `run` and `test` are handled separately.
- */
-const BUN_SUBCOMMANDS = new Set(
-	"install i add a remove rm update outdated link unlink pm x create init build upgrade publish patch audit why exec repl".split(
-		" ",
-	),
-);
-
-/**
- * `bun` / `bun run` normalize to the same `bun run <script>` family, but bun's
- * own subcommands (`bun install`, `bun add`, …) keep their `bun <sub>` shape
- * rather than masquerading as a run script.
- */
-function generalizeBun(rest: readonly string[]): string {
-	const first = rest[0];
-	if (first === undefined) return "bun";
-	if (first !== "run" && first !== "test" && BUN_SUBCOMMANDS.has(first)) {
-		return `bun ${first}`;
-	}
-	const args = first === "run" ? rest.slice(1) : rest;
-	const script = args[0];
-	if (script === undefined) return "bun";
-	if (script === "test") return "bun test";
-	return `bun run ${script}`;
-}
-
-export function isOsEcoCommand(generalized: string): boolean {
-	const bin = generalized.split(" ")[0] ?? "";
-	if (bin === "ml" || bin === "sd" || bin === "gh") return true;
-	return generalized.startsWith("bun run check:");
-}
-
-// True when any token's `:`-delimited segments exactly match `segment`, so
-// `test:unit`/`lint:test` match `test` while `latest` does not (warren-1f19).
-function hasSegment(parts: readonly string[], segment: string): boolean {
-	return parts.some((part) => part.split(":").includes(segment));
-}
-
-export function categorize(generalized: string): CommandCategory {
-	if (isOsEcoCommand(generalized)) return "os-eco";
-	const parts = generalized.split(" ");
-	const bin = parts[0] ?? "";
-	if (bin === "git") return "vcs";
-	if (PKG_MANAGERS.has(bin)) {
-		// Token- and segment-precise matching: `latest`/`rebuild` must not match
-		// `test`/`build` (warren-d4d5), while colon-namespaced scripts like
-		// `test:unit`/`build:ui` bucket by their matching segment (warren-1f19).
-		if (hasSegment(parts, "test")) return "test";
-		if (PKG_SUBS.has(parts[1] ?? "")) return "package";
-		if (hasSegment(parts, "build")) return "build";
-		return "other";
-	}
-	if (["tsc", "vite", "make", "cargo", "tsup", "esbuild", "webpack"].includes(bin)) return "build";
-	if (["vitest", "jest", "mocha", "pytest"].includes(bin)) return "test";
-	if (FS_BINS.has(bin)) return "filesystem";
-	if (NET_BINS.has(bin)) return "network";
-	return "other";
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-	return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
-}
-
-/** Extract the command string from a `tool_use` payload, or null. */
-function commandOf(payload: unknown): string | null {
-	const obj = asRecord(payload);
-	if (obj === null) return null;
-	const input = asRecord(obj.input);
-	const fromInput = input?.command;
-	if (typeof fromInput === "string") return fromInput;
-	return typeof obj.command === "string" ? obj.command : null;
-}
-
-function toolUseIdOf(payload: unknown): string | null {
-	const obj = asRecord(payload);
-	if (obj === null) return null;
-	const id = obj.tool_use_id ?? obj.id;
-	return typeof id === "string" ? id : null;
-}
-
-function isErrorOf(payload: unknown): boolean {
-	const obj = asRecord(payload);
-	if (obj === null) return false;
-	const flag = obj.is_error ?? obj.isError;
-	return flag === true;
+/** Resolve a row's runtime's declared tool shape (coverage `shaped` flag). */
+function shapeForRow(row: ToolCallMiningRow) {
+	return row.runtime === null ? null : toolShapeFor(row.runtime);
 }
 
 interface StatAcc {
@@ -311,8 +202,8 @@ interface UseEntry {
 	isError: boolean;
 }
 
-function groupByRun(rows: readonly ToolEventRow[]): Map<string, ToolEventRow[]> {
-	const grouped = new Map<string, ToolEventRow[]>();
+function groupByRun(rows: readonly ToolCallMiningRow[]): Map<string, ToolCallMiningRow[]> {
+	const grouped = new Map<string, ToolCallMiningRow[]>();
 	for (const r of rows) {
 		let g = grouped.get(r.runId);
 		if (g === undefined) {
@@ -324,47 +215,83 @@ function groupByRun(rows: readonly ToolEventRow[]): Map<string, ToolEventRow[]> 
 	return grouped;
 }
 
-/** tool_use_id → is_error for every tool_result row in a run. */
-function resultMap(sorted: readonly ToolEventRow[]): Map<string, boolean> {
-	const results = new Map<string, boolean>();
-	for (const r of sorted) {
-		if (r.kind !== "tool_result") continue;
-		const id = toolUseIdOf(r.payload);
-		if (id !== null) results.set(id, isErrorOf(r.payload));
+/**
+ * True when the extraction could not read the source payload at all — the
+ * shape registry's exact parse-failure condition (all three fields null).
+ */
+function isUnparsed(row: ToolCallMiningRow): boolean {
+	return row.toolName === null && row.command === null && row.toolUseId === null;
+}
+
+/** Parse outcome for one rollup row, for the per-runtime coverage rollup. */
+type UseParse =
+	| { readonly outcome: "entry"; readonly entry: UseEntry }
+	| { readonly outcome: "no-command" } // parsed, but a non-command tool
+	| { readonly outcome: "unparsed" }; // the shape could not read the payload
+
+/** Resolve a rollup row to a UseEntry; is_error is pre-joined. */
+function parseUse(row: ToolCallMiningRow): UseParse {
+	if (isUnparsed(row)) return { outcome: "unparsed" };
+	if (row.command === null) return { outcome: "no-command" };
+	const command = generalizeCommand(row.command);
+	if (command === null) return { outcome: "no-command" };
+	return { outcome: "entry", entry: { command, isError: row.isError } };
+}
+
+interface CoverageAcc {
+	runtime: RuntimeId | "unknown";
+	shaped: boolean;
+	toolUses: number;
+	commands: number;
+	unparsed: number;
+}
+
+function coverageFor(acc: Map<string, CoverageAcc>, row: ToolCallMiningRow): CoverageAcc {
+	const runtime = row.runtime ?? "unknown";
+	let cov = acc.get(runtime);
+	if (cov === undefined) {
+		cov = {
+			runtime,
+			shaped: shapeForRow(row) !== null,
+			toolUses: 0,
+			commands: 0,
+			unparsed: 0,
+		};
+		acc.set(runtime, cov);
 	}
-	return results;
+	return cov;
 }
 
-/** Resolve a command-bearing tool_use row to a UseEntry, or null to skip it. */
-function toEntry(row: ToolEventRow, results: Map<string, boolean>): UseEntry | null {
-	const raw = commandOf(row.payload);
-	if (raw === null) return null;
-	const command = generalizeCommand(raw);
-	if (command === null) return null;
-	const id = toolUseIdOf(row.payload);
-	return { command, isError: id !== null && (results.get(id) ?? false) };
-}
-
-/** Group rows by run; within a run, resolve each command-bearing tool_use. */
-function entriesByRun(rows: readonly ToolEventRow[]): {
+/** Group rows by run; within a run, resolve each command-bearing call. */
+function entriesByRun(rows: readonly ToolCallMiningRow[]): {
 	byRun: Map<string, UseEntry[]>;
 	toolUses: number;
+	coverage: RuntimeCommandCoverage[];
 } {
 	let toolUses = 0;
+	const coverageAcc = new Map<string, CoverageAcc>();
 	const byRun = new Map<string, UseEntry[]>();
 	for (const [runId, runRows] of groupByRun(rows)) {
 		const sorted = [...runRows].sort((a, b) => a.seq - b.seq);
-		const results = resultMap(sorted);
 		const entries: UseEntry[] = [];
 		for (const r of sorted) {
-			if (r.kind !== "tool_use") continue;
 			toolUses += 1;
-			const entry = toEntry(r, results);
-			if (entry !== null) entries.push(entry);
+			const cov = coverageFor(coverageAcc, r);
+			cov.toolUses += 1;
+			const parsed = parseUse(r);
+			if (parsed.outcome === "entry") {
+				cov.commands += 1;
+				entries.push(parsed.entry);
+			} else if (parsed.outcome === "unparsed") {
+				cov.unparsed += 1;
+			}
 		}
 		byRun.set(runId, entries);
 	}
-	return { byRun, toolUses };
+	const coverage = [...coverageAcc.values()].sort((a, b) =>
+		a.runtime < b.runtime ? -1 : a.runtime > b.runtime ? 1 : 0,
+	);
+	return { byRun, toolUses, coverage };
 }
 
 function accumulateRun(
@@ -445,11 +372,12 @@ function buildCategories(stats: readonly CommandStat[]): CategoryBucket[] {
 }
 
 /**
- * Build the full command-mining report from tool-call trace `rows`. O(rows) —
- * a group-by-run pass plus a handful of sorts over the distinct-command set.
+ * Build the full command-mining report from structured tool-call `rows`.
+ * O(rows) — a group-by-run pass plus a handful of sorts over the
+ * distinct-command set.
  */
-export function buildCommandMining(rows: readonly ToolEventRow[]): CommandMining {
-	const { byRun, toolUses } = entriesByRun(rows);
+export function buildCommandMining(rows: readonly ToolCallMiningRow[]): CommandMining {
+	const { byRun, toolUses, coverage } = entriesByRun(rows);
 	const acc = new Map<string, StatAcc>();
 	accumulate(acc, byRun);
 	const stats: CommandStat[] = [];
@@ -471,6 +399,7 @@ export function buildCommandMining(rows: readonly ToolEventRow[]): CommandMining
 			distinctCommands: stats.length,
 			failures,
 			retries,
+			byRuntime: coverage,
 		},
 		byFrequency: rankBy(
 			stats,

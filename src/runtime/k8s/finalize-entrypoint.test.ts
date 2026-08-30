@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { DEFAULT_WATCHDOG_HEARTBEAT_TIMEOUT_MS } from "../../runs/watchdog.ts";
 import {
 	collectFinalizeResult,
 	collectMulchDelta,
@@ -9,6 +10,7 @@ import {
 	type FinalizeGitRunner,
 } from "./finalize-collect.ts";
 import {
+	DEFAULT_FINALIZE_MAX_WAIT_MS,
 	extractIntent,
 	type FinalizeHttp,
 	parseFinalizeEntrypointEnv,
@@ -78,6 +80,28 @@ describe("parseFinalizeEntrypointEnv", () => {
 
 	test("throws on a missing required var", () => {
 		expect(() => parseFinalizeEntrypointEnv({ WARREN_RUN_ID: "run_x" })).toThrow(/WARREN_API_URL/);
+	});
+
+	test("warren-6016: the pod-carried git token resolves WARREN_GIT_TOKEN then GITHUB_TOKEN", () => {
+		const required = {
+			WARREN_RUN_ID: "run_x",
+			WARREN_API_URL: "http://warren:8080",
+			WARREN_API_TOKEN: "tok",
+		};
+		expect(parseFinalizeEntrypointEnv(required).gitToken).toBeUndefined();
+		expect(
+			parseFinalizeEntrypointEnv({ ...required, WARREN_GIT_TOKEN: " pod-tok " }).gitToken,
+		).toBe("pod-tok");
+		// GITHUB_TOKEN is the fallback only — a set WARREN_GIT_TOKEN wins.
+		expect(parseFinalizeEntrypointEnv({ ...required, GITHUB_TOKEN: "gh" }).gitToken).toBe("gh");
+		expect(
+			parseFinalizeEntrypointEnv({ ...required, WARREN_GIT_TOKEN: "pod", GITHUB_TOKEN: "gh" })
+				.gitToken,
+		).toBe("pod");
+		expect(
+			parseFinalizeEntrypointEnv({ ...required, WARREN_GIT_TOKEN: "  ", GITHUB_TOKEN: "" })
+				.gitToken,
+		).toBeUndefined();
 	});
 });
 
@@ -374,9 +398,15 @@ describe("pollForIntent + runFinalizeEntrypoint", () => {
 		expect(postCalls).toBe(3); // exactly max attempts, no more
 	});
 
-	test("warren-5ea1 defaults: maxWait outlasts the 45-min heartbeat watchdog; early salvage at 5 min", () => {
+	test("warren-9d24 defaults: maxWait gives up below the 45-min heartbeat watchdog; early salvage at 5 min", () => {
 		const parsed = parseFinalizeEntrypointEnv(env);
-		expect(parsed.maxWaitMs).toBe(3_000_000);
+		expect(parsed.maxWaitMs).toBe(DEFAULT_FINALIZE_MAX_WAIT_MS);
+		expect(parsed.maxWaitMs).toBe(2_400_000);
+		// Cross-budget guard: a pod polling for an intent is silent, so the
+		// finalize wait must end before the heartbeat watchdog terminalizes the
+		// run — otherwise the terminal no_intent salvage POST lands after the
+		// run-scope gate starts 401ing (warren-9d24).
+		expect(DEFAULT_FINALIZE_MAX_WAIT_MS).toBeLessThan(DEFAULT_WATCHDOG_HEARTBEAT_TIMEOUT_MS);
 		expect(parsed.earlySalvageMs).toBe(300_000);
 		// `0` disables the early capture.
 		expect(
@@ -393,6 +423,8 @@ describe("pollForIntent + runFinalizeEntrypoint", () => {
 					? { status: 200, body: { intent: null } }
 					: { status: 200, body: { intent: intent() } },
 			post: async (url) => {
+				// The window-3 credential re-mint is plumbing, not a capture (warren-c9ac).
+				if (url.endsWith("/git-credential")) return { status: 503 };
 				posted.push(url);
 				return { status: 200 };
 			},

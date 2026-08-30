@@ -1,13 +1,27 @@
 {
 	"name": "@os-eco/warren-cli",
-	"version": "0.13.1",
-	"description": "Self-hostable control plane for ephemeral cloud agents — spawn sandboxed agents at your GitHub repos, watch them work live, steer them, get a branch back",
+	"version": "0.19.0",
+	"description": "Self-hosted infrastructure for coding-agent workloads: isolated runs, live control, spend limits, recovery, and Git delivery",
 	"type": "module",
 	"bin": {
 		"warren": "./src/cli/main.ts",
 		"wr": "./src/cli/main.ts"
 	},
 	"main": "src/index.ts",
+	"exports": {
+		".": "./src/index.ts",
+		"./client": "./src/client/index.ts",
+		"./package.json": "./package.json"
+	},
+	"files": [
+		"src",
+		"!src/ui",
+		"!src/ui-tests",
+		"src/ui/dist"
+	],
+	"publishConfig": {
+		"access": "public"
+	},
 	"engines": {
 		"bun": ">=1.1.0"
 	},
@@ -41,14 +55,20 @@
 		"test:ci": "mkdir -p test-results && bun test --reporter=junit --reporter-outfile=test-results/junit.xml",
 		"test:pg": "bun run scripts/test-pg.ts",
 		"report:test-timing": "bun run scripts/report-test-timing.ts",
+		"report:test-failures": "bun run scripts/report-test-failures.ts",
 		"report:quality-metrics": "bun run scripts/report-quality-metrics.ts",
-		"lint": "biome check --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-prose.ts && bun run scripts/check-seeds-integrity.ts",
-		"lint:fix": "biome check --write --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-prose.ts",
+		"lint": "biome check --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-runtime-ids.ts && bun run scripts/check-design-docs.ts && bun run scripts/check-prose.ts && bun run scripts/check-seeds-integrity.ts && bun run scripts/check-merge-strategy.ts && bun run scripts/check-rls.ts && bun run scripts/check-client-contract.ts && bun run gen:cli-ref:check",
+		"lint:fix": "biome check --write --error-on-warnings . && bun run scripts/check-layers.ts && bun run scripts/check-version-sync.ts && bun run scripts/check-wire-types.ts && bun run scripts/check-runtime-ids.ts && bun run scripts/check-design-docs.ts && bun run scripts/check-prose.ts && bun run gen:cli-ref:check",
 		"check:layers": "bun run scripts/check-layers.ts",
 		"check:version-sync": "bun run scripts/check-version-sync.ts",
 		"check:wire-types": "bun run scripts/check-wire-types.ts",
+		"check:runtime-ids": "bun run scripts/check-runtime-ids.ts",
+		"check:design-docs": "bun run scripts/check-design-docs.ts",
 		"check:prose": "bun run scripts/check-prose.ts",
+		"check:rls": "bun run scripts/check-rls.ts",
+		"check:client-contract": "bun run scripts/check-client-contract.ts",
 		"check:seeds-integrity": "bun run scripts/check-seeds-integrity.ts",
+		"check:merge-strategy": "bun run scripts/check-merge-strategy.ts",
 		"typecheck": "tsc --noEmit",
 		"check:agents": "bun run scripts/validate-agents-md.ts",
 		"check:size": "bun run scripts/check-file-sizes.ts",
@@ -56,10 +76,13 @@
 		"check:dups": "jscpd && bun run scripts/check-dups-scoped.ts",
 		"check:deps": "knip --dependencies",
 		"check:bundle-size": "bun run scripts/check-bundle-size.ts --build",
+		"check:package-ui": "bun run scripts/check-package-ui.ts",
 		"gen:docs": "bun run scripts/generate-docs.ts",
 		"gen:docs:check": "bun run scripts/generate-docs.ts --check",
 		"gen:openapi": "bun run scripts/generate-openapi.ts",
 		"gen:openapi:check": "bun run scripts/generate-openapi.ts --check",
+		"gen:cli-ref": "bun run scripts/generate-cli-reference.ts",
+		"gen:cli-ref:check": "bun run scripts/generate-cli-reference.ts --check",
 		"check:ci-parity": "bun scripts/check-ci-parity.ts",
 		"check:all": "bun scripts/check-all.ts",
 		"verify": "bun run check:all",
@@ -68,13 +91,14 @@
 		"db:generate:sqlite": "drizzle-kit generate --config=drizzle.config.sqlite.ts",
 		"db:generate:postgres": "drizzle-kit generate --config=drizzle.config.postgres.ts",
 		"ui:install": "cd src/ui && bun install",
+		"ext:install": "for d in extensions/*/; do [ -f \"$d/package.json\" ] && (cd \"$d\" && bun install); done",
 		"ui:dev": "cd src/ui && bun run dev",
 		"build:ui": "cd src/ui && bun install --frozen-lockfile && bun run build",
 		"acceptance": "bun run scripts/acceptance/run.ts",
 		"acceptance:container": "bun run scripts/acceptance/run.ts --mode container",
 		"acceptance:public": "bun run scripts/acceptance/run.ts --only 39 --stop-on-failure",
-		"acceptance:nightly": "bun run scripts/acceptance/run.ts --only 01,03,04,05,06,07,08,09,10,11,12,14,15,16,17,21,22,26,30,35,36",
-		"prepare": "[ -e .git ] && git config core.hooksPath scripts/hooks || true"
+		"acceptance:nightly": "bun run scripts/acceptance/run.ts --only 01,03,04,05,06,07,08,09,10,11,12,14,15,16,17,21,22,26,30,35,36,40,41,42,43",
+		"prepare": "[ -e .git ] && git config core.hooksPath scripts/hooks && git config merge.seeds-jsonl.driver 'bun scripts/merge-seeds-jsonl.ts %O %A %B' || true"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.4.10",
@@ -87,8 +111,7 @@
 		"yaml": "^2.8.2"
 	},
 	"dependencies": {
-		"@kubernetes/client-node": "^1.4.0",
-		"@os-eco/burrow-cli": "^0.3.15",
+		"@kubernetes/client-node": "^2.0.0",
 		"@sentry/bun": "^10.59.0",
 		"commander": "^15.0.0",
 		"croner": "^10.0.1",

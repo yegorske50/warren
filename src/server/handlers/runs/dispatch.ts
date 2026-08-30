@@ -1,9 +1,14 @@
 import { ValidationError } from "../../../core/errors.ts";
+import { mintGitCredential } from "../../../forge/credentials.ts";
 import { readProviderFrontmatter } from "../../../registry/schema.ts";
+import { validateBaseCommit, validateDispatchRef } from "../../../runs/base-commit.ts";
+import { readMaxCostUsd } from "../../../runs/cost-cap.ts";
 import { spawnRun } from "../../../runs/index.ts";
+import type { GitSpawnCredential } from "../../../workspace/git/credential-env.ts";
 import type { IdempotentDispatch } from "../../idempotency.ts";
 import { jsonResponse } from "../../response.ts";
 import type { RouteHandler, ServerDeps } from "../../types.ts";
+import { optionalObject, optionalPositiveNumber } from "../body-fields.ts";
 import { defaultSpawn, optionalString, readJsonBody, requireString } from "../index.ts";
 
 /**
@@ -19,6 +24,7 @@ interface CloneDefaults {
 	readonly prompt: string;
 	readonly providerOverride?: string;
 	readonly modelOverride?: string;
+	readonly maxCostUsd?: number;
 }
 
 /**
@@ -28,6 +34,20 @@ interface CloneDefaults {
  * same model the parent used, regardless of which slot (override vs project
  * default vs agent frontmatter) originally supplied it.
  */
+/**
+ * warren-6c4c: mint the spawn's clone-refresh credential per-spawn through
+ * the boot forge (forge-contract.md §4); no config object holds a token.
+ * Extracted so `createRunHandler`'s complexity budget stays intact.
+ */
+async function mintSpawnGitCredential(
+	deps: ServerDeps,
+	projectId: string,
+): Promise<{ gitCredential?: GitSpawnCredential }> {
+	const project = await deps.repos.projects.require(projectId);
+	const secret = await mintGitCredential(deps.forge, project.gitUrl);
+	return secret !== undefined ? { gitCredential: secret } : {};
+}
+
 async function resolveCloneDefaults(
 	deps: ServerDeps,
 	cloneFromRunId: string,
@@ -40,12 +60,17 @@ async function resolveCloneDefaults(
 	}
 	const rendered = parent.renderedAgentJson as { frontmatter?: Record<string, unknown> };
 	const fm = readProviderFrontmatter(rendered.frontmatter ?? {});
+	// warren-a63d: the parent's EFFECTIVE cap (whichever tier supplied it) sits
+	// folded on the frozen frontmatter; read it back so the replica inherits it
+	// verbatim, same as provider/model.
+	const capUsd = readMaxCostUsd(rendered.frontmatter ?? {});
 	return {
 		agentName: parent.agentName,
 		projectId: parent.projectId,
 		prompt: parent.prompt,
 		...(fm.provider !== undefined ? { providerOverride: fm.provider } : {}),
 		...(fm.model !== undefined ? { modelOverride: fm.model } : {}),
+		...(capUsd !== null ? { maxCostUsd: capUsd } : {}),
 	};
 }
 
@@ -62,6 +87,7 @@ interface ResolvedDispatchFields {
 	readonly prompt: string;
 	readonly providerOverride?: string;
 	readonly modelOverride?: string;
+	readonly maxCostUsd?: number;
 	readonly parentRunId?: string;
 	readonly cloneKind?: "replicate";
 }
@@ -91,6 +117,10 @@ async function resolveDispatchFields(
 		prompt: optionalString(body, "prompt") ?? clone?.prompt ?? requireString(body, "prompt"),
 		providerOverride: optionalString(body, "providerOverride") ?? clone?.providerOverride,
 		modelOverride: optionalString(body, "modelOverride") ?? clone?.modelOverride,
+		// Per-dispatch spend cap (warren-a63d): explicit body field wins; a
+		// replicate falls back to the parent's effective cap read off its
+		// frozen frontmatter, matching the provider/model inheritance above.
+		maxCostUsd: optionalPositiveNumber(body, "maxCostUsd") ?? clone?.maxCostUsd,
 		// A replicate records the same `parent_run_id` column as a continuation;
 		// the `clone_kind` discriminator keeps them apart.
 		...(continueFromRunId !== undefined ? { parentRunId: continueFromRunId } : {}),
@@ -100,66 +130,97 @@ async function resolveDispatchFields(
 	};
 }
 
+/**
+ * Assemble the `spawnRun` input bag for `POST /runs` (warren-9ce3 origin +
+ * optional field forwarding). Extracted so `createRunHandler`'s request
+ * body stays under the cognitive-complexity ceiling.
+ */
+async function buildHttpSpawnOptions(
+	deps: ServerDeps,
+	body: Record<string, unknown>,
+	logger: Parameters<typeof spawnRun>[0]["logger"],
+): Promise<Parameters<typeof spawnRun>[0]> {
+	const seedId = optionalString(body, "seedId");
+	// warren-aaf7: the base-commit pin split. `ref` must stay branch-shaped
+	// (it feeds the PR base at reap); a SHA belongs in `baseCommit`, which
+	// overrides only the workspace cut point.
+	const ref = validateDispatchRef(optionalString(body, "ref"));
+	const baseCommit = validateBaseCommit(optionalString(body, "baseCommit"));
+	// warren-709e (#419): an explicit target branch the run must push to
+	// instead of the composed `${prefix}/${runId}`.
+	const targetBranch = optionalString(body, "targetBranch");
+	// warren-326f: opt-in dispatch onto an existing push-remote branch. The
+	// fail-closed remote-existence check lives in spawnRun (domain layer), so
+	// the handler only forwards the field.
+	const existingBranch = optionalString(body, "existingBranch");
+	const dispatcherHandle = optionalString(body, "dispatcherHandle");
+	// warren-97a2: the HTTP-collapsed `warren run` labels its dispatches
+	// trigger=cli; omitting the field preserves the spawnRun default.
+	const trigger = optionalString(body, "trigger");
+	const {
+		agentName,
+		projectId,
+		prompt,
+		providerOverride,
+		modelOverride,
+		maxCostUsd,
+		parentRunId,
+		cloneKind,
+	} = await resolveDispatchFields(deps, body);
+
+	// warren-9ce3: trigger=cli → origin "cli"; every other POST /runs is "api".
+	const dispatchOrigin = trigger === "cli" ? "cli" : "api";
+	return {
+		repos: deps.repos,
+		// warren-245d: thread the resolved runtime provider so POST /runs
+		// dispatches through the K8sProvider under WARREN_RUNTIME=k8s.
+		runtimeProvider: deps.runtimeProvider,
+		agentName,
+		projectId,
+		prompt,
+		mode: "batch",
+		projectsConfig: deps.projectsConfig,
+		projectSpawn: deps.spawn ?? defaultSpawn,
+		...(await mintSpawnGitCredential(deps, projectId)),
+		// warren-b27c: shape-checked, not cast.
+		metadata: optionalObject(body, "metadata"),
+		now: deps.now,
+		ref,
+		// warren-aaf7: workspace cut override; never reaches PR-base resolution.
+		...(baseCommit !== undefined ? { baseCommit } : {}),
+		providerOverride,
+		modelOverride,
+		...(trigger !== undefined ? { trigger } : {}),
+		...(maxCostUsd !== undefined ? { maxCostUsdOverride: maxCostUsd } : {}),
+		seedId,
+		...(targetBranch !== undefined ? { targetBranch } : {}),
+		...(existingBranch !== undefined ? { existingBranch } : {}),
+		...(parentRunId !== undefined ? { parentRunId } : {}),
+		...(cloneKind !== undefined ? { cloneKind } : {}),
+		dispatcherHandle,
+		dispatchOrigin,
+		warrenConfigs: deps.warrenConfigs,
+		runBranchPrefixDefault: deps.runBranchPrefixDefault,
+		seedsCli: deps.seedsCli,
+		...(deps.issueTracker !== undefined ? { issueTracker: deps.issueTracker } : {}),
+		logger,
+	};
+}
+
 export function createRunHandler(deps: ServerDeps): RouteHandler {
 	return async (ctx) => {
 		const body = await readJsonBody(ctx);
-		const seedId = optionalString(body, "seedId");
-		const ref = optionalString(body, "ref");
-		// warren-709e (#419): an explicit target branch the run must push to
-		// instead of the composed `${prefix}/${runId}`. Persisted on the run row
-		// and used both to pin the burrow workspace branch (composeRunBranch) and
-		// to default the root-run base ref when no `ref` is supplied.
-		const targetBranch = optionalString(body, "targetBranch");
-		const dispatcherHandle = optionalString(body, "dispatcherHandle");
-		const {
-			agentName,
-			projectId,
-			prompt,
-			providerOverride,
-			modelOverride,
-			parentRunId,
-			cloneKind,
-		} = await resolveDispatchFields(deps, body);
-
-		const options: Parameters<typeof spawnRun>[0] = {
-			repos: deps.repos,
-			// warren-245d: thread the resolved runtime provider so POST /runs
-			// dispatches through the K8sProvider under WARREN_RUNTIME=k8s. Without
-			// this, spawnRun fell back to the burrow LocalProvider and every K8s
-			// dispatch 503'd `burrow_unreachable`. Mirrors conversations.ts.
-			runtimeProvider: deps.runtimeProvider,
-			agentName,
-			projectId,
-			prompt,
-			mode: "batch",
-			projectsConfig: deps.projectsConfig,
-			projectSpawn: deps.spawn ?? defaultSpawn,
-			githubToken: deps.autoOpenPr?.gitToken,
-			metadata: body.metadata as Record<string, unknown> | undefined,
-			now: deps.now,
-			ref,
-			providerOverride,
-			modelOverride,
-			seedId,
-			...(targetBranch !== undefined ? { targetBranch } : {}),
-			...(parentRunId !== undefined ? { parentRunId } : {}),
-			...(cloneKind !== undefined ? { cloneKind } : {}),
-			dispatcherHandle,
-			warrenConfigs: deps.warrenConfigs,
-			runBranchPrefixDefault: deps.runBranchPrefixDefault,
-			seedsCli: deps.seedsCli,
-			logger: ctx.logger,
-		};
+		const options = await buildHttpSpawnOptions(deps, body, ctx.logger);
 
 		// warren-d525: the real dispatch — spawn and attach the bridge. Wrapped
 		// so the idempotency store can run it at most once per (projectId, key),
 		// keeping every side effect (spawn + bridge start) deduped.
 		const dispatch = async (): Promise<IdempotentDispatch> => {
 			const result = await spawnRun(options);
-			deps.bridges.start(result.run.id, result.burrowRun.id, result.burrow.id);
+			deps.bridges.start(result.run.id, result.sandboxRun.id, result.sandbox.id);
 			return {
 				run: result.run,
-				burrow: { id: result.burrow.id, workspacePath: result.burrow.workspacePath },
+				sandbox: { id: result.sandbox.id, workspacePath: result.sandbox.workspacePath },
 			};
 		};
 
@@ -170,7 +231,7 @@ export function createRunHandler(deps: ServerDeps): RouteHandler {
 		const idempotencyKey = ctx.request.headers.get("Idempotency-Key") ?? "";
 		const dispatched =
 			idempotencyKey !== "" && deps.idempotencyStore !== undefined
-				? await deps.idempotencyStore.run(projectId, idempotencyKey, dispatch)
+				? await deps.idempotencyStore.run(options.projectId, idempotencyKey, dispatch)
 				: await dispatch();
 
 		return jsonResponse(201, dispatched);

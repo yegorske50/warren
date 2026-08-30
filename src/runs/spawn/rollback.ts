@@ -32,10 +32,31 @@ const NOOP_SPAWN_LOGGER: Required<Pick<SpawnLogger, "info" | "warn" | "error">> 
 	},
 };
 
-/** Bind `run_id` onto the caller's logger (or the no-op) once per spawn. */
-export function bindRunLogger(logger: SpawnLogger | undefined, runId: string): SpawnLogger {
+/**
+ * Bind `run_id` (and, when present, dispatch provenance) onto the caller's
+ * logger once per spawn (warren-c686 / warren-9ce3). Reading
+ * `dispatcherHandle` + `dispatchOrigin` here is what keeps them from being
+ * dropped silently — the dispatch-context writer (warren-d6ca) will also
+ * consume them off the input bag, but the logger binding is the live carry
+ * until that lands.
+ */
+export function bindRunLogger(
+	logger: SpawnLogger | undefined,
+	runId: string,
+	provenance?: {
+		readonly dispatcherHandle?: string;
+		readonly dispatchOrigin?: string;
+	},
+): SpawnLogger {
 	const base = logger ?? NOOP_SPAWN_LOGGER;
-	return base.child?.({ run_id: runId }) ?? base;
+	const bindings: Record<string, string> = { run_id: runId };
+	if (provenance?.dispatcherHandle !== undefined && provenance.dispatcherHandle !== "") {
+		bindings.dispatcher_handle = provenance.dispatcherHandle;
+	}
+	if (provenance?.dispatchOrigin !== undefined) {
+		bindings.dispatch_origin = provenance.dispatchOrigin;
+	}
+	return base.child?.(bindings) ?? base;
 }
 
 /** warren-c686: worker placement resolved (logged before the run row exists). */
@@ -53,14 +74,14 @@ export function logPlacement(
 /** warren-c686: burrow provisioned, with provision latency. */
 export function logProvisioned(
 	log: SpawnLogger,
-	burrowId: string,
+	sandboxId: string,
 	workerId: string,
 	startedAt: number,
 ): void {
 	log.info(
 		{
 			event: "spawn.provisioned",
-			burrow_id: burrowId,
+			sandbox_id: sandboxId,
 			worker_id: workerId,
 			duration_ms: Date.now() - startedAt,
 		},
@@ -71,15 +92,15 @@ export function logProvisioned(
 /** warren-c686: run dispatched onto the burrow, with dispatch latency. */
 export function logDispatched(
 	log: SpawnLogger,
-	burrowId: string,
-	burrowRunId: string,
+	sandboxId: string,
+	sandboxRunId: string,
 	startedAt: number,
 ): void {
 	log.info(
 		{
 			event: "spawn.dispatched",
-			burrow_id: burrowId,
-			burrow_run_id: burrowRunId,
+			sandbox_id: sandboxId,
+			sandbox_run_id: sandboxRunId,
 			duration_ms: Date.now() - startedAt,
 		},
 		"spawn: run dispatched onto burrow",
@@ -87,9 +108,9 @@ export function logDispatched(
 }
 
 /** warren-c686: spawn failed past the warren-row point; about to roll back. */
-export function logSpawnFailed(log: SpawnLogger, burrowId: string | null, err: unknown): void {
+export function logSpawnFailed(log: SpawnLogger, sandboxId: string | null, err: unknown): void {
 	log.warn(
-		{ event: "spawn.failed", burrow_id: burrowId, error: errorMessage(err) },
+		{ event: "spawn.failed", sandbox_id: sandboxId, error: errorMessage(err) },
 		"spawn: failed, rolling back",
 	);
 }
@@ -105,7 +126,7 @@ function errorMessage(err: unknown): string {
  * Two writes, mirroring the `reap_failed` pattern:
  *
  *   1. Append a `spawn_failed` system event carrying `{ step, message,
- *      burrowId? }`. The events pane's generic fallback renders the
+ *      sandboxId? }`. The events pane's generic fallback renders the
  *      `message` field, so the cause shows up "for free" the same way a
  *      `reap_failed` step does.
  *   2. Finalize the run `failed` with `failure_reason = never_started`
@@ -119,7 +140,7 @@ function errorMessage(err: unknown): string {
  * Both writes are best-effort: a failure here is logged but never masks
  * the original spawn error the caller is about to see rethrown.
  *
- * warren-c42c: no `burrowId` rides the `spawn_failed` event — the runtime
+ * warren-c42c: no `sandboxId` rides the `spawn_failed` event — the runtime
  * seam (`RuntimeProvider.create()`) owns the sandbox and destroys any
  * partial provision itself, so the domain never learns a sandbox id on a
  * failed spawn (nor is one left stranded to reference).
@@ -136,7 +157,7 @@ async function persistSpawnFailure(
 		const seq = ((await input.repos.events.maxSeqForRun(runId)) ?? 0) + 1;
 		await input.repos.events.append({
 			runId,
-			burrowEventSeq: seq,
+			sandboxEventSeq: seq,
 			ts: now.toISOString(),
 			kind: "spawn_failed",
 			stream: "system",
