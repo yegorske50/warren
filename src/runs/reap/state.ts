@@ -1,6 +1,7 @@
 import type { Repos } from "../../db/repos/index.ts";
 import type { RunFailureReason, RunTerminalState } from "../../db/schema.ts";
 import { UID_DROP_PREFLIGHT_ERROR_PREFIX } from "../../runtime/k8s/agent-uid-drop.ts";
+import { backfillTerminalUsage } from "../usage-hydrate.ts";
 
 export function isTerminal(state: string): boolean {
 	return state === "succeeded" || state === "failed" || state === "cancelled";
@@ -206,5 +207,13 @@ export async function transitionToTerminal(
 		await repos.runs.markRunning(runId, now);
 	}
 	const finalized = await repos.runs.finalize(runId, outcome, now, failureReason);
+	// warren-7116: `reaped_at` stamps the same instant as `ended_at` — the
+	// terminal transition IS the reap completing. First-write-wins so an
+	// already-stamped row (defensive) keeps its original observation.
+	await repos.runs.markReaped(runId, now);
+	// warren-b33e: hydrate cost/tokens from events at write time so the
+	// row never enters the null-cost state that forces a read-time
+	// re-aggregation on every list call. Best-effort inside.
+	await backfillTerminalUsage(finalized, repos.events, repos.runs);
 	return finalized.state as RunTerminalState;
 }

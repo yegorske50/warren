@@ -1,4 +1,5 @@
 import { ValidationError } from "../../../core/errors.ts";
+import type { DispatchFacts } from "../../../db/repos/dispatch-context.ts";
 import { readProviderFrontmatter } from "../../../registry/index.ts";
 import type { RunRow } from "../../../runs/index.ts";
 import {
@@ -41,6 +42,14 @@ export const PUBLIC_RUN_FIELDS = [
 	"createdAt",
 	"startedAt",
 	"endedAt",
+	// warren-7116: the stage timestamps decompose the run wall clock into its
+	// four observed edges (workspace ready / agent ready / agent ended / reaped).
+	// Load-shape timestamps of the same spectator class as startedAt/endedAt;
+	// NULL reads as "never observed" (pre-column rows, never-claimed runs).
+	"workspaceReadyAt",
+	"agentReadyAt",
+	"agentEndedAt",
+	"reapedAt",
 	"prompt",
 	"trigger",
 	"prUrl",
@@ -54,6 +63,11 @@ export const PUBLIC_RUN_FIELDS = [
 	// warren-aaf7: the base-commit pin — a SHA of the same spectator class as
 	// ref/targetBranch (a name in the public repo's history).
 	"baseCommit",
+	// warren-b19e: the resolved workspace base SHA — the merge-base read at
+	// reap where commits_ahead is measured. A SHA of the same spectator
+	// class as baseCommit; NULL = never measured (pre-column rows, skipped
+	// finalize, unpinnable diff base).
+	"baseSha",
 	// warren-cd3b: the rescue ref is operator-recovery metadata (a branch name
 	// carrying the run id, which is already public) — safe for spectators.
 	"salvageRef",
@@ -193,13 +207,18 @@ async function projectRunsWithCaps(
 	actor: Actor | undefined,
 ): Promise<unknown[]> {
 	const publicOnly = isPublicOnly(actor);
-	const caps = publicOnly
-		? new Map<string, number>()
-		: await deps.repos.dispatchContext.getMaxCostUsdByRunIds(runs.map((r) => r.id));
+	const facts = publicOnly
+		? new Map<string, DispatchFacts>()
+		: await deps.repos.dispatchContext.getDispatchFactsByRunIds(runs.map((r) => r.id));
 	return runs.map((run) => {
 		const projected = projectRun(run, actor);
 		if (publicOnly) return projected;
-		return { ...projected, maxCostUsd: caps.get(run.id) ?? null };
+		const fact = facts.get(run.id);
+		return {
+			...projected,
+			maxCostUsd: fact?.maxCostUsd ?? null,
+			runtimeBackend: fact?.runtimeBackend ?? null,
+		};
 	});
 }
 
@@ -221,7 +240,7 @@ export function listRunsHandler(deps: ServerDeps): RouteHandler {
 					: await deps.repos.runs.listAll(listOpts);
 		// warren-ab18: surface in-events cost for terminal runs whose
 		// bridge died before the final checkpoint landed.
-		const hydrated = await hydrateRunsUsage(rows, deps.repos.events);
+		const hydrated = await hydrateRunsUsage(rows, deps.repos.events, deps.repos.runs);
 		// warren-ee50 / pl-b0c0 step 1: aggregate the full filtered set so
 		// the Runs page can show all-time totals next to a paginated table.
 		const aggFilter = {
@@ -253,6 +272,16 @@ export function getRunHandler(deps: ServerDeps): RouteHandler {
 		// warren-ab18: same compute-on-read fallback as the list handler
 		// so the RunDetail page shows cost for ghost / reboot-orphaned runs.
 		const run = await hydrateRunUsage(row, deps.repos.events);
+		// warren-b19e: the detail GET carries the dispatch-context spend cap
+		// too — the Spend panel renders "$X of $Y cap" off it. Operator-only,
+		// same posture as the list overlay in projectRunsWithCaps: a spectator
+		// gets no caps at all, so the cap never reaches the public projection.
+		if (!isPublicOnly(ctx.actor)) {
+			const fact = await deps.repos.dispatchContext.getByRunId(id);
+			return jsonResponse(200, {
+				run: { ...projectRun(run, ctx.actor), maxCostUsd: fact?.maxCostUsd ?? null },
+			});
+		}
 		// warren-7d84: detail GETs wrap the resource, matching POST /runs
 		// ({run}) and the plan-runs family ({planRun, children, runs}) so
 		// consumers need no per-route envelope knowledge.
@@ -284,7 +313,7 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 		if (projectId !== undefined) filter.projectId = projectId;
 		const rowsRaw = await deps.repos.runs.listForAnalytics(filter);
 		// Hydrate so terminal runs with bridge-died cost still count.
-		const rows = await hydrateRunsUsage(rowsRaw, deps.repos.events);
+		const rows = await hydrateRunsUsage(rowsRaw, deps.repos.events, deps.repos.runs);
 		const planByRun = new Map<string, string | null>();
 		if (rows.length > 0) {
 			const joined = await deps.repos.planRuns.resolvePlanForRunIds(rows.map((r) => r.id));
@@ -304,6 +333,7 @@ export function listCostAnalyticsHandler(deps: ServerDeps): RouteHandler {
 				provider: r.provider ?? fallback.provider ?? null,
 				model: r.model ?? fallback.model ?? null,
 				costUsd: r.costUsd,
+				costBasis: r.costBasis,
 				startedAt: r.startedAt,
 			};
 		});

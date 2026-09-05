@@ -1,0 +1,35 @@
+{
+	"schemaVersion": 1,
+	"campaignId": "camp-openhuman-v0",
+	"campaignVersion": 1,
+	"upstream": {
+		"owner": "tinyhumansai",
+		"repo": "openhuman"
+	},
+	"fork": {
+		"owner": "warren-run-bot",
+		"repo": "openhuman"
+	},
+	"defaultBranch": "main",
+	"issues": [5893],
+	"warren": {
+		"project": "openhuman-contrib",
+		"agent": "pi",
+		"provider": "anthropic",
+		"model": "claude-sonnet-4-5"
+	},
+	"promptDigest": "29c91c433685b212ed7594596cf2c6a711f3b594b511b20c4f8d9e8878ac4ab2",
+	"budget": {
+		"perRunUsd": 6,
+		"dailyUsd": 12,
+		"totalUsd": 30
+	},
+	"maxConcurrentRuns": 1,
+	"expiresAt": "2026-12-31T00:00:00.000Z",
+	"issueEvidenceTiers": {},
+	"approval": {
+		"approvedBy": "jayminwest",
+		"approvedAt": "2026-09-01T00:00:00.000Z",
+		"manifestDigest": "b52df9f34da0ed0a270b4782a587cc996f90d8a82f97f6ed50a22fd8e882c3d5"
+	}
+}

@@ -1,0 +1,13 @@
+{
+	"knownBotLogins": [
+		"tinysweeper[bot]",
+		"coderabbitai[bot]",
+		"chatgpt-codex-connector[bot]"
+	],
+	"findingMarker": "_",
+	"findingLinePattern": "^\\*\\*(?<title>.+?)\\*\\*$",
+	"reReviewCommands": [
+		"@coderabbitai review",
+		"@coderabbitai full review"
+	]
+}

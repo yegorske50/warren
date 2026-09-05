@@ -1,6 +1,7 @@
 import type { OpsOverviewResponse } from "@/api/ops-types.ts";
 import type { RunRow } from "@/api/types.ts";
 import { cn } from "@/lib/utils.ts";
+import type { OpsWindow } from "../../../../core/wire.ts";
 import { formatDurationMs, oldestPhaseInstant } from "./operations.helpers.ts";
 
 /**
@@ -61,15 +62,18 @@ export function CapacityStrip({
 	overview,
 	runs,
 	now,
+	window = "24h",
 }: {
 	overview: OpsOverviewResponse | undefined;
 	runs: readonly RunRow[] | undefined;
 	now: number;
+	/** Trailing window the spend/delivery buckets cover (warren-7194). */
+	window?: OpsWindow;
 }) {
 	if (overview === undefined) {
 		return (
 			<div className="rounded-(--radius-md) border border-(--color-border) bg-(--color-surface) px-3.5 py-3 font-mono text-[10px] leading-3 text-(--color-text-3)">
-				loading control-plane snapshot…
+				loading snapshot…
 			</div>
 		);
 	}
@@ -105,10 +109,12 @@ export function CapacityStrip({
 	];
 	if (spend !== undefined) {
 		cells.push({
-			label: "SPEND · 24H",
-			value: spend.last24hUsd.toFixed(2),
+			label: `SPEND · ${window.toUpperCase()}`,
+			// The USD sums are operator-only — a spectator's reduced body
+			// carries windowRuns alone, so the value renders "—", not 0.00.
+			value: spend.windowUsd === undefined ? "—" : spend.windowUsd.toFixed(2),
 			unit: "USD",
-			detail: `$${spend.totalUsd.toFixed(2)} all-time · ${spend.last24hRuns} runs in window`,
+			detail: `${spend.windowRuns} runs in window`,
 		});
 	}
 	if (delivery !== undefined) {

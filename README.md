@@ -155,10 +155,12 @@ Open <http://localhost:8080>, paste the minted token, add a GitHub repository, a
 
 A fresh install needs no other os-eco tool. Projects can opt into persistent [Mulch](https://github.com/jayminwest/mulch) memory or the [Seeds](https://github.com/jayminwest/seeds) issue tracker by committing their data directories.
 
-The audit log and judge are optional, out-of-process extensions. They do not run in a base warren installation:
+The extensions are optional, out-of-process packages built on the HTTP surface. None of them runs in a base warren installation:
 
 - [`extensions/audit-log/`](extensions/audit-log/) exports append-only JSONL run activity.
 - [`extensions/judge/`](extensions/judge/) scores finished runs against a versioned rubric and stores verdicts separately.
+- [`extensions/campaign-controller/`](extensions/campaign-controller/) runs long-lived upstream contribution campaigns under an operator-approved policy.
+- [`extensions/tracker-jira/`](extensions/tracker-jira/) and [`extensions/tracker-ado/`](extensions/tracker-ado/) connect Jira Cloud and Azure DevOps Boards through the `warren-tracker/v1` protocol.
 
 See [Extensions](docs/design/extensions.md) for their contracts and current packaging limits.
 
@@ -184,7 +186,7 @@ See [Extensions](docs/design/extensions.md) for their contracts and current pack
 
 ## Status
 
-Stable (`0.19.0`). The run lifecycle is in continuous use on GKE. It operates against real repositories, including this one. [app.warren.run](https://app.warren.run) exposes the read-only run history and event streams without a login.
+Stable (`0.19.1`). The run lifecycle is in continuous use on GKE. It operates against real repositories, including this one. [app.warren.run](https://app.warren.run) exposes the read-only run history and event streams without a login.
 
 Warren is pre-1.0. Unit, integration, and scenario tests exercise the run lifecycle. The current shared-token trust model remains a deliberate limit.
 

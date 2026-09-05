@@ -118,14 +118,115 @@ Nothing in code *forces* Postgres under `k8s` — `run_inbox` has both a sqlite 
 But SQLite on a `ReadWriteOnce` PVC is a single-replica trap.
 Set `WARREN_DB_URL=postgres://...` deliberately.
 Agent run pods never get the DB URL — only the control plane does (§3, blast-radius minimization).
+Run pods talk to warren over HTTP and never to the DB, so a database cutover does not touch them.
 
-Supabase Postgres is the reference backend. Three of its gotchas each cost a deploy session (warren-4e36):
+**In-cluster Postgres (Component, warren-9f5a; the production database since 2026-09-03).**
+The kustomize Component `deploy/k8s/components/postgres/` runs Postgres inside the cluster: a
+StatefulSet on the postgres 17 image (one replica, 250m/1Gi requests, 1/2Gi limits, 10Gi PVC with
+`pg_isready` readiness), a ClusterIP Service on 5432, and a placeholder Secret template
+(`postgres-credentials`, never apply it as-is).
 
-- **The URL must carry `sslmode=require&uselibpqcompat=true`.** Without the compat flag, `pg-connection-string` reads `sslmode=require` as verify-full and rejects the pooler certificate chain with `SELF_SIGNED_CERT_IN_CHAIN`.
-- **Point at the session pooler host, not the direct host.** `db.<ref>.supabase.co` resolves over IPv6 only, and GKE Autopilot pods speak IPv4 by default. Use `aws-1-<region>.pooler.supabase.com:5432` with the tenant username form `postgres.<ref>`. The older `aws-0-` pooler generation answers "tenant not found".
-- **Single-quote the value in a shell.** The `&` in the query string forks the command otherwise.
+A NetworkPolicy admits ingress only from the warren control-plane pods in namespace `warren`.
+Run pods in `warren-runs` stay denied.
+The PVC omits `storageClassName`, so the GKE default `standard-rwo` binds.
 
-**Pre-migration snapshot (rollback anchor).** Before the Fly→GKE cutover, the operator took a full `pg_dump -Fc` snapshot of the production DB on 2026-07-13: `~/warren-backups/warren-supabase-2026-07-13.dump` on the operator workstation (1.7 GB, from an 11 GB source DB that is almost all `events`). A `pg_restore --list` check confirmed the TOC holds all 12 then-public tables, including the since-dropped `workers`/`burrows`. This snapshot is the restore point for anything that predates the cutover.
+The image runs postgres 17. Keep the major pinned when restoring an old dump so
+`pg_restore` stays same-major. The backup CronJob layer under
+`deploy/k8s/components/postgres/backup/` (warren-6db7) is the restore path.
+
+**Historical: Supabase (until September 3, 2026, warren-a3ed).** Supabase Postgres was the
+production database until the cutover of September 3, 2026 (warren-c01d) moved it to the
+in-cluster component above. Its pooler-host, sslmode, uselibpqcompat, and
+shell-quoting gotchas died with the migration. See the cutover checklist (§1.5). The operator deleted the Supabase project on
+September 3, 2026 (warren-f7e6), the same day as the cutover, after the live server served
+post-cutover runs from the in-cluster database. Two archives of it live in the backup bucket:
+`gs://warren-pg-backups-502318/warren/supabase-cutover-2026-09-03.dump` (the final Supabase
+state at cutover, 96 MB) and `gs://warren-pg-backups-502318/warren/supabase-archive-2026-07-13.dump`
+(the July full-history snapshot described below, 1.7 GB).
+
+**Pre-migration snapshot (rollback anchor).** Before the Fly→GKE cutover, the operator took a full `pg_dump -Fc` snapshot of the production DB on 2026-07-13: `~/warren-backups/warren-supabase-2026-07-13.dump` on the operator workstation (1.7 GB, from an 11 GB source DB that is almost all `events`). A `pg_restore --list` check confirmed the TOC holds all 12 then-public tables, including the since-dropped `workers`/`burrows`. This snapshot is the restore point for anything that predates the cutover. A copy is in the backup bucket as `warren/supabase-archive-2026-07-13.dump`.
+
+#### Backups (warren-6db7)
+
+An in-cluster database is only acceptable with independent restore paths.
+Three layers exist, deliberately independent of each other:
+
+| Layer | Mechanism | Retention |
+| --- | --- | --- |
+| Logical dumps | Nightly `pg_dump -Fc -n public -n drizzle --no-owner --no-privileges` CronJob (`postgres-backup`, 03:00 UTC) uploads to `gs://warren-pg-backups-502318/warren/<date>.dump` via Workload Identity (SA `postgres-backup` → GSA `postgres-backup@warren-502318.iam.gserviceaccount.com`) | 30 days (bucket lifecycle rule) |
+| Disk snapshots | GCP snapshot schedule `warren-pg-daily` attached to the PVC's PersistentDisk | 14 daily snapshots |
+| Volume itself | PVC `reclaimPolicy: Retain` — a deleted StatefulSet never deletes the disk | until an operator deletes it |
+
+The dump CronJob runs as two containers sharing an emptyDir:
+
+- `postgres:17` runs `pg_dump` (needs the same-major client. image major 17 matches the server).
+- `google/cloud-sdk:slim` uploads the file with `gcloud storage cp` (has the storage CLI but no postgres client).
+
+`concurrencyPolicy` is `Forbid`, the Job keeps 3 histories, and `backoffLimit` is 0. A failed backup shows `Failed` and never masks a broken dump. The bucket name is a ConfigMap key (`postgres-backup-config/backup-bucket-url`) so another operator can substitute their own bucket without editing the CronJob. The manifest directory is `deploy/k8s/components/postgres/backup/`.
+
+Verify a nightly dump ran:
+
+```bash
+gcloud storage ls "gs://warren-pg-backups-502318/warren/" | tail -5
+kubectl -n warren get cronjob postgres-backup -o wide
+```
+
+**Restore from a GCS dump (cold start).** Run this against an idle warren only. `--clean` drops all objects in the target database first, so drain the control plane (§7.6) before you restore. Scale warren to 0 first and keep it there until the smoke check passes. Do not edit a standing restore Job: a Job pod template is immutable, so the API server rejects `kubectl set env job/postgres-restore ...`. Render the template into a uniquely named throwaway Job instead.
+
+```bash
+# 1. Scale warren down so nothing writes to the DB.
+kubectl -n warren scale deploy/warren --replicas=0
+
+# 2. Render the template with the dump name (without the .dump suffix)
+#    and a unique job name, then create it.
+sed -e 's/__RESTORE_NAME__/postgres-restore-20260903/' \
+    -e 's/__RESTORE_DUMP__/20260903/' \
+    deploy/k8s/components/postgres/backup/restore-job.template.yaml \
+  | kubectl -n warren create -f -
+kubectl -n warren logs job/postgres-restore-20260903 -c restore -f
+kubectl -n warren delete job postgres-restore-20260903
+
+# 3. Smoke-check, then bring warren back.
+kubectl -n warren run psql-check --rm -it --restart=Never \
+  --image=postgres:17 --env "PGPASSWORD=$(kubectl -n warren get secret postgres-credentials -o jsonpath='{.data.postgres-password}' | base64 -d)" \
+  -- psql -h postgres.warren.svc -U warren -d warren -c "select count(*) from runs;"
+kubectl -n warren scale deploy/warren --replicas=1
+```
+
+If the rendered job name already exists from a previous attempt, delete it
+first: `kubectl -n warren delete job postgres-restore-20260903`.
+
+**Restore from a PD snapshot (cold start).** The snapshot is the disk, so it
+restores the whole volume, not just warren-owned schemas. Use it when you lost
+the disk, not for point-in-time schema repair:
+
+```bash
+gcloud compute snapshots list --filter="name~warren-pg-daily"
+gcloud compute disks create warren-pg-restored-<date> \
+  --source-snapshot=<SNAPSHOT_NAME> --zone=<ZONE> --type=pd-balanced
+# stop postgres, swap the disk onto the postgres PVC (delete the PVC first;
+# reclaimPolicy Retain keeps the old disk as the rollback), then restart.
+```
+
+The old disk survives deletion thanks to `reclaimPolicy: Retain`. Keep it
+until you verify the restored volume. This snapshot is the restore point for anything that predates the cutover. A copy is in the backup bucket as `warren/supabase-archive-2026-07-13.dump`.
+
+#### The cutover checklist (warren-c4b7)
+
+Run this at an idle window.
+The tooling lives in `scripts/pg-migrate/`: `dump.ts`, `restore.ts`, and `parity.ts` (tests beside them).
+Every step is reversible until step 6.
+
+1. **Idle check.** Confirm no work is in flight: `kubectl -n warren-runs get pods` shows nothing non-terminal, and the warren HTTP log is quiet.
+2. **Scale warren to 0.** `kubectl -n warren scale deploy/warren --replicas=0`. The database now has no warren writers. Run pods keep working. They talk to warren over HTTP and never to the DB.
+3. **Dump.** `SOURCE_DB_URL=<supabase-url> bun run scripts/pg-migrate/dump.ts`. The script writes a dated `-Fc` archive of the `public` and `drizzle` schemas with `--no-owner --no-privileges`, prints the archive size, and lists the tables from `pg_restore --list`. Read that table list before moving on.
+4. **Restore.** `TARGET_DB_URL=<in-cluster-dsn> bun run scripts/pg-migrate/restore.ts <dump-file>`. The script refuses to run while the target has live connections other than its own.
+5. **Parity.** `SOURCE_DB_URL=<supabase-url> TARGET_DB_URL=<in-cluster-dsn> bun run scripts/pg-migrate/parity.ts`. It compares per-table row counts, `max(events.id)`, `max(runs.created_at)`, and the drizzle journal hash list, then exits non-zero with a diff table on any mismatch. Do not proceed on red.
+6. **Rewrite the DB URL.** Point `warren-secrets/warren-db-url` at `postgres://warren:<pw>@postgres.warren.svc:5432/warren` with no sslmode flags, because traffic never leaves the cluster network. Re-apply the secret:
+   `kubectl -n warren create secret generic warren-secrets --from-literal=warren-db-url='postgres://...' --dry-run=client -o yaml | kubectl apply -f -`.
+7. **Scale up.** `kubectl -n warren scale deploy/warren --replicas=1`, then wait on `kubectl -n warren rollout status deploy/warren`.
+8. **Smoke dispatch.** Dispatch one run and watch it reach a terminal state. Confirm events stream and the delivery path works.
+9. **Rollback (if needed).** Swap `warren-secrets/warren-db-url` back to the source DSN and scale up again. Steps 2 to 8 never write to the source, so it stays intact as a rollback anchor until you decommission it. The operator deleted the Supabase source the same day as the 2026-09-03 cutover. The archived dumps above are now the only restore path for that data.
 
 ### 1.6 Automated CI/CD (GitHub Actions)
 
@@ -489,6 +590,9 @@ Manifest values live in `deploy/k8s/base/deployment.yaml` plus the overlays.
 | `WARREN_K8S_ANTHROPIC_SECRET_NAME` / `_KEY` | `warren-anthropic-key` / `api-key` | optional agent-key `secretKeyRef` |
 | `WARREN_K8S_GIT_SECRET_NAME` / `_KEY` | `warren-git-token` / `token` | init-container git token source |
 | `WARREN_K8S_EPHEMERAL_STORAGE_REQUEST_MIB` / `_LIMIT_MIB` | `10240` / `10240` (10Gi) | cluster-wide default ephemeral-storage budget (request + limit + emptyDir `sizeLimit`). A per-project `resources` block beats it (§7.3.1) |
+| `WARREN_K8S_MEMORY_REQUEST_MIB` / `_LIMIT_MIB` | `2048` / `4096` | cluster-wide default memory budget; a per-project `resources` block beats it. On the deploy-gke pipeline, set via the repo variables of the same names (warren-ff6f) — the render step re-wires the env on each deploy so the sizing survives releases |
+| `WARREN_K8S_CPU_REQUEST_MILLICORES` / `_LIMIT_MILLICORES` | `1000` / `4000` | cluster-wide default cpu budget; a per-project `resources` block beats it. Lower the request on a small node (a two-core laptop VM never schedules the 1-CPU default) |
+| `WARREN_K8S_SPOT` | unset (On-Demand) | run pods only: pin every run pod onto GKE Autopilot Spot nodes (`nodeSelector cloud.google.com/gke-spot=true` plus the matching NoSchedule toleration, warren-2e2e). Truthy values are exactly `1`/`true` (case-insensitive); anything else stays off. Never applies to the control-plane Deployment. On the deploy-gke pipeline, set via the repo variable of the same name (warren-ff6f). See "Spot run pods" below |
 | `WARREN_AUTH` | unset ⇒ `token` | auth posture (§2.5); `public` admits credential-less spectators to the public projection |
 | `WARREN_PUBLIC_ALLOWLIST` | unset | owners and/or `owner/repo` entries a public instance may hold; required under `WARREN_AUTH=public` |
 | `WARREN_GITHUB_APP_REGISTRATION` | unset (fail-safe default, §2.6) | existence gate for the `/github-app/*` registration surface (warren-e320). `on`/`off` overrides the default. Gated-off routes answer 404 |
@@ -496,6 +600,15 @@ Manifest values live in `deploy/k8s/base/deployment.yaml` plus the overlays.
 | `WARREN_JUDGE_EXPORT_TOKEN` | from `judge-secrets/judge-export-token` (optional) | bearer credential the proxy presents to the judge's export endpoint (`deploy/k8s/extensions/judge/secrets.yaml`). Both knobs unset ⇒ the surface is disabled |
 
 The provider injects these into pods (never set them by hand): `WARREN_API_URL`, `WARREN_RUN_ID`, `WARREN_REPO_URL`, `WARREN_BRANCH`, `WARREN_BASE_BRANCH`, `WARREN_WORKSPACE_PATH`, `WARREN_SEED_MANIFEST`.
+
+#### Spot run pods (warren-2e2e)
+
+Setting `WARREN_K8S_SPOT=true` opts every **run pod** into GKE Autopilot Spot capacity. `buildRunPod` adds `nodeSelector: {"cloud.google.com/gke-spot": "true"}` plus the toleration `{key: cloud.google.com/gke-spot, operator: Equal, value: "true", effect: NoSchedule}`. Run pods suit this placement: they are ephemeral and retry-safe. The trade:
+
+- Spot pods cost 60–91% less but the cluster can preempt them. Autopilot sends a **25 s** preemption signal before it reclaims the node.
+- A preemption counts as an infra-lost retry, not a failure of the work. The preemption classification treats it as retryable and the run re-dispatches from scratch. The model spend of the aborted attempt is the real cost of the trade. The run's `maxCostUsd` cap bounds it.
+- `terminationGracePeriodSeconds` stays at the K8s 30 s default. We do not raise it for Spot. Preemption ends the pod as lost whatever the grace says, and the run re-dispatches, so a longer grace buys nothing. Explicit `cancel()` controls its grace separately through `WARREN_K8S_CANCEL_GRACE_SECONDS` (a delete-request `gracePeriodSeconds`, independent of the 25 s notice).
+- The control plane stays on On-Demand. The Deployment manifests under `deploy/k8s/` do not read this knob, so warren itself never lands on preemptible capacity.
 
 ---
 
@@ -509,6 +622,7 @@ The verbs are exactly what `src/runtime/k8s/` exercises:
 | `pods` | `get, list, watch, create, delete` | dispatch (create), the pod-watcher informer (list/watch), status reads (get), reap + GC (delete) |
 | `pods/log` | `get, watch` | the pod-log NDJSON event stream (§6.1 / §5.1) |
 | `configmaps` | `get, list, create, delete` | per-run seed-file ConfigMaps — create at dispatch, list/delete at GC |
+| `events` | `list, watch` | the pod-warning-events watcher (`src/runtime/k8s/pod-event-watcher.ts`, warren-32f8) list-watches core Events to surface `FailedScheduling`, `FailedAttachVolume`, and image-pull stalls on the run's event stream. Without it the watcher reconnects on 403 forever |
 
 Two verb families are absent on purpose:
 
@@ -528,7 +642,7 @@ kubectl auth can-i --as=system:serviceaccount:warren:warren \
 
 If dispatch fails with a `403 Forbidden` from the K8s API, check this Role first.
 A missing verb shows up as pods that never get created, or as an informer that never attaches.
-`configmaps` and `watch` are the common gaps — the plan text under-specified them.
+`configmaps`, `watch`, and `events` are the common gaps — the plan text under-specified them.
 
 ### 4.1 NetworkPolicy — run-pod egress contract (warren-8dbb)
 
@@ -732,18 +846,25 @@ Concurrent run pods on different nodes deadlock on it (Multi-Attach), and the se
 Direct clones cost seconds against 5–20min runs.
 RWX storage (like GKE Filestore, 1TiB minimum) costs too much to share a disk of small mirrors.
 
-Single-node clusters may opt back in via an overlay that adds the claim and re-sets the env — see `deploy/k8s/README.md` "Repo cache (opt-in)".
-Before adding a second node, either turn the cache back off or migrate the claim to a `ReadWriteMany` class (design R2).
+**The default init path is now a blobless partial clone** (`--filter=blob:none`, warren-3b44).
+With `WARREN_K8S_REPO_CACHE_PVC` unset, `src/runtime/k8s/workspace-init.ts` clones directly with blob filtering, so the run needs no shared storage and no cache PVC.
+The trade is lazy blob fetches: content-walking git operations such as `git log -p` and `git blame` fetch blobs on demand from the remote. They run slower than against a full clone.
+Commits, working-tree diffs, and push/finalize behave as before.
 
-Multi-node clusters enable the cache with an RWX claim instead (warren-8175).
-Create `warren-repo-cache` in `warren-runs` on an RWX class (GKE: `standard-rwx`, Filestore Basic HDD, 1TiB tier minimum).
-Then set the repo variable `WARREN_K8S_REPO_CACHE_PVC=warren-repo-cache` — the render step in `deploy-gke.yml` re-wires the env on every deploy.
-The cost trade flips when a repo is large.
-Before the live cluster enabled the cache (2026-08), each openclaw run (~2.9GB) spent ~20min in Init on a fresh clone.
+**The Filestore RWX cache failed on cost.** The live cluster ran a `warren-repo-cache` Filestore Basic HDD instance from 2026-08-27 to 2026-09.
+The Basic HDD tier starts at 1 TiB, and GKE offers no smaller RWX tier. It cost ~$200/mo to cache a 2.9 GB openclaw mirror.
+The partial clone replaced it (warren-3b44), and the operator deleted the instance.
+Do not re-provision Filestore for this cache.
+
+Keep the mirror cache opt-in, sensible only for **single-node clusters with an RWO class** (the warren-554f caveat).
+Single-node clusters may opt back in via an overlay that adds the claim and re-sets the env (see `deploy/k8s/README.md`, "Repo cache (opt-in)").
+Before adding a second node, turn the cache back off or migrate the claim to a `ReadWriteMany` class (design R2). Check the cost record above first.
 
 When enabled, `warren-repo-cache` is a **shared clone cache**, never a working tree — the working tree is the per-pod `emptyDir`.
 The init container keeps a per-repo bare mirror at `/repo-cache` (`<sha256(url)>.git`, `git clone --mirror`, then `git fetch` on reuse).
 A run then costs a `git fetch` plus a fast local clone instead of a full network clone (warren-e908, design §4.3 / R2).
+The cost trade flips only when a repo is large **and** the cluster is single-node.
+The live cluster's openclaw runs (~2.9GB, ~20min Init on a fresh clone in 2026-08) now use the default partial clone, not the cache.
 
 The number of distinct repos times their object-store size bounds growth — run count does not.
 If the cache fills: expand the PVC, or clear `WARREN_K8S_REPO_CACHE_PVC` to turn the cache off (runs then clone fresh — slower, with no disk growth).
@@ -779,6 +900,70 @@ Checks run most-specific-first:
 
 Set any knob to `0` to turn that cap off.
 `warren_run_admission_rejections_total{reason}` makes rejections observable.
+
+### 5.6 Sizing run pods on Autopilot (warren-fe11)
+
+Autopilot **bills the request**, not the usage. A run pod's vCPU + memory
+request is what the invoice sees. Idling or saturating makes no difference to
+the bill.
+
+**The 1:6.5 ratio rule.** Autopilot enforces `memory request ≤ 6.5 × vCPU
+request`. When a pod asks for more memory than the ratio allows, Autopilot
+*raises* the vCPU request (0.25 vCPU increments) until the ratio holds.
+
+- Minimum requests: 0.25 vCPU / 0.5 GiB.
+- **Memory limits cannot exceed requests on Autopilot** (the limit clamps to
+  the request), so there is no burstable-memory gap.
+- The request IS the OOM ceiling on Autopilot.
+
+**August 2026 measurements** (Cloud Monitoring `memory/used_bytes`,
+non-evictable, per-pod peak via ALIGN_MAX, namespace `warren-runs`,
+2026-08-01 → 2026-09-02, supplied by the operator):
+
+| Container | n | p50 | p90 | p95 | max |
+|---|---|---|---|---|---|
+| agent | 470 pods | 1129 MiB | 1494 MiB | 1623 MiB | 10234 MiB |
+| workspace-init | 92 | 59 MiB | — | 390 MiB | 2310 MiB (openclaw clone) |
+
+Agent peaks bucketed: ≤2 GiB (458 pods), 2–4 GiB (3), 4–8 GiB (7), >8 GiB (2).
+All eight pods above 4 GiB belonged to the openclaw project (2.9 GB repo).
+
+- August outcomes (~297 runs): 1 `oom_killed` and 3 evicted. The `oom_killed`
+  run was openclaw, peaking at 10234 MiB under its 16384 MiB limit.
+- Live overlay: `WARREN_K8S_MEMORY_REQUEST_MIB=16384` and
+  `WARREN_K8S_MEMORY_LIMIT_MIB=16384`.
+
+**Worked cost per pod-hour** (us-central1 Autopilot list rates: $0.0445/vCPU-h,
+$0.0048/GiB-h):
+
+| Request | Ratio-forced vCPU | Per pod-hour | × ~114 pod-hours/mo |
+|---|---|---|---|
+| 16384 MiB (live) | 2.5 vCPU (ceil of 16/6.5) | $0.1113 + $0.0768 = **$0.188** | **$21.43** |
+| 4096 MiB (proposed) | 1 vCPU (4/6.5 = 0.62) | $0.0445 + $0.0192 = **$0.0637** | **$7.26** |
+| 2048 MiB (lean option) | 1 vCPU | $0.0445 + $0.0096 = **$0.0541** | $6.17 |
+
+**Proposal: 4096 MiB request / 4096 MiB limit.** Set
+`WARREN_K8S_MEMORY_REQUEST_MIB=WARREN_K8S_MEMORY_LIMIT_MIB=4096`.
+
+- Autopilot clamps the limit to the request. The separate limit env buys
+  nothing there.
+- It sits ~2.5× above the agent p95 (1623 MiB) and covers 98% of August pods.
+- Expected delta at ~114 run-pod-hours/month: **save ~$14.2/mo (~66%)**.
+
+**OOM risk at 4096 MiB:** 9 of 470 August pods (1.9%) peaked above it, all
+openclaw. Without a per-project memory override, every openclaw run that
+repeats its August peak OOM-kills.
+
+- A per-project request override (keyed off the existing
+  `.warren/config.yaml` dispatch path) would let openclaw keep a larger cap.
+  That override is future work. warren-fe11 does not build it.
+- The 2048 MiB option is not recommended: it sits only 26% above p90 and would
+  have OOM-killed 12 August pods.
+
+`src/runtime/k8s/pod-memory-sample.ts` (warren-fe11) stamps a one-shot
+`run_pod_memory_sample` system event at K8s finalize. It carries the agent
+container's last metrics.k8s.io memory reading, so future re-sizings ride
+measured data.
 
 ---
 
@@ -975,7 +1160,7 @@ Clients must honor `Retry-After` and back off.
 
 ### 7.5 Repo-cache corruption
 
-Applies only when the opt-in cache is enabled (§5.3). By default there is no cache and every run clones fresh.
+Applies only when the opt-in cache is enabled (§5.3). By default there is no cache: every run initialises with a blobless partial clone (warren-3b44) and no shared storage exists to corrupt.
 
 **Symptom.** Init containers log clone or fetch failures against `/repo-cache`, and `warren_workspace_init_failures_total` rises.
 Runs can still complete, only slower.

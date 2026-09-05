@@ -1,0 +1,142 @@
+{
+	"schemaVersion": 1,
+	"profileId": "openhuman",
+	"upstream": {
+		"owner": "tinyhumansai",
+		"repo": "openhuman"
+	},
+	"source": {
+		"url": "https://raw.githubusercontent.com/tinyhumansai/openhuman/main/CONTRIBUTING.md",
+		"fetchedAt": "2026-09-01T17:00:00.000Z",
+		"sha256": "3e7638312e5d6f2d4713d87fb8ad1130c7cda656c026cab2f772f2abd593c36c"
+	},
+	"stalenessMaxDays": 30,
+	"issueFirstRequired": true,
+	"aiDisclosure": {
+		"required": true,
+		"evidenceRequired": true
+	},
+	"prBodyContract": {
+		"version": 1,
+		"sections": [
+			{
+				"key": "closes",
+				"heading": "Related",
+				"required": true
+			},
+			{
+				"key": "problem",
+				"heading": "Problem",
+				"required": true
+			},
+			{
+				"key": "solution",
+				"heading": "Solution",
+				"required": true
+			},
+			{
+				"key": "userImpact",
+				"heading": "Impact",
+				"required": true
+			},
+			{
+				"key": "disclosure",
+				"heading": "AI Authored PR Metadata (required for Codex/Linear PRs)",
+				"required": true
+			},
+			{
+				"key": "evidence",
+				"heading": "Validation Run",
+				"required": true
+			},
+			{
+				"key": "knownGap",
+				"heading": "Validation Blocked",
+				"required": false
+			},
+			{
+				"key": "responseSummary",
+				"heading": "Response summary",
+				"required": false
+			},
+			{
+				"key": "runReference",
+				"heading": "Warren run reference",
+				"required": true
+			},
+			{
+				"key": "operatorNotes",
+				"heading": "Operator review notes",
+				"required": true
+			}
+		],
+		"disclosureTemplate": "This is an AI-authored contribution, prepared under the warren campaign `{campaignId}` (agent `{agent}` on `{provider}/{model}`) and approved by {approvedBy}. Per this repository's PR template, the AI Authored PR Metadata fields are filled below; validation commands and results are reported in the Validation Run section, and any blocked command is declared under Validation Blocked with the exact command and error.",
+		"footerTemplate": "Opened by the warren campaign controller from a journaled, owner-approved cross-fork intent (campaign `{campaignId}`). The exact request was journaled before any posting; when the campaign policy does not enable the create mutation, this body exists only as dry-run evidence and no pull request is opened."
+	},
+	"commentTemplates": {
+		"version": 1,
+		"findingResponseTemplate": "Addressed in follow-up run `{runId}` (PR #{prNumber}, campaign `{campaignId}`):\n\n{findingTitles}\n\nUpdated evidence:\n{evidenceLines}",
+		"reReviewCommandTemplate": "Body refreshed to address {findingTitles} — `{runId}`. {reReviewCommand}",
+		"maxCommentsPerDay": 20
+	},
+	"agentGuidance": {
+		"version": 1,
+		"norms": [
+			"Produce the smallest possible diff that resolves the issue; main moves at ~100 commits/day, so a scoped same-day fix is the only shape that merges.",
+			"Write tests for the happy path plus at least one failure/edge case, and hold diff coverage at or above 80% on changed lines (pnpm test:coverage; pnpm test:rust for Rust changes) — the ci-lite gate refuses PRs below it.",
+			"Update docs/TEST-COVERAGE-MATRIX.md for added/removed/renamed feature rows, or state 'N/A: behaviour-only change' honestly; list affected feature IDs under the Related section.",
+			"Introduce no new external network dependencies; use the repository's mock-backend policy for anything that would otherwise call out.",
+			"Use the pinned toolchain exactly: pnpm 10.10.0 on Node >=24 for the app workspace, Rust 1.96.1 for the core; run pnpm --filter openhuman-app format:check, pnpm typecheck, and the focused tests before finishing.",
+			"Never touch vendor/ or app/src-tauri/vendor/ (vendored submodules), never add JS injection to child webviews, never rename RPC namespace strings, and never re-declare vendored contract types — see the repository's AGENTS.md.",
+			"Fill the AI Authored PR Metadata section completely and report any blocked command with the exact command and error rather than omitting it; declared uncertainty beats silent omission."
+		]
+	},
+	"evidenceTiers": [
+		"local-provable",
+		"external-proof-required"
+	],
+	"allowedWorkTypes": [
+		"bug-fix",
+		"test"
+	],
+	"forbiddenPaths": [
+		".github/workflows/*",
+		".github/dependabot.yml",
+		"vendor/*",
+		"app/src-tauri/vendor/*",
+		"LICENSE",
+		"rust-toolchain.toml"
+	],
+	"protectedPaths": [
+		"pnpm-lock.yaml",
+		"Cargo.lock",
+		"package.json",
+		"Cargo.toml",
+		".github/*",
+		"security/*"
+	],
+	"upstreamObservedMaxOpenPrs": 200,
+	"maxOpenPrs": 1,
+	"maxNewPrsPerDay": 1,
+	"requiredChecks": [
+		"PR Submission Checklist",
+		"Frontend Checks",
+		"Coverage Matrix Sync"
+	],
+	"mutations": {
+		"createPullRequest": false,
+		"followUpPush": false,
+		"updatePullRequest": false,
+		"pushCommits": false,
+		"updateBranch": false,
+		"postComment": false,
+		"editComment": false,
+		"requestReview": false,
+		"addLabels": false,
+		"closePullRequest": false,
+		"reopenPullRequest": false,
+		"enableAutoMerge": false,
+		"mergePullRequest": false,
+		"editIssue": false
+	}
+}

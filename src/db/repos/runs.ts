@@ -34,6 +34,7 @@ import {
 	listForAnalytics,
 	listWithUnresolvedPr,
 } from "./runs-queries.ts";
+import { markAgentEnded, markReaped, markWorkspaceReady } from "./runs-stage.ts";
 import { countNonTerminal } from "./runs-stats.ts";
 import { clearBurrowIdForWorkspace } from "./runs-workspace.ts";
 
@@ -142,6 +143,11 @@ export class RunsRepo {
 			createdAt: (input.now ?? new Date()).getTime(),
 			startedAt: null,
 			endedAt: null,
+			// Stage timestamps (warren-7116); every edge stamps post-insert.
+			workspaceReadyAt: null,
+			agentReadyAt: null,
+			agentEndedAt: null,
+			reapedAt: null,
 			prompt: input.prompt,
 			trigger: input.trigger,
 			prUrl: null,
@@ -156,6 +162,7 @@ export class RunsRepo {
 			prMergedAt: null,
 			// Outcome facts (warren-ab2b): unknown until reap measures them — NULL.
 			commitsAhead: null,
+			baseSha: null,
 			filesChanged: null,
 			insertions: null,
 			deletions: null,
@@ -289,6 +296,19 @@ export class RunsRepo {
 		return clearBurrowIdForWorkspace(this.adapter, sandboxId);
 	}
 
+	/** Stage-timestamp writers (warren-7116); bodies live in runs-stage.ts. */
+	markWorkspaceReady(id: string, at: Date = new Date()): Promise<void> {
+		return markWorkspaceReady(this.adapter, id, at);
+	}
+
+	markAgentEnded(id: string, at: Date = new Date()): Promise<void> {
+		return markAgentEnded(this.adapter, id, at);
+	}
+
+	markReaped(id: string, at: Date = new Date()): Promise<void> {
+		return markReaped(this.adapter, id, at);
+	}
+
 	async markRunning(id: string, now: Date = new Date()): Promise<RunRow> {
 		const current = await this.require(id);
 		assertRunTransition(current.state, "running");
@@ -346,6 +366,25 @@ export class RunsRepo {
 		}
 		await this.adapter.runWrite(this.db.update(this.runs).set(patch).where(eq(this.runs.id, id)));
 		return { ...current, ...patch };
+	}
+
+	/**
+	 * Narrow write-through for the usage hydrator (warren-b33e): persist
+	 * derived cost/token totals onto the run row wholesale (no partial
+	 * patch semantics — the caller always has a full aggregate). Leaves
+	 * `cost_basis` and every other column untouched.
+	 */
+	async updateUsage(
+		id: string,
+		stats: {
+			costUsd: number;
+			tokensInput: number;
+			tokensOutput: number;
+			tokensCacheRead: number;
+			tokensCacheWrite: number;
+		},
+	): Promise<void> {
+		await this.adapter.runWrite(this.db.update(this.runs).set(stats).where(eq(this.runs.id, id)));
 	}
 
 	/** Preview-environment write (R-19); body lives in runs-preview.ts. */
@@ -433,10 +472,10 @@ export class RunsRepo {
 			await tx.runWrite(
 				txDb
 					.update(runs)
-					.set({ state: "running", startedAt })
+					.set({ state: "running", startedAt, agentReadyAt: startedAt })
 					.where(and(eq(runs.id, id), eq(runs.state, "queued"))),
 			);
-			return { ...row, state: "running", startedAt };
+			return { ...row, state: "running", startedAt, agentReadyAt: startedAt };
 		});
 	}
 }

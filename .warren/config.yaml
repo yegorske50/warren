@@ -50,3 +50,15 @@ qualityGate: bun run check:all
 #   readiness_path: /healthz
 #   idle_ttl: 30m         # <number><unit> pairs, units: ms, s, m, h, d
 #   max_lifetime: 8h
+
+# Run-pod memory for THIS project (warren-da21 / pl-9fa9). The cluster
+# default (WARREN_K8S_MEMORY_{REQUEST,LIMIT}_MIB) is 4 GiB, sized to the
+# non-UI p95. `bun run check:all` on warren builds the Vite UI and runs
+# the UI test suite inside the gate, which OOM-killed three of the four
+# UI runs on 2026-09-03 (exit 137). Per-project block wins over the env
+# default (resolveMemoryMiB in src/runtime/k8s/pod-resources.ts).
+resources:
+  requests:
+    memoryMiB: 8192
+  limits:
+    memoryMiB: 8192

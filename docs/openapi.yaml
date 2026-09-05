@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: warren HTTP API
-  version: 0.19.0
+  version: 0.19.1
   description: >-
     Auto-generated from `src/server/handlers/route-table.ts`'s `ROUTE_TABLE`. Run `bun run
     gen:openapi` to refresh; CI fails if this schema drifts from the handler module. Response
@@ -171,6 +171,11 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+      description: >-
+        warren-97ae: spectators get the reduced projection — counts, rates and timings survive; USD
+        aggregates stay redacted except the instance-wide cost/merged-PR ratio. The
+        per-agent/per-model/ per-provider buckets keep their USD figures redacted because ratio ×
+        merged count reconstructs spend.
   /events:
     get:
       operationId: listEventsHandler
@@ -1252,6 +1257,7 @@ components:
         - provider_error
         - oom_killed
         - evicted
+        - preempted
     RunMode:
       type: string
       enum:
@@ -1458,6 +1464,7 @@ components:
             - provider_error
             - oom_killed
             - evicted
+            - preempted
             - null
         createdAt:
           type:

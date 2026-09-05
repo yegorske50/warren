@@ -45,8 +45,8 @@ advance only when pilot evidence supplies their payer.
 | Storage | dialect-aware db layer (`src/db/client.ts`) | **Live** — sqlite + postgres. |
 | Auth | `AuthProvider` (`src/server/auth.ts`) | **Live** — `NoAuth`, `BearerToken`, `PublicRead` behind `WARREN_AUTH` (pl-b82d). The multi-user widening moved to Deferred until paid (2026-08-03). |
 | Extensions (Tier 1) | lifecycle bus (`src/runs/lifecycle-bus.ts`, `warren-ext/v1`) | **Live, observe-only** — all 6 hooks emit in production (`run_started` + `event_emitted` wired in v0.13.1, warren-28ca). |
-| Forge | `Forge` — repo refs, git auth, PR open/find, checks, error taxonomy | **Live** (v0.15.0, pl-d1c9) — GitHubForge (PAT) + GitHubApp (installation tokens) + FakeForge, boot-resolved via `WARREN_FORGE`, boundary held by a `check:layers` rule pair. Design record: `docs/design/forge-contract.md`. Further forges (GitLab, then Forgejo/Gitea) land in-core as registry arms, not as extensions (Decisions, 2026-08-20). |
-| Issue tracker | `IssueTracker` — capability-flagged (`supportsPlans`, `isGitNative`). Seeds in-core. External trackers arrive through the `RemoteTracker` bridge speaking `warren-tracker/v1` (wire protocol experimental until a foreign implementation survives the conformance suite). | **Live** (v0.18.0, pl-a37b) — `SeedsTracker` + `RemoteTracker`, per-project `tracker` block in `.warren/config.yaml`. `extensions/tracker-jira/` (v0.19.0) is the first external implementation of the wire protocol. Design record: `docs/design/issue-tracker.md`. |
+| Forge | `Forge` — repo refs, git auth, PR open/find, checks, error taxonomy | **Live** (v0.15.0, pl-d1c9) — GitHubForge (PAT) + GitHubApp (installation tokens) + AdoForge (Azure DevOps Repos, PAT) + FakeForge, boot-resolved via `WARREN_FORGE`, boundary held by `check:layers` rules. Design record: `docs/design/forge-contract.md`. Further forges (GitLab, then Forgejo/Gitea) land in-core as registry arms, not as extensions (Decisions, 2026-08-20). |
+| Issue tracker | `IssueTracker` — capability-flagged (`supportsPlans`, `isGitNative`). Seeds in-core. External trackers arrive through the `RemoteTracker` bridge speaking `warren-tracker/v1` (wire protocol experimental until a foreign implementation survives the conformance suite). | **Live** (v0.18.0, pl-a37b) — `SeedsTracker` + `RemoteTracker`, per-project `tracker` block in `.warren/config.yaml`. `extensions/tracker-jira/` (v0.19.0) and `extensions/tracker-ado/` (v0.19.1) are the first two external implementations of the wire protocol; both pass the conformance suite unchanged. The protocol's status vocabulary was fixed to `open`/`closed`/`other` in v0.19.1. Design record: `docs/design/issue-tracker.md`. |
 | Agent runtime | `AgentRuntimeAdapter` phase 1 — terminal detect, usage, error classes, seed layout | **Live** — phase 2 (harness repatriation) shipped with pl-3007 in v0.17.0. The adapters are warren-owned (`src/runtime/adapters/`). Phase 1 completed with `runtimeId` typed off the union + the `check:runtime-ids` guard (GH#846 items 4–5, PR #964). |
 
 ## Now — in flight
@@ -65,11 +65,15 @@ advance only when pilot evidence supplies their payer.
 
 ## Next — planned, in order
 
-1. **Upstream contribution loop v1 (Phase 3, pl-096b).** The campaign controller's
-   V0 dry run and Phase 2 policy-gated create-PR shipped in v0.19.0 and opened the
-   first live OpenClaw PR. Phase 3 closes the response loop: consume upstream review
-   comments, checks, and merge outcomes, and turn them into bounded follow-up work.
-   Design record: `docs/design/campaign-controller.md`.
+1. **Campaign controller, later phases.** The upstream contribution loop v1
+   (pl-096b) shipped in v0.19.1, so the controller now answers review-bot
+   findings, checks, and merge outcomes on its own PRs with policy-gated
+   follow-up runs, body refreshes, and comment replies.
+
+   The remaining phases in the design record (audit-to-campaign proposal,
+   replay controller, replay-lab automation, broader autonomy) advance only
+   when the mirror pilot supplies the evidence each one names. Design record:
+   `docs/design/campaign-controller.md`.
 
 ## Deferred until paid
 
@@ -78,11 +82,13 @@ Honest replacements for old sequencing steps with no payer. Each entry names its
 - **Integration breadth: Linear, GitLab, and Forgejo/Gitea.** The contracts are ready,
   but no waiting deployment currently pays for another implementation. Jira shipped as
   the first external tracker behind `warren-tracker/v1` (v0.19.0,
-  `extensions/tracker-jira/`). Linear follows the same path when a payer appears.
+  `extensions/tracker-jira/`), and Azure DevOps Boards followed as the second
+  (`extensions/tracker-ado/`). Linear follows the same path when a payer appears.
 
-  GitLab remains the intended second in-core Forge. Warren-1b6f is no-regret pre-work,
-  and warren-7ba8 is the provider issue. Forgejo/Gitea follows GitLab when a real
-  Codeberg or self-hosted user appears.
+  Azure DevOps Repos arrived as the second in-core Forge (`src/forge/ado/`, GH#1172),
+  paid for by a deployment running on it. GitLab remains the intended third:
+  warren-1b6f was its no-regret pre-work, and warren-7ba8 is the provider issue.
+  Forgejo/Gitea follows GitLab when a real Codeberg or self-hosted user appears.
 
   Price of admission: a concrete deployment prepared to exercise the implementation and
   its conformance or acceptance suite.
@@ -132,10 +138,14 @@ Honest replacements for old sequencing steps with no payer. Each entry names its
 | The burrow absorption — sandbox, harness adapters, spawn path, and preview sidecars internalized; `src/burrow-client/` deleted; supervisor spawns only warren | v0.17.0 | pl-3007, `docs/design/runtime-and-supervisor.md` |
 | The self-host push — first-boot operator-token minting, `DockerProvider` sibling containers, one-line docker bring-up pinned by `acceptance:container` | v0.17.0 | warren-ef6e, `docs/design/runtime-docker-provider.md` |
 | The any-setup campaign — IssueTracker cut, dispatch-context analytics, external-repo onboarding, and runtime hardening | v0.18.0 | pl-a37b, `docs/design/issue-tracker.md` |
-| Direction C operator console — full UI rebuild on the design spec, Operations index, Event explorer, `GET /events` + `GET /instance` + ops-overview APIs, mobile pass, bug sweep | v0.19.0 | pl-7e38, pl-3ce8, pl-4ab6 (verification sweep warren-2c97 pending) |
+| Direction C operator console — full UI rebuild on the design spec, Operations index, Event explorer, `GET /events` + `GET /instance` + ops-overview APIs, mobile pass, bug sweep | v0.19.0 | pl-7e38, pl-3ce8, pl-4ab6 |
 | The casual-user happy path — one-line installer, `warren up` credential wizard + runtime autodetect, browser auth handoff, GitHub App persistence + hot-activation, first-run onboarding | v0.19.0 | pl-26f3 |
 | Campaign controller V0 + Phase 2 — `extensions/campaign-controller/`, immutable manifests, action journal, dry-run tick, policy-gated create-PR, first live OpenClaw PR | v0.19.0 | pl-91b6, `docs/design/campaign-controller.md` |
 | Jira tracker extension — first external tracker, warren-tracker/v1 over Jira Cloud | v0.19.0 | warren-27d9, `docs/design/issue-tracker.md` |
+| Upstream contribution loop v1 — review-feedback classifier, follow-up run coordinator, branch freshness, four policy-gated response mutations, terminal accounting, manifest amendments, evidence tiers; dispatch onto an existing branch in core | v0.19.1 | pl-096b, `docs/design/campaign-controller.md` |
+| Azure DevOps on both seams — `AdoForge` in-core forge arm plus `extensions/tracker-ado/` over Boards | v0.19.1 | GH#1172, `docs/design/forge-contract.md`, `docs/design/issue-tracker.md` |
+| In-cluster Postgres — kustomize component, nightly `pg_dump` to GCS, `pg-migrate` cutover tooling, Supabase decommissioned; Spot run pods with preemption classified as retryable | v0.19.1 | pl-6076 (30-day cost review still open), `docs/RUNBOOK-K8S.md` |
+| Console operator-review patches — burn and runtime in the topbar, windowed ops overview, run-detail spend and phase rail, delivery/autonomy/economics analytics rendered in telemetry | v0.19.1 | pl-9fa9, `docs/design/agent-analytics.md` |
 
 ## Deliberately not in core
 

@@ -120,6 +120,13 @@ export interface RuntimeProviderDeps {
 	 */
 	readonly k8sPodAdmission?: PodAdmissionSource;
 	/**
+	 * OPTIONAL preemption-witness source (warren-ea4b) — only consulted for
+	 * `WARREN_RUNTIME=k8s`. Boot threads the started `PodWatcher`, whose
+	 * `wasPreempted` records pods that vanished while their (spot-labelled)
+	 * node was deleted.
+	 */
+	readonly k8sPreemptedPods?: { wasPreempted(runId: string): boolean };
+	/**
 	 * OPTIONAL structured logger for the K8s pod-log stream pump (warren-72a8) —
 	 * only consulted for `WARREN_RUNTIME=k8s`. Threaded onto the provider so the
 	 * pump's backoff/disconnect warnings surface instead of being silent no-ops;
@@ -155,6 +162,13 @@ export interface RuntimeProviderDeps {
 	 * port forwards. Absent ⇒ terminate skips the cascade (tests).
 	 */
 	readonly localSidecars?: SidecarCascade;
+	/**
+	 * Workspace-ready signal (warren-7116) — the runtime → domain edge for the
+	 * `runs.workspace_ready_at` stamp. The drive loop fires it after the
+	 * workspace is prepared; the boot wiring lands the write through the runs
+	 * repo. Only consulted for `WARREN_RUNTIME=local`.
+	 */
+	readonly onWorkspaceReady?: (runId: string, at: Date) => void;
 	/**
 	 * OPTIONAL docker spawn seams — only consulted for `WARREN_RUNTIME=docker`
 	 * (warren-3732). A test injects a scripted docker CLI here; production
@@ -200,6 +214,11 @@ export function resolveRuntimeProvider(
 				...(deps.exec !== undefined ? { exec: deps.exec } : {}),
 				...(deps.localStore !== undefined ? { store: deps.localStore } : {}),
 				...(deps.localSidecars !== undefined ? { sidecars: deps.localSidecars } : {}),
+				// warren-7116: thread the workspace-ready signal through the drive
+				// deps so the drive loop never touches the database directly.
+				...(deps.onWorkspaceReady !== undefined
+					? { drive: { onWorkspaceReady: deps.onWorkspaceReady } }
+					: {}),
 			});
 		case "k8s":
 			return buildK8sProvider(deps);
@@ -245,6 +264,7 @@ function buildK8sProvider(deps: RuntimeProviderDeps): K8sProvider {
 			: {}),
 		...(deps.k8sPodCache !== undefined ? { podCache: deps.k8sPodCache } : {}),
 		...(deps.k8sPodAdmission !== undefined ? { podAdmission: deps.k8sPodAdmission } : {}),
+		...(deps.k8sPreemptedPods !== undefined ? { preemptedPods: deps.k8sPreemptedPods } : {}),
 		...(deps.k8sLogger !== undefined ? { logger: deps.k8sLogger } : {}),
 		...(deps.k8sMintGitCredential !== undefined
 			? { mintGitCredential: deps.k8sMintGitCredential }

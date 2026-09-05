@@ -5,25 +5,17 @@
  * streaming — the strategic fix for the co-tenancy OOM crash loop that motivated
  * the migration (docs/design/k8s-migration.md §Motivation).
  *
- * `create()` (pl-829f step 15 / warren-2181) and `status()` (step 16 /
- * warren-a7ff) are the first real bodies: `create` materializes the workspace in
- * an init container, ships seed files as a ConfigMap, points the agent at warren
- * over Service DNS, and creates the pod; `status` reconciles the pod's
- * phase/container state onto the seam's `RunStatus` (OOMKilled → `oom_killed`,
- * absent pod → `exists:false`). The remaining methods stay deliberate
- * `RuntimeNotImplementedError` stubs that name the plan step that fills each:
- *
- *   - `streamEvents` → step 17 (warren-026c): follow pod logs, synthesize the seq cursor.
- *   - `sendMessage`  → step 18 (warren-3d0b): persist into `run_inbox`; the in-pod
- *     harness drains it via the `GET /runs/:id/inbox` poll endpoint.
- *   - `cancel`/`terminate` → step 19 (warren-31d4): delete pod + SIGTERM grace + GC.
- *   - `finalize`     → step 20 (warren-0d35): in-pod post-agent reap emitting deltas.
+ * `create()` (pl-829f step 15 / warren-2181) materializes the workspace in an
+ * init container, ships seed files as a ConfigMap, and creates the pod;
+ * `status()` (step 16 / warren-a7ff) reconciles the pod's phase/container state
+ * onto the seam's `RunStatus` (OOMKilled → `oom_killed`, absent pod →
+ * `exists:false`).
  *
  * The K8s API client is taken as a FACTORY (`() => CoreV1Api`) rather than a live
- * client — mirroring `LocalProvider`'s `() => BurrowClient`. Construction
- * never touches a cluster (no stub invokes the factory), so the registry can
- * build a `K8sProvider` off `WARREN_RUNTIME=k8s` in any environment; only the
- * real method bodies (later steps) need in-cluster config.
+ * client — mirroring `LocalProvider`'s `() => BurrowClient`. Construction never
+ * touches a cluster (no stub invokes the factory), so the registry can build a
+ * `K8sProvider` off `WARREN_RUNTIME=k8s` in any environment; only the real method
+ * bodies need in-cluster config.
  */
 
 import { ApiException, type CoreV1Api, type V1Pod } from "@kubernetes/client-node";
@@ -61,6 +53,11 @@ import {
 	streamK8sLogs,
 } from "./log-stream.ts";
 import {
+	type PodMemorySampler,
+	sampleRunPodMemoryMiB,
+	stampPodMemorySampleEvent,
+} from "./pod-memory-sample.ts";
+import {
 	AGENT_CONTAINER_NAME,
 	buildRunPod,
 	type K8sPodConfig,
@@ -93,11 +90,8 @@ export interface K8sProviderDeps {
 	 */
 	readonly serverEnv?: EnvLike;
 	/**
-	 * OPTIONAL live pod cache the pod-watcher (`./pod-watcher.ts`) maintains
-	 * (pl-829f step 16). `status()` consults it as an optimization to skip a
-	 * list-by-label round-trip; when absent — or on a cache miss — `status()`
-	 * still works cache-cold by listing the run's pod itself. The watcher is
-	 * provider-internal plumbing, so wiring this stays optional.
+	 * OPTIONAL live pod cache the pod-watcher maintains (pl-829f step 16). `status()`
+	 * consults it to skip a list round-trip; absent (or on a miss) it lists cache-cold.
 	 */
 	readonly podCache?: PodCacheReader;
 	/**
@@ -113,15 +107,13 @@ export interface K8sProviderDeps {
 	readonly admissionMetrics?: AdmissionCounterSink;
 	/**
 	 * OPTIONAL injectable pod-log follow seam `streamEvents` drives (pl-829f step
-	 * 17). A factory-free direct fn (mirrors the pod-watcher's `WatchFn`) so tests
-	 * script the log source; when absent the provider lazily builds the real
-	 * `@kubernetes/client-node` `Log`-backed follow via `defaultLogFollowFactory`.
+	 * 17); tests script the log source. When absent the provider lazily builds the
+	 * real `@kubernetes/client-node` `Log`-backed follow via `defaultLogFollowFactory`.
 	 */
 	readonly logFollow?: LogFollowFn;
 	/**
-	 * OPTIONAL counter sink for the pod-log parse-failure metric
-	 * (`METRIC_LOG_PARSE_FAILURES_TOTAL`) — satisfied by the shared
-	 * `MetricsRegistry`. When absent, malformed lines are still dropped safely;
+	 * OPTIONAL counter sink for the pod-log parse-failure metric — satisfied by the
+	 * shared `MetricsRegistry`. Absent ⇒ malformed lines are still dropped safely;
 	 * only the observability counter is skipped.
 	 */
 	readonly metrics?: StreamCounterSink;
@@ -131,8 +123,7 @@ export interface K8sProviderDeps {
 	 * Lazy run_inbox store `sendMessage` writes steering messages into (pl-829f
 	 * step 18 / warren-3d0b). A factory — mirroring `coreApi` — so the provider
 	 * builds without a DB handle in environments that never steer; `sendMessage`
-	 * raises `RuntimeProviderError` if it is called without one. Boot threads
-	 * `() => repos.runInbox` here (src/server/main/deps.ts).
+	 * raises `RuntimeProviderError` without one. Boot threads `() => repos.runInbox`.
 	 */
 	readonly runInbox?: () => K8sInboxStore;
 	/**
@@ -149,24 +140,30 @@ export interface K8sProviderDeps {
 	readonly finalizePodPollMs?: number;
 	/** Injectable timer for the finalize race — tests drive it without real delays. */
 	readonly finalizeSetTimer?: (fn: () => void, ms: number) => { cancel: () => void };
+	/** OPTIONAL finalize-time pod-memory sampler (warren-fe11); tests inject a stub. */
+	readonly podMemorySampler?: PodMemorySampler;
 	/**
 	 * OPTIONAL git-credential mint seam (forge-contract.md §4.1, warren-c9ac).
 	 * `create()` mints the window-1 init-container clone credential at pod-spec
-	 * time so a short-lived App-mode token is fresh for the clone. Boot wires
-	 * this to `mintGitCredential` over the resolved forge; absent, the pod
-	 * spec keeps the static `warren-git-token` Secret ref (PAT-mode posture).
+	 * time so a short-lived App-mode token is fresh. Boot wires this to
+	 * `mintGitCredential` over the resolved forge; absent, the pod spec keeps the
+	 * static `warren-git-token` Secret ref (PAT-mode posture).
 	 */
 	readonly mintGitCredential?: (gitUrl: string) => Promise<string | undefined>;
 	/**
 	 * Whether the window-2 finalize push may fall back to the STATIC control-plane
 	 * env (`WARREN_GIT_TOKEN` / `GITHUB_TOKEN`) when the intent carries no minted
 	 * token. Boot sets this from the forge's `credentialLifetime`: `static` (PAT)
-	 * ⇒ true; `short-lived` (App) ⇒ false — under App mode the static value is an
-	 * hourly-expiring credential a >1h run must never depend on (warren-c9ac).
-	 * Defaults to true (the pre-warren-c9ac behavior) so unwired paths keep the
-	 * fallback.
+	 * ⇒ true; `short-lived` (App) ⇒ false — the hourly-expiring App credential is
+	 * not something a >1h run must depend on (warren-c9ac). Defaults to true (the
+	 * pre-warren-c9ac behavior) so unwired paths keep the fallback.
 	 */
 	readonly allowStaticPushTokenFallback?: boolean;
+	/**
+	 * OPTIONAL preemption witness source (warren-ea4b, the pod-watcher): a pod that
+	 * vanished while its spot node was deleted maps to `preempted`, not `lost`.
+	 */
+	readonly preemptedPods?: { wasPreempted(runId: string): boolean };
 }
 
 /**
@@ -379,12 +376,10 @@ export class K8sProvider implements RuntimeProvider {
 	/**
 	 * Out-of-band reconcile snapshot (contract §6.7) — what the watchdog /
 	 * recovery / pod-watcher read. NEVER throws on a missing run: an absent pod
-	 * returns `exists:false` + `terminalReason:"lost"` (`runLostStatus`), a value
-	 * not a throw.
-	 *
-	 * Correlation is by the `warren.io/run-id` LABEL (the exact runId), never by
-	 * pod name — the pod name is a DNS-sanitized derivative (`podNameForRun`),
-	 * whereas the label carries the runId verbatim (contract-preserving, step 15).
+	 * returns `exists:false` + `terminalReason:"lost"` (`runLostStatus`), a value,
+	 * not a throw. Correlation is by the `warren.io/run-id` LABEL (the exact runId),
+	 * never by pod name — the pod name is a DNS-sanitized derivative
+	 * (`podNameForRun`), whereas the label carries the runId verbatim.
 	 *
 	 * A wired pod-watcher cache short-circuits the list; on a miss (or no cache)
 	 * we list the run's pod by label — so `status()` works cache-cold. The pure
@@ -409,7 +404,13 @@ export class K8sProvider implements RuntimeProvider {
 			throw mapApiError(err, `pod status list for run ${handle.runId}`);
 		}
 		const pod = pickPodForRun(items, handle);
-		if (pod === undefined) return runLostStatus();
+		if (pod === undefined) {
+			// warren-ea4b: vanished while its spot node was deleted ⇒ preempted.
+			if (this.deps.preemptedPods?.wasPreempted(handle.runId) === true) {
+				return runLostStatus("preempted");
+			}
+			return runLostStatus();
+		}
 		return mapPodToRunStatus(pod);
 	}
 
@@ -450,28 +451,24 @@ export class K8sProvider implements RuntimeProvider {
 	 * — finalize runs in-pod, the domain applies the mirror deltas to the clone);
 	 * the branch comes off the `warren.io/branch` pod annotation. Best-effort so a
 	 * succeeded run always reaches finalize. See `./workspace-info.ts`.
-	 */
-	workspaceInfo(handle: RunHandle): Promise<WorkspaceInfo> {
+	 */ workspaceInfo(handle: RunHandle): Promise<WorkspaceInfo> {
 		// `K8sProviderDeps` is a structural superset of `K8sWorkspaceInfoDeps`.
 		return k8sWorkspaceInfo(this.deps, handle);
 	}
 
 	/**
 	 * Run the workspace-dependent half of reap (contract §4) as a post-agent step
-	 * INSIDE the pod, and return its artifacts (pl-829f step 20 / warren-0d35).
-	 * The control plane cannot reach the pod's `emptyDir`, so `finalize` registers
-	 * the neutral intent with the coordinator, the in-pod harness polls
-	 * `GET /runs/:id/finalize-intent` + POSTs its `FinalizeResult`, and this call
-	 * awaits that result — bounded by a wall-clock timeout and a pod terminal-or-gone
-	 * probe so a dead/crashed pod degrades to a FAILED result (reap still
-	 * terminates) rather than hanging. See `./finalize.ts`.
-	 *
-	 * The short-lived git push credential rides the intent (fetched over the
-	 * authenticated callback AFTER the agent exits), NOT the agent container's
-	 * static env — a compromised agent never holds the push token (blast-radius
-	 * minimization). warren-4e1c: the domain-minted `intent.gitCredential?.secret` wins; absent,
-	 * the static env fallback is gated on `allowStaticPushTokenFallback` (OFF under
-	 * App mode — warren-c9ac, `./git-tokens.ts`). */
+	 * INSIDE the pod (pl-829f step 20 / warren-0d35). The control plane cannot reach
+	 * the pod's `emptyDir`, so `finalize` registers the neutral intent with the
+	 * coordinator; the in-pod harness polls `GET /runs/:id/finalize-intent` + POSTs
+	 * its `FinalizeResult`, and this call awaits it, bounded by a wall-clock timeout
+	 * and a pod terminal-or-gone probe (a dead pod degrades to a FAILED result; reap
+	 * still terminates). See `./finalize.ts`. The short-lived git push credential
+	 * rides the intent (fetched AFTER the agent exits), NOT the agent container's
+	 * static env — a compromised agent never holds the push token. warren-4e1c: the
+	 * domain-minted `intent.gitCredential?.secret` wins; absent, the static env
+	 * fallback is gated on `allowStaticPushTokenFallback` (OFF under App mode —
+	 * warren-c9ac, `./git-tokens.ts`). */
 	finalize(handle: RunHandle, intent: FinalizeIntent): Promise<FinalizeResult> {
 		const env = this.deps.serverEnv ?? process.env;
 		const gitToken = resolveK8sPushToken({
@@ -483,13 +480,14 @@ export class K8sProvider implements RuntimeProvider {
 			timeoutMs: this.deps.finalizeTimeoutMs, // warren-fd08: env-tunable, explicit dep wins
 			podPollMs: this.deps.finalizePodPollMs,
 		});
+		const sampler = this.deps.podMemorySampler ?? sampleRunPodMemoryMiB; // warren-fe11
 		return finalizeK8sRun(handle, intent, {
 			coordinator: this.deps.finalizeCoordinator ?? sharedFinalizeCoordinator,
 			status: (h) => this.status(h),
 			...(gitToken !== undefined ? { gitToken } : {}),
 			...budgets,
 			...(this.deps.finalizeSetTimer !== undefined ? { setTimer: this.deps.finalizeSetTimer } : {}),
-		});
+		}).then((r) => stampPodMemorySampleEvent(r, sampler, handle.runId));
 	}
 
 	/**

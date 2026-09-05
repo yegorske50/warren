@@ -7,6 +7,7 @@
  */
 
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { USAGE_ENVELOPE_TYPES } from "../../core/usage-shape.ts";
 import type { SqliteDrizzleDb } from "../client.ts";
 import type { EventRow, EventStream } from "../schema.ts";
 import type { DrizzleAdapter } from "./drizzle-adapter.ts";
@@ -158,11 +159,25 @@ export class EventsRepo {
 	 * minimal scan the read-time cost hydrator needs to reconstruct
 	 * totals for a run whose bridge died before its next checkpoint.
 	 *
+	 * warren-5dd5 also narrows on `payload.type` IN (turn_end, result):
+	 * the same carrier also carries `turn_start`, `tool_execution_*`,
+	 * `message_*` and `agent_end` rows (the last embedding the whole
+	 * transcript), none of which any usage shape reads. The type list is
+	 * sourced from `USAGE_ENVELOPE_TYPES` so the SQL predicate and the
+	 * readers cannot drift. The JSON extraction is dialect-specific —
+	 * sqlite stores `payload_json` as TEXT (`json_extract`), postgres as
+	 * `jsonb` (`->>`).
+	 *
 	 * Empty `runIds` short-circuits without a DB hit. Ordered by
 	 * (runId, seq) so callers can group + aggregate in a single pass.
 	 */
 	async listUsageEvents(runIds: readonly string[]): Promise<EventRow[]> {
 		if (runIds.length === 0) return [];
+		const column = this.events.payloadJson;
+		const extracted =
+			this.adapter.dialect === "postgres"
+				? sql<string | null>`${column} ->> 'type'`
+				: sql<string | null>`json_extract(${column}, '$.type')`;
 		return this.adapter.pickAll(
 			this.db
 				.select()
@@ -172,6 +187,7 @@ export class EventsRepo {
 						inArray(this.events.runId, runIds as string[]),
 						eq(this.events.kind, "state_change"),
 						eq(this.events.stream, "system"),
+						inArray(extracted, [...USAGE_ENVELOPE_TYPES]),
 					),
 				)
 				.orderBy(asc(this.events.runId), asc(this.events.sandboxEventSeq)),
@@ -219,6 +235,35 @@ export class EventsRepo {
 					),
 				)
 				.orderBy(asc(this.events.runId), asc(this.events.sandboxEventSeq)),
+		);
+	}
+
+	/**
+	 * Fetch the newest event per (runId, kind) pair for the given runs and
+	 * kinds. Used by the `GET /analytics/runs` handler (warren-bc9c) to pull
+	 * the `reap.branch_pushed` / `reap.pr_opened` timestamps that feed the
+	 * delivery block — the same shape `listSteeringEventsForRuns` returns,
+	 * so callers can pass rows straight into their extractors.
+	 *
+	 * Ordered by (runId, kind, seq). Empty `runIds` or `kinds` short-circuits
+	 * without a DB hit.
+	 */
+	async listEventsByKindsForRuns(
+		runIds: readonly string[],
+		kinds: readonly string[],
+	): Promise<EventRow[]> {
+		if (runIds.length === 0 || kinds.length === 0) return [];
+		return this.adapter.pickAll(
+			this.db
+				.select()
+				.from(this.events)
+				.where(
+					and(
+						inArray(this.events.runId, runIds as string[]),
+						inArray(this.events.kind, kinds as string[]),
+					),
+				)
+				.orderBy(asc(this.events.runId), asc(this.events.kind), asc(this.events.sandboxEventSeq)),
 		);
 	}
 

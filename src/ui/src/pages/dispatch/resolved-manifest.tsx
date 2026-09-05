@@ -92,7 +92,8 @@ function AdmissionBand({ rows }: { rows: readonly AdmissionRow[] }) {
 
 export interface ResolvedManifestProps {
 	readonly project: ProjectRow | undefined;
-	readonly ref: string;
+	/** Git ref draft value — named gitRef because `ref` is a reserved JSX prop. */
+	readonly gitRef: string;
 	readonly seedId: string;
 	readonly agent: string;
 	readonly provider: string;
@@ -107,7 +108,7 @@ export interface ResolvedManifestProps {
 export function ResolvedManifest(props: ResolvedManifestProps) {
 	const lines = buildManifestLines({
 		project: props.project,
-		ref: props.ref,
+		ref: props.gitRef,
 		seedId: props.seedId,
 		agent: props.agent,
 		provider: props.provider,
@@ -119,7 +120,7 @@ export function ResolvedManifest(props: ResolvedManifestProps) {
 	const admission = buildAdmissionRows(props.project, props.facts);
 	const summary = buildManifestSummaryLines({
 		project: props.project,
-		ref: props.ref,
+		ref: props.gitRef,
 		seedId: props.seedId,
 		agent: props.agent,
 		provider: props.provider,

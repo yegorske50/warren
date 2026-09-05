@@ -10,6 +10,190 @@ Releases **0.9.10 and earlier** live in
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-09-03
+
+The upstream-loop release. The campaign controller closes its response
+loop (Phase 3, pl-096b): it reads review-bot findings, checks, and merge
+outcomes on the PRs it opened and turns them into bounded follow-up
+runs, body refreshes, and comment replies, each behind its own
+policy flag. Warren core learned to dispatch a run onto an existing
+branch to serve that loop. Azure DevOps arrived on both seams at once
+as the second in-core forge and the second external tracker. The
+dogfood deployment moved from Supabase to in-cluster Postgres with
+nightly backups, and run pods can ride GKE Spot nodes with preemption
+classified as a retryable loss. A twenty-patch operator review of the
+console shipped alongside a delivery, autonomy, and economics analytics
+layer that the telemetry pages now render.
+
+### Added
+
+- **Upstream contribution loop v1 (campaign controller Phase 3,
+  pl-096b).** A review-feedback classifier driven by profile-declared
+  bot grammar (bot logins, finding marker, line grammar, re-review
+  commands) files durable `review_feedback` rows for failing checks,
+  requested changes, bot findings, maintainer questions, and merge or
+  close events. A follow-up run coordinator turns classified feedback
+  into journaled follow-up runs on the existing PR branch, with a
+  progress table, a per-cycle invariant, and a per-day cap. Branch
+  freshness on reconcile journals a policy-gated `updateBranch` when
+  the PR is behind and clean, and dispatches a conflict-repair follow-up
+  when it is conflicted. Four new individually policy-gated mutations
+  (`updatePullRequest` body refresh, `postComment` finding responses,
+  `updateBranch`, `followUpPush`) each get a transport that can only be
+  constructed from a policy enabling that flag. Terminal accounting maps
+  a merged or closed PR to a work-item outcome and a campaign report
+  with cost per merged PR. Manifest amendments (append issues, adjust
+  budget, extend expiry or concurrency) apply in place as a new campaign
+  version under digest re-approval. Profiles gain evidence tiers with a
+  known-gap PR section, a PR-body contract as data, a versioned
+  `agentGuidance` block injected into every dispatch prompt, and
+  attention hygiene that auto-resolves stale items. Executed campaign
+  PRs now open ready for review instead of as drafts, because upstream
+  review bots skip drafts. New repository profiles: crewAI (observed
+  CodeRabbit grammar), meridian, and openhuman. A second-profile
+  acceptance e2e drives both openclaw and meridian through dispatch,
+  bot review, follow-up, body refresh, green checks, merge, and
+  accounting.
+- **Dispatch onto an existing branch (warren-326f).** `POST /runs`
+  accepts an existing branch; the run checks it out instead of minting
+  a fresh one, so a follow-up lands on the PR it answers. Acceptance
+  scenario 44 pins it.
+- **Azure DevOps Repos forge (GH#1172).** `WARREN_FORGE=ado` resolves
+  `AdoForge` (`src/forge/ado/`), the second in-core arm of the `Forge`
+  contract: clone-URL grammars for `dev.azure.com`, `ssh.dev.azure.com`
+  and the legacy `visualstudio.com` host; a PAT credential from
+  `WARREN_GIT_TOKEN`; pull requests over the REST API with the 409
+  duplicate resolving to the existing PR; Pipelines builds as check runs
+  with the failed task's log as the job-log tail; branch deletion
+  through the refs API. Every call carries a 30 s deadline and a 203
+  sign-in page reads as a rejected credential. The contract gains one
+  optional method, `repoLayout`, for forges whose clone URLs carry a
+  deeper coordinate than `<owner>/<name>`; `parseProjectUrl` now lives
+  once in `src/projects/url.ts` and the re-clone healer uses it with
+  the boot-resolved forge, so a non-GitHub project whose clone vanished
+  heals. A clone URL carrying a username is refused at registration.
+- **Azure DevOps Boards tracker (`extensions/tracker-ado/`).** The
+  second foreign implementation of warren-tracker/v1, beside Jira. Work
+  items map by number, status folds by the type's state category,
+  description assembles the Description, Repro Steps, and Acceptance
+  Criteria fields, and `blockedBy` reads Dependency-Reverse links. Close
+  is revision-checked with one retry and a configurable terminal state
+  (`ADO_DONE_STATE`). It holds its own PAT or Entra bearer, puts a
+  deadline on every call, refuses malformed 2xx payloads, answers an
+  over-cap WIQL result with a non-retried 409, and passes the
+  conformance suite unchanged in both auth modes. Smoke-tested against
+  a live organization; the README carries the friction report.
+- **In-cluster Postgres (pl-6076).** An opt-in kustomize component
+  (`deploy/k8s/components/postgres/`) runs a single-replica
+  `postgres:17` StatefulSet behind a NetworkPolicy that admits only the
+  control plane. A backup layer runs a nightly `pg_dump -Fc` CronJob to
+  GCS through Workload Identity, with a sed-rendered restore Job
+  template. `scripts/pg-migrate/` dumps, restores, and checks parity
+  for a cutover, and `docs/RUNBOOK-K8S.md` carries the checklist. The
+  dogfood instance cut over on 2026-09-03 and the Supabase project is
+  decommissioned; the runbook and deploy docs no longer describe it as
+  a rollback anchor.
+- **Spot run pods (warren-2e2e, warren-ea4b).** `WARREN_K8S_SPOT=1`
+  pins run pods to GKE Autopilot Spot nodes. A new `preempted` failure
+  reason classifies Spot preemption (pod status reason, node-shutdown
+  message, DisruptionTarget, vanished pod on a deleted Spot node) as a
+  retryable infrastructure loss for both run-level and plan-run retry,
+  counted by `warren_run_preempted_total`.
+- **K8s knobs:** `WARREN_K8S_CPU_REQUEST_MILLICORES` /
+  `_LIMIT_MILLICORES` mirror the memory knob so a pod schedules on a
+  two-core node; the base Role gains list/watch on Events for the
+  pod-warning watcher; `deploy-gke` renders the Spot and memory repo
+  variables. The `opencode-go` provider joins the env registry.
+- **Delivery, autonomy, and economics analytics.** Reap persists a
+  `reap.branch_pushed` event, and `GET /analytics/runs` gains a public
+  delivery block (branch push to PR open, PR open to merge, dispatch to
+  merge, end to merge) plus an autonomy rate (merged, unsteered, first
+  attempt). Cost gains p50/p95 per-run percentiles, a budget cap-hit
+  count, and spend by cost basis; the instance-wide cost per merged PR
+  is public for spectators while every bucketed USD figure stays
+  operator-only. Runs carry four stage timestamps (`workspace_ready_at`,
+  `agent_ready_at`, `agent_ended_at`, `reaped_at`) and a resolved
+  `base_sha`, and the usage hydrator writes derived cost and tokens back
+  to the run row so a terminal run is priced once.
+- **Operator console patches (pl-9fa9).** Twenty patches from the
+  2026-09 operator review: the topbar shows burn rate and the runtime
+  backend; `GET /ops/overview` takes `?window=24h|7d|30d` and the
+  interventions panel is gone; run detail gets a Spend panel with the
+  cap, a phase rail on real stage pairs, a live workspace-ready probe,
+  and an internally scrolling event stream; the runs list shows the
+  runtime kind with a copyable handle and hides the column for
+  spectators; telemetry gets a project selector, a Delivery tab, an
+  economics tab that renders the whole cost API, and a judge tab that
+  fetches the newest verdicts with honest judged coverage; plain-label
+  copy sweeps across every page.
+- **Docs and guards.** `docs/local-models.md` records the verified
+  pi-extension recipe for a local Ollama provider. The README carries
+  live-instance screenshots. The prose guard flags clause dashes
+  (warren-f5bf). Run-pod sizing analysis from August memory samples
+  lives in the runbook.
+
+### Changed
+
+- **warren-tracker/v1: issue `status` must be `open`, `closed` or
+  `other`.** The protocol told servers to send their raw status string
+  and promised the bridge would normalize it, but the bridge only knew
+  those three words and folded everything else to `other`, so a remote
+  tracker's `Done` never read as closed: plan-runs never skipped
+  finished children and auto-plan-run detection never fired. Servers
+  now fold their own states, the bridge rejects any other string as a
+  malformed payload, the conformance suite requires the vocabulary, and
+  `tracker-jira` maps Jira's `statusCategory`.
+- Workspace init on K8s falls back to a blobless partial clone
+  (`--filter=blob:none`) when no repo-cache PVC is set. A 2.67 GiB
+  openclaw pack clones in about a minute instead of six, never
+  `--depth`, so base-commit pinning and merge-base still work. The
+  Filestore RWX repo cache was removed on cost.
+- `check:bundle-size --update` refuses to lower budgets inside a
+  warren-dispatched run (warren-6397), because the agent image gzips
+  about 1.3 KB cooler than CI and a pod-written floor corrupted the
+  CI-enforced number three times.
+- `EventsRepo.listUsageEvents` narrows to usage envelope payload types
+  in SQL, so the hydrator no longer scans every event row.
+- The warren project's own run pods request 8 GiB, because UI-heavy
+  runs were OOM-killed at the 4 GiB cluster default.
+
+### Fixed
+
+- A K8s cost-cap cancel destroyed committed work: the pod died on
+  SIGTERM before in-pod finalize ran, so no branch was pushed and no
+  salvage bundle existed. The agent entrypoint now latches the
+  termination signal, stops the agent, and falls through to finalize
+  and salvage inside the grace window (warren-01d5).
+- Provider retry now classifies OpenRouter-style stream truncation
+  (`Stream ended without finish_reason`, aborted, premature close) as a
+  transient provider error and retries once, instead of leaving the run
+  failed as `unknown` (GH#1036, #1211, contributed by zerone0x).
+- Reap counts commits ahead with `--first-parent`, so a follow-up run
+  that merged upstream into its branch reports three commits, not
+  3,278 (warren-a8cc).
+- The Dispatch page crashed in production builds: a form prop named
+  `ref` is reserved in JSX and React 18 threw minified error #290. The
+  prop is `gitRef` now.
+- Plan-runs pages crashed for spectators on the six redacted fields
+  (warren-17d7); the UI types them optional and formats an absent cost
+  as a dash.
+- The judge's calibration sample was not random: it always took the
+  first N run ids in sorted order. The judge's pi pin moves to 0.84.4
+  so the OpenRouter registry resolves the new calibration model.
+- The campaign controller's profile bot grammar was never loaded on the
+  tick path, so classification silently no-opped in production
+  (warren-8c83); it is now a required, validated input. Bot-grammar
+  validation accepts GitHub App `<owner>[bot]` logins (warren-442e).
+  The CLI amendment apply passed the validated wrapper into
+  `applyAmendment` and always failed (warren-04a6).
+- The K8s provider-secret override for a hyphenated provider id built
+  an unexportable variable name; hyphens map to underscores. The events
+  Role rule dropped an unused `get` verb.
+- `deploy-gke` quotes rendered numeric env values so the Deployment
+  patch is accepted.
+- Three git-preflight tests inherited the host platform and failed on
+  macOS; they pin Linux like their siblings.
+
 ## [0.19.0] — 2026-08-27
 
 The operator-console release. The UI is rebuilt end to end on the
